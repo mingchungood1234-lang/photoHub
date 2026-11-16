@@ -11,10 +11,27 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section {
-                    TextField("Server URL (e.g. http://192.168.1.100:3000)", text: $settings.serverURL)
+                    Picker("Protocol", selection: $settings.serverProtocolRaw) {
+                        ForEach(ServerProtocol.allCases) { proto in
+                            Text(proto.displayName).tag(proto.rawValue)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    TextField("Host / IP (e.g. 10.8.0.1:3000 or photos.domain.com)", text: $settings.serverURL)
                         .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+
+                    if let resolved = settings.normalizedBaseURL {
+                        Text("Using: \(resolved.absoluteString)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if settings.serverProtocol == .https {
+                        Toggle("Allow Self-Signed HTTPS (VPN / Testing)", isOn: $settings.allowSelfSignedHTTPS)
+                    }
 
                     SecureField("User Key / API Key (e.g. mingchun)", text: $settings.apiKey)
                         .textInputAutocapitalization(.never)

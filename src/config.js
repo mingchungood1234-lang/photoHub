@@ -80,6 +80,11 @@ function getConfig(overrides = {}) {
 
   return {
     port: Number(overrides.port ?? process.env.PORT ?? 3000),
+    protocol: String(overrides.protocol ?? process.env.PROTOCOL ?? 'http')
+      .trim()
+      .toLowerCase(),
+    sslCertPath: (overrides.sslCertPath ?? process.env.SSL_CERT_PATH ?? '').trim(),
+    sslKeyPath: (overrides.sslKeyPath ?? process.env.SSL_KEY_PATH ?? '').trim(),
     storageDir,
     dataDir,
     hashIndexFile: path.join(dataDir, 'hash-index.json'),

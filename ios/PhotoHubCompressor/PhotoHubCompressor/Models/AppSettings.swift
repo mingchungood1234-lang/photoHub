@@ -1,6 +1,17 @@
 import Foundation
 import SwiftUI
 
+enum ServerProtocol: String, CaseIterable, Identifiable {
+    case http = "http"
+    case https = "https"
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        rawValue.uppercased()
+    }
+}
+
 enum UploadMode: String, CaseIterable, Identifiable {
     case directVPS = "direct_vps"
     case s3Presigned = "s3_presigned"
@@ -30,13 +41,20 @@ enum ProxyFormat: String, CaseIterable, Identifiable {
 }
 
 final class AppSettings: ObservableObject {
-    @AppStorage("serverURL") var serverURL: String = "http://192.168.1.100:3000"
+    @AppStorage("serverProtocol") var serverProtocolRaw: String = ServerProtocol.http.rawValue
+    @AppStorage("serverURL") var serverURL: String = "192.168.1.100:3000"
+    @AppStorage("allowSelfSignedHTTPS") var allowSelfSignedHTTPS: Bool = false
     @AppStorage("apiKey") var apiKey: String = ""
     @AppStorage("uploadMode") var uploadModeRaw: String = UploadMode.directVPS.rawValue
     @AppStorage("proxyFormat") var proxyFormatRaw: String = ProxyFormat.heic.rawValue
     @AppStorage("proxyMaxPixelSize") var proxyMaxPixelSize: Int = 2048
     @AppStorage("proxyQuality") var proxyQuality: Double = 0.72
     @AppStorage("minimumOriginalSizeKB") var minimumOriginalSizeKB: Int = 500
+
+    var serverProtocol: ServerProtocol {
+        get { ServerProtocol(rawValue: serverProtocolRaw) ?? .http }
+        set { serverProtocolRaw = newValue.rawValue }
+    }
 
     var uploadMode: UploadMode {
         get { UploadMode(rawValue: uploadModeRaw) ?? .directVPS }
@@ -49,12 +67,17 @@ final class AppSettings: ObservableObject {
     }
 
     var normalizedBaseURL: URL? {
-        var trimmed = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        var host = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard !trimmed.isEmpty else { return nil }
-        if !trimmed.lowercased().hasPrefix("http://") && !trimmed.lowercased().hasPrefix("https://") {
-            trimmed = "http://\(trimmed)"
+        guard !host.isEmpty else { return nil }
+
+        // Strip any manually pasted scheme so the selected HTTP/HTTPS picker controls the protocol
+        if host.lowercased().hasPrefix("https://") {
+            host = String(host.dropFirst("https://".count))
+        } else if host.lowercased().hasPrefix("http://") {
+            host = String(host.dropFirst("http://".count))
         }
-        return URL(string: trimmed)
+
+        return URL(string: "\(serverProtocol.rawValue)://\(host)")
     }
 }

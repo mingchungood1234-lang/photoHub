@@ -1,4 +1,6 @@
 const fs = require('fs');
+const http = require('http');
+const https = require('https');
 const path = require('path');
 const express = require('express');
 const multer = require('multer');
@@ -654,16 +656,37 @@ async function createApp(configOverrides = {}) {
 if (require.main === module) {
   createApp()
     .then((app) => {
-      const { port, storageDir, userKeyMap } = app.locals.config;
-      app.listen(port, '0.0.0.0', () => {
-        console.log(`PhotoHub backend listening on http://0.0.0.0:${port}`);
+      const { port, protocol, sslCertPath, sslKeyPath, storageDir, userKeyMap } =
+        app.locals.config;
+
+      const onListening = () => {
+        const scheme = protocol === 'https' ? 'https' : 'http';
+        console.log(`PhotoHub backend listening on ${scheme}://0.0.0.0:${port}`);
         console.log(`Base storage directory: ${storageDir}`);
         if (userKeyMap.size > 0) {
           console.log(
             `Multi-user folders active: ${Array.from(new Set(userKeyMap.values())).join(', ')}`
           );
         }
-      });
+      };
+
+      if (protocol === 'https') {
+        if (!sslCertPath || !sslKeyPath) {
+          throw new Error(
+            'PROTOCOL=https requires SSL_CERT_PATH and SSL_KEY_PATH in .env'
+          );
+        }
+        const server = https.createServer(
+          {
+            cert: fs.readFileSync(sslCertPath),
+            key: fs.readFileSync(sslKeyPath),
+          },
+          app
+        );
+        server.listen(port, '0.0.0.0', onListening);
+      } else {
+        http.createServer(app).listen(port, '0.0.0.0', onListening);
+      }
     })
     .catch((err) => {
       console.error('Failed to start server:', err);

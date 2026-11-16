@@ -87,8 +87,10 @@ private struct PresignResponse: Decodable {
 
 private final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate {
     private let onProgress: (Double) -> Void
+    private let allowSelfSignedHTTPS: Bool
 
-    init(onProgress: @escaping (Double) -> Void) {
+    init(allowSelfSignedHTTPS: Bool = false, onProgress: @escaping (Double) -> Void = { _ in }) {
+        self.allowSelfSignedHTTPS = allowSelfSignedHTTPS
         self.onProgress = onProgress
     }
 
@@ -103,6 +105,20 @@ private final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate {
         let fraction = min(1.0, max(0.0, Double(totalBytesSent) / Double(totalBytesExpectedToSend)))
         onProgress(fraction)
     }
+
+    func urlSession(
+        _ session: URLSession,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        if allowSelfSignedHTTPS,
+           challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+           let serverTrust = challenge.protectionSpace.serverTrust {
+            completionHandler(.useCredential, URLCredential(trust: serverTrust))
+            return
+        }
+        completionHandler(.performDefaultHandling, nil)
+    }
 }
 
 final class PhotoHubAPIClient {
@@ -115,6 +131,14 @@ final class PhotoHubAPIClient {
 
     init(settings: AppSettings) {
         self.settings = settings
+    }
+
+    private func makeSession(onProgress: @escaping (Double) -> Void = { _ in }) -> URLSession {
+        let delegate = UploadProgressDelegate(
+            allowSelfSignedHTTPS: settings.allowSelfSignedHTTPS,
+            onProgress: onProgress
+        )
+        return URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
     }
 
     private func makeURL(_ path: String) throws -> URL {
@@ -133,7 +157,9 @@ final class PhotoHubAPIClient {
 
     func checkHealth() async throws -> HealthResponse {
         let url = try makeURL("/api/health")
-        let (data, response) = try await URLSession.shared.data(from: url)
+        let session = makeSession()
+        defer { session.finishTasksAndInvalidate() }
+        let (data, response) = try await session.data(from: url)
         try validateHTTP(response: response, data: data)
         return try JSONDecoder().decode(HealthResponse.self, from: data)
     }
@@ -144,7 +170,9 @@ final class PhotoHubAPIClient {
         request.httpMethod = "GET"
         applyAuth(to: &request)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let session = makeSession()
+        defer { session.finishTasksAndInvalidate() }
+        let (data, response) = try await session.data(for: request)
         try validateHTTP(response: response, data: data)
         return try JSONDecoder().decode(WhoAmIResponse.self, from: data)
     }
@@ -162,7 +190,9 @@ final class PhotoHubAPIClient {
         request.httpMethod = "GET"
         applyAuth(to: &request)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let session = makeSession()
+        defer { session.finishTasksAndInvalidate() }
+        let (data, response) = try await session.data(for: request)
         try validateHTTP(response: response, data: data)
         let decoded = try JSONDecoder().decode(ServerPhotosResponse.self, from: data)
         return decoded.photos
@@ -174,7 +204,9 @@ final class PhotoHubAPIClient {
         request.httpMethod = "GET"
         applyAuth(to: &request)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let session = makeSession()
+        defer { session.finishTasksAndInvalidate() }
+        let (data, response) = try await session.data(for: request)
         try validateHTTP(response: response, data: data)
         return data
     }
@@ -185,7 +217,9 @@ final class PhotoHubAPIClient {
         request.httpMethod = "GET"
         applyAuth(to: &request)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let session = makeSession()
+        defer { session.finishTasksAndInvalidate() }
+        let (data, response) = try await session.data(for: request)
         try validateHTTP(response: response, data: data)
         return try JSONDecoder().decode(CheckResponse.self, from: data)
     }
@@ -215,8 +249,7 @@ final class PhotoHubAPIClient {
             request.setValue(isoFormatter.string(from: createdAt), forHTTPHeaderField: "X-Photo-Date")
         }
 
-        let delegate = UploadProgressDelegate(onProgress: onProgress)
-        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+        let session = makeSession(onProgress: onProgress)
         defer { session.finishTasksAndInvalidate() }
 
         let (data, response) = try await session.upload(for: request, fromFile: fileURL)
@@ -250,7 +283,10 @@ final class PhotoHubAPIClient {
             "expectedHash": expectedSha256,
         ])
 
-        let (presignData, presignResp) = try await URLSession.shared.data(for: presignReq)
+        let metaSession = makeSession()
+        defer { metaSession.finishTasksAndInvalidate() }
+
+        let (presignData, presignResp) = try await metaSession.data(for: presignReq)
         try validateHTTP(response: presignResp, data: presignData)
         let presign = try JSONDecoder().decode(PresignResponse.self, from: presignData)
 
@@ -280,8 +316,7 @@ final class PhotoHubAPIClient {
         putReq.httpMethod = "PUT"
         putReq.timeoutInterval = 300
 
-        let delegate = UploadProgressDelegate(onProgress: onProgress)
-        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+        let session = makeSession(onProgress: onProgress)
         defer { session.finishTasksAndInvalidate() }
 
         let (putData, putResp) = try await session.upload(for: putReq, fromFile: fileURL)
@@ -300,7 +335,7 @@ final class PhotoHubAPIClient {
             "createdAt": dateStr,
         ])
 
-        let (confirmData, confirmResp) = try await URLSession.shared.data(for: confirmReq)
+        let (confirmData, confirmResp) = try await metaSession.data(for: confirmReq)
         try validateHTTP(response: confirmResp, data: confirmData)
         let confirmed = try JSONDecoder().decode(UploadConfirmResponse.self, from: confirmData)
         try ensureChecksumConfirmed(confirmed, expectedSha256: expectedSha256)
@@ -319,7 +354,9 @@ final class PhotoHubAPIClient {
             "assetId": assetId,
         ])
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let session = makeSession()
+        defer { session.finishTasksAndInvalidate() }
+        let (data, response) = try await session.data(for: request)
         try validateHTTP(response: response, data: data)
     }
 
