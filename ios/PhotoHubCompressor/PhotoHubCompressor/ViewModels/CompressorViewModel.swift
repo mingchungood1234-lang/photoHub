@@ -12,8 +12,6 @@ final class CompressorViewModel: ObservableObject {
     @Published var totalSavedBytes: Int64 = 0
     @Published var completedCount: Int = 0
     @Published var totalToProcess: Int = 0
-    @Published var readyToDeleteItems: [PhotoLibraryService.PendingProxyReplacement] = []
-    @Published var isDeletingOriginals: Bool = false
 
     let settings: AppSettings
     private let photoService = PhotoLibraryService()
@@ -103,10 +101,6 @@ final class CompressorViewModel: ObservableObject {
 
     func toggleSelection(for id: String) {
         guard let idx = candidates.firstIndex(where: { $0.id == id }) else { return }
-        if case .readyToDelete = candidates[idx].state {
-            deleteReadyOriginalsFromDevice()
-            return
-        }
         guard !candidates[idx].state.isFinished else { return }
         candidates[idx].isSelected.toggle()
     }
@@ -141,86 +135,33 @@ final class CompressorViewModel: ObservableObject {
         var failedCount = 0
         for idx in targetIndices {
             if Task.isCancelled { break }
-            if let pending = await processSingleCandidate(at: idx, apiClient: apiClient) {
-                readyToDeleteItems.append(pending)
-                candidates[idx].state = .readyToDelete(savedBytes: pending.savedBytes)
-                candidates[idx].isSelected = false
-            } else {
-                failedCount += 1
-            }
+            let ok = await processSingleCandidate(at: idx, apiClient: apiClient)
+            if !ok { failedCount += 1 }
             completedCount += 1
         }
 
         isProcessing = false
-
-        guard !readyToDeleteItems.isEmpty else {
-            if failedCount > 0 && statusBanner == nil {
-                statusBanner = "Finished with \(failedCount) error(s)."
-            }
-            return
-        }
-
-        statusBanner = "Backed up \(readyToDeleteItems.count) item(s)! Tap the red 'Delete' button below to remove the original(s) from your iPhone."
-    }
-
-    func deleteReadyOriginalsFromDevice() {
-        let items = readyToDeleteItems
-        guard !items.isEmpty else {
-            statusBanner = "No backed-up items waiting for deletion."
-            return
-        }
-
-        isDeletingOriginals = true
-        statusBanner = "Asking iOS Photos to delete \(items.count) original item(s)…"
-
-        let keepLocal = settings.keepLocalProxyInPhotos
-        photoService.performBatchDeleteAndOptionalProxySave(
-            items: items,
-            keepLocalProxy: keepLocal
-        ) { [weak self] result in
-            guard let self = self else { return }
-            self.isDeletingOriginals = false
-            switch result {
-            case .success(let createdProxyIds):
-                for (i, item) in items.enumerated() {
-                    self.totalSavedBytes += item.savedBytes
-                    self.tracker.markAsProxy(
-                        assetId: item.originalAsset.localIdentifier,
-                        proxySha256: item.proxySha256
-                    )
-                    if i < createdProxyIds.count {
-                        self.tracker.markAsProxy(
-                            assetId: createdProxyIds[i],
-                            proxySha256: item.proxySha256
-                        )
-                    }
-                }
-
-                let completedAssetIds = Set(items.map { $0.originalAsset.localIdentifier })
-                self.candidates.removeAll { completedAssetIds.contains($0.id) }
-                self.readyToDeleteItems.removeAll()
-
-                let savedStr = ByteCountFormatter.string(fromByteCount: self.totalSavedBytes, countStyle: .file)
-                self.statusBanner = "Success! Deleted \(items.count) original photo(s). Space saved: \(savedStr)."
-
-            case .failure(let error):
-                self.statusBanner = "Delete error: \(error.localizedDescription)"
-            }
+        let savedStr = ByteCountFormatter.string(fromByteCount: totalSavedBytes, countStyle: .file)
+        if failedCount > 0 && statusBanner == nil {
+            statusBanner = "Finished with \(failedCount) error(s). Space saved: \(savedStr)."
+        } else if failedCount == 0 {
+            statusBanner = "Finished! Space saved: \(savedStr). Empty 'Recently Deleted' in Photos to reclaim storage immediately."
         }
     }
 
+    @discardableResult
     private func processSingleCandidate(
         at index: Int,
         apiClient: PhotoHubAPIClient
-    ) async -> PhotoLibraryService.PendingProxyReplacement? {
+    ) async -> Bool {
         let candidate = candidates[index]
         var masterTempURL: URL?
-        var proxyImageTempURL: URL?
+        var proxyTempURL: URL?
         var posterTempURL: URL?
 
         defer {
             if let masterTempURL { try? FileManager.default.removeItem(at: masterTempURL) }
-            if let proxyImageTempURL { try? FileManager.default.removeItem(at: proxyImageTempURL) }
+            if let proxyTempURL { try? FileManager.default.removeItem(at: proxyTempURL) }
             if let posterTempURL { try? FileManager.default.removeItem(at: posterTempURL) }
         }
 
@@ -273,16 +214,12 @@ final class CompressorViewModel: ObservableObject {
             let quality = settings.proxyQuality
 
             let proxy: GeneratedProxy
-            let proxyData: Data?
-            let proxyVideoURL: URL?
             let previewFileForServer: URL?
             let previewFormatForServer: String
 
             if candidate.mediaType == .video {
                 proxy = try await ProxyGenerator.createVideoProxy(from: master.fileURL)
                 posterTempURL = proxy.posterFileURL
-                proxyData = nil
-                proxyVideoURL = proxy.fileURL
                 previewFileForServer = proxy.posterFileURL
                 previewFormatForServer = "jpeg"
             } else {
@@ -294,15 +231,12 @@ final class CompressorViewModel: ObservableObject {
                         quality: quality
                     )
                 }.value
-                proxyImageTempURL = proxy.fileURL
-                proxyData = try Data(contentsOf: proxy.fileURL)
-                proxyVideoURL = nil
                 previewFileForServer = proxy.fileURL
                 previewFormatForServer = format.rawValue
             }
+            proxyTempURL = proxy.fileURL
 
-            // 5. Register proxy hash & upload small compressed preview to server
-            candidates[index].state = .replacingInPhotos
+            // 5. Register proxy hash & upload small compressed preview to server BEFORE PhotoKit prompt
             try? await apiClient.registerProxy(
                 masterHash: master.sha256,
                 proxyHash: proxy.sha256,
@@ -311,22 +245,29 @@ final class CompressorViewModel: ObservableObject {
                 proxyFormat: previewFormatForServer
             )
 
+            // 6. Replace original in native Photos app with lightweight proxy (exact working e2c7312 flow!)
+            candidates[index].state = .replacingInPhotos
+            let newAssetId = try await photoService.replaceWithProxy(
+                originalAsset: candidate.asset,
+                mediaType: candidate.mediaType,
+                proxyFileURL: proxy.fileURL,
+                keepLocalProxy: settings.keepLocalProxyInPhotos
+            )
+
+            tracker.markAsProxy(assetId: candidate.id, proxySha256: proxy.sha256)
+            tracker.markAsProxy(assetId: newAssetId, proxySha256: proxy.sha256)
+
             let saved = settings.keepLocalProxyInPhotos
                 ? max(0, master.sizeBytes - proxy.sizeBytes)
                 : master.sizeBytes
-
-            return PhotoLibraryService.PendingProxyReplacement(
-                originalAsset: candidate.asset,
-                mediaType: candidate.mediaType,
-                proxyData: proxyData,
-                proxyVideoURL: proxyVideoURL,
-                proxySha256: proxy.sha256,
-                savedBytes: saved
-            )
+            totalSavedBytes += saved
+            candidates[index].state = .completed(savedBytes: saved)
+            candidates[index].isSelected = false
+            return true
         } catch {
             candidates[index].state = .failed(error.localizedDescription)
             statusBanner = error.localizedDescription
-            return nil
+            return false
         }
     }
 }

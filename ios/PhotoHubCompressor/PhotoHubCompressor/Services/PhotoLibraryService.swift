@@ -167,117 +167,31 @@ final class PhotoLibraryService {
         )
     }
 
-    struct PendingProxyReplacement {
-        let originalAsset: PHAsset
-        let mediaType: PHAssetMediaType
-        let proxyData: Data?
-        let proxyVideoURL: URL?
-        let proxySha256: String
-        let savedBytes: Int64
-    }
+    /// Creates the lightweight proxy in the native Photos library (preserving date, GPS, and favorite status)
+    /// and deletes the heavy original in the same atomic PhotoKit transaction (exact proven implementation from e2c7312).
+    func replaceWithProxy(
+        originalAsset: PHAsset,
+        mediaType: PHAssetMediaType,
+        proxyFileURL: URL,
+        keepLocalProxy: Bool = true
+    ) async throws -> String {
+        var createdLocalIdentifier: String?
 
-    /// Performs PhotoKit deletion (and optional proxy creation) using plain completion handlers
-    /// (NO async/await continuation) so the MainActor runloop is completely free to display the iOS Delete confirmation alert.
-    func performBatchDeleteAndOptionalProxySave(
-        items: [PendingProxyReplacement],
-        keepLocalProxy: Bool,
-        completion: @escaping (Result<[String], Error>) -> Void
-    ) {
-        guard !items.isEmpty else {
-            DispatchQueue.main.async { completion(.success([])) }
-            return
+        try await PHPhotoLibrary.shared().performChanges {
+            if keepLocalProxy {
+                let createRequest = (mediaType == .video)
+                    ? PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: proxyFileURL)
+                    : PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: proxyFileURL)
+                createRequest?.creationDate = originalAsset.creationDate
+                createRequest?.location = originalAsset.location
+                createRequest?.isFavorite = originalAsset.isFavorite
+                createdLocalIdentifier = createRequest?.placeholderForCreatedAsset?.localIdentifier
+            }
+
+            PHAssetChangeRequest.deleteAssets([originalAsset] as NSArray)
         }
 
-        let identifiers = items.map { $0.originalAsset.localIdentifier }
-
-        // On iOS 18+, initiate fetchAssets and performChanges from a background queue
-        // so the main thread is never blocked when SpringBoard/Photos presents the system Delete confirmation alert.
-        DispatchQueue.global(qos: .userInitiated).async {
-            let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil)
-
-            guard fetchResult.count > 0 else {
-                DispatchQueue.main.async {
-                    completion(.failure(PhotoLibraryError.proxyReplacementFailed("Asset not found in Photo Library (may already be deleted or restricted by Limited Access).")))
-                }
-                return
-            }
-
-            var deletableAssets: [PHAsset] = []
-            for i in 0..<fetchResult.count {
-                let asset = fetchResult.object(at: i)
-                if asset.canPerform(.delete) {
-                    deletableAssets.append(asset)
-                }
-            }
-
-            guard !deletableAssets.isEmpty else {
-                DispatchQueue.main.async {
-                    completion(.failure(PhotoLibraryError.proxyReplacementFailed("iOS reports this photo cannot be deleted (canPerform(.delete) == false). Check Settings -> photoHub -> Photos -> Full Access.")))
-                }
-                return
-            }
-
-            // Step 1: Delete original assets first
-            PHPhotoLibrary.shared().performChanges({
-                PHAssetChangeRequest.deleteAssets(deletableAssets as NSArray)
-            }, completionHandler: { deleteSuccess, deleteError in
-                guard deleteSuccess else {
-                    let nsErr = deleteError as NSError?
-                    let detail = nsErr.map { "\($0.localizedDescription) [\($0.domain):\($0.code)]" }
-                        ?? "Deletion was cancelled or denied."
-                    DispatchQueue.main.async {
-                        completion(.failure(PhotoLibraryError.proxyReplacementFailed(detail)))
-                    }
-                    return
-                }
-
-                let cleanupTempVideos = {
-                    for item in items {
-                        if let videoURL = item.proxyVideoURL {
-                            try? FileManager.default.removeItem(at: videoURL)
-                        }
-                    }
-                }
-
-                guard keepLocalProxy else {
-                    cleanupTempVideos()
-                    DispatchQueue.main.async {
-                        completion(.success([]))
-                    }
-                    return
-                }
-
-                // Step 2: Save lightweight proxy assets in a separate performChanges call after deletion succeeded
-                var createdIds: [String] = []
-                PHPhotoLibrary.shared().performChanges({
-                    for item in items {
-                        if item.mediaType == .video, let videoURL = item.proxyVideoURL {
-                            let req = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: videoURL)
-                            req?.creationDate = item.originalAsset.creationDate
-                            req?.location = item.originalAsset.location
-                            req?.isFavorite = item.originalAsset.isFavorite
-                            if let id = req?.placeholderForCreatedAsset?.localIdentifier {
-                                createdIds.append(id)
-                            }
-                        } else if let data = item.proxyData {
-                            let creationRequest = PHAssetCreationRequest.forAsset()
-                            creationRequest.addResource(with: .photo, data: data, options: nil)
-                            creationRequest.creationDate = item.originalAsset.creationDate
-                            creationRequest.location = item.originalAsset.location
-                            creationRequest.isFavorite = item.originalAsset.isFavorite
-                            if let id = creationRequest.placeholderForCreatedAsset?.localIdentifier {
-                                createdIds.append(id)
-                            }
-                        }
-                    }
-                }, completionHandler: { _, _ in
-                    cleanupTempVideos()
-                    DispatchQueue.main.async {
-                        completion(.success(createdIds))
-                    }
-                })
-            })
-        }
+        return createdLocalIdentifier ?? originalAsset.localIdentifier
     }
 
     private static func pickOriginalResource(from resources: [PHAssetResource]) -> PHAssetResource? {
