@@ -42,8 +42,10 @@ final class CompressorViewModel: ObservableObject {
             }
 
             // Run fetch on background queue, then assign on main thread
+            let service = self.photoService
+            let tracker = self.tracker
             DispatchQueue.global(qos: .userInitiated).async {
-                let scanned = self.photoService.scanCandidates(tracker: self.tracker)
+                let scanned = service.scanCandidates(tracker: tracker)
                 DispatchQueue.main.async {
                     self.candidates = scanned
                     self.isScanning = false

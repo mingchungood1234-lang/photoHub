@@ -9,11 +9,37 @@ targets:
     platform: iOS
     sources:
       - PhotoHubCompressor
+    # IMPORTANT: XcodeGen REGENERATES Info.plist from these properties on every
+    # `xcodegen generate` (CI does this). Add/edit keys HERE, not in Info.plist.
     info:
       path: PhotoHubCompressor/Info.plist
+      properties:
+        CFBundleDisplayName: photoHub
+        CFBundleName: photoHub
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        LSRequiresIPhoneOS: true
+        UIRequiresFullScreen: true
+        UILaunchStoryboardName: LaunchScreen
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSPhotoLibraryUsageDescription: photoHub needs access to your Photos library to back up full-resolution originals to your server and replace them with lightweight proxies.
+        NSPhotoLibraryAddUsageDescription: photoHub needs permission to save compressed proxy photos and restored originals to your Photos library.
+        NSLocalNetworkUsageDescription: photoHub needs local network access to upload photos to your self-hosted server.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.photohub.compressor
         SWIFT_VERSION: "5.9"
         GENERATE_INFOPLIST_FILE: NO
         TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor

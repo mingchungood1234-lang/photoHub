@@ -45,6 +45,18 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             clean build
 
+      - name: Verify Info.plist privacy keys are in the built app
+        run: |
+          PLIST=build/DerivedData/Build/Products/Release-iphoneos/PhotoHubCompressor.app/Info.plist
+          plutil -p "$PLIST"
+          for KEY in NSPhotoLibraryUsageDescription NSPhotoLibraryAddUsageDescription UILaunchStoryboardName CFBundleDisplayName; do
+            if ! /usr/libexec/PlistBuddy -c "Print :$KEY" "$PLIST" >/dev/null 2>&1; then
+              echo "::error::Missing $KEY in built Info.plist - app would crash or misbehave"
+              exit 1
+            fi
+          done
+          echo "All required Info.plist keys present."
+
       - name: Package unsigned IPA for sideloading
         run: |
           mkdir -p build/ipa/Payload
