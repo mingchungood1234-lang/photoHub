@@ -47,7 +47,7 @@ final class AppSettings: ObservableObject {
     @AppStorage("apiKey") var apiKey: String = ""
     @AppStorage("uploadMode") var uploadModeRaw: String = UploadMode.directVPS.rawValue
     @AppStorage("proxyFormat") var proxyFormatRaw: String = ProxyFormat.heic.rawValue
-    @AppStorage("proxyMaxPixelSize") var proxyMaxPixelSize: Int = 2048
+    @AppStorage("proxyMaxPixelSize") var proxyMaxPixelSize: Int = 0 // 0 = Auto for all resolutions
     @AppStorage("proxyQuality") var proxyQuality: Double = 0.72
     @AppStorage("minimumOriginalSizeKB") var minimumOriginalSizeKB: Int = 500
 

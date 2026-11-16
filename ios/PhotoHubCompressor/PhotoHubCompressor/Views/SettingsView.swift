@@ -5,7 +5,7 @@ struct SettingsView: View {
     @State private var connectionStatus: String?
     @State private var isTesting: Bool = false
 
-    private let resolutions = [1280, 1920, 2048, 2560]
+    private let resolutions = [0, 1280, 1920, 2048, 2560]
 
     var body: some View {
         NavigationStack {
@@ -72,9 +72,13 @@ struct SettingsView: View {
                         }
                     }
 
-                    Picker("Max Dimension", selection: $settings.proxyMaxPixelSize) {
+                    Picker("Proxy Target Size", selection: $settings.proxyMaxPixelSize) {
                         ForEach(resolutions, id: \.self) { px in
-                            Text("\(px) px").tag(px)
+                            if px == 0 {
+                                Text("Auto (All Resolutions)").tag(0)
+                            } else {
+                                Text("\(px) px").tag(px)
+                            }
                         }
                     }
 
