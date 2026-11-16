@@ -29,17 +29,14 @@ struct ExportedMaster {
 }
 
 final class PhotoLibraryService {
-    func requestAuthorization() async -> PHAuthorizationStatus {
+    func requestAuthorization(completion: @escaping (PHAuthorizationStatus) -> Void) {
         let current = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         if current == .authorized || current == .limited {
-            return current
+            DispatchQueue.main.async { completion(current) }
+            return
         }
-        return await withCheckedContinuation { continuation in
-            DispatchQueue.main.async {
-                PHPhotoLibrary.requestAuthorization(for: .readWrite) { status in
-                    continuation.resume(returning: status)
-                }
-            }
+        PHPhotoLibrary.requestAuthorization(for: .readWrite) { status in
+            DispatchQueue.main.async { completion(status) }
         }
     }
 

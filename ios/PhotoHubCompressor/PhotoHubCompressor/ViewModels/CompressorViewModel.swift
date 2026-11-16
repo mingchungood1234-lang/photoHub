@@ -26,23 +26,32 @@ final class CompressorViewModel: ObservableObject {
         candidates.filter { $0.isSelected && !$0.state.isFinished }.count
     }
 
-    func scanLibrary() async {
+    func scanLibrary() {
+        guard !isScanning else { return }
         isScanning = true
         statusBanner = nil
-        defer { isScanning = false }
 
-        let status = await photoService.requestAuthorization()
-        permissionStatus = status
-        guard status == .authorized || status == .limited else {
-            statusBanner = "Please allow Photos access in iOS Settings to scan your library."
-            return
-        }
+        photoService.requestAuthorization { [weak self] status in
+            guard let self = self else { return }
+            self.permissionStatus = status
 
-        let scanned = photoService.scanCandidates(tracker: tracker)
-        candidates = scanned
+            guard status == .authorized || status == .limited else {
+                self.isScanning = false
+                self.statusBanner = "Please allow Photos access in iOS Settings to scan your library."
+                return
+            }
 
-        if candidates.isEmpty {
-            statusBanner = "No photos found in photo library."
+            // Run fetch on background queue, then assign on main thread
+            DispatchQueue.global(qos: .userInitiated).async {
+                let scanned = self.photoService.scanCandidates(tracker: self.tracker)
+                DispatchQueue.main.async {
+                    self.candidates = scanned
+                    self.isScanning = false
+                    if scanned.isEmpty {
+                        self.statusBanner = "No photos found in photo library."
+                    }
+                }
+            }
         }
     }
 

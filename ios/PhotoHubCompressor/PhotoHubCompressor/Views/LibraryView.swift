@@ -51,7 +51,7 @@ struct LibraryView: View {
                             .buttonStyle(.borderedProminent)
                         } else {
                             Button("Scan Library") {
-                                Task { await viewModel.scanLibrary() }
+                                viewModel.scanLibrary()
                             }
                             .buttonStyle(.borderedProminent)
                             .disabled(viewModel.isScanning)
@@ -76,12 +76,12 @@ struct LibraryView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .navigationTitle("PhotoHub")
+            .navigationTitle("photoHub")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button {
-                        Task { await viewModel.scanLibrary() }
+                        viewModel.scanLibrary()
                     } label: {
                         if viewModel.isScanning {
                             ProgressView()
