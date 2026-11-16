@@ -6,6 +6,26 @@ struct LibraryView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
+                if viewModel.permissionStatus == .limited {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        Text("Limited Photos Access: iOS blocks deleting originals in Limited mode.")
+                            .font(.caption)
+                        Spacer()
+                        Button("Full Access") {
+                            if let url = URL(string: UIApplication.openSettingsURLString) {
+                                UIApplication.shared.open(url)
+                            }
+                        }
+                        .font(.caption.bold())
+                        .buttonStyle(.borderedProminent)
+                        .tint(.orange)
+                    }
+                    .padding(10)
+                    .background(Color.orange.opacity(0.15))
+                }
+
                 if let banner = viewModel.statusBanner {
                     HStack(spacing: 8) {
                         Image(systemName: "info.circle.fill")
@@ -149,7 +169,11 @@ struct LibraryView: View {
                     viewModel.deleteReadyOriginalsFromDevice()
                 } label: {
                     HStack {
-                        Image(systemName: "trash.fill")
+                        if viewModel.isDeletingOriginals {
+                            ProgressView().tint(.white)
+                        } else {
+                            Image(systemName: "trash.fill")
+                        }
                         Text("Delete \(viewModel.readyToDeleteItems.count) Backed-Up Original(s) from iPhone")
                             .fontWeight(.semibold)
                     }
@@ -158,6 +182,7 @@ struct LibraryView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.red)
+                .disabled(viewModel.isDeletingOriginals)
             }
 
             if viewModel.selectedCount > 0 {

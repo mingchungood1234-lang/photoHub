@@ -13,6 +13,7 @@ final class CompressorViewModel: ObservableObject {
     @Published var completedCount: Int = 0
     @Published var totalToProcess: Int = 0
     @Published var readyToDeleteItems: [PhotoLibraryService.PendingProxyReplacement] = []
+    @Published var isDeletingOriginals: Bool = false
 
     let settings: AppSettings
     private let photoService = PhotoLibraryService()
@@ -155,17 +156,16 @@ final class CompressorViewModel: ObservableObject {
             return
         }
 
-        statusBanner = "Backed up \(readyToDeleteItems.count) photo(s)! Tap 'Delete from iPhone' below (or Allow on the iOS prompt) to remove originals."
-
-        // Automatically trigger the iOS delete prompt once the async Task exits
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-            self?.deleteReadyOriginalsFromDevice()
-        }
+        statusBanner = "Backed up \(readyToDeleteItems.count) photo(s)! Tap the red 'Delete Original(s)' button below to remove them from your iPhone."
     }
 
     func deleteReadyOriginalsFromDevice() {
+        guard !isDeletingOriginals else { return }
         let items = readyToDeleteItems
         guard !items.isEmpty else { return }
+
+        isDeletingOriginals = true
+        statusBanner = "Requesting iOS confirmation to delete \(items.count) original photo(s)…"
 
         let keepLocal = settings.keepLocalProxyInPhotos
         photoService.performBatchDeleteAndOptionalProxySave(
@@ -173,6 +173,7 @@ final class CompressorViewModel: ObservableObject {
             keepLocalProxy: keepLocal
         ) { [weak self] result in
             guard let self = self else { return }
+            self.isDeletingOriginals = false
             switch result {
             case .success(let createdProxyIds):
                 for (i, item) in items.enumerated() {
@@ -194,10 +195,10 @@ final class CompressorViewModel: ObservableObject {
                 self.readyToDeleteItems.removeAll()
 
                 let savedStr = ByteCountFormatter.string(fromByteCount: self.totalSavedBytes, countStyle: .file)
-                self.statusBanner = "Success! Replaced/deleted \(items.count) photo(s). Space saved: \(savedStr)."
+                self.statusBanner = "Success! Deleted \(items.count) original photo(s). Space saved: \(savedStr)."
 
             case .failure(let error):
-                self.statusBanner = "Tap the red 'Delete from iPhone' button below to confirm removing the original photo(s). (\(error.localizedDescription))"
+                self.statusBanner = "Delete error: \(error.localizedDescription)"
             }
         }
     }

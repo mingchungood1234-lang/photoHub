@@ -85,7 +85,7 @@ final class PhotoLibraryService {
     func loadThumbnail(for asset: PHAsset, targetSize: CGSize = CGSize(width: 160, height: 160)) async -> UIImage? {
         await withCheckedContinuation { continuation in
             let options = PHImageRequestOptions()
-            options.deliveryMode = .fastFormat
+            options.deliveryMode = .opportunistic
             options.isNetworkAccessAllowed = true
             options.resizeMode = .fast
             options.isSynchronous = false
@@ -99,34 +99,14 @@ final class PhotoLibraryService {
                 contentMode: .aspectFill,
                 options: options
             ) { image, info in
-                let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
-                // Only return when we have an image or when request is complete
                 lock.lock()
                 defer { lock.unlock() }
-                if !hasResumed {
-                    if let image = image, !isDegraded {
-                        hasResumed = true
-                        continuation.resume(returning: image)
-                    } else if image != nil && hasResumed == false {
-                        // Keep waiting for non-degraded, unless error or cancelled
-                        let isCancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
-                        let error = info?[PHImageErrorKey] as? Error
-                        if isCancelled || error != nil {
-                            hasResumed = true
-                            continuation.resume(returning: image)
-                        }
-                    } else if info?[PHImageErrorKey] != nil || (info?[PHImageCancelledKey] as? Bool) == true {
-                        hasResumed = true
-                        continuation.resume(returning: nil)
-                    }
-                }
-            }
+                guard !hasResumed else { return }
 
-            // Safety timeout to ensure continuation ALWAYS resumes even if PhotoKit drops callback
-            DispatchQueue.global().asyncAfter(deadline: .now() + 3.0) {
-                lock.lock()
-                defer { lock.unlock() }
-                if !hasResumed {
+                if let image = image {
+                    hasResumed = true
+                    continuation.resume(returning: image)
+                } else if info?[PHImageErrorKey] != nil || (info?[PHImageCancelledKey] as? Bool) == true {
                     hasResumed = true
                     continuation.resume(returning: nil)
                 }
@@ -198,16 +178,24 @@ final class PhotoLibraryService {
             return
         }
 
-        let assetsToDelete = items.map { $0.originalAsset }
+        let identifiers = items.map { $0.originalAsset.localIdentifier }
+        let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil)
 
-        // Step 1: Delete original assets first in a standalone performChanges call
+        guard fetchResult.count > 0 else {
+            DispatchQueue.main.async { completion(.success([])) }
+            return
+        }
+
+        // Step 1: Delete original assets first using fresh PHFetchResult
         PHPhotoLibrary.shared().performChanges({
-            PHAssetChangeRequest.deleteAssets(assetsToDelete as NSArray)
+            PHAssetChangeRequest.deleteAssets(fetchResult)
         }, completionHandler: { deleteSuccess, deleteError in
             guard deleteSuccess else {
-                let msg = deleteError?.localizedDescription ?? "Photo deletion was cancelled or denied."
+                let nsErr = deleteError as NSError?
+                let detail = nsErr.map { "\($0.localizedDescription) [\($0.domain):\($0.code)]" }
+                    ?? "Photo deletion was cancelled or denied."
                 DispatchQueue.main.async {
-                    completion(.failure(PhotoLibraryError.proxyReplacementFailed(msg)))
+                    completion(.failure(PhotoLibraryError.proxyReplacementFailed(detail)))
                 }
                 return
             }
