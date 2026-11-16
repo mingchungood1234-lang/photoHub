@@ -1,3 +1,4 @@
+import ImageIO
 import Photos
 import SwiftUI
 
@@ -8,6 +9,7 @@ struct ServerGalleryView: View {
     @State private var errorMessage: String?
     @State private var selectedPhoto: ServerPhoto?
     @State private var imageCache: [String: UIImage] = [:]
+    @State private var compressedDataCache: [String: Data] = [:]
 
     private let columns = [
         GridItem(.adaptive(minimum: 108, maximum: 160), spacing: 3)
@@ -17,7 +19,7 @@ struct ServerGalleryView: View {
         NavigationStack {
             Group {
                 if isLoading && photos.isEmpty {
-                    ProgressView("Loading server photos…")
+                    ProgressView("Loading compressed server previews…")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if let errorMessage, photos.isEmpty {
                     ContentUnavailableView {
@@ -35,7 +37,7 @@ struct ServerGalleryView: View {
                     ContentUnavailableView {
                         Label("No Photos on Server", systemImage: "cloud")
                     } description: {
-                        Text("Photos you upload and compress will appear here.")
+                        Text("Photos you upload and compress will appear here as lightweight compressed previews.")
                     } actions: {
                         Button("Refresh") {
                             Task { await loadPhotos() }
@@ -55,7 +57,7 @@ struct ServerGalleryView: View {
                                     selectedPhoto = photo
                                 }
                                 .task(id: photo.hash) {
-                                    await loadImageIfNeeded(for: photo)
+                                    await loadCompressedPreviewIfNeeded(for: photo)
                                 }
                             }
                         }
@@ -91,7 +93,8 @@ struct ServerGalleryView: View {
                 ServerPhotoDetailView(
                     photo: photo,
                     settings: settings,
-                    initialImage: imageCache[photo.hash]
+                    initialImage: imageCache[photo.hash],
+                    initialCompressedData: compressedDataCache[photo.hash]
                 )
             }
         }
@@ -110,13 +113,44 @@ struct ServerGalleryView: View {
         }
     }
 
-    private func loadImageIfNeeded(for photo: ServerPhoto) async {
+    private func loadCompressedPreviewIfNeeded(for photo: ServerPhoto) async {
         guard imageCache[photo.hash] == nil else { return }
         let client = PhotoHubAPIClient(settings: settings)
-        if let data = try? await client.downloadPhotoData(hash: photo.hash),
-           let uiImage = UIImage(data: data) {
-            imageCache[photo.hash] = uiImage
+        if let rawData = try? await client.downloadPhotoPreviewData(hash: photo.hash),
+           let (smallImage, smallData) = Self.makeSmallCompressedPreview(from: rawData, maxPixelSize: 800, quality: 0.65) {
+            imageCache[photo.hash] = smallImage
+            compressedDataCache[photo.hash] = smallData
         }
+    }
+
+    static func makeSmallCompressedPreview(
+        from data: Data,
+        maxPixelSize: Int = 800,
+        quality: CGFloat = 0.65
+    ) -> (UIImage, Data)? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+            guard let img = UIImage(data: data),
+                  let jpg = img.jpegData(compressionQuality: quality) else { return nil }
+            return (UIImage(data: jpg) ?? img, jpg)
+        }
+
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+        ]
+
+        guard let cgImg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+            return nil
+        }
+
+        let uiImg = UIImage(cgImage: cgImg)
+        guard let smallJpg = uiImg.jpegData(compressionQuality: quality),
+              let decodedSmall = UIImage(data: smallJpg) else {
+            return (uiImg, data)
+        }
+        return (decodedSmall, smallJpg)
     }
 }
 
@@ -141,15 +175,14 @@ private struct ServerThumbnailCell: View {
                 }
                 .clipped()
 
-            if photo.hasProxy == true {
-                Image(systemName: "checkmark.seal.fill")
-                    .font(.caption2)
-                    .foregroundStyle(.white)
-                    .padding(4)
-                    .background(.black.opacity(0.55))
-                    .clipShape(Circle())
-                    .padding(4)
-            }
+            Text("PROXY")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(.black.opacity(0.6))
+                .clipShape(Capsule())
+                .padding(4)
         }
     }
 }
@@ -158,18 +191,20 @@ private struct ServerPhotoDetailView: View {
     let photo: ServerPhoto
     @ObservedObject var settings: AppSettings
     let initialImage: UIImage?
+    let initialCompressedData: Data?
 
     @Environment(\.dismiss) private var dismiss
-    @State private var fullImage: UIImage?
-    @State private var isRestoring: Bool = false
-    @State private var restoreMessage: String?
+    @State private var previewImage: UIImage?
+    @State private var compressedData: Data?
+    @State private var isSaving: Bool = false
+    @State private var saveMessage: String?
 
     var body: some View {
         NavigationStack {
             ZStack {
                 Color.black.ignoresSafeArea()
 
-                if let img = fullImage ?? initialImage {
+                if let img = previewImage ?? initialImage {
                     Image(uiImage: img)
                         .resizable()
                         .scaledToFit()
@@ -181,34 +216,39 @@ private struct ServerPhotoDetailView: View {
             }
             .safeAreaInset(edge: .bottom) {
                 VStack(spacing: 8) {
-                    if let restoreMessage {
-                        Text(restoreMessage)
+                    if let saveMessage {
+                        Text(saveMessage)
                             .font(.caption)
                             .foregroundStyle(.green)
                     }
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(photo.originalName)
+                            Text("\(photo.originalName) (Compressed Demo)")
                                 .font(.subheadline.weight(.semibold))
                                 .foregroundStyle(.white)
                                 .lineLimit(1)
-                            Text("\(ByteCountFormatter.string(fromByteCount: photo.size, countStyle: .file)) • \(photo.photoDate)")
+                            let smallBytes = Int64((compressedData ?? initialCompressedData)?.count ?? Int(photo.proxySize ?? 0))
+                            let smallStr = smallBytes > 0
+                                ? ByteCountFormatter.string(fromByteCount: smallBytes, countStyle: .file)
+                                : "Small Proxy"
+                            let masterStr = ByteCountFormatter.string(fromByteCount: photo.size, countStyle: .file)
+                            Text("Preview: \(smallStr) • Original Master: \(masterStr)")
                                 .font(.caption)
                                 .foregroundStyle(.white.opacity(0.75))
                         }
                         Spacer()
                         Button {
-                            Task { await restoreToPhotos() }
+                            Task { await saveCompressedPreviewToPhotos() }
                         } label: {
-                            if isRestoring {
+                            if isSaving {
                                 ProgressView().tint(.white)
                             } else {
-                                Label("Save Original", systemImage: "square.and.arrow.down")
+                                Label("Save Compressed", systemImage: "square.and.arrow.down")
                                     .font(.caption.weight(.semibold))
                             }
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(isRestoring)
+                        .disabled(isSaving)
                     }
                     .padding()
                     .background(.ultraThinMaterial)
@@ -222,35 +262,50 @@ private struct ServerPhotoDetailView: View {
             }
             .toolbarBackground(.hidden, for: .navigationBar)
             .task {
-                if fullImage == nil {
+                if previewImage == nil {
+                    if let initialImage, let initialCompressedData {
+                        previewImage = initialImage
+                        compressedData = initialCompressedData
+                        return
+                    }
                     let client = PhotoHubAPIClient(settings: settings)
-                    if let data = try? await client.downloadPhotoData(hash: photo.hash),
-                       let img = UIImage(data: data) {
-                        fullImage = img
+                    if let rawData = try? await client.downloadPhotoPreviewData(hash: photo.hash),
+                       let (smallImg, smallJpg) = ServerGalleryView.makeSmallCompressedPreview(from: rawData, maxPixelSize: 800, quality: 0.65) {
+                        previewImage = smallImg
+                        compressedData = smallJpg
                     }
                 }
             }
         }
     }
 
-    private func restoreToPhotos() async {
-        isRestoring = true
-        restoreMessage = nil
-        defer { isRestoring = false }
+    private func saveCompressedPreviewToPhotos() async {
+        isSaving = true
+        saveMessage = nil
+        defer { isSaving = false }
 
         do {
-            let client = PhotoHubAPIClient(settings: settings)
-            let data = try await client.downloadPhotoData(hash: photo.hash)
-            let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(photo.originalName)
-            try data.write(to: tempURL)
+            let dataToSave: Data
+            if let existing = compressedData ?? initialCompressedData {
+                dataToSave = existing
+            } else {
+                let client = PhotoHubAPIClient(settings: settings)
+                let raw = try await client.downloadPhotoPreviewData(hash: photo.hash)
+                dataToSave = ServerGalleryView.makeSmallCompressedPreview(from: raw, maxPixelSize: 800, quality: 0.65)?.1 ?? raw
+            }
+
+            let tempURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("compressed_\(UUID().uuidString).jpg")
+            try dataToSave.write(to: tempURL)
             defer { try? FileManager.default.removeItem(at: tempURL) }
 
             try await PHPhotoLibrary.shared().performChanges {
                 PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: tempURL)
             }
-            restoreMessage = "Saved full-resolution original to Photos!"
+            let sizeStr = ByteCountFormatter.string(fromByteCount: Int64(dataToSave.count), countStyle: .file)
+            saveMessage = "Saved small compressed picture (\(sizeStr)) to Photos!"
         } catch {
-            restoreMessage = "Restore failed: \(error.localizedDescription)"
+            saveMessage = "Save failed: \(error.localizedDescription)"
         }
     }
 }

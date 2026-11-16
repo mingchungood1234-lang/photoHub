@@ -43,6 +43,7 @@ struct ServerPhoto: Decodable, Identifiable, Hashable {
     let savedPath: String
     let hasProxy: Bool?
     let proxyHash: String?
+    let proxySize: Int64?
 
     var id: String { hash }
 }
@@ -198,6 +199,19 @@ final class PhotoHubAPIClient {
         return decoded.photos
     }
 
+    func downloadPhotoPreviewData(hash: String) async throws -> Data {
+        let url = try makeURL("/api/photo/\(hash)/preview")
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        applyAuth(to: &request)
+
+        let session = makeSession()
+        defer { session.finishTasksAndInvalidate() }
+        let (data, response) = try await session.data(for: request)
+        try validateHTTP(response: response, data: data)
+        return data
+    }
+
     func downloadPhotoData(hash: String) async throws -> Data {
         let url = try makeURL("/api/photo/\(hash)")
         var request = URLRequest(url: url)
@@ -342,17 +356,29 @@ final class PhotoHubAPIClient {
         return confirmed
     }
 
-    func registerProxy(masterHash: String, proxyHash: String, assetId: String) async throws {
+    func registerProxy(
+        masterHash: String,
+        proxyHash: String,
+        assetId: String,
+        proxyFileURL: URL? = nil,
+        proxyFormat: String = "heic"
+    ) async throws {
         let url = try makeURL("/api/proxy/register")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         applyAuth(to: &request)
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
+
+        var payload: [String: Any] = [
             "masterHash": masterHash,
             "proxyHash": proxyHash,
             "assetId": assetId,
-        ])
+            "proxyFormat": proxyFormat,
+        ]
+        if let proxyFileURL, let data = try? Data(contentsOf: proxyFileURL) {
+            payload["proxyBase64"] = data.base64EncodedString()
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
         let session = makeSession()
         defer { session.finishTasksAndInvalidate() }

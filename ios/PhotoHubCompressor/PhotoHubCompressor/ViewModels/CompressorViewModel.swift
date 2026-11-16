@@ -221,12 +221,14 @@ final class CompressorViewModel: ObservableObject {
                 proxyFileURL: proxy.fileURL
             )
 
-            // 6. Register proxy hash on server & local tracker
+            // 6. Register proxy hash & upload small compressed preview to server
             tracker.markAsProxy(assetId: newAssetId, proxySha256: proxy.sha256)
             try? await apiClient.registerProxy(
                 masterHash: master.sha256,
                 proxyHash: proxy.sha256,
-                assetId: newAssetId
+                assetId: newAssetId,
+                proxyFileURL: proxy.fileURL,
+                proxyFormat: format.rawValue
             )
 
             let saved = max(0, master.sizeBytes - proxy.sizeBytes)

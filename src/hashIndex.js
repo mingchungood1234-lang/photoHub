@@ -97,6 +97,7 @@ class HashIndex {
       for (const d of entries) {
         const fullPath = path.join(dir, d.name);
         if (d.isDirectory()) {
+          if (d.name === '.proxies') continue;
           await walk(fullPath);
         } else if (d.isFile() && !d.name.endsWith('.tmp')) {
           const relPath = path.normalize(path.relative(this.storageDir, fullPath));
@@ -194,7 +195,7 @@ class HashIndex {
     return { status: 'missing', record: null, masterHash: null };
   }
 
-  async registerProxy(masterHash, proxyHash, assetId = '') {
+  async registerProxy(masterHash, proxyHash, assetId = '', proxyMeta = {}) {
     const normMaster = String(masterHash || '').trim().toLowerCase();
     const normProxy = String(proxyHash || '').trim().toLowerCase();
     if (!normMaster || !normProxy) {
@@ -213,6 +214,12 @@ class HashIndex {
     record.proxyHash = normProxy;
     if (assetId) {
       record.assetId = String(assetId);
+    }
+    if (proxyMeta.proxyRelativePath) {
+      record.proxyRelativePath = proxyMeta.proxyRelativePath;
+    }
+    if (proxyMeta.proxySize) {
+      record.proxySize = Number(proxyMeta.proxySize);
     }
     record.proxyRegisteredAt = new Date().toISOString();
 
@@ -260,6 +267,7 @@ class HashIndex {
         savedPath: entry.relativePath,
         hasProxy: Boolean(entry.proxyHash),
         proxyHash: entry.proxyHash || null,
+        proxySize: entry.proxySize || null,
       });
     }
     items.sort((a, b) => {

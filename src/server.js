@@ -542,10 +542,11 @@ async function createApp(configOverrides = {}) {
     }
   });
 
-  // Register a lightweight local proxy hash against a verified master photo
+  // Register a lightweight local proxy hash (and optional compressed preview image) against a verified master photo
   app.post('/api/proxy/register', async (req, res) => {
     try {
-      const { masterHash, proxyHash, assetId } = req.body || {};
+      const { masterHash, proxyHash, assetId, proxyBase64, proxyFormat } =
+        req.body || {};
       if (!masterHash || !proxyHash) {
         return res.status(400).json({
           success: false,
@@ -553,11 +554,34 @@ async function createApp(configOverrides = {}) {
         });
       }
 
-      const { hashIndex } = req.userContext;
+      const { hashIndex, storageDir } = req.userContext;
+      const normMaster = String(masterHash).trim().toLowerCase();
+      let proxyMeta = {};
+
+      if (proxyBase64 && typeof proxyBase64 === 'string') {
+        const proxyBuf = Buffer.from(proxyBase64, 'base64');
+        if (proxyBuf.length > 0) {
+          const ext =
+            String(proxyFormat || '').toLowerCase() === 'heic'
+              ? '.heic'
+              : '.jpg';
+          const proxiesDir = path.join(storageDir, '.proxies');
+          await fs.promises.mkdir(proxiesDir, { recursive: true });
+          const proxyFileName = `${normMaster}${ext}`;
+          const proxyFullPath = path.join(proxiesDir, proxyFileName);
+          await fs.promises.writeFile(proxyFullPath, proxyBuf);
+          proxyMeta = {
+            proxyRelativePath: `.proxies/${proxyFileName}`,
+            proxySize: proxyBuf.length,
+          };
+        }
+      }
+
       const updated = await hashIndex.registerProxy(
         masterHash,
         proxyHash,
-        assetId
+        assetId,
+        proxyMeta
       );
       if (!updated) {
         return res.status(404).json({
@@ -570,6 +594,7 @@ async function createApp(configOverrides = {}) {
         success: true,
         masterHash: updated.diskHash || updated.hash,
         proxyHash: updated.proxyHash,
+        proxySize: updated.proxySize || null,
         savedPath: updated.relativePath,
       });
     } catch (err) {
@@ -594,6 +619,50 @@ async function createApp(configOverrides = {}) {
         total: all.length,
         photos,
       });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: err.message,
+      });
+    }
+  });
+
+  // Stream small compressed preview (proxy) when available, falling back to master
+  app.get('/api/photo/:hash/preview', async (req, res) => {
+    try {
+      const { hashIndex, storageDir } = req.userContext;
+      const lookupResult = await hashIndex.lookup(req.params.hash);
+      if (lookupResult.status === 'missing' || !lookupResult.record) {
+        return res.status(404).json({
+          success: false,
+          error: 'Photo not found',
+        });
+      }
+
+      const record = lookupResult.record;
+      if (record.proxyRelativePath) {
+        const proxyPath = path.join(storageDir, record.proxyRelativePath);
+        if (fs.existsSync(proxyPath)) {
+          res.setHeader('X-Photo-Variant', 'proxy');
+          res.setHeader('X-Master-Sha256', lookupResult.masterHash);
+          return fs.createReadStream(proxyPath).pipe(res);
+        }
+      }
+
+      if (record.storageType === 's3' && isS3Configured(config.s3)) {
+        const downloadUrl = createPresignedUrl({
+          s3Config: config.s3,
+          method: 'GET',
+          objectKey: record.relativePath,
+          expiresIn: 300,
+        });
+        return res.redirect(downloadUrl);
+      }
+
+      const fullPath = path.join(storageDir, record.relativePath);
+      res.setHeader('X-Photo-Variant', 'master');
+      res.setHeader('X-Master-Sha256', lookupResult.masterHash);
+      return fs.createReadStream(fullPath).pipe(res);
     } catch (err) {
       return res.status(500).json({
         success: false,
