@@ -141,6 +141,17 @@ async function createApp(configOverrides = {}) {
     limits: { fileSize: config.maxFileSizeBytes },
   });
 
+  // Verify API/User key and report which folder this key routes to
+  app.get('/api/whoami', (req, res) => {
+    const { folderName, hashIndex } = req.userContext;
+    return res.json({
+      success: true,
+      userFolder: folderName || null,
+      indexedPhotos: hashIndex.size(),
+      s3Enabled: isS3Configured(config.s3),
+    });
+  });
+
   // Pre-upload duplicate check by SHA-256 hash (GET or POST)
   app.get('/api/check/:hash', async (req, res) => {
     try {

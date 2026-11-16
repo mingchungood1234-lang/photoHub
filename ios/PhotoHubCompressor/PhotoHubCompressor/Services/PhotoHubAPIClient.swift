@@ -27,6 +27,13 @@ struct HealthResponse: Decodable {
     let s3Enabled: Bool?
 }
 
+struct WhoAmIResponse: Decodable {
+    let success: Bool
+    let userFolder: String?
+    let indexedPhotos: Int
+    let s3Enabled: Bool?
+}
+
 struct ServerPhoto: Decodable, Identifiable, Hashable {
     let hash: String
     let originalName: String
@@ -129,6 +136,17 @@ final class PhotoHubAPIClient {
         let (data, response) = try await URLSession.shared.data(from: url)
         try validateHTTP(response: response, data: data)
         return try JSONDecoder().decode(HealthResponse.self, from: data)
+    }
+
+    func whoami() async throws -> WhoAmIResponse {
+        let url = try makeURL("/api/whoami")
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        applyAuth(to: &request)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validateHTTP(response: response, data: data)
+        return try JSONDecoder().decode(WhoAmIResponse.self, from: data)
     }
 
     func fetchServerPhotos(limit: Int = 200, offset: Int = 0) async throws -> [ServerPhoto] {

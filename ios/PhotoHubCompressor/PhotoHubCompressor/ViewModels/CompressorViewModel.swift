@@ -84,10 +84,10 @@ final class CompressorViewModel: ObservableObject {
         let apiClient = PhotoHubAPIClient(settings: settings)
 
         do {
-            _ = try await apiClient.checkHealth()
+            _ = try await apiClient.whoami()
         } catch {
             isProcessing = false
-            statusBanner = "Cannot reach server (\(settings.serverURL)): \(error.localizedDescription). Check your Server URL in Settings."
+            statusBanner = "Server/Key check failed (\(settings.serverURL)): \(error.localizedDescription). Check Server URL and User Key in Settings."
             return
         }
 

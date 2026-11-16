@@ -240,6 +240,17 @@ test('Multi-User API keys (USER_KEYS) save photos to separate user folders', asy
     const body = await res.json();
     assert.equal(body.canDelete, false);
   });
+
+  await t.test('4. GET /api/whoami reports the resolved userFolder for the provided key', async () => {
+    const res = await ctx.request('/api/whoami', {
+      headers: { 'X-API-Key': 'alice_secret' },
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.success, true);
+    assert.equal(body.userFolder, 'alice');
+    assert.equal(body.indexedPhotos, 1);
+  });
 });
 
 test('iOS Proxy-Replacement Workflow: strict checksum, proxy registration, batch check, restore, and S3 presign/confirm', async (t) => {

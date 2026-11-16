@@ -10,13 +10,13 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("PhotoHub Server") {
+                Section {
                     TextField("Server URL (e.g. http://192.168.1.100:3000)", text: $settings.serverURL)
                         .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
 
-                    SecureField("API Key (optional)", text: $settings.apiKey)
+                    SecureField("User Key / API Key (e.g. mingchun)", text: $settings.apiKey)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
 
@@ -30,7 +30,7 @@ struct SettingsView: View {
                         Task { await testConnection() }
                     } label: {
                         HStack {
-                            Text("Test Server Connection")
+                            Text("Test Server & Key")
                             Spacer()
                             if isTesting { ProgressView() }
                         }
@@ -42,6 +42,10 @@ struct SettingsView: View {
                             .font(.footnote)
                             .foregroundStyle(connectionStatus.hasPrefix("Connected") ? .green : .red)
                     }
+                } header: {
+                    Text("PhotoHub Server")
+                } footer: {
+                    Text("Your User Key (from .env USER_KEYS) determines which folder on the server stores and lists your photos.")
                 }
 
                 Section("Lightweight Proxy Settings") {
@@ -89,9 +93,10 @@ struct SettingsView: View {
 
         let client = PhotoHubAPIClient(settings: settings)
         do {
-            let health = try await client.checkHealth()
-            let s3Note = (health.s3Enabled == true) ? "S3 enabled" : "Direct VPS mode"
-            connectionStatus = "Connected! (\(health.indexedPhotos) indexed photos, \(s3Note))"
+            let info = try await client.whoami()
+            let folderLabel = info.userFolder.map { "Folder: \($0)" } ?? "Root folder"
+            let s3Note = (info.s3Enabled == true) ? "S3 enabled" : "Direct VPS"
+            connectionStatus = "Connected! \(folderLabel) (\(info.indexedPhotos) photos, \(s3Note))"
         } catch {
             connectionStatus = "Failed: \(error.localizedDescription)"
         }
