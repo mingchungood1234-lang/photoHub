@@ -331,9 +331,16 @@ test('iOS Proxy-Replacement Workflow: strict checksum, proxy registration, batch
     assert.equal(batchBody.results[missingHash].exists, false);
   });
 
-  await t.test('4. Restore full-resolution master via GET /api/photo/:hash using either masterHash or proxyHash', async () => {
-    // Use raw http via ctx.request? ctx.request parses json, so let's verify status 200 and check via S3 or binary
-    // Let's test 404 for unknown hash first
+  await t.test('4. List backed-up photos via GET /api/photos and check 404 on unknown GET /api/photo/:hash', async () => {
+    const listRes = await ctx.request('/api/photos');
+    assert.equal(listRes.status, 200);
+    const listBody = await listRes.json();
+    assert.equal(listBody.success, true);
+    assert.equal(listBody.total, 1);
+    assert.equal(listBody.photos[0].hash, masterHash);
+    assert.equal(listBody.photos[0].hasProxy, true);
+    assert.equal(listBody.photos[0].proxyHash, proxyHash);
+
     const notFound = await ctx.request(`/api/photo/${'a'.repeat(64)}`);
     assert.equal(notFound.status, 404);
   });

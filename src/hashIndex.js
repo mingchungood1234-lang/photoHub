@@ -238,6 +238,38 @@ class HashIndex {
     return this.records.size;
   }
 
+  /**
+   * Returns a deduplicated list of backed-up master photo records, sorted newest first.
+   */
+  listMasters() {
+    const seenPaths = new Set();
+    const items = [];
+    for (const [key, entry] of this.records.entries()) {
+      if (!entry || !entry.relativePath) continue;
+      // Skip alias keys (where key != diskHash) so each photo appears once
+      const canonicalHash = (entry.diskHash || entry.hash || key).toLowerCase();
+      if (key !== canonicalHash && this.records.has(canonicalHash)) continue;
+      if (seenPaths.has(entry.relativePath)) continue;
+      seenPaths.add(entry.relativePath);
+      items.push({
+        hash: canonicalHash,
+        originalName: entry.originalName,
+        size: entry.size || 0,
+        photoDate: entry.photoDate || '',
+        uploadedAt: entry.uploadedAt || '',
+        savedPath: entry.relativePath,
+        hasProxy: Boolean(entry.proxyHash),
+        proxyHash: entry.proxyHash || null,
+      });
+    }
+    items.sort((a, b) => {
+      const dateCmp = String(b.photoDate).localeCompare(String(a.photoDate));
+      if (dateCmp !== 0) return dateCmp;
+      return String(b.uploadedAt).localeCompare(String(a.uploadedAt));
+    });
+    return items;
+  }
+
   async persist() {
     this.writePromise = this.writePromise.then(async () => {
       const obj = Object.fromEntries(this.records.entries());

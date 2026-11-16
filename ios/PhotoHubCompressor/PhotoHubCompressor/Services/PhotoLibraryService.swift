@@ -45,26 +45,27 @@ final class PhotoLibraryService {
         let assets = PHAsset.fetchAssets(with: .image, options: fetchOptions)
 
         var candidates: [PhotoCandidate] = []
+        candidates.reserveCapacity(assets.count)
+
         assets.enumerateObjects { asset, _, _ in
-            let resources = PHAssetResource.assetResources(for: asset)
-            let primary = Self.pickOriginalResource(from: resources)
-            let filename = primary?.originalFilename ?? "IMG_\(asset.localIdentifier.prefix(8)).HEIC"
+            autoreleasepool {
+                let shortId = String(asset.localIdentifier.prefix(8))
+                var candidate = PhotoCandidate(
+                    id: asset.localIdentifier,
+                    asset: asset,
+                    filename: "Photo_\(shortId)",
+                    pixelWidth: asset.pixelWidth,
+                    pixelHeight: asset.pixelHeight,
+                    creationDate: asset.creationDate
+                )
 
-            var candidate = PhotoCandidate(
-                id: asset.localIdentifier,
-                asset: asset,
-                filename: filename,
-                pixelWidth: asset.pixelWidth,
-                pixelHeight: asset.pixelHeight,
-                creationDate: asset.creationDate
-            )
+                if tracker.isKnownProxy(assetId: asset.localIdentifier) {
+                    candidate.state = .alreadyProxy
+                    candidate.isSelected = false
+                }
 
-            if tracker.isKnownProxy(assetId: asset.localIdentifier) {
-                candidate.state = .alreadyProxy
-                candidate.isSelected = false
+                candidates.append(candidate)
             }
-
-            candidates.append(candidate)
         }
 
         return candidates

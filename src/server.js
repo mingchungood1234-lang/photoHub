@@ -567,6 +567,28 @@ async function createApp(configOverrides = {}) {
     }
   });
 
+  // List all backed-up master photos for the authenticated user
+  app.get('/api/photos', async (req, res) => {
+    try {
+      const { hashIndex, folderName } = req.userContext;
+      const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 200));
+      const offset = Math.max(0, Number(req.query.offset) || 0);
+      const all = hashIndex.listMasters();
+      const photos = all.slice(offset, offset + limit);
+      return res.json({
+        success: true,
+        userFolder: folderName,
+        total: all.length,
+        photos,
+      });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: err.message,
+      });
+    }
+  });
+
   // Download / restore full-resolution master photo by either masterHash or proxyHash
   app.get('/api/photo/:hash', async (req, res) => {
     try {

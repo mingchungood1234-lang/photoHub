@@ -67,6 +67,9 @@ struct LibraryView: View {
                                 .onTapGesture {
                                     viewModel.toggleSelection(for: item.id)
                                 }
+                                .task(id: item.id) {
+                                    await viewModel.loadThumbnailIfNeeded(for: item.id)
+                                }
                         }
                     }
                     .listStyle(.plain)

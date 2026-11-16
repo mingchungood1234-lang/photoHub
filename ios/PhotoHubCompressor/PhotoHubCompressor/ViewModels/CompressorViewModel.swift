@@ -43,14 +43,17 @@ final class CompressorViewModel: ObservableObject {
         }.value
 
         candidates = scanned
+    }
 
-        // Load thumbnails for visible items
-        for index in candidates.indices {
-            let asset = candidates[index].asset
-            if let thumb = await photoService.loadThumbnail(for: asset) {
-                if index < candidates.count && candidates[index].id == asset.localIdentifier {
-                    candidates[index].thumbnail = thumb
-                }
+    func loadThumbnailIfNeeded(for id: String) async {
+        guard let index = candidates.firstIndex(where: { $0.id == id }),
+              candidates[index].thumbnail == nil else {
+            return
+        }
+        let asset = candidates[index].asset
+        if let thumb = await photoService.loadThumbnail(for: asset) {
+            if let currentIndex = candidates.firstIndex(where: { $0.id == id }) {
+                candidates[currentIndex].thumbnail = thumb
             }
         }
     }

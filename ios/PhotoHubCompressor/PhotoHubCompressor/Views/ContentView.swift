@@ -16,6 +16,11 @@ struct ContentView: View {
                     Label("Compress", systemImage: "photo.stack")
                 }
 
+            ServerGalleryView(settings: settings)
+                .tabItem {
+                    Label("Server", systemImage: "cloud")
+                }
+
             SettingsView(settings: settings)
                 .tabItem {
                     Label("Settings", systemImage: "gearshape")

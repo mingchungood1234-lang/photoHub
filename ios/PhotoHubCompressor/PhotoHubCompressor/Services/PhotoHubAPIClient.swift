@@ -27,6 +27,25 @@ struct HealthResponse: Decodable {
     let s3Enabled: Bool?
 }
 
+struct ServerPhoto: Decodable, Identifiable, Hashable {
+    let hash: String
+    let originalName: String
+    let size: Int64
+    let photoDate: String
+    let uploadedAt: String
+    let savedPath: String
+    let hasProxy: Bool?
+    let proxyHash: String?
+
+    var id: String { hash }
+}
+
+private struct ServerPhotosResponse: Decodable {
+    let success: Bool
+    let total: Int
+    let photos: [ServerPhoto]
+}
+
 struct CheckResponse: Decodable {
     let success: Bool
     let exists: Bool
@@ -109,6 +128,36 @@ final class PhotoHubAPIClient {
         let (data, response) = try await URLSession.shared.data(from: url)
         try validateHTTP(response: response, data: data)
         return try JSONDecoder().decode(HealthResponse.self, from: data)
+    }
+
+    func fetchServerPhotos(limit: Int = 200, offset: Int = 0) async throws -> [ServerPhoto] {
+        var components = URLComponents(url: try makeURL("/api/photos"), resolvingAgainstBaseURL: false)
+        components?.queryItems = [
+            URLQueryItem(name: "limit", value: String(limit)),
+            URLQueryItem(name: "offset", value: String(offset)),
+        ]
+        guard let url = components?.url else {
+            throw APIClientError.invalidServerURL
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        applyAuth(to: &request)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validateHTTP(response: response, data: data)
+        let decoded = try JSONDecoder().decode(ServerPhotosResponse.self, from: data)
+        return decoded.photos
+    }
+
+    func downloadPhotoData(hash: String) async throws -> Data {
+        let url = try makeURL("/api/photo/\(hash)")
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        applyAuth(to: &request)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validateHTTP(response: response, data: data)
+        return data
     }
 
     func checkHash(_ sha256: String) async throws -> CheckResponse {
