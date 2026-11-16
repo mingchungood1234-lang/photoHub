@@ -35,8 +35,10 @@ final class PhotoLibraryService {
             return current
         }
         return await withCheckedContinuation { continuation in
-            PHPhotoLibrary.requestAuthorization(for: .readWrite) { status in
-                continuation.resume(returning: status)
+            DispatchQueue.main.async {
+                PHPhotoLibrary.requestAuthorization(for: .readWrite) { status in
+                    continuation.resume(returning: status)
+                }
             }
         }
     }
@@ -46,9 +48,6 @@ final class PhotoLibraryService {
     ) -> [PhotoCandidate] {
         let fetchOptions = PHFetchOptions()
         fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        // Include hidden or burst photos safely if needed, or query standard image assets
-        fetchOptions.includeHiddenAssets = false
-        fetchOptions.includeAllBurstAssets = false
         let assets = PHAsset.fetchAssets(with: .image, options: fetchOptions)
 
         var candidates: [PhotoCandidate] = []
@@ -56,14 +55,17 @@ final class PhotoLibraryService {
         if totalCount == 0 {
             return []
         }
-        candidates.reserveCapacity(min(totalCount, 1000))
+        candidates.reserveCapacity(min(totalCount, 500))
 
         for i in 0..<totalCount {
             autoreleasepool {
                 let asset = assets.object(at: i)
-                let shortId = String(asset.localIdentifier.prefix(8))
+                let localId = asset.localIdentifier
+                let prefixLen = min(8, localId.count)
+                let shortId = String(localId.prefix(prefixLen))
+
                 var candidate = PhotoCandidate(
-                    id: asset.localIdentifier,
+                    id: localId,
                     asset: asset,
                     filename: "Photo_\(shortId)",
                     pixelWidth: asset.pixelWidth,
@@ -71,7 +73,7 @@ final class PhotoLibraryService {
                     creationDate: asset.creationDate
                 )
 
-                if tracker.isKnownProxy(assetId: asset.localIdentifier) {
+                if tracker.isKnownProxy(assetId: localId) {
                     candidate.state = .alreadyProxy
                     candidate.isSelected = false
                 }
@@ -86,24 +88,51 @@ final class PhotoLibraryService {
     func loadThumbnail(for asset: PHAsset, targetSize: CGSize = CGSize(width: 160, height: 160)) async -> UIImage? {
         await withCheckedContinuation { continuation in
             let options = PHImageRequestOptions()
-            options.deliveryMode = .highQualityFormat
+            options.deliveryMode = .fastFormat
             options.isNetworkAccessAllowed = true
             options.resizeMode = .fast
+            options.isSynchronous = false
 
-            let lock = NSLock()
             var hasResumed = false
+            let lock = NSLock()
 
             PHImageManager.default().requestImage(
                 for: asset,
                 targetSize: targetSize,
                 contentMode: .aspectFill,
                 options: options
-            ) { image, _ in
+            ) { image, info in
+                let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+                // Only return when we have an image or when request is complete
                 lock.lock()
                 defer { lock.unlock() }
-                guard !hasResumed else { return }
-                hasResumed = true
-                continuation.resume(returning: image)
+                if !hasResumed {
+                    if let image = image, !isDegraded {
+                        hasResumed = true
+                        continuation.resume(returning: image)
+                    } else if image != nil && hasResumed == false {
+                        // Keep waiting for non-degraded, unless error or cancelled
+                        let isCancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
+                        let error = info?[PHImageErrorKey] as? Error
+                        if isCancelled || error != nil {
+                            hasResumed = true
+                            continuation.resume(returning: image)
+                        }
+                    } else if info?[PHImageErrorKey] != nil || (info?[PHImageCancelledKey] as? Bool) == true {
+                        hasResumed = true
+                        continuation.resume(returning: nil)
+                    }
+                }
+            }
+
+            // Safety timeout to ensure continuation ALWAYS resumes even if PhotoKit drops callback
+            DispatchQueue.global().asyncAfter(deadline: .now() + 3.0) {
+                lock.lock()
+                defer { lock.unlock() }
+                if !hasResumed {
+                    hasResumed = true
+                    continuation.resume(returning: nil)
+                }
             }
         }
     }

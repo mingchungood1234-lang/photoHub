@@ -38,17 +38,11 @@ final class CompressorViewModel: ObservableObject {
             return
         }
 
-        do {
-            let scanned = await Task.detached(priority: .userInitiated) { [photoService, tracker] in
-                photoService.scanCandidates(tracker: tracker)
-            }.value
+        let scanned = photoService.scanCandidates(tracker: tracker)
+        candidates = scanned
 
-            candidates = scanned
-            if candidates.isEmpty {
-                statusBanner = "No photos found in photo library."
-            }
-        } catch {
-            statusBanner = "Error scanning photos: \(error.localizedDescription)"
+        if candidates.isEmpty {
+            statusBanner = "No photos found in photo library."
         }
     }
 
