@@ -78,6 +78,14 @@ function getConfig(overrides = {}) {
   const userKeyMap =
     rawUserKeys instanceof Map ? rawUserKeys : parseUserKeys(rawUserKeys);
 
+  const rawEnvMaxMb = Number(process.env.MAX_FILE_SIZE_MB);
+  const effectiveMaxMb =
+    overrides.maxFileSizeMb !== undefined
+      ? Number(overrides.maxFileSizeMb)
+      : Number.isFinite(rawEnvMaxMb) && rawEnvMaxMb >= 5000
+        ? rawEnvMaxMb
+        : 50000;
+
   return {
     port: Number(overrides.port ?? process.env.PORT ?? 3000),
     protocol: String(overrides.protocol ?? process.env.PROTOCOL ?? 'http')
@@ -90,10 +98,7 @@ function getConfig(overrides = {}) {
     hashIndexFile: path.join(dataDir, 'hash-index.json'),
     apiKey: (overrides.apiKey ?? process.env.API_KEY ?? '').trim(),
     userKeyMap, // Map<apiKey, folderName>
-    maxFileSizeBytes:
-      Number(overrides.maxFileSizeMb ?? process.env.MAX_FILE_SIZE_MB ?? 50000) *
-      1024 *
-      1024,
+    maxFileSizeBytes: effectiveMaxMb * 1024 * 1024,
     // Set SCAN_STORAGE_ON_STARTUP=false if using a large remote rclone/gdrive mount to avoid slow startup scans
     scanStorageOnStartup:
       String(

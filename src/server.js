@@ -59,7 +59,7 @@ async function createApp(configOverrides = {}) {
   app.locals.folderContexts = folderContexts;
 
   // Parse JSON bodies for /api/check
-  app.use(express.json({ limit: '2mb' }));
+  app.use(express.json({ limit: '50mb' }));
 
   // Parse raw binary uploads when Apple Shortcut uses "Request Body: File"
   app.use(

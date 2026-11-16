@@ -360,12 +360,19 @@ final class PhotoHubAPIClient {
         try validateHTTP(response: response, data: data)
     }
 
+    private struct ServerErrorPayload: Decodable {
+        let error: String?
+        let message: String?
+    }
+
     private func validateHTTP(response: URLResponse, data: Data) throws {
         guard let http = response as? HTTPURLResponse else {
             throw APIClientError.invalidResponse
         }
         guard (200...299).contains(http.statusCode) else {
-            let msg = (try? JSONDecoder().decode([String: String].self, from: data)["error"])
+            let payload = try? JSONDecoder().decode(ServerErrorPayload.self, from: data)
+            let msg = payload?.error
+                ?? payload?.message
                 ?? String(data: data, encoding: .utf8)
                 ?? "Unknown error"
             throw APIClientError.httpError(http.statusCode, msg)
