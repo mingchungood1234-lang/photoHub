@@ -50,6 +50,7 @@ final class AppSettings: ObservableObject {
     @AppStorage("proxyMaxPixelSize") var proxyMaxPixelSize: Int = 0 // 0 = Auto for all resolutions
     @AppStorage("proxyQuality") var proxyQuality: Double = 0.72
     @AppStorage("minimumOriginalSizeKB") var minimumOriginalSizeKB: Int = 500
+    @AppStorage("keepLocalProxyInPhotos") var keepLocalProxyInPhotos: Bool = true
 
     var serverProtocol: ServerProtocol {
         get { ServerProtocol(rawValue: serverProtocolRaw) ?? .http }

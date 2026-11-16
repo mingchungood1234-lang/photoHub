@@ -65,7 +65,9 @@ struct SettingsView: View {
                     Text("Your User Key (from .env USER_KEYS) determines which folder on the server stores and lists your photos.")
                 }
 
-                Section("Lightweight Proxy Settings") {
+                Section {
+                    Toggle("Keep Compressed Proxy in iPhone Photos", isOn: $settings.keepLocalProxyInPhotos)
+
                     Picker("Format", selection: $settings.proxyFormatRaw) {
                         ForEach(ProxyFormat.allCases) { fmt in
                             Text(fmt.displayName).tag(fmt.rawValue)
@@ -86,13 +88,10 @@ struct SettingsView: View {
                         Text("Compression Quality: \(Int(settings.proxyQuality * 100))%")
                         Slider(value: $settings.proxyQuality, in: 0.4...0.95, step: 0.05)
                     }
-
-                    Stepper(
-                        "Skip photos under \(settings.minimumOriginalSizeKB) KB",
-                        value: $settings.minimumOriginalSizeKB,
-                        in: 100...5000,
-                        step: 100
-                    )
+                } header: {
+                    Text("Lightweight Proxy Settings")
+                } footer: {
+                    Text("When 'Keep Compressed Proxy in iPhone Photos' is ON, the original photo is replaced with a small proxy in Photos. Turn it OFF to delete the photo from your iPhone completely after uploading to the Server tab.")
                 }
 
                 Section("How Safety Works") {

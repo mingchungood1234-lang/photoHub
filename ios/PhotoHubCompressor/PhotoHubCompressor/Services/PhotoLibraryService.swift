@@ -58,10 +58,15 @@ final class PhotoLibraryService {
             autoreleasepool {
                 let asset = assets.object(at: i)
                 let localId = asset.localIdentifier
+                // Skip photos that have already been compressed into local proxies
+                if tracker.isKnownProxy(assetId: localId) {
+                    return
+                }
+
                 let prefixLen = min(8, localId.count)
                 let shortId = String(localId.prefix(prefixLen))
 
-                var candidate = PhotoCandidate(
+                let candidate = PhotoCandidate(
                     id: localId,
                     asset: asset,
                     filename: "Photo_\(shortId)",
@@ -69,11 +74,6 @@ final class PhotoLibraryService {
                     pixelHeight: asset.pixelHeight,
                     creationDate: asset.creationDate
                 )
-
-                if tracker.isKnownProxy(assetId: localId) {
-                    candidate.state = .alreadyProxy
-                    candidate.isSelected = false
-                }
 
                 candidates.append(candidate)
             }
@@ -179,23 +179,43 @@ final class PhotoLibraryService {
         )
     }
 
-    /// Step 1: Saves the lightweight proxy in the native Photos library using in-memory Data
-    /// (avoids cross-process sandbox file deadlocks with photolibraryd).
-    func saveProxyAsset(originalAsset: PHAsset, proxyFileURL: URL) async throws -> String {
-        let proxyData = try Data(contentsOf: proxyFileURL)
+    struct PendingProxyReplacement {
+        let originalAsset: PHAsset
+        let proxyData: Data
+        let proxySha256: String
+        let savedBytes: Int64
+    }
 
-        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
+    /// Performs a single atomic PhotoKit transaction for the batch using in-memory Data (no sandbox file URL deadlock):
+    /// - Deletes all original assets (triggering ONE iOS "Allow photoHub to delete photo(s)?" prompt).
+    /// - Optionally creates the lightweight proxy assets if `keepLocalProxy` is true.
+    func applyBatchReplacementOrDeletion(
+        items: [PendingProxyReplacement],
+        keepLocalProxy: Bool
+    ) async throws -> [String] {
+        guard !items.isEmpty else { return [] }
+
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[String], Error>) in
             let lock = NSLock()
             var hasResumed = false
-            var placeholderId: String?
+            var createdIds: [String] = []
+
+            let assetsToDelete = items.map { $0.originalAsset }
 
             PHPhotoLibrary.shared().performChanges({
-                let creationRequest = PHAssetCreationRequest.forAsset()
-                creationRequest.addResource(with: .photo, data: proxyData, options: nil)
-                creationRequest.creationDate = originalAsset.creationDate
-                creationRequest.location = originalAsset.location
-                creationRequest.isFavorite = originalAsset.isFavorite
-                placeholderId = creationRequest.placeholderForCreatedAsset?.localIdentifier
+                if keepLocalProxy {
+                    for item in items {
+                        let creationRequest = PHAssetCreationRequest.forAsset()
+                        creationRequest.addResource(with: .photo, data: item.proxyData, options: nil)
+                        creationRequest.creationDate = item.originalAsset.creationDate
+                        creationRequest.location = item.originalAsset.location
+                        creationRequest.isFavorite = item.originalAsset.isFavorite
+                        if let id = creationRequest.placeholderForCreatedAsset?.localIdentifier {
+                            createdIds.append(id)
+                        }
+                    }
+                }
+                PHAssetChangeRequest.deleteAssets(assetsToDelete as NSArray)
             }, completionHandler: { success, error in
                 lock.lock()
                 defer { lock.unlock() }
@@ -203,41 +223,12 @@ final class PhotoLibraryService {
                 hasResumed = true
 
                 if success {
-                    continuation.resume(returning: placeholderId ?? originalAsset.localIdentifier)
+                    continuation.resume(returning: createdIds)
                 } else {
-                    let msg = error?.localizedDescription ?? "Could not save compressed proxy to Photos."
+                    let msg = error?.localizedDescription ?? "Photo deletion was cancelled or denied."
                     continuation.resume(throwing: PhotoLibraryError.proxyReplacementFailed(msg))
                 }
             })
-        }
-    }
-
-    /// Step 2: Requests iOS to delete the heavy original asset(s) in a separate transaction
-    /// so iOS presents the native "Allow photoHub to delete photo(s)?" prompt cleanly without hanging.
-    func deleteOriginalAssets(_ assets: [PHAsset]) async throws {
-        guard !assets.isEmpty else { return }
-
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let lock = NSLock()
-            var hasResumed = false
-
-            DispatchQueue.main.async {
-                PHPhotoLibrary.shared().performChanges({
-                    PHAssetChangeRequest.deleteAssets(assets as NSArray)
-                }, completionHandler: { success, error in
-                    lock.lock()
-                    defer { lock.unlock() }
-                    guard !hasResumed else { return }
-                    hasResumed = true
-
-                    if success {
-                        continuation.resume(returning: ())
-                    } else {
-                        let msg = error?.localizedDescription ?? "Original deletion was cancelled or denied."
-                        continuation.resume(throwing: PhotoLibraryError.proxyReplacementFailed(msg))
-                    }
-                })
-            }
         }
     }
 

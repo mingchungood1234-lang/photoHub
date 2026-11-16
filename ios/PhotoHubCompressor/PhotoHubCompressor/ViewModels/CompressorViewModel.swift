@@ -104,32 +104,42 @@ final class CompressorViewModel: ObservableObject {
         }
 
         var failedCount = 0
-        var originalsToDelete: [PHAsset] = []
-        var succeededIndices: [(index: Int, saved: Int64)] = []
+        var pendingReplacements: [PhotoLibraryService.PendingProxyReplacement] = []
+        var succeededIndices: [Int] = []
 
         for idx in targetIndices {
             if Task.isCancelled { break }
-            if let savedBytes = await processSingleCandidate(at: idx, apiClient: apiClient) {
-                originalsToDelete.append(candidates[idx].asset)
-                succeededIndices.append((index: idx, saved: savedBytes))
+            if let pending = await processSingleCandidate(at: idx, apiClient: apiClient) {
+                pendingReplacements.append(pending)
+                succeededIndices.append(idx)
             } else {
                 failedCount += 1
             }
             completedCount += 1
         }
 
-        // Delete all backed-up & proxied originals in a single batch so iOS shows ONE confirmation prompt
-        if !originalsToDelete.isEmpty {
+        // Apply replacement or deletion in a single atomic PhotoKit transaction (prompts iOS Delete confirmation once)
+        if !pendingReplacements.isEmpty {
+            let keepLocal = settings.keepLocalProxyInPhotos
             do {
-                try await photoService.deleteOriginalAssets(originalsToDelete)
-                for item in succeededIndices {
-                    totalSavedBytes += item.saved
-                    candidates[item.index].state = .completed(savedBytes: item.saved)
-                    candidates[item.index].isSelected = false
+                let createdProxyIds = try await photoService.applyBatchReplacementOrDeletion(
+                    items: pendingReplacements,
+                    keepLocalProxy: keepLocal
+                )
+
+                for (i, item) in pendingReplacements.enumerated() {
+                    totalSavedBytes += item.savedBytes
+                    tracker.markAsProxy(assetId: item.originalAsset.localIdentifier, proxySha256: item.proxySha256)
+                    if i < createdProxyIds.count {
+                        tracker.markAsProxy(assetId: createdProxyIds[i], proxySha256: item.proxySha256)
+                    }
                 }
+
+                let completedAssetIds = Set(pendingReplacements.map { $0.originalAsset.localIdentifier })
+                candidates.removeAll { completedAssetIds.contains($0.id) }
             } catch {
-                for item in succeededIndices {
-                    candidates[item.index].state = .failed("Proxy saved, but original deletion was cancelled")
+                for idx in succeededIndices where idx < candidates.count {
+                    candidates[idx].state = .failed("Deletion cancelled: \(error.localizedDescription)")
                 }
                 statusBanner = error.localizedDescription
             }
@@ -144,7 +154,10 @@ final class CompressorViewModel: ObservableObject {
         }
     }
 
-    private func processSingleCandidate(at index: Int, apiClient: PhotoHubAPIClient) async -> Int64? {
+    private func processSingleCandidate(
+        at index: Int,
+        apiClient: PhotoHubAPIClient
+    ) async -> PhotoLibraryService.PendingProxyReplacement? {
         let candidate = candidates[index]
         var masterTempURL: URL?
         var proxyTempURL: URL?
@@ -211,26 +224,28 @@ final class CompressorViewModel: ObservableObject {
                 )
             }.value
             proxyTempURL = proxy.fileURL
+            let proxyData = try Data(contentsOf: proxy.fileURL)
 
-            // 5. Save lightweight proxy into Photos library (in-memory Data, no alert hang)
+            // 5. Register proxy hash & upload small compressed preview to server
             candidates[index].state = .replacingInPhotos
-            let newAssetId = try await photoService.saveProxyAsset(
-                originalAsset: candidate.asset,
-                proxyFileURL: proxy.fileURL
-            )
-
-            // 6. Register proxy hash & upload small compressed preview to server
-            tracker.markAsProxy(assetId: newAssetId, proxySha256: proxy.sha256)
             try? await apiClient.registerProxy(
                 masterHash: master.sha256,
                 proxyHash: proxy.sha256,
-                assetId: newAssetId,
+                assetId: candidate.id,
                 proxyFileURL: proxy.fileURL,
                 proxyFormat: format.rawValue
             )
 
-            let saved = max(0, master.sizeBytes - proxy.sizeBytes)
-            return saved
+            let saved = settings.keepLocalProxyInPhotos
+                ? max(0, master.sizeBytes - proxy.sizeBytes)
+                : master.sizeBytes
+
+            return PhotoLibraryService.PendingProxyReplacement(
+                originalAsset: candidate.asset,
+                proxyData: proxyData,
+                proxySha256: proxy.sha256,
+                savedBytes: saved
+            )
         } catch {
             candidates[index].state = .failed(error.localizedDescription)
             statusBanner = error.localizedDescription
