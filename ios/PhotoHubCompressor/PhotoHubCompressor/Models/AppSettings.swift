@@ -49,8 +49,12 @@ final class AppSettings: ObservableObject {
     }
 
     var normalizedBaseURL: URL? {
-        let trimmed = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        var trimmed = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !trimmed.isEmpty else { return nil }
+        if !trimmed.lowercased().hasPrefix("http://") && !trimmed.lowercased().hasPrefix("https://") {
+            trimmed = "http://\(trimmed)"
+        }
         return URL(string: trimmed)
     }
 }

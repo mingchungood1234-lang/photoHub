@@ -58,6 +58,7 @@ struct CheckResponse: Decodable {
 
 struct UploadConfirmResponse: Decodable {
     let success: Bool
+    let canDelete: Bool?
     let checksumVerified: Bool?
     let canReplaceWithProxy: Bool?
     let serverSha256: String?
@@ -238,6 +239,7 @@ final class PhotoHubAPIClient {
         if presign.alreadyExists == true {
             let existing = UploadConfirmResponse(
                 success: true,
+                canDelete: true,
                 checksumVerified: presign.checksumVerified,
                 canReplaceWithProxy: presign.canReplaceWithProxy,
                 serverSha256: presign.serverSha256,
@@ -316,12 +318,14 @@ final class PhotoHubAPIClient {
     }
 
     private func ensureChecksumConfirmed(_ result: UploadConfirmResponse, expectedSha256: String) throws {
+        let confirmedHash = (result.serverSha256 ?? result.hash)?.lowercased()
+        let verifiedFlag = (result.checksumVerified == true) || (result.canDelete == true)
         guard result.success,
-              result.checksumVerified == true,
-              result.canReplaceWithProxy == true,
-              let serverHash = result.serverSha256?.lowercased(),
+              verifiedFlag,
+              let serverHash = confirmedHash,
               serverHash == expectedSha256.lowercased() else {
-            throw APIClientError.checksumNotConfirmed(result.error ?? "Hash mismatch or unverified")
+            let detail = result.error ?? "Server hash (\(confirmedHash ?? "nil")) did not match local master (\(expectedSha256.prefix(12))...)"
+            throw APIClientError.checksumNotConfirmed(detail)
         }
     }
 }

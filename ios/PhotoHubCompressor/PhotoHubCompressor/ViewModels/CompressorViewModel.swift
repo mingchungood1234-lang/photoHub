@@ -83,18 +83,33 @@ final class CompressorViewModel: ObservableObject {
 
         let apiClient = PhotoHubAPIClient(settings: settings)
 
+        do {
+            _ = try await apiClient.checkHealth()
+        } catch {
+            isProcessing = false
+            statusBanner = "Cannot reach server (\(settings.serverURL)): \(error.localizedDescription). Check your Server URL in Settings."
+            return
+        }
+
+        var failedCount = 0
         for idx in targetIndices {
             if Task.isCancelled { break }
-            await processSingleCandidate(at: idx, apiClient: apiClient)
+            let ok = await processSingleCandidate(at: idx, apiClient: apiClient)
+            if !ok { failedCount += 1 }
             completedCount += 1
         }
 
         isProcessing = false
         let savedStr = ByteCountFormatter.string(fromByteCount: totalSavedBytes, countStyle: .file)
-        statusBanner = "Finished! Estimated space saved: \(savedStr). Empty 'Recently Deleted' in the Photos app to reclaim storage immediately."
+        if failedCount > 0 && statusBanner == nil {
+            statusBanner = "Finished with \(failedCount) error(s). Space saved: \(savedStr)."
+        } else if failedCount == 0 {
+            statusBanner = "Finished! Space saved: \(savedStr). Empty 'Recently Deleted' in Photos to reclaim storage immediately."
+        }
     }
 
-    private func processSingleCandidate(at index: Int, apiClient: PhotoHubAPIClient) async {
+    @discardableResult
+    private func processSingleCandidate(at index: Int, apiClient: PhotoHubAPIClient) async -> Bool {
         let candidate = candidates[index]
         var masterTempURL: URL?
         var proxyTempURL: URL?
@@ -114,14 +129,14 @@ final class CompressorViewModel: ObservableObject {
             if master.sizeBytes > 0 && master.sizeBytes < minBytes {
                 candidates[index].state = .skipped("Under \(settings.minimumOriginalSizeKB) KB")
                 candidates[index].isSelected = false
-                return
+                return true
             }
 
             // 2. Check local tracker & server to ensure we never re-upload an already-compressed proxy
             if tracker.isKnownProxy(sha256: master.sha256) {
                 candidates[index].state = .alreadyProxy
                 candidates[index].isSelected = false
-                return
+                return true
             }
 
             let checkResult = try await apiClient.checkHash(master.sha256)
@@ -129,7 +144,7 @@ final class CompressorViewModel: ObservableObject {
                 tracker.markAsProxy(assetId: candidate.id, proxySha256: master.sha256)
                 candidates[index].state = .alreadyProxy
                 candidates[index].isSelected = false
-                return
+                return true
             }
 
             // 3. Upload full-resolution original if not already verified on backend
@@ -184,7 +199,7 @@ final class CompressorViewModel: ObservableObject {
             if proxy.sizeBytes >= master.sizeBytes {
                 candidates[index].state = .skipped("Already compact")
                 candidates[index].isSelected = false
-                return
+                return true
             }
 
             // 5. Replace original in native Photos app with lightweight proxy
@@ -206,8 +221,11 @@ final class CompressorViewModel: ObservableObject {
             totalSavedBytes += saved
             candidates[index].state = .completed(savedBytes: saved)
             candidates[index].isSelected = false
+            return true
         } catch {
             candidates[index].state = .failed(error.localizedDescription)
+            statusBanner = error.localizedDescription
+            return false
         }
     }
 }
