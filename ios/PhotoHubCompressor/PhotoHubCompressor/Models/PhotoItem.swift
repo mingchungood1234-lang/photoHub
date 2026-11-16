@@ -30,7 +30,7 @@ enum PhotoCompressionState: Equatable {
         case .creatingProxy:
             return "Compressing Proxy…"
         case .replacingInPhotos:
-            return "Saving Proxy to Server…"
+            return "Replacing in Photos…"
         case .readyToDelete(let savedBytes):
             let formatted = ByteCountFormatter.string(fromByteCount: max(0, savedBytes), countStyle: .file)
             return "Backed Up • Tap Delete (\(formatted))"

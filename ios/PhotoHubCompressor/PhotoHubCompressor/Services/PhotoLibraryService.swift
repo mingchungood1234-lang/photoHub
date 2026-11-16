@@ -15,7 +15,7 @@ enum PhotoLibraryError: LocalizedError {
         case .noOriginalResourceFound:
             return "Could not locate original photo resource."
         case .proxyReplacementFailed(let msg):
-            return "Failed to replace photo in Photos library: \(msg)"
+            return msg
         }
     }
 }
@@ -40,9 +40,7 @@ final class PhotoLibraryService {
         }
     }
 
-    func scanCandidates(
-        tracker: LocalProxyTracker
-    ) -> [PhotoCandidate] {
+    func scanCandidates(tracker: LocalProxyTracker) -> [PhotoCandidate] {
         let fetchOptions = PHFetchOptions()
         fetchOptions.predicate = NSPredicate(
             format: "mediaType == %d OR mediaType == %d",
@@ -63,7 +61,6 @@ final class PhotoLibraryService {
             autoreleasepool {
                 let asset = assets.object(at: i)
                 let localId = asset.localIdentifier
-                // Skip photos/videos that have already been compressed into local proxies
                 if tracker.isKnownProxy(assetId: localId) {
                     return
                 }
@@ -90,132 +87,172 @@ final class PhotoLibraryService {
         return candidates
     }
 
-    func loadThumbnail(for asset: PHAsset, targetSize: CGSize = CGSize(width: 160, height: 160)) async -> UIImage? {
-        await withCheckedContinuation { continuation in
-            let options = PHImageRequestOptions()
-            options.deliveryMode = .opportunistic
-            options.isNetworkAccessAllowed = true
-            options.resizeMode = .fast
-            options.isSynchronous = false
+    func loadThumbnail(
+        for asset: PHAsset,
+        targetSize: CGSize = CGSize(width: 160, height: 160),
+        completion: @escaping (UIImage?) -> Void
+    ) {
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .opportunistic
+        options.isNetworkAccessAllowed = true
+        options.resizeMode = .fast
+        options.isSynchronous = false
 
-            var hasResumed = false
-            let lock = NSLock()
-
-            PHImageManager.default().requestImage(
-                for: asset,
-                targetSize: targetSize,
-                contentMode: .aspectFill,
-                options: options
-            ) { image, info in
-                lock.lock()
-                defer { lock.unlock() }
-                guard !hasResumed else { return }
-
-                if let image = image {
-                    hasResumed = true
-                    continuation.resume(returning: image)
-                } else if info?[PHImageErrorKey] != nil || (info?[PHImageCancelledKey] as? Bool) == true {
-                    hasResumed = true
-                    continuation.resume(returning: nil)
-                }
+        PHImageManager.default().requestImage(
+            for: asset,
+            targetSize: targetSize,
+            contentMode: .aspectFill,
+            options: options
+        ) { image, _ in
+            guard let image = image else { return }
+            DispatchQueue.main.async {
+                completion(image)
             }
         }
     }
 
-    func exportOriginalMaster(for asset: PHAsset) async throws -> ExportedMaster {
+    func exportOriginalMaster(
+        for asset: PHAsset,
+        completion: @escaping (Result<ExportedMaster, Error>) -> Void
+    ) {
         let resources = PHAssetResource.assetResources(for: asset)
         guard let resource = Self.pickOriginalResource(from: resources) else {
-            throw PhotoLibraryError.noOriginalResourceFound
+            completion(.failure(PhotoLibraryError.noOriginalResourceFound))
+            return
         }
 
         let ext = (resource.originalFilename as NSString).pathExtension
-        let safeExt = ext.isEmpty ? "heic" : ext
+        let safeExt = ext.isEmpty ? (asset.mediaType == .video ? "mov" : "heic") : ext
         let tempURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("master_\(UUID().uuidString).\(safeExt)")
 
         let options = PHAssetResourceRequestOptions()
         options.isNetworkAccessAllowed = true
 
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let lock = NSLock()
-            var hasResumed = false
-            PHAssetResourceManager.default().writeData(for: resource, toFile: tempURL, options: options) { error in
-                lock.lock()
-                defer { lock.unlock() }
-                guard !hasResumed else { return }
-                hasResumed = true
-                if let error {
-                    try? FileManager.default.removeItem(at: tempURL)
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume(returning: ())
-                }
+        let lock = NSLock()
+        var hasCompleted = false
+
+        PHAssetResourceManager.default().writeData(for: resource, toFile: tempURL, options: options) { error in
+            lock.lock()
+            if hasCompleted {
+                lock.unlock()
+                return
+            }
+            hasCompleted = true
+            lock.unlock()
+
+            if let error = error {
+                try? FileManager.default.removeItem(at: tempURL)
+                completion(.failure(error))
+                return
+            }
+
+            do {
+                let attrs = try FileManager.default.attributesOfItem(atPath: tempURL.path)
+                let sizeBytes = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+                let sha256 = try ProxyGenerator.computeFileSHA256(url: tempURL)
+                let mimeType = UTType(resource.uniformTypeIdentifier)?.preferredMIMEType ?? "application/octet-stream"
+
+                let master = ExportedMaster(
+                    fileURL: tempURL,
+                    sha256: sha256,
+                    sizeBytes: sizeBytes,
+                    filename: resource.originalFilename,
+                    mimeType: mimeType
+                )
+                completion(.success(master))
+            } catch {
+                try? FileManager.default.removeItem(at: tempURL)
+                completion(.failure(error))
             }
         }
-
-        let attrs = try FileManager.default.attributesOfItem(atPath: tempURL.path)
-        let sizeBytes = (attrs[.size] as? NSNumber)?.int64Value ?? 0
-        let sha256 = try ProxyGenerator.computeFileSHA256(url: tempURL)
-        let mimeType = UTType(resource.uniformTypeIdentifier)?.preferredMIMEType ?? "application/octet-stream"
-
-        return ExportedMaster(
-            fileURL: tempURL,
-            sha256: sha256,
-            sizeBytes: sizeBytes,
-            filename: resource.originalFilename,
-            mimeType: mimeType
-        )
     }
 
-    /// Deletes the heavy original asset first (triggering the iOS Delete confirmation prompt),
-    /// and then saves the clean lightweight proxy in the native Photos library (preserving date, GPS, and favorite status).
+    /// Uses standard Objective-C completion callbacks (zero Swift concurrency continuations):
+    /// 1. Saves the clean lightweight proxy to Photos first (if `keepLocalProxy` is true).
+    /// 2. Calls `PHAssetChangeRequest.deleteAssets` on the freshly fetched original asset so iOS pops up the Delete confirmation alert.
     func replaceWithProxy(
         originalAsset: PHAsset,
         mediaType: PHAssetMediaType,
         proxyFileURL: URL,
-        keepLocalProxy: Bool = true
-    ) async throws -> String {
+        keepLocalProxy: Bool,
+        completion: @escaping (Result<String, Error>) -> Void
+    ) {
         let originalId = originalAsset.localIdentifier
         let originalDate = originalAsset.creationDate
         let originalLocation = originalAsset.location
         let originalFavorite = originalAsset.isFavorite
 
-        let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [originalId], options: nil)
-        guard fetchResult.count > 0 else {
-            throw PhotoLibraryError.noOriginalResourceFound
-        }
+        let performDeleteStep: (String?) -> Void = { createdProxyId in
+            let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [originalId], options: nil)
+            guard fetchResult.count > 0 else {
+                DispatchQueue.main.async {
+                    completion(.success(createdProxyId ?? originalId))
+                }
+                return
+            }
 
-        // Step 1: Delete the original asset first in a standalone performChanges block
-        // so photolibraryd never aborts the delete prompt due to bundled creation requests.
-        try await PHPhotoLibrary.shared().performChanges {
-            PHAssetChangeRequest.deleteAssets(fetchResult)
+            PHPhotoLibrary.shared().performChanges({
+                PHAssetChangeRequest.deleteAssets(fetchResult)
+            }, completionHandler: { deleteSuccess, deleteError in
+                if deleteSuccess {
+                    DispatchQueue.main.async {
+                        completion(.success(createdProxyId ?? originalId))
+                    }
+                } else {
+                    // If user cancelled deletion and we already created a proxy, clean up the proxy so no duplicate remains
+                    if let proxyId = createdProxyId {
+                        let proxyFetch = PHAsset.fetchAssets(withLocalIdentifiers: [proxyId], options: nil)
+                        if proxyFetch.count > 0 {
+                            PHPhotoLibrary.shared().performChanges({
+                                PHAssetChangeRequest.deleteAssets(proxyFetch)
+                            }, completionHandler: nil)
+                        }
+                    }
+                    let nsErr = deleteError as NSError?
+                    let detail = nsErr.map { "\($0.localizedDescription) [\($0.domain):\($0.code)]" }
+                        ?? "Delete confirmation was cancelled or denied."
+                    DispatchQueue.main.async {
+                        completion(.failure(PhotoLibraryError.proxyReplacementFailed(detail)))
+                    }
+                }
+            })
         }
 
         guard keepLocalProxy else {
-            return originalId
+            performDeleteStep(nil)
+            return
         }
 
-        // Step 2: Save the lightweight proxy into Photos after the original was deleted
+        // Save the compressed proxy first (using clean file or UIImage fallback), then immediately delete the original
         var createdLocalIdentifier: String?
-        try await PHPhotoLibrary.shared().performChanges {
+        PHPhotoLibrary.shared().performChanges({
             let createRequest: PHAssetChangeRequest?
             if mediaType == .video {
                 createRequest = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: proxyFileURL)
-            } else if let req = PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: proxyFileURL) {
-                createRequest = req
             } else if let img = UIImage(contentsOfFile: proxyFileURL.path) {
                 createRequest = PHAssetChangeRequest.creationRequestForAsset(from: img)
             } else {
-                createRequest = nil
+                createRequest = PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: proxyFileURL)
             }
 
             createRequest?.creationDate = originalDate
             createRequest?.location = originalLocation
             createRequest?.isFavorite = originalFavorite
             createdLocalIdentifier = createRequest?.placeholderForCreatedAsset?.localIdentifier
-        }
+        }, completionHandler: { saveSuccess, saveError in
+            guard saveSuccess else {
+                let nsErr = saveError as NSError?
+                let detail = nsErr.map { "Could not save proxy: \($0.localizedDescription) [\($0.domain):\($0.code)]" }
+                    ?? "Could not save compressed proxy to Photos."
+                DispatchQueue.main.async {
+                    completion(.failure(PhotoLibraryError.proxyReplacementFailed(detail)))
+                }
+                return
+            }
 
-        return createdLocalIdentifier ?? originalId
+            performDeleteStep(createdLocalIdentifier)
+        })
     }
 
     private static func pickOriginalResource(from resources: [PHAssetResource]) -> PHAssetResource? {

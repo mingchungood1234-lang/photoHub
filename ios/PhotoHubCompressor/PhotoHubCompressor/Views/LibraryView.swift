@@ -88,8 +88,8 @@ struct LibraryView: View {
                                     viewModel.toggleSelection(for: item.id)
                                 }
                             )
-                            .task(id: item.id) {
-                                await viewModel.loadThumbnailIfNeeded(for: item.id)
+                            .onAppear {
+                                viewModel.loadThumbnailIfNeeded(for: item.id)
                             }
                         }
                     }
@@ -165,7 +165,7 @@ struct LibraryView: View {
 
     private var actionBar: some View {
         Button {
-            Task { await viewModel.processSelectedPhotos() }
+            viewModel.startProcessingSelectedPhotos()
         } label: {
             HStack {
                 Image(systemName: "arrow.up.circle.fill")

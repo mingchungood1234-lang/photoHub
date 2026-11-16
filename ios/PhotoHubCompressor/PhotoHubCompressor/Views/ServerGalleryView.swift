@@ -296,7 +296,6 @@ private struct ServerPhotoDetailView: View {
     private func saveCompressedPreviewToPhotos() async {
         isSaving = true
         saveMessage = nil
-        defer { isSaving = false }
 
         do {
             let dataToSave: Data
@@ -308,21 +307,26 @@ private struct ServerPhotoDetailView: View {
                 dataToSave = ServerGalleryView.makeSmallCompressedPreview(from: raw, maxPixelSize: 800, quality: 0.65)?.1 ?? raw
             }
 
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                PHPhotoLibrary.shared().performChanges({
+            PHPhotoLibrary.shared().performChanges({
+                if let img = UIImage(data: dataToSave) {
+                    PHAssetChangeRequest.creationRequestForAsset(from: img)
+                } else {
                     let req = PHAssetCreationRequest.forAsset()
                     req.addResource(with: .photo, data: dataToSave, options: nil)
-                }, completionHandler: { success, err in
+                }
+            }, completionHandler: { success, err in
+                DispatchQueue.main.async {
+                    isSaving = false
                     if success {
-                        continuation.resume(returning: ())
+                        let sizeStr = ByteCountFormatter.string(fromByteCount: Int64(dataToSave.count), countStyle: .file)
+                        saveMessage = "Saved small compressed picture (\(sizeStr)) to Photos!"
                     } else {
-                        continuation.resume(throwing: err ?? PhotoLibraryError.proxyReplacementFailed("Could not save preview"))
+                        saveMessage = "Save failed: \(err?.localizedDescription ?? "Unknown error")"
                     }
-                })
-            }
-            let sizeStr = ByteCountFormatter.string(fromByteCount: Int64(dataToSave.count), countStyle: .file)
-            saveMessage = "Saved small compressed picture (\(sizeStr)) to Photos!"
+                }
+            })
         } catch {
+            isSaving = false
             saveMessage = "Save failed: \(error.localizedDescription)"
         }
     }
@@ -330,27 +334,27 @@ private struct ServerPhotoDetailView: View {
     private func restoreFullMasterToPhotos() async {
         isSaving = true
         saveMessage = nil
-        defer { isSaving = false }
 
         do {
             let client = PhotoHubAPIClient(settings: settings)
             let masterData = try await client.downloadPhotoData(hash: photo.hash)
 
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                PHPhotoLibrary.shared().performChanges({
-                    let req = PHAssetCreationRequest.forAsset()
-                    req.addResource(with: .photo, data: masterData, options: nil)
-                }, completionHandler: { success, err in
+            PHPhotoLibrary.shared().performChanges({
+                let req = PHAssetCreationRequest.forAsset()
+                req.addResource(with: .photo, data: masterData, options: nil)
+            }, completionHandler: { success, err in
+                DispatchQueue.main.async {
+                    isSaving = false
                     if success {
-                        continuation.resume(returning: ())
+                        let sizeStr = ByteCountFormatter.string(fromByteCount: Int64(masterData.count), countStyle: .file)
+                        saveMessage = "Restored full-resolution original (\(sizeStr)) to Photos!"
                     } else {
-                        continuation.resume(throwing: err ?? PhotoLibraryError.proxyReplacementFailed("Could not restore original"))
+                        saveMessage = "Restore failed: \(err?.localizedDescription ?? "Unknown error")"
                     }
-                })
-            }
-            let sizeStr = ByteCountFormatter.string(fromByteCount: Int64(masterData.count), countStyle: .file)
-            saveMessage = "Restored full-resolution original (\(sizeStr)) to Photos!"
+                }
+            })
         } catch {
+            isSaving = false
             saveMessage = "Restore failed: \(error.localizedDescription)"
         }
     }
