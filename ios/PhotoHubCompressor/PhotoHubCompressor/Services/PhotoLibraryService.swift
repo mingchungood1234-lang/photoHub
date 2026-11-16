@@ -44,8 +44,13 @@ final class PhotoLibraryService {
         tracker: LocalProxyTracker
     ) -> [PhotoCandidate] {
         let fetchOptions = PHFetchOptions()
+        fetchOptions.predicate = NSPredicate(
+            format: "mediaType == %d OR mediaType == %d",
+            PHAssetMediaType.image.rawValue,
+            PHAssetMediaType.video.rawValue
+        )
         fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        let assets = PHAsset.fetchAssets(with: .image, options: fetchOptions)
+        let assets = PHAsset.fetchAssets(with: fetchOptions)
 
         var candidates: [PhotoCandidate] = []
         let totalCount = assets.count
@@ -58,18 +63,21 @@ final class PhotoLibraryService {
             autoreleasepool {
                 let asset = assets.object(at: i)
                 let localId = asset.localIdentifier
-                // Skip photos that have already been compressed into local proxies
+                // Skip photos/videos that have already been compressed into local proxies
                 if tracker.isKnownProxy(assetId: localId) {
                     return
                 }
 
                 let prefixLen = min(8, localId.count)
                 let shortId = String(localId.prefix(prefixLen))
+                let prefixLabel = asset.mediaType == .video ? "Video" : "Photo"
 
                 let candidate = PhotoCandidate(
                     id: localId,
                     asset: asset,
-                    filename: "Photo_\(shortId)",
+                    mediaType: asset.mediaType,
+                    duration: asset.duration,
+                    filename: "\(prefixLabel)_\(shortId)",
                     pixelWidth: asset.pixelWidth,
                     pixelHeight: asset.pixelHeight,
                     creationDate: asset.creationDate
@@ -161,7 +169,9 @@ final class PhotoLibraryService {
 
     struct PendingProxyReplacement {
         let originalAsset: PHAsset
-        let proxyData: Data
+        let mediaType: PHAssetMediaType
+        let proxyData: Data?
+        let proxyVideoURL: URL?
         let proxySha256: String
         let savedBytes: Int64
     }
@@ -193,15 +203,24 @@ final class PhotoLibraryService {
             guard deleteSuccess else {
                 let nsErr = deleteError as NSError?
                 let detail = nsErr.map { "\($0.localizedDescription) [\($0.domain):\($0.code)]" }
-                    ?? "Photo deletion was cancelled or denied."
+                    ?? "Deletion was cancelled or denied."
                 DispatchQueue.main.async {
                     completion(.failure(PhotoLibraryError.proxyReplacementFailed(detail)))
                 }
                 return
             }
 
+            let cleanupTempVideos = {
+                for item in items {
+                    if let videoURL = item.proxyVideoURL {
+                        try? FileManager.default.removeItem(at: videoURL)
+                    }
+                }
+            }
+
             // If user does not want a duplicate/proxy copy added back to iPhone Photos, we are done!
             guard keepLocalProxy else {
+                cleanupTempVideos()
                 DispatchQueue.main.async {
                     completion(.success([]))
                 }
@@ -212,16 +231,27 @@ final class PhotoLibraryService {
             var createdIds: [String] = []
             PHPhotoLibrary.shared().performChanges({
                 for item in items {
-                    let creationRequest = PHAssetCreationRequest.forAsset()
-                    creationRequest.addResource(with: .photo, data: item.proxyData, options: nil)
-                    creationRequest.creationDate = item.originalAsset.creationDate
-                    creationRequest.location = item.originalAsset.location
-                    creationRequest.isFavorite = item.originalAsset.isFavorite
-                    if let id = creationRequest.placeholderForCreatedAsset?.localIdentifier {
-                        createdIds.append(id)
+                    if item.mediaType == .video, let videoURL = item.proxyVideoURL {
+                        let req = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: videoURL)
+                        req?.creationDate = item.originalAsset.creationDate
+                        req?.location = item.originalAsset.location
+                        req?.isFavorite = item.originalAsset.isFavorite
+                        if let id = req?.placeholderForCreatedAsset?.localIdentifier {
+                            createdIds.append(id)
+                        }
+                    } else if let data = item.proxyData {
+                        let creationRequest = PHAssetCreationRequest.forAsset()
+                        creationRequest.addResource(with: .photo, data: data, options: nil)
+                        creationRequest.creationDate = item.originalAsset.creationDate
+                        creationRequest.location = item.originalAsset.location
+                        creationRequest.isFavorite = item.originalAsset.isFavorite
+                        if let id = creationRequest.placeholderForCreatedAsset?.localIdentifier {
+                            createdIds.append(id)
+                        }
                     }
                 }
             }, completionHandler: { _, _ in
+                cleanupTempVideos()
                 DispatchQueue.main.async {
                     completion(.success(createdIds))
                 }
@@ -230,8 +260,8 @@ final class PhotoLibraryService {
     }
 
     private static func pickOriginalResource(from resources: [PHAssetResource]) -> PHAssetResource? {
-        resources.first(where: { $0.type == .photo })
-            ?? resources.first(where: { $0.type == .fullSizePhoto })
+        resources.first(where: { $0.type == .photo || $0.type == .video })
+            ?? resources.first(where: { $0.type == .fullSizePhoto || $0.type == .fullSizeVideo })
             ?? resources.first
     }
 }

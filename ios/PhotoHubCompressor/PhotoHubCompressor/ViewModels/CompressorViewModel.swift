@@ -103,6 +103,10 @@ final class CompressorViewModel: ObservableObject {
 
     func toggleSelection(for id: String) {
         guard let idx = candidates.firstIndex(where: { $0.id == id }) else { return }
+        if case .readyToDelete = candidates[idx].state {
+            deleteReadyOriginalsFromDevice()
+            return
+        }
         guard !candidates[idx].state.isFinished else { return }
         candidates[idx].isSelected.toggle()
     }
@@ -156,7 +160,12 @@ final class CompressorViewModel: ObservableObject {
             return
         }
 
-        statusBanner = "Backed up \(readyToDeleteItems.count) photo(s)! Tap the red 'Delete Original(s)' button below to remove them from your iPhone."
+        statusBanner = "Backed up \(readyToDeleteItems.count) item(s)! Confirm the iOS Delete prompt (or tap the red Delete button) to remove originals."
+
+        // Immediately trigger the iOS delete prompt on the next main runloop tick
+        DispatchQueue.main.async { [weak self] in
+            self?.deleteReadyOriginalsFromDevice()
+        }
     }
 
     func deleteReadyOriginalsFromDevice() {
@@ -209,11 +218,13 @@ final class CompressorViewModel: ObservableObject {
     ) async -> PhotoLibraryService.PendingProxyReplacement? {
         let candidate = candidates[index]
         var masterTempURL: URL?
-        var proxyTempURL: URL?
+        var proxyImageTempURL: URL?
+        var posterTempURL: URL?
 
         defer {
             if let masterTempURL { try? FileManager.default.removeItem(at: masterTempURL) }
-            if let proxyTempURL { try? FileManager.default.removeItem(at: proxyTempURL) }
+            if let proxyImageTempURL { try? FileManager.default.removeItem(at: proxyImageTempURL) }
+            if let posterTempURL { try? FileManager.default.removeItem(at: posterTempURL) }
         }
 
         do {
@@ -258,22 +269,40 @@ final class CompressorViewModel: ObservableObject {
                 }
             }
 
-            // 4. Backend checksum confirmed! Generate lightweight local proxy
+            // 4. Backend checksum confirmed! Generate lightweight local proxy (Photo or Video)
             candidates[index].state = .creatingProxy
             let format = settings.proxyFormat
             let maxPx = settings.proxyMaxPixelSize
             let quality = settings.proxyQuality
 
-            let proxy = try await Task.detached(priority: .userInitiated) {
-                try ProxyGenerator.createProxy(
-                    from: master.fileURL,
-                    format: format,
-                    maxPixelSize: maxPx,
-                    quality: quality
-                )
-            }.value
-            proxyTempURL = proxy.fileURL
-            let proxyData = try Data(contentsOf: proxy.fileURL)
+            let proxy: GeneratedProxy
+            let proxyData: Data?
+            let proxyVideoURL: URL?
+            let previewFileForServer: URL?
+            let previewFormatForServer: String
+
+            if candidate.mediaType == .video {
+                proxy = try await ProxyGenerator.createVideoProxy(from: master.fileURL)
+                posterTempURL = proxy.posterFileURL
+                proxyData = nil
+                proxyVideoURL = proxy.fileURL
+                previewFileForServer = proxy.posterFileURL
+                previewFormatForServer = "jpeg"
+            } else {
+                proxy = try await Task.detached(priority: .userInitiated) {
+                    try ProxyGenerator.createProxy(
+                        from: master.fileURL,
+                        format: format,
+                        maxPixelSize: maxPx,
+                        quality: quality
+                    )
+                }.value
+                proxyImageTempURL = proxy.fileURL
+                proxyData = try Data(contentsOf: proxy.fileURL)
+                proxyVideoURL = nil
+                previewFileForServer = proxy.fileURL
+                previewFormatForServer = format.rawValue
+            }
 
             // 5. Register proxy hash & upload small compressed preview to server
             candidates[index].state = .replacingInPhotos
@@ -281,8 +310,8 @@ final class CompressorViewModel: ObservableObject {
                 masterHash: master.sha256,
                 proxyHash: proxy.sha256,
                 assetId: candidate.id,
-                proxyFileURL: proxy.fileURL,
-                proxyFormat: format.rawValue
+                proxyFileURL: previewFileForServer,
+                proxyFormat: previewFormatForServer
             )
 
             let saved = settings.keepLocalProxyInPhotos
@@ -291,7 +320,9 @@ final class CompressorViewModel: ObservableObject {
 
             return PhotoLibraryService.PendingProxyReplacement(
                 originalAsset: candidate.asset,
+                mediaType: candidate.mediaType,
                 proxyData: proxyData,
+                proxyVideoURL: proxyVideoURL,
                 proxySha256: proxy.sha256,
                 savedBytes: saved
             )

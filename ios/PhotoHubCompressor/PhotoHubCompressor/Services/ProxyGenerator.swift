@@ -1,6 +1,8 @@
+import AVFoundation
 import CryptoKit
 import Foundation
 import ImageIO
+import UIKit
 import UniformTypeIdentifiers
 
 enum ProxyGeneratorError: LocalizedError {
@@ -27,6 +29,7 @@ struct GeneratedProxy {
     let fileURL: URL
     let sha256: String
     let sizeBytes: Int64
+    var posterFileURL: URL? = nil
 }
 
 enum ProxyGenerator {
@@ -141,6 +144,55 @@ enum ProxyGenerator {
         let sha256 = try computeFileSHA256(url: proxyURL)
 
         return GeneratedProxy(fileURL: proxyURL, sha256: sha256, sizeBytes: sizeBytes)
+    }
+
+    static func createVideoProxy(from masterURL: URL) async throws -> GeneratedProxy {
+        let avAsset = AVURLAsset(url: masterURL)
+        let proxyURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("video_proxy_\(UUID().uuidString).mp4")
+
+        guard let exportSession = AVAssetExportSession(
+            asset: avAsset,
+            presetName: AVAssetExportPresetMediumQuality
+        ) else {
+            throw ProxyGeneratorError.failedToOpenSource
+        }
+
+        exportSession.outputURL = proxyURL
+        exportSession.outputFileType = .mp4
+        exportSession.shouldOptimizeForNetworkUse = true
+
+        await exportSession.export()
+
+        guard exportSession.status == .completed else {
+            try? FileManager.default.removeItem(at: proxyURL)
+            throw exportSession.error ?? ProxyGeneratorError.failedToFinalize
+        }
+
+        // Also generate a small compressed JPEG poster frame so the Server tab can display a preview thumbnail
+        var posterURL: URL?
+        let generator = AVAssetImageGenerator(asset: avAsset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 800, height: 800)
+        if let cgImage = try? generator.copyCGImage(at: .zero, actualTime: nil),
+           let jpgData = UIImage(cgImage: cgImage).jpegData(compressionQuality: 0.65) {
+            let pURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("video_poster_\(UUID().uuidString).jpg")
+            if (try? jpgData.write(to: pURL)) != nil {
+                posterURL = pURL
+            }
+        }
+
+        let attrs = try FileManager.default.attributesOfItem(atPath: proxyURL.path)
+        let sizeBytes = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+        let sha256 = try computeFileSHA256(url: proxyURL)
+
+        return GeneratedProxy(
+            fileURL: proxyURL,
+            sha256: sha256,
+            sizeBytes: sizeBytes,
+            posterFileURL: posterURL
+        )
     }
 
     static func computeFileSHA256(url: URL) throws -> String {

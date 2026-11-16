@@ -82,14 +82,19 @@ struct LibraryView: View {
                     summaryHeader
                     List {
                         ForEach(viewModel.candidates) { item in
-                            PhotoCandidateRow(item: item)
-                                .contentShape(Rectangle())
-                                .onTapGesture {
-                                    viewModel.toggleSelection(for: item.id)
+                            PhotoCandidateRow(
+                                item: item,
+                                onDelete: {
+                                    viewModel.deleteReadyOriginalsFromDevice()
                                 }
-                                .task(id: item.id) {
-                                    await viewModel.loadThumbnailIfNeeded(for: item.id)
-                                }
+                            )
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                viewModel.toggleSelection(for: item.id)
+                            }
+                            .task(id: item.id) {
+                                await viewModel.loadThumbnailIfNeeded(for: item.id)
+                            }
                         }
                     }
                     .listStyle(.plain)
@@ -140,9 +145,9 @@ struct LibraryView: View {
     private var summaryHeader: some View {
         HStack {
             VStack(alignment: .leading, spacing: 2) {
-                Text("\(viewModel.candidates.count) Photos Found")
+                Text("\(viewModel.candidates.count) Photos & Videos")
                     .font(.headline)
-                Text("Selected: \(viewModel.selectedCount) photos")
+                Text("Selected: \(viewModel.selectedCount) item(s)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -208,6 +213,7 @@ struct LibraryView: View {
 
 private struct PhotoCandidateRow: View {
     let item: PhotoCandidate
+    let onDelete: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
@@ -216,16 +222,28 @@ private struct PhotoCandidateRow: View {
                 .font(.title3)
                 .opacity(item.state.isFinished ? 0.3 : 1.0)
 
-            if let thumb = item.thumbnail {
-                Image(uiImage: thumb)
-                    .resizable()
-                    .scaledToFill()
-                    .frame(width: 56, height: 56)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-            } else {
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color.secondary.opacity(0.2))
-                    .frame(width: 56, height: 56)
+            ZStack(alignment: .bottomTrailing) {
+                if let thumb = item.thumbnail {
+                    Image(uiImage: thumb)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 56, height: 56)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                } else {
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color.secondary.opacity(0.2))
+                        .frame(width: 56, height: 56)
+                }
+
+                if item.isVideo {
+                    Image(systemName: "video.fill")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(4)
+                        .background(.black.opacity(0.65))
+                        .clipShape(Circle())
+                        .padding(3)
+                }
             }
 
             VStack(alignment: .leading, spacing: 4) {
@@ -251,6 +269,17 @@ private struct PhotoCandidateRow: View {
             }
 
             Spacer()
+
+            if case .readyToDelete = item.state {
+                Button(role: .destructive) {
+                    onDelete()
+                } label: {
+                    Label("Delete", systemImage: "trash.fill")
+                        .font(.caption.weight(.semibold))
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+            }
         }
         .padding(.vertical, 4)
     }

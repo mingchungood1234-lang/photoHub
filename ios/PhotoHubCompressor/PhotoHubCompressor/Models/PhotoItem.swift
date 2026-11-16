@@ -57,6 +57,8 @@ enum PhotoCompressionState: Equatable {
 struct PhotoCandidate: Identifiable {
     let id: String
     let asset: PHAsset
+    let mediaType: PHAssetMediaType
+    let duration: TimeInterval
     let filename: String
     let pixelWidth: Int
     let pixelHeight: Int
@@ -65,7 +67,20 @@ struct PhotoCandidate: Identifiable {
     var state: PhotoCompressionState = .pending
     var isSelected: Bool = false
 
+    var isVideo: Bool {
+        mediaType == .video
+    }
+
     var resolutionLabel: String {
+        if isVideo {
+            let mins = Int(duration) / 60
+            let secs = Int(duration) % 60
+            let durStr = String(format: "%d:%02d", mins, secs)
+            if pixelWidth > 0 && pixelHeight > 0 {
+                return "Video \(durStr) (\(pixelWidth)×\(pixelHeight))"
+            }
+            return "Video \(durStr)"
+        }
         guard pixelWidth > 0 && pixelHeight > 0 else { return "Photo" }
         let mp = Double(pixelWidth * pixelHeight) / 1_000_000.0
         return String(format: "%.1f MP (%d×%d)", mp, pixelWidth, pixelHeight)
