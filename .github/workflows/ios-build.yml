@@ -25,6 +25,13 @@ jobs:
           sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
           xcodebuild -version
 
+      - name: Generate Xcode project with XcodeGen
+        working-directory: ios/PhotoHubCompressor
+        run: |
+          brew install xcodegen
+          rm -rf PhotoHubCompressor.xcodeproj
+          xcodegen generate
+
       - name: Build unsigned iOS device app (.app)
         run: |
           xcodebuild \
