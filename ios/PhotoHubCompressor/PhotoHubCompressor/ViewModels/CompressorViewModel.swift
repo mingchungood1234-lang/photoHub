@@ -137,27 +137,8 @@ final class CompressorViewModel: ObservableObject {
             let master = try await photoService.exportOriginalMaster(for: candidate.asset)
             masterTempURL = master.fileURL
 
-            let minBytes = Int64(settings.minimumOriginalSizeKB) * 1024
-            if master.sizeBytes > 0 && master.sizeBytes < minBytes {
-                candidates[index].state = .skipped("Under \(settings.minimumOriginalSizeKB) KB")
-                candidates[index].isSelected = false
-                return true
-            }
-
-            // 2. Check local tracker & server to ensure we never re-upload an already-compressed proxy
-            if tracker.isKnownProxy(sha256: master.sha256) {
-                candidates[index].state = .alreadyProxy
-                candidates[index].isSelected = false
-                return true
-            }
-
+            // 2. Check server to see if master is already backed up
             let checkResult = try await apiClient.checkHash(master.sha256)
-            if checkResult.isProxy == true {
-                tracker.markAsProxy(assetId: candidate.id, proxySha256: master.sha256)
-                candidates[index].state = .alreadyProxy
-                candidates[index].isSelected = false
-                return true
-            }
 
             // 3. Upload full-resolution original if not already verified on backend
             let needsUpload = !(checkResult.exists && checkResult.isMaster == true && checkResult.canReplaceWithProxy == true)
@@ -208,13 +189,7 @@ final class CompressorViewModel: ObservableObject {
             }.value
             proxyTempURL = proxy.fileURL
 
-            if proxy.sizeBytes >= master.sizeBytes {
-                candidates[index].state = .skipped("Already compact")
-                candidates[index].isSelected = false
-                return true
-            }
-
-            // 5. Replace original in native Photos app with lightweight proxy
+            // 5. Replace original in native Photos app with lightweight proxy (triggers iOS Delete confirmation prompt!)
             candidates[index].state = .replacingInPhotos
             let newAssetId = try await photoService.replaceWithProxy(
                 originalAsset: candidate.asset,

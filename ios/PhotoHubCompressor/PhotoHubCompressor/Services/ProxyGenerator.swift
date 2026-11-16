@@ -45,30 +45,61 @@ enum ProxyGenerator {
         let srcHeight = (metadata[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue ?? 0
         let longestEdge = max(srcWidth, srcHeight)
 
-        // When maxPixelSize <= 0 (Auto mode), automatically adapt to ANY input resolution (12MP, 24MP, 48MP 8064x6048, panoramas, etc.)
+        // When maxPixelSize <= 0 (Auto mode), always scale down so every resolution (48MP, 24MP, 12MP, or smaller) produces a lightweight proxy
         let targetMaxPixelSize: Int
         if maxPixelSize <= 0 {
             if longestEdge > 4096 {
-                // 24MP / 48MP (8064x6048) / large panoramas -> scale longest edge by 50% (capped at 2560px)
-                targetMaxPixelSize = min(2560, max(2048, longestEdge / 2))
+                targetMaxPixelSize = 1920
             } else if longestEdge > 2048 {
-                // 12MP (4032x3024) -> 2048px proxy
-                targetMaxPixelSize = 2048
+                targetMaxPixelSize = 1440
+            } else if longestEdge > 1280 {
+                targetMaxPixelSize = 1024
             } else if longestEdge > 0 {
-                // Already <= 2048px -> keep original dimensions and compress quality only
-                targetMaxPixelSize = longestEdge
+                targetMaxPixelSize = max(640, Int(Double(longestEdge) * 0.75))
             } else {
-                targetMaxPixelSize = 2048
+                targetMaxPixelSize = 1440
             }
         } else {
             targetMaxPixelSize = longestEdge > 0 ? min(longestEdge, maxPixelSize) : maxPixelSize
         }
 
+        let masterAttrs = try? FileManager.default.attributesOfItem(atPath: masterURL.path)
+        let masterSize = (masterAttrs?[.size] as? NSNumber)?.int64Value ?? Int64.max
+
+        // First pass with requested format/quality
+        if let proxy = try? encodeThumbnail(
+            source: source,
+            metadata: metadata,
+            format: format,
+            maxPixelSize: targetMaxPixelSize,
+            quality: quality
+        ), proxy.sizeBytes < masterSize {
+            return proxy
+        }
+
+        // Fallback pass: stronger compression in JPEG to guarantee a smaller proxy for any photo/screenshot
+        let fallbackPx = max(512, Int(Double(targetMaxPixelSize) * 0.7))
+        return try encodeThumbnail(
+            source: source,
+            metadata: metadata,
+            format: .jpeg,
+            maxPixelSize: fallbackPx,
+            quality: min(0.5, quality)
+        )
+    }
+
+    private static func encodeThumbnail(
+        source: CGImageSource,
+        metadata baseMetadata: [CFString: Any],
+        format: ProxyFormat,
+        maxPixelSize: Int,
+        quality: Double
+    ) throws -> GeneratedProxy {
         let thumbOptions: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: targetMaxPixelSize,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
         ]
 
         guard let downsampledImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbOptions as CFDictionary) else {
@@ -76,6 +107,7 @@ enum ProxyGenerator {
         }
 
         // Preserve EXIF/GPS/Creation metadata while resetting orientation to 1 (already applied by transform)
+        var metadata = baseMetadata
         metadata[kCGImagePropertyOrientation] = 1
         if var tiff = metadata[kCGImagePropertyTIFFDictionary] as? [CFString: Any] {
             tiff[kCGImagePropertyTIFFOrientation] = 1
