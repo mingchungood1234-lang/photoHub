@@ -150,8 +150,25 @@ async function storeAndVerifyPhoto({
   // 2. Determine date folder (YYYY/YYYY-MM-DD) and target filename
   const { year, dateFolder, dateObj } = parseDateFolder(createdAt);
   const safeName = sanitizeFilename(originalName, mimeType, actualHash);
+
+  // Ensure base storage directory exists before creating subdirectories (especially important on remote / FUSE mounts)
+  try {
+    await fsp.mkdir(storageDir, { recursive: true });
+  } catch (err) {
+    if (err.code !== 'EEXIST') {
+      console.warn(`[storage] Warning: could not ensure base storageDir ${storageDir}:`, err.message);
+    }
+  }
+
   const targetDir = path.join(storageDir, year, dateFolder);
-  await fsp.mkdir(targetDir, { recursive: true });
+  try {
+    await fsp.mkdir(targetDir, { recursive: true });
+  } catch (err) {
+    // If recursive mkdir failed (e.g. FUSE/rclone mounts failing on multi-level creation), create each step sequentially
+    const yearDir = path.join(storageDir, year);
+    await fsp.mkdir(yearDir, { recursive: true }).catch(() => {});
+    await fsp.mkdir(targetDir, { recursive: true });
+  }
 
   // Avoid overwriting a different file that happens to share the same filename on the same date
   const ext = path.extname(safeName);
