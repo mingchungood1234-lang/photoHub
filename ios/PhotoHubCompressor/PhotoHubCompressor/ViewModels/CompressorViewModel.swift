@@ -118,39 +118,58 @@ final class CompressorViewModel: ObservableObject {
             completedCount += 1
         }
 
-        // Apply replacement or deletion in a single atomic PhotoKit transaction (prompts iOS Delete confirmation once)
-        if !pendingReplacements.isEmpty {
-            let keepLocal = settings.keepLocalProxyInPhotos
-            do {
-                let createdProxyIds = try await photoService.applyBatchReplacementOrDeletion(
-                    items: pendingReplacements,
-                    keepLocalProxy: keepLocal
-                )
-
-                for (i, item) in pendingReplacements.enumerated() {
-                    totalSavedBytes += item.savedBytes
-                    tracker.markAsProxy(assetId: item.originalAsset.localIdentifier, proxySha256: item.proxySha256)
-                    if i < createdProxyIds.count {
-                        tracker.markAsProxy(assetId: createdProxyIds[i], proxySha256: item.proxySha256)
-                    }
-                }
-
-                let completedAssetIds = Set(pendingReplacements.map { $0.originalAsset.localIdentifier })
-                candidates.removeAll { completedAssetIds.contains($0.id) }
-            } catch {
-                for idx in succeededIndices where idx < candidates.count {
-                    candidates[idx].state = .failed("Deletion cancelled: \(error.localizedDescription)")
-                }
-                statusBanner = error.localizedDescription
+        guard !pendingReplacements.isEmpty else {
+            isProcessing = false
+            if failedCount > 0 && statusBanner == nil {
+                statusBanner = "Finished with \(failedCount) error(s)."
             }
+            return
         }
 
-        isProcessing = false
-        let savedStr = ByteCountFormatter.string(fromByteCount: totalSavedBytes, countStyle: .file)
-        if failedCount > 0 && statusBanner == nil {
-            statusBanner = "Finished with \(failedCount) error(s). Space saved: \(savedStr)."
-        } else if failedCount == 0 && statusBanner == nil {
-            statusBanner = "Finished! Space saved: \(savedStr). Empty 'Recently Deleted' in Photos to reclaim storage immediately."
+        // Exit the async Task and trigger PhotoKit deletion via standard completion callback on next main runloop tick
+        let keepLocal = settings.keepLocalProxyInPhotos
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.photoService.performBatchDeleteAndOptionalProxySave(
+                items: pendingReplacements,
+                keepLocalProxy: keepLocal
+            ) { [weak self] result in
+                guard let self = self else { return }
+                switch result {
+                case .success(let createdProxyIds):
+                    for (i, item) in pendingReplacements.enumerated() {
+                        self.totalSavedBytes += item.savedBytes
+                        self.tracker.markAsProxy(
+                            assetId: item.originalAsset.localIdentifier,
+                            proxySha256: item.proxySha256
+                        )
+                        if i < createdProxyIds.count {
+                            self.tracker.markAsProxy(
+                                assetId: createdProxyIds[i],
+                                proxySha256: item.proxySha256
+                            )
+                        }
+                    }
+
+                    let completedAssetIds = Set(pendingReplacements.map { $0.originalAsset.localIdentifier })
+                    self.candidates.removeAll { completedAssetIds.contains($0.id) }
+                    self.isProcessing = false
+
+                    let savedStr = ByteCountFormatter.string(fromByteCount: self.totalSavedBytes, countStyle: .file)
+                    if failedCount > 0 {
+                        self.statusBanner = "Finished with \(failedCount) error(s). Space saved: \(savedStr)."
+                    } else {
+                        self.statusBanner = "Deleted \(pendingReplacements.count) original photo(s) from iPhone! Space saved: \(savedStr). View compressed demo in the Server tab."
+                    }
+
+                case .failure(let error):
+                    for idx in succeededIndices where idx < self.candidates.count {
+                        self.candidates[idx].state = .failed("Deletion cancelled: \(error.localizedDescription)")
+                    }
+                    self.isProcessing = false
+                    self.statusBanner = error.localizedDescription
+                }
+            }
         }
     }
 
