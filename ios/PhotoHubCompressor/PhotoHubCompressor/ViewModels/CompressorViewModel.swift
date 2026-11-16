@@ -267,11 +267,11 @@ final class CompressorViewModel: ObservableObject {
                                 try? FileManager.default.removeItem(at: posterURL)
                             }
 
-                            // Step 5: Exit async Task completely and invoke PhotoKit replace/delete via pure callback!
+                            // Step 5: Invoke PhotoKit replace/delete on a background queue (NEVER DispatchQueue.main!)
                             let keepLocal = self.settings.keepLocalProxyInPhotos
                             self.updateStateOnMain(id: currentId, state: .replacingInPhotos)
 
-                            DispatchQueue.main.async {
+                            DispatchQueue.global(qos: .userInitiated).async {
                                 self.photoService.replaceWithProxy(
                                     originalAsset: candidate.asset,
                                     mediaType: candidate.mediaType,

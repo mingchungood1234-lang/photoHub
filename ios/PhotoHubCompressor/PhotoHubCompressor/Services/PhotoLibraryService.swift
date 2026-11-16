@@ -187,7 +187,9 @@ final class PhotoLibraryService {
         let preloadedImage: UIImage? = (mediaType == .image) ? UIImage(contentsOfFile: proxyFileURL.path) : nil
 
         let deleteOriginalAndVerify: (String?) -> Void = { createdProxyId in
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            // IMPORTANT: Must dispatch on a BACKGROUND queue (DispatchQueue.global), NOT DispatchQueue.main!
+            // Calling performChanges({ deleteAssets }) on DispatchQueue.main deadlocks when iOS presents the Delete alert.
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.4) {
                 let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [originalId], options: nil)
                 let assetToDelete = fetchResult.firstObject ?? originalAsset
 
@@ -195,13 +197,12 @@ final class PhotoLibraryService {
                     PHAssetChangeRequest.deleteAssets([assetToDelete] as NSArray)
                 }, completionHandler: { deleteSuccess, deleteError in
                     DispatchQueue.main.async {
-                        let checkRemaining = PHAsset.fetchAssets(withLocalIdentifiers: [originalId], options: nil)
-                        if deleteSuccess && checkRemaining.count == 0 {
+                        if deleteSuccess {
                             completion(.success(createdProxyId ?? originalId))
                         } else {
                             let nsErr = deleteError as NSError?
                             let detail = nsErr.map { "\($0.localizedDescription) [\($0.domain):\($0.code)]" }
-                                ?? "Original photo was not deleted (Tap 'Delete' when iOS prompts, and ensure Settings -> photoHub -> Photos is set to Full Access)."
+                                ?? "Original photo deletion was cancelled or denied."
                             completion(.failure(PhotoLibraryError.proxyReplacementFailed(detail)))
                         }
                     }
