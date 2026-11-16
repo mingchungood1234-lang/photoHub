@@ -294,13 +294,17 @@ private struct ServerPhotoDetailView: View {
                 dataToSave = ServerGalleryView.makeSmallCompressedPreview(from: raw, maxPixelSize: 800, quality: 0.65)?.1 ?? raw
             }
 
-            let tempURL = FileManager.default.temporaryDirectory
-                .appendingPathComponent("compressed_\(UUID().uuidString).jpg")
-            try dataToSave.write(to: tempURL)
-            defer { try? FileManager.default.removeItem(at: tempURL) }
-
-            try await PHPhotoLibrary.shared().performChanges {
-                PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: tempURL)
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                PHPhotoLibrary.shared().performChanges({
+                    let req = PHAssetCreationRequest.forAsset()
+                    req.addResource(with: .photo, data: dataToSave, options: nil)
+                }, completionHandler: { success, err in
+                    if success {
+                        continuation.resume(returning: ())
+                    } else {
+                        continuation.resume(throwing: err ?? PhotoLibraryError.proxyReplacementFailed("Could not save preview"))
+                    }
+                })
             }
             let sizeStr = ByteCountFormatter.string(fromByteCount: Int64(dataToSave.count), countStyle: .file)
             saveMessage = "Saved small compressed picture (\(sizeStr)) to Photos!"

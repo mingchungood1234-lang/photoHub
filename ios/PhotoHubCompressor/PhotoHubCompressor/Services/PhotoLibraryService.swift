@@ -149,7 +149,13 @@ final class PhotoLibraryService {
         options.isNetworkAccessAllowed = true
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let lock = NSLock()
+            var hasResumed = false
             PHAssetResourceManager.default().writeData(for: resource, toFile: tempURL, options: options) { error in
+                lock.lock()
+                defer { lock.unlock() }
+                guard !hasResumed else { return }
+                hasResumed = true
                 if let error {
                     try? FileManager.default.removeItem(at: tempURL)
                     continuation.resume(throwing: error)
@@ -173,22 +179,66 @@ final class PhotoLibraryService {
         )
     }
 
-    /// Creates the lightweight proxy in the native Photos library (preserving date, GPS, and favorite status)
-    /// and deletes the heavy original in the same atomic PhotoKit transaction.
-    func replaceWithProxy(originalAsset: PHAsset, proxyFileURL: URL) async throws -> String {
-        var createdLocalIdentifier: String?
+    /// Step 1: Saves the lightweight proxy in the native Photos library using in-memory Data
+    /// (avoids cross-process sandbox file deadlocks with photolibraryd).
+    func saveProxyAsset(originalAsset: PHAsset, proxyFileURL: URL) async throws -> String {
+        let proxyData = try Data(contentsOf: proxyFileURL)
 
-        try await PHPhotoLibrary.shared().performChanges {
-            let createRequest = PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: proxyFileURL)
-            createRequest?.creationDate = originalAsset.creationDate
-            createRequest?.location = originalAsset.location
-            createRequest?.isFavorite = originalAsset.isFavorite
-            createdLocalIdentifier = createRequest?.placeholderForCreatedAsset?.localIdentifier
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
+            let lock = NSLock()
+            var hasResumed = false
+            var placeholderId: String?
 
-            PHAssetChangeRequest.deleteAssets([originalAsset] as NSArray)
+            PHPhotoLibrary.shared().performChanges({
+                let creationRequest = PHAssetCreationRequest.forAsset()
+                creationRequest.addResource(with: .photo, data: proxyData, options: nil)
+                creationRequest.creationDate = originalAsset.creationDate
+                creationRequest.location = originalAsset.location
+                creationRequest.isFavorite = originalAsset.isFavorite
+                placeholderId = creationRequest.placeholderForCreatedAsset?.localIdentifier
+            }, completionHandler: { success, error in
+                lock.lock()
+                defer { lock.unlock() }
+                guard !hasResumed else { return }
+                hasResumed = true
+
+                if success {
+                    continuation.resume(returning: placeholderId ?? originalAsset.localIdentifier)
+                } else {
+                    let msg = error?.localizedDescription ?? "Could not save compressed proxy to Photos."
+                    continuation.resume(throwing: PhotoLibraryError.proxyReplacementFailed(msg))
+                }
+            })
         }
+    }
 
-        return createdLocalIdentifier ?? originalAsset.localIdentifier
+    /// Step 2: Requests iOS to delete the heavy original asset(s) in a separate transaction
+    /// so iOS presents the native "Allow photoHub to delete photo(s)?" prompt cleanly without hanging.
+    func deleteOriginalAssets(_ assets: [PHAsset]) async throws {
+        guard !assets.isEmpty else { return }
+
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let lock = NSLock()
+            var hasResumed = false
+
+            DispatchQueue.main.async {
+                PHPhotoLibrary.shared().performChanges({
+                    PHAssetChangeRequest.deleteAssets(assets as NSArray)
+                }, completionHandler: { success, error in
+                    lock.lock()
+                    defer { lock.unlock() }
+                    guard !hasResumed else { return }
+                    hasResumed = true
+
+                    if success {
+                        continuation.resume(returning: ())
+                    } else {
+                        let msg = error?.localizedDescription ?? "Original deletion was cancelled or denied."
+                        continuation.resume(throwing: PhotoLibraryError.proxyReplacementFailed(msg))
+                    }
+                })
+            }
+        }
     }
 
     private static func pickOriginalResource(from resources: [PHAssetResource]) -> PHAssetResource? {

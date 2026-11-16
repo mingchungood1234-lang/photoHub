@@ -104,24 +104,47 @@ final class CompressorViewModel: ObservableObject {
         }
 
         var failedCount = 0
+        var originalsToDelete: [PHAsset] = []
+        var succeededIndices: [(index: Int, saved: Int64)] = []
+
         for idx in targetIndices {
             if Task.isCancelled { break }
-            let ok = await processSingleCandidate(at: idx, apiClient: apiClient)
-            if !ok { failedCount += 1 }
+            if let savedBytes = await processSingleCandidate(at: idx, apiClient: apiClient) {
+                originalsToDelete.append(candidates[idx].asset)
+                succeededIndices.append((index: idx, saved: savedBytes))
+            } else {
+                failedCount += 1
+            }
             completedCount += 1
+        }
+
+        // Delete all backed-up & proxied originals in a single batch so iOS shows ONE confirmation prompt
+        if !originalsToDelete.isEmpty {
+            do {
+                try await photoService.deleteOriginalAssets(originalsToDelete)
+                for item in succeededIndices {
+                    totalSavedBytes += item.saved
+                    candidates[item.index].state = .completed(savedBytes: item.saved)
+                    candidates[item.index].isSelected = false
+                }
+            } catch {
+                for item in succeededIndices {
+                    candidates[item.index].state = .failed("Proxy saved, but original deletion was cancelled")
+                }
+                statusBanner = error.localizedDescription
+            }
         }
 
         isProcessing = false
         let savedStr = ByteCountFormatter.string(fromByteCount: totalSavedBytes, countStyle: .file)
         if failedCount > 0 && statusBanner == nil {
             statusBanner = "Finished with \(failedCount) error(s). Space saved: \(savedStr)."
-        } else if failedCount == 0 {
+        } else if failedCount == 0 && statusBanner == nil {
             statusBanner = "Finished! Space saved: \(savedStr). Empty 'Recently Deleted' in Photos to reclaim storage immediately."
         }
     }
 
-    @discardableResult
-    private func processSingleCandidate(at index: Int, apiClient: PhotoHubAPIClient) async -> Bool {
+    private func processSingleCandidate(at index: Int, apiClient: PhotoHubAPIClient) async -> Int64? {
         let candidate = candidates[index]
         var masterTempURL: URL?
         var proxyTempURL: URL?
@@ -189,9 +212,9 @@ final class CompressorViewModel: ObservableObject {
             }.value
             proxyTempURL = proxy.fileURL
 
-            // 5. Replace original in native Photos app with lightweight proxy (triggers iOS Delete confirmation prompt!)
+            // 5. Save lightweight proxy into Photos library (in-memory Data, no alert hang)
             candidates[index].state = .replacingInPhotos
-            let newAssetId = try await photoService.replaceWithProxy(
+            let newAssetId = try await photoService.saveProxyAsset(
                 originalAsset: candidate.asset,
                 proxyFileURL: proxy.fileURL
             )
@@ -207,14 +230,11 @@ final class CompressorViewModel: ObservableObject {
             )
 
             let saved = max(0, master.sizeBytes - proxy.sizeBytes)
-            totalSavedBytes += saved
-            candidates[index].state = .completed(savedBytes: saved)
-            candidates[index].isSelected = false
-            return true
+            return saved
         } catch {
             candidates[index].state = .failed(error.localizedDescription)
             statusBanner = error.localizedDescription
-            return false
+            return nil
         }
     }
 }
