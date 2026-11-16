@@ -2,6 +2,7 @@ import SwiftUI
 
 struct LibraryView: View {
     @ObservedObject var viewModel: CompressorViewModel
+    @AppStorage("keepLocalProxyInPhotos") private var keepLocalProxyInPhotos: Bool = true
 
     var body: some View {
         NavigationStack {
@@ -160,7 +161,7 @@ struct LibraryView: View {
                 }
             }
 
-            Picker("After Upload Action", selection: $viewModel.settings.keepLocalProxyInPhotos) {
+            Picker("After Upload Action", selection: $keepLocalProxyInPhotos) {
                 Text("Replace with Proxy").tag(true)
                 Text("Delete from iPhone").tag(false)
             }
