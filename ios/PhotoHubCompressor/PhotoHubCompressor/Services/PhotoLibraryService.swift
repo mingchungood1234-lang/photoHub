@@ -38,7 +38,6 @@ final class PhotoLibraryService {
     }
 
     func scanCandidates(
-        minimumSizeBytes: Int64,
         tracker: LocalProxyTracker
     ) -> [PhotoCandidate] {
         let fetchOptions = PHFetchOptions()
@@ -48,18 +47,15 @@ final class PhotoLibraryService {
         var candidates: [PhotoCandidate] = []
         assets.enumerateObjects { asset, _, _ in
             let resources = PHAssetResource.assetResources(for: asset)
-            guard let primary = Self.pickOriginalResource(from: resources) else { return }
-
-            let size = (primary.value(forKey: "fileSize") as? NSNumber)?.int64Value ?? 0
-            if size > 0 && size < minimumSizeBytes {
-                return
-            }
+            let primary = Self.pickOriginalResource(from: resources)
+            let filename = primary?.originalFilename ?? "IMG_\(asset.localIdentifier.prefix(8)).HEIC"
 
             var candidate = PhotoCandidate(
                 id: asset.localIdentifier,
                 asset: asset,
-                filename: primary.originalFilename,
-                originalSizeBytes: size,
+                filename: filename,
+                pixelWidth: asset.pixelWidth,
+                pixelHeight: asset.pixelHeight,
                 creationDate: asset.creationDate
             )
 
@@ -77,22 +73,24 @@ final class PhotoLibraryService {
     func loadThumbnail(for asset: PHAsset, targetSize: CGSize = CGSize(width: 160, height: 160)) async -> UIImage? {
         await withCheckedContinuation { continuation in
             let options = PHImageRequestOptions()
-            options.deliveryMode = .opportunistic
+            options.deliveryMode = .highQualityFormat
             options.isNetworkAccessAllowed = true
             options.resizeMode = .fast
 
-            var resumed = false
+            let lock = NSLock()
+            var hasResumed = false
+
             PHImageManager.default().requestImage(
                 for: asset,
                 targetSize: targetSize,
                 contentMode: .aspectFill,
                 options: options
-            ) { image, info in
-                let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
-                if !isDegraded && !resumed {
-                    resumed = true
-                    continuation.resume(returning: image)
-                }
+            ) { image, _ in
+                lock.lock()
+                defer { lock.unlock() }
+                guard !hasResumed else { return }
+                hasResumed = true
+                continuation.resume(returning: image)
             }
         }
     }

@@ -54,9 +54,16 @@ struct PhotoCandidate: Identifiable {
     let id: String
     let asset: PHAsset
     let filename: String
-    let originalSizeBytes: Int64
+    let pixelWidth: Int
+    let pixelHeight: Int
     let creationDate: Date?
     var thumbnail: UIImage?
     var state: PhotoCompressionState = .pending
     var isSelected: Bool = true
+
+    var resolutionLabel: String {
+        guard pixelWidth > 0 && pixelHeight > 0 else { return "Photo" }
+        let mp = Double(pixelWidth * pixelHeight) / 1_000_000.0
+        return String(format: "%.1f MP (%d×%d)", mp, pixelWidth, pixelHeight)
+    }
 }

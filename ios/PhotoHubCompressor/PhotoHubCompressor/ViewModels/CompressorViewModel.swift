@@ -26,12 +26,6 @@ final class CompressorViewModel: ObservableObject {
         candidates.filter { $0.isSelected && !$0.state.isFinished }.count
     }
 
-    var totalSelectedOriginalBytes: Int64 {
-        candidates
-            .filter { $0.isSelected && !$0.state.isFinished }
-            .reduce(0) { $0 + $1.originalSizeBytes }
-    }
-
     func scanLibrary() async {
         isScanning = true
         statusBanner = nil
@@ -44,9 +38,8 @@ final class CompressorViewModel: ObservableObject {
             return
         }
 
-        let minBytes = Int64(settings.minimumOriginalSizeKB) * 1024
         let scanned = await Task.detached(priority: .userInitiated) { [photoService, tracker] in
-            photoService.scanCandidates(minimumSizeBytes: minBytes, tracker: tracker)
+            photoService.scanCandidates(tracker: tracker)
         }.value
 
         candidates = scanned
@@ -113,6 +106,13 @@ final class CompressorViewModel: ObservableObject {
             candidates[index].state = .hashing
             let master = try await photoService.exportOriginalMaster(for: candidate.asset)
             masterTempURL = master.fileURL
+
+            let minBytes = Int64(settings.minimumOriginalSizeKB) * 1024
+            if master.sizeBytes > 0 && master.sizeBytes < minBytes {
+                candidates[index].state = .skipped("Under \(settings.minimumOriginalSizeKB) KB")
+                candidates[index].isSelected = false
+                return
+            }
 
             // 2. Check local tracker & server to ensure we never re-upload an already-compressed proxy
             if tracker.isKnownProxy(sha256: master.sha256) {

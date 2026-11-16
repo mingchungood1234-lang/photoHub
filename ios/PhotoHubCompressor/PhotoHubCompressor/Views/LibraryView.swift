@@ -36,14 +36,28 @@ struct LibraryView: View {
                     ContentUnavailableView {
                         Label("No Photos Scanned", systemImage: "photo.on.rectangle.angled")
                     } description: {
-                        Text("Tap Scan Library to find full-resolution photos that can be backed up and replaced with lightweight proxies.")
-                    } actions: {
-                        Button("Scan Library") {
-                            Task { await viewModel.scanLibrary() }
+                        if viewModel.permissionStatus == .denied || viewModel.permissionStatus == .restricted {
+                            Text("Photos permission is required. Open iOS Settings to allow access.")
+                        } else {
+                            Text("Tap Scan Library to find full-resolution photos that can be backed up and replaced with lightweight proxies.")
                         }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(viewModel.isScanning)
+                    } actions: {
+                        if viewModel.permissionStatus == .denied || viewModel.permissionStatus == .restricted {
+                            Button("Open iOS Settings") {
+                                if let url = URL(string: UIApplication.openSettingsURLString) {
+                                    UIApplication.shared.open(url)
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                        } else {
+                            Button("Scan Library") {
+                                Task { await viewModel.scanLibrary() }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(viewModel.isScanning)
+                        }
                     }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     summaryHeader
                     List {
@@ -58,7 +72,9 @@ struct LibraryView: View {
                     .listStyle(.plain)
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .navigationTitle("PhotoHub")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button {
@@ -98,7 +114,7 @@ struct LibraryView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("\(viewModel.candidates.count) Photos Found")
                     .font(.headline)
-                Text("Selected: \(viewModel.selectedCount) (\(ByteCountFormatter.string(fromByteCount: viewModel.totalSelectedOriginalBytes, countStyle: .file)))")
+                Text("Selected: \(viewModel.selectedCount) photos")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -165,7 +181,7 @@ private struct PhotoCandidateRow: View {
                     .lineLimit(1)
 
                 HStack(spacing: 8) {
-                    Text(ByteCountFormatter.string(fromByteCount: item.originalSizeBytes, countStyle: .file))
+                    Text(item.resolutionLabel)
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
