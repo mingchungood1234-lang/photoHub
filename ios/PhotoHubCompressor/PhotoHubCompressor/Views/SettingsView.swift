@@ -66,6 +66,7 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    Toggle("Auto Scan & Compress on App Open", isOn: $settings.autoCompressOnOpen)
                     Toggle("Keep Compressed Proxy in iPhone Photos", isOn: $settings.keepLocalProxyInPhotos)
 
                     Picker("Format", selection: $settings.proxyFormatRaw) {

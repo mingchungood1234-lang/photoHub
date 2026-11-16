@@ -109,6 +109,11 @@ struct LibraryView: View {
                     actionBar
                 }
             }
+            .onAppear {
+                if viewModel.candidates.isEmpty && viewModel.settings.autoCompressOnOpen {
+                    viewModel.scanAndAutoCompressIfEnabled()
+                }
+            }
         }
     }
 

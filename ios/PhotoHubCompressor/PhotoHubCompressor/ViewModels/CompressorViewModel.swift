@@ -57,6 +57,34 @@ final class CompressorViewModel: ObservableObject {
         }
     }
 
+    func scanAndAutoCompressIfEnabled() {
+        guard !isScanning && !isProcessing else { return }
+        isScanning = true
+        statusBanner = nil
+
+        photoService.requestAuthorization { [weak self] status in
+            guard let self = self else { return }
+            self.permissionStatus = status
+            guard status == .authorized || status == .limited else {
+                self.isScanning = false
+                return
+            }
+
+            let service = self.photoService
+            let tracker = self.tracker
+            DispatchQueue.global(qos: .userInitiated).async {
+                let scanned = service.scanCandidates(tracker: tracker)
+                DispatchQueue.main.async {
+                    self.candidates = scanned
+                    self.isScanning = false
+                    if !scanned.isEmpty && self.settings.autoCompressOnOpen {
+                        Task { await self.processSelectedPhotos() }
+                    }
+                }
+            }
+        }
+    }
+
     func loadThumbnailIfNeeded(for id: String) async {
         guard let index = candidates.firstIndex(where: { $0.id == id }),
               candidates[index].thumbnail == nil else {
