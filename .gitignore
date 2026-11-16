@@ -3,4 +3,9 @@ uploads/
 data/
 .env
 *.log
+build/
+DerivedData/
+xcuserdata/
+*.ipa
+
 
