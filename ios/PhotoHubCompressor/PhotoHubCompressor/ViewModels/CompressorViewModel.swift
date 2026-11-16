@@ -160,21 +160,18 @@ final class CompressorViewModel: ObservableObject {
             return
         }
 
-        statusBanner = "Backed up \(readyToDeleteItems.count) item(s)! Confirm the iOS Delete prompt (or tap the red Delete button) to remove originals."
-
-        // Immediately trigger the iOS delete prompt on the next main runloop tick
-        DispatchQueue.main.async { [weak self] in
-            self?.deleteReadyOriginalsFromDevice()
-        }
+        statusBanner = "Backed up \(readyToDeleteItems.count) item(s)! Tap the red 'Delete' button below to remove the original(s) from your iPhone."
     }
 
     func deleteReadyOriginalsFromDevice() {
-        guard !isDeletingOriginals else { return }
         let items = readyToDeleteItems
-        guard !items.isEmpty else { return }
+        guard !items.isEmpty else {
+            statusBanner = "No backed-up items waiting for deletion."
+            return
+        }
 
         isDeletingOriginals = true
-        statusBanner = "Requesting iOS confirmation to delete \(items.count) original photo(s)…"
+        statusBanner = "Asking iOS Photos to delete \(items.count) original item(s)…"
 
         let keepLocal = settings.keepLocalProxyInPhotos
         photoService.performBatchDeleteAndOptionalProxySave(

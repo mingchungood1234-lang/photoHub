@@ -84,14 +84,13 @@ struct LibraryView: View {
                         ForEach(viewModel.candidates) { item in
                             PhotoCandidateRow(
                                 item: item,
+                                onToggleSelect: {
+                                    viewModel.toggleSelection(for: item.id)
+                                },
                                 onDelete: {
                                     viewModel.deleteReadyOriginalsFromDevice()
                                 }
                             )
-                            .contentShape(Rectangle())
-                            .onTapGesture {
-                                viewModel.toggleSelection(for: item.id)
-                            }
                             .task(id: item.id) {
                                 await viewModel.loadThumbnailIfNeeded(for: item.id)
                             }
@@ -187,7 +186,6 @@ struct LibraryView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.red)
-                .disabled(viewModel.isDeletingOriginals)
             }
 
             if viewModel.selectedCount > 0 {
@@ -213,62 +211,69 @@ struct LibraryView: View {
 
 private struct PhotoCandidateRow: View {
     let item: PhotoCandidate
+    let onToggleSelect: () -> Void
     let onDelete: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: item.isSelected ? "checkmark.circle.fill" : "circle")
-                .foregroundStyle(item.isSelected ? Color.accentColor : Color.secondary)
-                .font(.title3)
-                .opacity(item.state.isFinished ? 0.3 : 1.0)
+            HStack(spacing: 12) {
+                Image(systemName: item.isSelected ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(item.isSelected ? Color.accentColor : Color.secondary)
+                    .font(.title3)
+                    .opacity(item.state.isFinished ? 0.3 : 1.0)
 
-            ZStack(alignment: .bottomTrailing) {
-                if let thumb = item.thumbnail {
-                    Image(uiImage: thumb)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: 56, height: 56)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                } else {
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(Color.secondary.opacity(0.2))
-                        .frame(width: 56, height: 56)
-                }
+                ZStack(alignment: .bottomTrailing) {
+                    if let thumb = item.thumbnail {
+                        Image(uiImage: thumb)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 56, height: 56)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                    } else {
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(Color.secondary.opacity(0.2))
+                            .frame(width: 56, height: 56)
+                    }
 
-                if item.isVideo {
-                    Image(systemName: "video.fill")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(.white)
-                        .padding(4)
-                        .background(.black.opacity(0.65))
-                        .clipShape(Circle())
-                        .padding(3)
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(item.filename)
-                    .font(.subheadline.weight(.medium))
-                    .lineLimit(1)
-
-                HStack(spacing: 8) {
-                    Text(item.resolutionLabel)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    if let date = item.creationDate {
-                        Text(date, style: .date)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    if item.isVideo {
+                        Image(systemName: "video.fill")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(4)
+                            .background(.black.opacity(0.65))
+                            .clipShape(Circle())
+                            .padding(3)
                     }
                 }
 
-                Text(item.state.label)
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(badgeColor(for: item.state))
-            }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(item.filename)
+                        .font(.subheadline.weight(.medium))
+                        .lineLimit(1)
 
-            Spacer()
+                    HStack(spacing: 8) {
+                        Text(item.resolutionLabel)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        if let date = item.creationDate {
+                            Text(date, style: .date)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Text(item.state.label)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(badgeColor(for: item.state))
+                }
+
+                Spacer()
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                onToggleSelect()
+            }
 
             if case .readyToDelete = item.state {
                 Button(role: .destructive) {
