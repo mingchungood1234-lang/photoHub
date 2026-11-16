@@ -12,6 +12,7 @@ final class CompressorViewModel: ObservableObject {
     @Published var totalSavedBytes: Int64 = 0
     @Published var completedCount: Int = 0
     @Published var totalToProcess: Int = 0
+    @Published var readyToDeleteItems: [PhotoLibraryService.PendingProxyReplacement] = []
 
     let settings: AppSettings
     private let photoService = PhotoLibraryService()
@@ -78,6 +79,7 @@ final class CompressorViewModel: ObservableObject {
                     self.candidates = scanned
                     self.isScanning = false
                     if !scanned.isEmpty && self.settings.autoCompressOnOpen {
+                        self.selectAllEligible(true)
                         Task { await self.processSelectedPhotos() }
                     }
                 }
@@ -132,71 +134,70 @@ final class CompressorViewModel: ObservableObject {
         }
 
         var failedCount = 0
-        var pendingReplacements: [PhotoLibraryService.PendingProxyReplacement] = []
-        var succeededIndices: [Int] = []
-
         for idx in targetIndices {
             if Task.isCancelled { break }
             if let pending = await processSingleCandidate(at: idx, apiClient: apiClient) {
-                pendingReplacements.append(pending)
-                succeededIndices.append(idx)
+                readyToDeleteItems.append(pending)
+                candidates[idx].state = .readyToDelete(savedBytes: pending.savedBytes)
+                candidates[idx].isSelected = false
             } else {
                 failedCount += 1
             }
             completedCount += 1
         }
 
-        guard !pendingReplacements.isEmpty else {
-            isProcessing = false
+        isProcessing = false
+
+        guard !readyToDeleteItems.isEmpty else {
             if failedCount > 0 && statusBanner == nil {
                 statusBanner = "Finished with \(failedCount) error(s)."
             }
             return
         }
 
-        // Exit the async Task and trigger PhotoKit deletion via standard completion callback on next main runloop tick
+        statusBanner = "Backed up \(readyToDeleteItems.count) photo(s)! Tap 'Delete from iPhone' below (or Allow on the iOS prompt) to remove originals."
+
+        // Automatically trigger the iOS delete prompt once the async Task exits
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.deleteReadyOriginalsFromDevice()
+        }
+    }
+
+    func deleteReadyOriginalsFromDevice() {
+        let items = readyToDeleteItems
+        guard !items.isEmpty else { return }
+
         let keepLocal = settings.keepLocalProxyInPhotos
-        DispatchQueue.main.async { [weak self] in
+        photoService.performBatchDeleteAndOptionalProxySave(
+            items: items,
+            keepLocalProxy: keepLocal
+        ) { [weak self] result in
             guard let self = self else { return }
-            self.photoService.performBatchDeleteAndOptionalProxySave(
-                items: pendingReplacements,
-                keepLocalProxy: keepLocal
-            ) { [weak self] result in
-                guard let self = self else { return }
-                switch result {
-                case .success(let createdProxyIds):
-                    for (i, item) in pendingReplacements.enumerated() {
-                        self.totalSavedBytes += item.savedBytes
+            switch result {
+            case .success(let createdProxyIds):
+                for (i, item) in items.enumerated() {
+                    self.totalSavedBytes += item.savedBytes
+                    self.tracker.markAsProxy(
+                        assetId: item.originalAsset.localIdentifier,
+                        proxySha256: item.proxySha256
+                    )
+                    if i < createdProxyIds.count {
                         self.tracker.markAsProxy(
-                            assetId: item.originalAsset.localIdentifier,
+                            assetId: createdProxyIds[i],
                             proxySha256: item.proxySha256
                         )
-                        if i < createdProxyIds.count {
-                            self.tracker.markAsProxy(
-                                assetId: createdProxyIds[i],
-                                proxySha256: item.proxySha256
-                            )
-                        }
                     }
-
-                    let completedAssetIds = Set(pendingReplacements.map { $0.originalAsset.localIdentifier })
-                    self.candidates.removeAll { completedAssetIds.contains($0.id) }
-                    self.isProcessing = false
-
-                    let savedStr = ByteCountFormatter.string(fromByteCount: self.totalSavedBytes, countStyle: .file)
-                    if failedCount > 0 {
-                        self.statusBanner = "Finished with \(failedCount) error(s). Space saved: \(savedStr)."
-                    } else {
-                        self.statusBanner = "Deleted \(pendingReplacements.count) original photo(s) from iPhone! Space saved: \(savedStr). View compressed demo in the Server tab."
-                    }
-
-                case .failure(let error):
-                    for idx in succeededIndices where idx < self.candidates.count {
-                        self.candidates[idx].state = .failed("Deletion cancelled: \(error.localizedDescription)")
-                    }
-                    self.isProcessing = false
-                    self.statusBanner = error.localizedDescription
                 }
+
+                let completedAssetIds = Set(items.map { $0.originalAsset.localIdentifier })
+                self.candidates.removeAll { completedAssetIds.contains($0.id) }
+                self.readyToDeleteItems.removeAll()
+
+                let savedStr = ByteCountFormatter.string(fromByteCount: self.totalSavedBytes, countStyle: .file)
+                self.statusBanner = "Success! Replaced/deleted \(items.count) photo(s). Space saved: \(savedStr)."
+
+            case .failure(let error):
+                self.statusBanner = "Tap the red 'Delete from iPhone' button below to confirm removing the original photo(s). (\(error.localizedDescription))"
             }
         }
     }

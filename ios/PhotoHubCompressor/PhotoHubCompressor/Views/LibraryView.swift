@@ -105,7 +105,7 @@ struct LibraryView: View {
                 }
             }
             .safeAreaInset(edge: .bottom) {
-                if viewModel.selectedCount > 0 {
+                if !viewModel.readyToDeleteItems.isEmpty || viewModel.selectedCount > 0 {
                     actionBar
                 }
             }
@@ -143,21 +143,41 @@ struct LibraryView: View {
     }
 
     private var actionBar: some View {
-        Button {
-            Task { await viewModel.processSelectedPhotos() }
-        } label: {
-            HStack {
-                Image(systemName: "arrow.up.circle.fill")
-                Text("Upload & Compress \(viewModel.selectedCount) Photos")
-                    .fontWeight(.semibold)
+        VStack(spacing: 10) {
+            if !viewModel.readyToDeleteItems.isEmpty {
+                Button(role: .destructive) {
+                    viewModel.deleteReadyOriginalsFromDevice()
+                } label: {
+                    HStack {
+                        Image(systemName: "trash.fill")
+                        Text("Delete \(viewModel.readyToDeleteItems.count) Backed-Up Original(s) from iPhone")
+                            .fontWeight(.semibold)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
             }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 14)
+
+            if viewModel.selectedCount > 0 {
+                Button {
+                    Task { await viewModel.processSelectedPhotos() }
+                } label: {
+                    HStack {
+                        Image(systemName: "arrow.up.circle.fill")
+                        Text("Upload & Compress \(viewModel.selectedCount) Photo(s)")
+                            .fontWeight(.semibold)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(viewModel.isProcessing)
+            }
         }
-        .buttonStyle(.borderedProminent)
         .padding()
         .background(.ultraThinMaterial)
-        .disabled(viewModel.isProcessing)
     }
 }
 
@@ -213,6 +233,7 @@ private struct PhotoCandidateRow: View {
     private func badgeColor(for state: PhotoCompressionState) -> Color {
         switch state {
         case .completed: return .green
+        case .readyToDelete: return .orange
         case .alreadyProxy, .skipped: return .secondary
         case .failed: return .red
         case .uploading, .hashing, .verifyingChecksum, .creatingProxy, .replacingInPhotos: return .blue

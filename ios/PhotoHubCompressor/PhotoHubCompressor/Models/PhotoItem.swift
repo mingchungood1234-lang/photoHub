@@ -10,6 +10,7 @@ enum PhotoCompressionState: Equatable {
     case verifyingChecksum
     case creatingProxy
     case replacingInPhotos
+    case readyToDelete(savedBytes: Int64)
     case completed(savedBytes: Int64)
     case skipped(String)
     case failed(String)
@@ -17,7 +18,7 @@ enum PhotoCompressionState: Equatable {
     var label: String {
         switch self {
         case .pending:
-            return "Ready"
+            return "Tap to Select"
         case .hashing:
             return "Hashing…"
         case .alreadyProxy:
@@ -29,7 +30,10 @@ enum PhotoCompressionState: Equatable {
         case .creatingProxy:
             return "Compressing Proxy…"
         case .replacingInPhotos:
-            return "Replacing in Photos…"
+            return "Saving Proxy to Server…"
+        case .readyToDelete(let savedBytes):
+            let formatted = ByteCountFormatter.string(fromByteCount: max(0, savedBytes), countStyle: .file)
+            return "Backed Up • Tap Delete (\(formatted))"
         case .completed(let savedBytes):
             let formatted = ByteCountFormatter.string(fromByteCount: max(0, savedBytes), countStyle: .file)
             return "Saved \(formatted)"
@@ -59,7 +63,7 @@ struct PhotoCandidate: Identifiable {
     let creationDate: Date?
     var thumbnail: UIImage?
     var state: PhotoCompressionState = .pending
-    var isSelected: Bool = true
+    var isSelected: Bool = false
 
     var resolutionLabel: String {
         guard pixelWidth > 0 && pixelHeight > 0 else { return "Photo" }
