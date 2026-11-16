@@ -167,31 +167,55 @@ final class PhotoLibraryService {
         )
     }
 
-    /// Creates the lightweight proxy in the native Photos library (preserving date, GPS, and favorite status)
-    /// and deletes the heavy original in the same atomic PhotoKit transaction (exact proven implementation from e2c7312).
+    /// Deletes the heavy original asset first (triggering the iOS Delete confirmation prompt),
+    /// and then saves the clean lightweight proxy in the native Photos library (preserving date, GPS, and favorite status).
     func replaceWithProxy(
         originalAsset: PHAsset,
         mediaType: PHAssetMediaType,
         proxyFileURL: URL,
         keepLocalProxy: Bool = true
     ) async throws -> String {
-        var createdLocalIdentifier: String?
+        let originalId = originalAsset.localIdentifier
+        let originalDate = originalAsset.creationDate
+        let originalLocation = originalAsset.location
+        let originalFavorite = originalAsset.isFavorite
 
-        try await PHPhotoLibrary.shared().performChanges {
-            if keepLocalProxy {
-                let createRequest = (mediaType == .video)
-                    ? PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: proxyFileURL)
-                    : PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: proxyFileURL)
-                createRequest?.creationDate = originalAsset.creationDate
-                createRequest?.location = originalAsset.location
-                createRequest?.isFavorite = originalAsset.isFavorite
-                createdLocalIdentifier = createRequest?.placeholderForCreatedAsset?.localIdentifier
-            }
-
-            PHAssetChangeRequest.deleteAssets([originalAsset] as NSArray)
+        let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [originalId], options: nil)
+        guard fetchResult.count > 0 else {
+            throw PhotoLibraryError.noOriginalResourceFound
         }
 
-        return createdLocalIdentifier ?? originalAsset.localIdentifier
+        // Step 1: Delete the original asset first in a standalone performChanges block
+        // so photolibraryd never aborts the delete prompt due to bundled creation requests.
+        try await PHPhotoLibrary.shared().performChanges {
+            PHAssetChangeRequest.deleteAssets(fetchResult)
+        }
+
+        guard keepLocalProxy else {
+            return originalId
+        }
+
+        // Step 2: Save the lightweight proxy into Photos after the original was deleted
+        var createdLocalIdentifier: String?
+        try await PHPhotoLibrary.shared().performChanges {
+            let createRequest: PHAssetChangeRequest?
+            if mediaType == .video {
+                createRequest = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: proxyFileURL)
+            } else if let req = PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: proxyFileURL) {
+                createRequest = req
+            } else if let img = UIImage(contentsOfFile: proxyFileURL.path) {
+                createRequest = PHAssetChangeRequest.creationRequestForAsset(from: img)
+            } else {
+                createRequest = nil
+            }
+
+            createRequest?.creationDate = originalDate
+            createRequest?.location = originalLocation
+            createRequest?.isFavorite = originalFavorite
+            createdLocalIdentifier = createRequest?.placeholderForCreatedAsset?.localIdentifier
+        }
+
+        return createdLocalIdentifier ?? originalId
     }
 
     private static func pickOriginalResource(from resources: [PHAssetResource]) -> PHAssetResource? {

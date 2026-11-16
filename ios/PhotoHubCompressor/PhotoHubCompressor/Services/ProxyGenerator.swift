@@ -109,14 +109,12 @@ enum ProxyGenerator {
             throw ProxyGeneratorError.failedToCreateThumbnail
         }
 
-        // Preserve EXIF/GPS/Creation metadata while resetting orientation to 1 (already applied by transform)
-        var metadata = baseMetadata
-        metadata[kCGImagePropertyOrientation] = 1
-        if var tiff = metadata[kCGImagePropertyTIFFDictionary] as? [CFString: Any] {
-            tiff[kCGImagePropertyTIFFOrientation] = 1
-            metadata[kCGImagePropertyTIFFDictionary] = tiff
-        }
-        metadata[kCGImageDestinationLossyCompressionQuality] = quality
+        // Use clean encoding properties without copying raw {MakerApple}/LivePhoto/HDR/dimension dictionaries
+        // from the original master (which cause photolibraryd to reject the proxy container during performChanges).
+        // Creation date, GPS location, and favorite status are preserved directly via PHAssetChangeRequest.
+        let encodeProps: [CFString: Any] = [
+            kCGImageDestinationLossyCompressionQuality: quality,
+        ]
 
         let utType: UTType = (format == .heic) ? .heic : .jpeg
         let ext = (format == .heic) ? "heic" : "jpg"
@@ -132,7 +130,7 @@ enum ProxyGenerator {
             throw ProxyGeneratorError.failedToCreateDestination
         }
 
-        CGImageDestinationAddImage(destination, downsampledImage, metadata as CFDictionary)
+        CGImageDestinationAddImage(destination, downsampledImage, encodeProps as CFDictionary)
 
         guard CGImageDestinationFinalize(destination) else {
             try? FileManager.default.removeItem(at: proxyURL)

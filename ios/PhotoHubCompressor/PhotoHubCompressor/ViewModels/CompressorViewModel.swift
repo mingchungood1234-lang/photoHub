@@ -112,14 +112,14 @@ final class CompressorViewModel: ObservableObject {
     }
 
     func processSelectedPhotos() async {
-        let targetIndices = candidates.indices.filter {
-            candidates[$0].isSelected && !candidates[$0].state.isFinished
-        }
-        guard !targetIndices.isEmpty else { return }
+        let targetIds = candidates
+            .filter { $0.isSelected && !$0.state.isFinished }
+            .map { $0.id }
+        guard !targetIds.isEmpty else { return }
 
         isProcessing = true
         completedCount = 0
-        totalToProcess = targetIndices.count
+        totalToProcess = targetIds.count
         statusBanner = nil
 
         let apiClient = PhotoHubAPIClient(settings: settings)
@@ -133,9 +133,9 @@ final class CompressorViewModel: ObservableObject {
         }
 
         var failedCount = 0
-        for idx in targetIndices {
+        for itemId in targetIds {
             if Task.isCancelled { break }
-            let ok = await processSingleCandidate(at: idx, apiClient: apiClient)
+            let ok = await processSingleCandidate(id: itemId, apiClient: apiClient)
             if !ok { failedCount += 1 }
             completedCount += 1
         }
@@ -151,13 +151,22 @@ final class CompressorViewModel: ObservableObject {
 
     @discardableResult
     private func processSingleCandidate(
-        at index: Int,
+        id: String,
         apiClient: PhotoHubAPIClient
     ) async -> Bool {
-        let candidate = candidates[index]
+        guard let initialIndex = candidates.firstIndex(where: { $0.id == id }) else {
+            return false
+        }
+        let candidate = candidates[initialIndex]
         var masterTempURL: URL?
         var proxyTempURL: URL?
         var posterTempURL: URL?
+
+        func updateState(_ newState: PhotoCompressionState) {
+            if let idx = candidates.firstIndex(where: { $0.id == id }) {
+                candidates[idx].state = newState
+            }
+        }
 
         defer {
             if let masterTempURL { try? FileManager.default.removeItem(at: masterTempURL) }
@@ -167,7 +176,7 @@ final class CompressorViewModel: ObservableObject {
 
         do {
             // 1. Export full-resolution original & compute SHA-256
-            candidates[index].state = .hashing
+            updateState(.hashing)
             let master = try await photoService.exportOriginalMaster(for: candidate.asset)
             masterTempURL = master.fileURL
 
@@ -177,11 +186,11 @@ final class CompressorViewModel: ObservableObject {
             // 3. Upload full-resolution original if not already verified on backend
             let needsUpload = !(checkResult.exists && checkResult.isMaster == true && checkResult.canReplaceWithProxy == true)
             if needsUpload {
-                candidates[index].state = .uploading(0)
+                updateState(.uploading(0))
                 let progressHandler: (Double) -> Void = { [weak self] progress in
                     Task { @MainActor in
-                        guard let self, index < self.candidates.count else { return }
-                        self.candidates[index].state = .uploading(progress)
+                        guard let self, let idx = self.candidates.firstIndex(where: { $0.id == id }) else { return }
+                        self.candidates[idx].state = .uploading(progress)
                     }
                 }
 
@@ -208,7 +217,7 @@ final class CompressorViewModel: ObservableObject {
             }
 
             // 4. Backend checksum confirmed! Generate lightweight local proxy (Photo or Video)
-            candidates[index].state = .creatingProxy
+            updateState(.creatingProxy)
             let format = settings.proxyFormat
             let maxPx = settings.proxyMaxPixelSize
             let quality = settings.proxyQuality
@@ -245,8 +254,8 @@ final class CompressorViewModel: ObservableObject {
                 proxyFormat: previewFormatForServer
             )
 
-            // 6. Replace original in native Photos app with lightweight proxy (exact working e2c7312 flow!)
-            candidates[index].state = .replacingInPhotos
+            // 6. Delete original & save lightweight proxy in native Photos app
+            updateState(.replacingInPhotos)
             let newAssetId = try await photoService.replaceWithProxy(
                 originalAsset: candidate.asset,
                 mediaType: candidate.mediaType,
@@ -261,11 +270,10 @@ final class CompressorViewModel: ObservableObject {
                 ? max(0, master.sizeBytes - proxy.sizeBytes)
                 : master.sizeBytes
             totalSavedBytes += saved
-            candidates[index].state = .completed(savedBytes: saved)
-            candidates[index].isSelected = false
+            candidates.removeAll { $0.id == id }
             return true
         } catch {
-            candidates[index].state = .failed(error.localizedDescription)
+            updateState(.failed(error.localizedDescription))
             statusBanner = error.localizedDescription
             return false
         }
