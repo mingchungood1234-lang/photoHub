@@ -38,11 +38,18 @@ final class CompressorViewModel: ObservableObject {
             return
         }
 
-        let scanned = await Task.detached(priority: .userInitiated) { [photoService, tracker] in
-            photoService.scanCandidates(tracker: tracker)
-        }.value
+        do {
+            let scanned = await Task.detached(priority: .userInitiated) { [photoService, tracker] in
+                photoService.scanCandidates(tracker: tracker)
+            }.value
 
-        candidates = scanned
+            candidates = scanned
+            if candidates.isEmpty {
+                statusBanner = "No photos found in photo library."
+            }
+        } catch {
+            statusBanner = "Error scanning photos: \(error.localizedDescription)"
+        }
     }
 
     func loadThumbnailIfNeeded(for id: String) async {

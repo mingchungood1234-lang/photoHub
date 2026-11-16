@@ -34,7 +34,11 @@ final class PhotoLibraryService {
         if current == .authorized || current == .limited {
             return current
         }
-        return await PHPhotoLibrary.requestAuthorization(for: .readWrite)
+        return await withCheckedContinuation { continuation in
+            PHPhotoLibrary.requestAuthorization(for: .readWrite) { status in
+                continuation.resume(returning: status)
+            }
+        }
     }
 
     func scanCandidates(
@@ -42,13 +46,21 @@ final class PhotoLibraryService {
     ) -> [PhotoCandidate] {
         let fetchOptions = PHFetchOptions()
         fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        // Include hidden or burst photos safely if needed, or query standard image assets
+        fetchOptions.includeHiddenAssets = false
+        fetchOptions.includeAllBurstAssets = false
         let assets = PHAsset.fetchAssets(with: .image, options: fetchOptions)
 
         var candidates: [PhotoCandidate] = []
-        candidates.reserveCapacity(assets.count)
+        let totalCount = assets.count
+        if totalCount == 0 {
+            return []
+        }
+        candidates.reserveCapacity(min(totalCount, 1000))
 
-        assets.enumerateObjects { asset, _, _ in
+        for i in 0..<totalCount {
             autoreleasepool {
+                let asset = assets.object(at: i)
                 let shortId = String(asset.localIdentifier.prefix(8))
                 var candidate = PhotoCandidate(
                     id: asset.localIdentifier,
