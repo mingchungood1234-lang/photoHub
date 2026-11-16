@@ -168,10 +168,8 @@ final class PhotoLibraryService {
         }
     }
 
-    /// 1. Uses `PHAssetChangeRequest.creationRequestForAsset(from: UIImage)` (proven working in f901cbc)
-    ///    instead of `creationRequestForAssetFromImage(atFileURL:)`.
-    /// 2. Deletes the original asset using `[PHAsset] as NSArray` and verifies via `fetchAssets(withLocalIdentifiers:)`
-    ///    that the original asset is actually removed from the device before reporting success.
+    /// 1. Deletes the original asset FIRST and verifies via `fetchAssets(withLocalIdentifiers:)` that `count == 0`.
+    /// 2. Only after the original asset is confirmed deleted from the device, saves the compressed proxy (if `keepLocalProxy` is true).
     func replaceWithProxy(
         originalAsset: PHAsset,
         mediaType: PHAssetMediaType,
@@ -186,64 +184,75 @@ final class PhotoLibraryService {
 
         let preloadedImage: UIImage? = (mediaType == .image) ? UIImage(contentsOfFile: proxyFileURL.path) : nil
 
-        let deleteOriginalAndVerify: (String?) -> Void = { createdProxyId in
-            // IMPORTANT: Must dispatch on a BACKGROUND queue (DispatchQueue.global), NOT DispatchQueue.main!
-            // Calling performChanges({ deleteAssets }) on DispatchQueue.main deadlocks when iOS presents the Delete alert.
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.4) {
-                let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [originalId], options: nil)
-                let assetToDelete = fetchResult.firstObject ?? originalAsset
-
-                PHPhotoLibrary.shared().performChanges({
-                    PHAssetChangeRequest.deleteAssets([assetToDelete] as NSArray)
-                }, completionHandler: { deleteSuccess, deleteError in
-                    DispatchQueue.main.async {
-                        if deleteSuccess {
-                            completion(.success(createdProxyId ?? originalId))
-                        } else {
-                            let nsErr = deleteError as NSError?
-                            let detail = nsErr.map { "\($0.localizedDescription) [\($0.domain):\($0.code)]" }
-                                ?? "Original photo deletion was cancelled or denied."
-                            completion(.failure(PhotoLibraryError.proxyReplacementFailed(detail)))
-                        }
-                    }
-                })
+        let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [originalId], options: nil)
+        guard let assetToDelete = fetchResult.firstObject else {
+            DispatchQueue.main.async {
+                completion(.failure(PhotoLibraryError.noOriginalResourceFound))
             }
-        }
-
-        guard keepLocalProxy else {
-            deleteOriginalAndVerify(nil)
             return
         }
 
-        // Step 1: Create the compressed proxy using in-memory UIImage (exact method that succeeded in f901cbc)
-        var createdLocalIdentifier: String?
-        PHPhotoLibrary.shared().performChanges({
-            let createRequest: PHAssetChangeRequest?
-            if mediaType == .video {
-                createRequest = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: proxyFileURL)
-            } else if let img = preloadedImage {
-                createRequest = PHAssetChangeRequest.creationRequestForAsset(from: img)
-            } else {
-                createRequest = nil
+        guard assetToDelete.canPerform(.delete) else {
+            DispatchQueue.main.async {
+                completion(.failure(PhotoLibraryError.proxyReplacementFailed("iOS blocks deleting this item (canPerform(.delete) is false — check Settings -> photoHub -> Photos -> Full Access).")))
             }
+            return
+        }
 
-            createRequest?.creationDate = originalDate
-            createRequest?.location = originalLocation
-            createRequest?.isFavorite = originalFavorite
-            createdLocalIdentifier = createRequest?.placeholderForCreatedAsset?.localIdentifier
-        }, completionHandler: { saveSuccess, saveError in
-            guard saveSuccess else {
-                let nsErr = saveError as NSError?
-                let detail = nsErr.map { "Could not save proxy: \($0.localizedDescription) [\($0.domain):\($0.code)]" }
-                    ?? "Could not save compressed proxy to Photos."
+        // Step 1: Delete the original asset FIRST
+        PHPhotoLibrary.shared().performChanges({
+            PHAssetChangeRequest.deleteAssets([assetToDelete] as NSArray)
+        }, completionHandler: { deleteSuccess, deleteError in
+            // Verify that the original asset is actually gone from the Photos library
+            let remaining = PHAsset.fetchAssets(withLocalIdentifiers: [originalId], options: nil)
+            guard deleteSuccess && remaining.count == 0 else {
+                let nsErr = deleteError as NSError?
+                let detail = nsErr.map { "\($0.localizedDescription) [\($0.domain):\($0.code)]" }
+                    ?? "Original photo was not deleted (deletion was cancelled or denied by iOS)."
                 DispatchQueue.main.async {
                     completion(.failure(PhotoLibraryError.proxyReplacementFailed(detail)))
                 }
                 return
             }
 
-            // Step 2: After Step 1 unwinds (0.3s on main runloop), delete the original asset using [assetToDelete] as NSArray
-            deleteOriginalAndVerify(createdLocalIdentifier)
+            // If user selected "Delete After Upload" (keepLocalProxy == false), do not add a proxy back to iPhone Photos
+            guard keepLocalProxy else {
+                DispatchQueue.main.async {
+                    completion(.success(originalId))
+                }
+                return
+            }
+
+            // Step 2: Original is confirmed deleted! Wait 0.3s for XPC unwind, then save the compressed proxy
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3) {
+                var createdLocalIdentifier: String?
+                PHPhotoLibrary.shared().performChanges({
+                    let createRequest: PHAssetChangeRequest?
+                    if mediaType == .video {
+                        createRequest = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: proxyFileURL)
+                    } else if let img = preloadedImage {
+                        createRequest = PHAssetChangeRequest.creationRequestForAsset(from: img)
+                    } else {
+                        createRequest = nil
+                    }
+
+                    createRequest?.creationDate = originalDate
+                    createRequest?.location = originalLocation
+                    createRequest?.isFavorite = originalFavorite
+                    createdLocalIdentifier = createRequest?.placeholderForCreatedAsset?.localIdentifier
+                }, completionHandler: { saveSuccess, saveError in
+                    DispatchQueue.main.async {
+                        if saveSuccess {
+                            completion(.success(createdLocalIdentifier ?? originalId))
+                        } else {
+                            let nsErr = saveError as NSError?
+                            let detail = nsErr.map { "Original deleted, but proxy save failed: \($0.localizedDescription)" }
+                                ?? "Original deleted, but could not save proxy."
+                            completion(.failure(PhotoLibraryError.proxyReplacementFailed(detail)))
+                        }
+                    }
+                })
+            }
         })
     }
 

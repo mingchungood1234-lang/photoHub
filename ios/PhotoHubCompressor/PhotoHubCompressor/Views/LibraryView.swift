@@ -139,24 +139,32 @@ struct LibraryView: View {
     }
 
     private var summaryHeader: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("\(viewModel.candidates.count) Photos & Videos")
-                    .font(.headline)
-                Text("Selected: \(viewModel.selectedCount) item(s)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        VStack(spacing: 8) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(viewModel.candidates.count) Photos & Videos")
+                        .font(.headline)
+                    Text("Selected: \(viewModel.selectedCount) item(s)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if viewModel.totalSavedBytes > 0 {
+                    Text("Saved \(ByteCountFormatter.string(fromByteCount: viewModel.totalSavedBytes, countStyle: .file))")
+                        .font(.caption.bold())
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(Color.green.opacity(0.15))
+                        .foregroundStyle(.green)
+                        .clipShape(Capsule())
+                }
             }
-            Spacer()
-            if viewModel.totalSavedBytes > 0 {
-                Text("Saved \(ByteCountFormatter.string(fromByteCount: viewModel.totalSavedBytes, countStyle: .file))")
-                    .font(.caption.bold())
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(Color.green.opacity(0.15))
-                    .foregroundStyle(.green)
-                    .clipShape(Capsule())
+
+            Picker("After Upload Action", selection: $viewModel.settings.keepLocalProxyInPhotos) {
+                Text("Replace with Proxy").tag(true)
+                Text("Delete from iPhone").tag(false)
             }
+            .pickerStyle(.segmented)
         }
         .padding(.horizontal)
         .padding(.vertical, 10)
