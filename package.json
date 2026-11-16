@@ -1,0 +1,16 @@
+{
+  "name": "photohub-backend",
+  "version": "1.0.0",
+  "description": "Photo backup & verification backend for Apple Shortcuts auto-delete workflow",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test test/server.test.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "multer": "^2.0.0"
+  }
+}

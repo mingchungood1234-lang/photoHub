@@ -1,0 +1,641 @@
+const fs = require('fs');
+const path = require('path');
+const express = require('express');
+const multer = require('multer');
+const { getConfig } = require('./config');
+const { HashIndex } = require('./hashIndex');
+const {
+  storeAndVerifyPhoto,
+  sanitizeFilename,
+  parseDateFolder,
+} = require('./storage');
+const {
+  isS3Configured,
+  createPresignedUrl,
+  verifyS3ObjectChecksum,
+} = require('./s3');
+
+async function createApp(configOverrides = {}) {
+  const config = getConfig(configOverrides);
+
+  // Default (root) HashIndex used when single API_KEY or no auth is configured
+  const defaultHashIndex = new HashIndex({
+    storageDir: config.storageDir,
+    hashIndexFile: config.hashIndexFile,
+    scanStorageOnStartup:
+      config.userKeyMap.size === 0 ? config.scanStorageOnStartup : false,
+  });
+  if (config.userKeyMap.size === 0 || config.apiKey) {
+    await defaultHashIndex.init();
+  }
+
+  // Per-user HashIndex instances for each folder in USER_KEYS
+  const folderContexts = new Map(); // folderName -> { folderName, storageDir, hashIndex }
+  for (const folderName of new Set(config.userKeyMap.values())) {
+    const userStorageDir = path.join(config.storageDir, folderName);
+    const fileSlug = folderName.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const userHashIndexFile = path.join(
+      config.dataDir,
+      `hash-index-${fileSlug}.json`
+    );
+    const userHashIndex = new HashIndex({
+      storageDir: userStorageDir,
+      hashIndexFile: userHashIndexFile,
+      scanStorageOnStartup: config.scanStorageOnStartup,
+    });
+    await userHashIndex.init();
+    folderContexts.set(folderName, {
+      folderName,
+      storageDir: userStorageDir,
+      hashIndex: userHashIndex,
+    });
+  }
+
+  const app = express();
+  app.locals.config = config;
+  app.locals.hashIndex = defaultHashIndex;
+  app.locals.folderContexts = folderContexts;
+
+  // Parse JSON bodies for /api/check
+  app.use(express.json({ limit: '2mb' }));
+
+  // Parse raw binary uploads when Apple Shortcut uses "Request Body: File"
+  app.use(
+    '/api/upload',
+    express.raw({
+      type: (req) => {
+        const contentType = String(req.headers['content-type'] || '').toLowerCase();
+        return (
+          !contentType.startsWith('multipart/form-data') &&
+          !contentType.startsWith('application/json')
+        );
+      },
+      limit: config.maxFileSizeBytes,
+    })
+  );
+
+  // Health check endpoint (public so Docker HEALTHCHECK always succeeds)
+  app.get('/api/health', (req, res) => {
+    let totalIndexed = defaultHashIndex.size();
+    for (const ctx of folderContexts.values()) {
+      totalIndexed += ctx.hashIndex.size();
+    }
+    res.json({
+      success: true,
+      status: 'ok',
+      indexedPhotos: totalIndexed,
+      configuredUsers: folderContexts.size,
+      storageDir: config.storageDir,
+      s3Enabled: isS3Configured(config.s3),
+    });
+  });
+
+  // API Key & Multi-User routing middleware
+  app.use('/api', (req, res, next) => {
+    const providedKey = String(
+      req.headers['x-api-key'] ||
+        req.query.apiKey ||
+        (req.headers.authorization &&
+        req.headers.authorization.startsWith('Bearer ')
+          ? req.headers.authorization.slice(7)
+          : '') ||
+        ''
+    ).trim();
+
+    // 1. Check if providedKey matches a user in USER_KEYS
+    if (config.userKeyMap.size > 0 && config.userKeyMap.has(providedKey)) {
+      const folderName = config.userKeyMap.get(providedKey);
+      req.userContext = folderContexts.get(folderName);
+      return next();
+    }
+
+    // 2. Fallback to single API_KEY if configured
+    if (config.apiKey && providedKey === config.apiKey) {
+      req.userContext = {
+        folderName: null,
+        storageDir: config.storageDir,
+        hashIndex: defaultHashIndex,
+      };
+      return next();
+    }
+
+    // 3. If neither USER_KEYS nor API_KEY is configured, allow open access to root storageDir
+    if (config.userKeyMap.size === 0 && !config.apiKey) {
+      req.userContext = {
+        folderName: null,
+        storageDir: config.storageDir,
+        hashIndex: defaultHashIndex,
+      };
+      return next();
+    }
+
+    return res.status(401).json({
+      success: false,
+      canDelete: false,
+      error: 'Unauthorized: Invalid or missing API key',
+    });
+  });
+
+  const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: config.maxFileSizeBytes },
+  });
+
+  // Pre-upload duplicate check by SHA-256 hash (GET or POST)
+  app.get('/api/check/:hash', async (req, res) => {
+    try {
+      const { hashIndex, folderName } = req.userContext;
+      const lookupResult = await hashIndex.lookup(req.params.hash);
+      const record = lookupResult.record;
+      const exists = lookupResult.status !== 'missing';
+      return res.json({
+        success: true,
+        exists,
+        isMaster: lookupResult.status === 'master',
+        isProxy: lookupResult.status === 'proxy',
+        canDelete: exists,
+        canReplaceWithProxy: lookupResult.status === 'master',
+        masterHash: lookupResult.masterHash,
+        userFolder: folderName,
+        hash: String(req.params.hash || '').trim().toLowerCase(),
+        savedPath: record ? record.relativePath : null,
+      });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        exists: false,
+        canDelete: false,
+        canReplaceWithProxy: false,
+        error: err.message,
+      });
+    }
+  });
+
+  app.post('/api/check', async (req, res) => {
+    try {
+      const hash = req.body && (req.body.hash || req.body.sha256);
+      if (!hash || typeof hash !== 'string') {
+        return res.status(400).json({
+          success: false,
+          exists: false,
+          canDelete: false,
+          canReplaceWithProxy: false,
+          error: 'Missing "hash" field in JSON body',
+        });
+      }
+      const { hashIndex, folderName } = req.userContext;
+      const lookupResult = await hashIndex.lookup(hash);
+      const record = lookupResult.record;
+      const exists = lookupResult.status !== 'missing';
+      return res.json({
+        success: true,
+        exists,
+        isMaster: lookupResult.status === 'master',
+        isProxy: lookupResult.status === 'proxy',
+        canDelete: exists,
+        canReplaceWithProxy: lookupResult.status === 'master',
+        masterHash: lookupResult.masterHash,
+        userFolder: folderName,
+        hash: hash.trim().toLowerCase(),
+        savedPath: record ? record.relativePath : null,
+      });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        exists: false,
+        canDelete: false,
+        canReplaceWithProxy: false,
+        error: err.message,
+      });
+    }
+  });
+
+  // Batch check up to 500 hashes in a single request (used by the iOS app during library scan)
+  app.post('/api/check/batch', async (req, res) => {
+    try {
+      const hashes = req.body && req.body.hashes;
+      if (!Array.isArray(hashes)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Missing "hashes" array in JSON body',
+        });
+      }
+      if (hashes.length > 500) {
+        return res.status(400).json({
+          success: false,
+          error: 'Maximum 500 hashes per batch request',
+        });
+      }
+
+      const { hashIndex } = req.userContext;
+      const results = {};
+      for (const rawHash of hashes) {
+        if (typeof rawHash !== 'string' || !rawHash.trim()) continue;
+        const normalized = rawHash.trim().toLowerCase();
+        const lookupResult = await hashIndex.lookup(normalized);
+        const exists = lookupResult.status !== 'missing';
+        results[normalized] = {
+          exists,
+          isMaster: lookupResult.status === 'master',
+          isProxy: lookupResult.status === 'proxy',
+          canDelete: exists,
+          canReplaceWithProxy: lookupResult.status === 'master',
+          masterHash: lookupResult.masterHash,
+          savedPath: lookupResult.record ? lookupResult.record.relativePath : null,
+        };
+      }
+
+      return res.json({
+        success: true,
+        results,
+      });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: err.message,
+      });
+    }
+  });
+
+  // Main upload endpoint for Apple Shortcuts (supports Form multipart OR Raw File body)
+  app.post(
+    '/api/upload',
+    (req, res, next) => {
+      const contentType = String(req.headers['content-type'] || '').toLowerCase();
+      if (contentType.startsWith('multipart/form-data')) {
+        return upload.any()(req, res, next);
+      }
+      return next();
+    },
+    async (req, res) => {
+      try {
+        let buffer = null;
+        let originalName = '';
+        let mimeType = '';
+
+        if (Array.isArray(req.files) && req.files.length > 0) {
+          const file = req.files[0];
+          buffer = file.buffer;
+          originalName = file.originalname;
+          mimeType = file.mimetype;
+        } else if (Buffer.isBuffer(req.body) && req.body.length > 0) {
+          buffer = req.body;
+          originalName = decodeURIComponent(
+            String(req.headers['x-file-name'] || '')
+          );
+          mimeType = String(
+            req.headers['content-type'] || 'application/octet-stream'
+          );
+        }
+
+        if (!buffer || buffer.length === 0) {
+          return res.status(400).json({
+            success: false,
+            canDelete: false,
+            error:
+              'No photo file received. In Apple Shortcuts, use "Form" with a File field named "photo" or "File" request body.',
+          });
+        }
+
+        const bodyFields =
+          req.body && !Buffer.isBuffer(req.body) ? req.body : {};
+        const createdAt =
+          bodyFields.createdAt ||
+          bodyFields.photoDate ||
+          req.headers['x-photo-date'] ||
+          req.headers['x-created-at'] ||
+          '';
+        const expectedHash =
+          bodyFields.hash ||
+          bodyFields.expectedHash ||
+          bodyFields.sha256 ||
+          req.headers['x-file-sha256'] ||
+          req.headers['x-file-hash'] ||
+          '';
+        const customName =
+          bodyFields.fileName ||
+          bodyFields.filename ||
+          (req.headers['x-file-name']
+            ? decodeURIComponent(String(req.headers['x-file-name']))
+            : '') ||
+          originalName;
+        const strictChecksum =
+          String(
+            bodyFields.strictChecksum ??
+              req.headers['x-verify-checksum'] ??
+              req.query.strictChecksum ??
+              ''
+          )
+            .trim()
+            .toLowerCase() === 'strict' ||
+          String(
+            bodyFields.strictChecksum ?? req.query.strictChecksum ?? ''
+          )
+            .trim()
+            .toLowerCase() === 'true';
+
+        const { storageDir, hashIndex, folderName } = req.userContext;
+
+        // If the Shortcut uploaded multiple files in a single request (e.g., passing Photos directly without a Repeat loop)
+        if (Array.isArray(req.files) && req.files.length > 1) {
+          const results = [];
+          for (const file of req.files) {
+            const itemResult = await storeAndVerifyPhoto({
+              buffer: file.buffer,
+              originalName: file.originalname,
+              mimeType: file.mimetype,
+              createdAt,
+              expectedHash: '',
+              storageDir,
+              hashIndex,
+            });
+            itemResult.userFolder = folderName;
+            results.push(itemResult);
+            const displayPath = folderName
+              ? `${folderName}/${itemResult.savedPath}`
+              : itemResult.savedPath;
+            console.log(
+              `[${new Date().toISOString()}] ${itemResult.status.toUpperCase()}${folderName ? ` [${folderName}]` : ''}: ${displayPath} (${itemResult.hash.slice(0, 12)}..., ${itemResult.size} bytes)`
+            );
+          }
+          return res.status(200).json({
+            success: true,
+            backedUp: true,
+            canDelete: true,
+            count: results.length,
+            userFolder: folderName,
+            files: results,
+          });
+        }
+
+        const result = await storeAndVerifyPhoto({
+          buffer,
+          originalName: customName,
+          mimeType,
+          createdAt,
+          expectedHash,
+          strictChecksum,
+          storageDir,
+          hashIndex,
+        });
+
+        result.userFolder = folderName;
+        const displayPath = folderName
+          ? `${folderName}/${result.savedPath}`
+          : result.savedPath;
+
+        console.log(
+          `[${new Date().toISOString()}] ${result.status.toUpperCase()}${folderName ? ` [${folderName}]` : ''}: ${displayPath} (${result.hash.slice(0, 12)}..., ${result.size} bytes) -> canDelete=${result.canDelete}`
+        );
+
+        return res.status(200).json(result);
+      } catch (err) {
+        const status = err.statusCode || 500;
+        console.error(`[${new Date().toISOString()}] UPLOAD ERROR:`, err.message);
+        return res.status(status).json({
+          success: false,
+          canDelete: false,
+          canReplaceWithProxy: false,
+          checksumVerified: false,
+          error: err.message,
+        });
+      }
+    }
+  );
+
+  // Optional S3/MinIO pre-signed URL upload flow:
+  // 1. POST /api/upload/presign -> returns a pre-signed PUT URL for direct upload to S3/MinIO
+  app.post('/api/upload/presign', async (req, res) => {
+    try {
+      if (!isS3Configured(config.s3)) {
+        return res.status(501).json({
+          success: false,
+          error:
+            'S3/MinIO is not configured on this server. Use direct VPS upload via POST /api/upload.',
+        });
+      }
+
+      const { fileName, mimeType, createdAt, expectedHash } = req.body || {};
+      const cleanHash = String(expectedHash || '').trim().toLowerCase();
+      if (!cleanHash || cleanHash.length !== 64) {
+        return res.status(400).json({
+          success: false,
+          error: 'Valid 64-character SHA-256 "expectedHash" is required.',
+        });
+      }
+
+      const { hashIndex, folderName } = req.userContext;
+      const existing = await hashIndex.verifyExisting(cleanHash);
+      if (existing) {
+        return res.json({
+          success: true,
+          alreadyExists: true,
+          checksumVerified: true,
+          canReplaceWithProxy: true,
+          serverSha256: existing.diskHash || existing.hash,
+          savedPath: existing.relativePath,
+        });
+      }
+
+      const { year, dateFolder } = parseDateFolder(createdAt);
+      const safeName = sanitizeFilename(fileName, mimeType, cleanHash);
+      const prefix = folderName ? `${folderName}/` : '';
+      const objectKey = `${prefix}${year}/${dateFolder}/${cleanHash.slice(0, 8)}_${safeName}`;
+
+      const uploadUrl = createPresignedUrl({
+        s3Config: config.s3,
+        method: 'PUT',
+        objectKey,
+        expiresIn: 900,
+      });
+
+      return res.json({
+        success: true,
+        alreadyExists: false,
+        uploadUrl,
+        objectKey,
+        expiresIn: 900,
+      });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: err.message,
+      });
+    }
+  });
+
+  // 2. POST /api/upload/confirm -> backend reads the S3 object, verifies its SHA-256, and indexes it
+  app.post('/api/upload/confirm', async (req, res) => {
+    try {
+      if (!isS3Configured(config.s3)) {
+        return res.status(501).json({
+          success: false,
+          checksumVerified: false,
+          canReplaceWithProxy: false,
+          error: 'S3/MinIO is not configured on this server.',
+        });
+      }
+
+      const { objectKey, expectedHash, fileName, createdAt } = req.body || {};
+      if (!objectKey || !expectedHash) {
+        return res.status(400).json({
+          success: false,
+          checksumVerified: false,
+          canReplaceWithProxy: false,
+          error: 'Both "objectKey" and "expectedHash" are required.',
+        });
+      }
+
+      const { actualSha256, size } = await verifyS3ObjectChecksum({
+        s3Config: config.s3,
+        objectKey,
+        expectedSha256: expectedHash,
+      });
+
+      const { dateFolder } = parseDateFolder(createdAt);
+      const { hashIndex, folderName } = req.userContext;
+      const record = await hashIndex.set(actualSha256, {
+        hash: actualSha256,
+        diskHash: actualSha256,
+        storageType: 's3',
+        relativePath: objectKey,
+        originalName: fileName || path.basename(objectKey),
+        size,
+        photoDate: dateFolder,
+        uploadedAt: new Date().toISOString(),
+      });
+
+      return res.json({
+        success: true,
+        backedUp: true,
+        canDelete: true,
+        canReplaceWithProxy: true,
+        checksumVerified: true,
+        serverSha256: actualSha256,
+        hash: actualSha256,
+        savedPath: record.relativePath,
+        size: record.size,
+        photoDate: record.photoDate,
+        userFolder: folderName,
+      });
+    } catch (err) {
+      const status = err.statusCode || 500;
+      return res.status(status).json({
+        success: false,
+        checksumVerified: false,
+        canReplaceWithProxy: false,
+        error: err.message,
+      });
+    }
+  });
+
+  // Register a lightweight local proxy hash against a verified master photo
+  app.post('/api/proxy/register', async (req, res) => {
+    try {
+      const { masterHash, proxyHash, assetId } = req.body || {};
+      if (!masterHash || !proxyHash) {
+        return res.status(400).json({
+          success: false,
+          error: 'Both "masterHash" and "proxyHash" are required',
+        });
+      }
+
+      const { hashIndex } = req.userContext;
+      const updated = await hashIndex.registerProxy(
+        masterHash,
+        proxyHash,
+        assetId
+      );
+      if (!updated) {
+        return res.status(404).json({
+          success: false,
+          error: 'Master photo not found or failed disk verification',
+        });
+      }
+
+      return res.json({
+        success: true,
+        masterHash: updated.diskHash || updated.hash,
+        proxyHash: updated.proxyHash,
+        savedPath: updated.relativePath,
+      });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: err.message,
+      });
+    }
+  });
+
+  // Download / restore full-resolution master photo by either masterHash or proxyHash
+  app.get('/api/photo/:hash', async (req, res) => {
+    try {
+      const { hashIndex, storageDir } = req.userContext;
+      const lookupResult = await hashIndex.lookup(req.params.hash);
+      if (lookupResult.status === 'missing' || !lookupResult.record) {
+        return res.status(404).json({
+          success: false,
+          error: 'Photo not found',
+        });
+      }
+
+      const record = lookupResult.record;
+      if (record.storageType === 's3' && isS3Configured(config.s3)) {
+        const downloadUrl = createPresignedUrl({
+          s3Config: config.s3,
+          method: 'GET',
+          objectKey: record.relativePath,
+          expiresIn: 300,
+        });
+        return res.redirect(downloadUrl);
+      }
+
+      const fullPath = path.join(storageDir, record.relativePath);
+      res.setHeader(
+        'Content-Disposition',
+        `inline; filename="${encodeURIComponent(record.originalName || path.basename(fullPath))}"`
+      );
+      res.setHeader('X-Master-Sha256', lookupResult.masterHash);
+      return fs.createReadStream(fullPath).pipe(res);
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: err.message,
+      });
+    }
+  });
+
+  // Multer & general error handler — always guarantees canDelete: false on error
+  app.use((err, req, res, _next) => {
+    console.error(`[${new Date().toISOString()}] SERVER ERROR:`, err.message);
+    res.status(err.status || 400).json({
+      success: false,
+      canDelete: false,
+      error: err.message || 'Unexpected upload error',
+    });
+  });
+
+  return app;
+}
+
+if (require.main === module) {
+  createApp()
+    .then((app) => {
+      const { port, storageDir, userKeyMap } = app.locals.config;
+      app.listen(port, '0.0.0.0', () => {
+        console.log(`PhotoHub backend listening on http://0.0.0.0:${port}`);
+        console.log(`Base storage directory: ${storageDir}`);
+        if (userKeyMap.size > 0) {
+          console.log(
+            `Multi-user folders active: ${Array.from(new Set(userKeyMap.values())).join(', ')}`
+          );
+        }
+      });
+    })
+    .catch((err) => {
+      console.error('Failed to start server:', err);
+      process.exit(1);
+    });
+}
+
+module.exports = { createApp };
