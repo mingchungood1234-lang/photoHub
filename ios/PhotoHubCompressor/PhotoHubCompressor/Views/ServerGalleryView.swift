@@ -16,17 +16,17 @@ struct ServerGalleryView: View {
     ]
 
     var body: some View {
-        NavigationStack {
+        AdaptiveNavigationStack {
             Group {
                 if isLoading && photos.isEmpty {
                     ProgressView("Loading compressed server previews…")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if let errorMessage, photos.isEmpty {
-                    ContentUnavailableView {
-                        Label("Could Not Load Server Photos", systemImage: "wifi.exclamationmark")
-                    } description: {
-                        Text(errorMessage)
-                    } actions: {
+                    CompatibleEmptyStateView(
+                        title: "Could Not Load Server Photos",
+                        systemImage: "wifi.exclamationmark",
+                        description: errorMessage
+                    ) {
                         Button("Retry") {
                             Task { await loadPhotos() }
                         }
@@ -34,11 +34,11 @@ struct ServerGalleryView: View {
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if photos.isEmpty {
-                    ContentUnavailableView {
-                        Label("No Photos on Server", systemImage: "cloud")
-                    } description: {
-                        Text("Photos you upload and compress will appear here as lightweight compressed previews.")
-                    } actions: {
+                    CompatibleEmptyStateView(
+                        title: "No Photos on Server",
+                        systemImage: "cloud",
+                        description: "Photos you upload and compress will appear here as lightweight compressed previews."
+                    ) {
                         Button("Refresh") {
                             Task { await loadPhotos() }
                         }
@@ -72,7 +72,7 @@ struct ServerGalleryView: View {
             .navigationTitle("Server (\(photos.count))")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
                         Task { await loadPhotos() }
                     } label: {
@@ -200,7 +200,7 @@ private struct ServerPhotoDetailView: View {
     @State private var saveMessage: String?
 
     var body: some View {
-        NavigationStack {
+        AdaptiveNavigationStack {
             ZStack {
                 Color.black.ignoresSafeArea()
 
@@ -269,12 +269,12 @@ private struct ServerPhotoDetailView: View {
                 }
             }
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItem(placement: .navigationBarLeading) {
                     Button("Close") { dismiss() }
                         .foregroundStyle(.white)
                 }
             }
-            .toolbarBackground(.hidden, for: .navigationBar)
+            .compatibleHiddenNavBarBackground()
             .task {
                 if previewImage == nil {
                     if let initialImage, let initialCompressedData {

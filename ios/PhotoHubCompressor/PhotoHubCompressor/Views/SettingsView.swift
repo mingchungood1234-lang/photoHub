@@ -8,7 +8,7 @@ struct SettingsView: View {
     private let resolutions = [0, 1280, 1920, 2048, 2560]
 
     var body: some View {
-        NavigationStack {
+        AdaptiveNavigationStack {
             Form {
                 Section {
                     Picker("Protocol", selection: $settings.serverProtocolRaw) {
@@ -21,7 +21,7 @@ struct SettingsView: View {
                     TextField("Host / IP (e.g. 10.8.0.1:3000 or photos.domain.com)", text: $settings.serverURL)
                         .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
+                        .compatibleAutocorrectionDisabled()
 
                     if let resolved = settings.normalizedBaseURL {
                         Text("Using: \(resolved.absoluteString)")
@@ -35,7 +35,7 @@ struct SettingsView: View {
 
                     SecureField("User Key / API Key (e.g. mingchun)", text: $settings.apiKey)
                         .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
+                        .compatibleAutocorrectionDisabled()
 
                     Picker("Upload Mode", selection: $settings.uploadModeRaw) {
                         ForEach(UploadMode.allCases) { mode in

@@ -3,16 +3,15 @@ import SwiftUI
 struct LibraryView: View {
     @ObservedObject var viewModel: CompressorViewModel
     @AppStorage("keepLocalProxyInPhotos") private var keepLocalProxyInPhotos: Bool = true
-    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
-        NavigationStack {
+        AdaptiveNavigationStack {
             VStack(spacing: 0) {
                 if viewModel.permissionStatus == .limited {
                     HStack(spacing: 8) {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundStyle(.orange)
-                        Text("Limited Photos Access: iOS blocks deleting originals in Limited mode.")
+                        Text("Limited Photos Access: Switch to Full Access in iOS Settings to scan and delete all originals.")
                             .font(.caption)
                         Spacer()
                         Button("Full Access") {
@@ -55,15 +54,13 @@ struct LibraryView: View {
                 }
 
                 if viewModel.candidates.isEmpty {
-                    ContentUnavailableView {
-                        Label("No Photos Scanned", systemImage: "photo.on.rectangle.angled")
-                    } description: {
-                        if viewModel.permissionStatus == .denied || viewModel.permissionStatus == .restricted {
-                            Text("Photos permission is required. Open iOS Settings to allow access.")
-                        } else {
-                            Text("Tap Scan Library to find full-resolution photos that can be backed up and replaced with lightweight proxies.")
-                        }
-                    } actions: {
+                    CompatibleEmptyStateView(
+                        title: "No Photos Scanned",
+                        systemImage: "photo.on.rectangle.angled",
+                        description: (viewModel.permissionStatus == .denied || viewModel.permissionStatus == .restricted)
+                            ? "Photos permission is required. Open iOS Settings to allow access."
+                            : "Tap Scan Library to find full-resolution photos that can be backed up and replaced with lightweight proxies."
+                    ) {
                         if viewModel.permissionStatus == .denied || viewModel.permissionStatus == .restricted {
                             Button("Open iOS Settings") {
                                 if let url = URL(string: UIApplication.openSettingsURLString) {
@@ -105,7 +102,7 @@ struct LibraryView: View {
             .navigationTitle("photoHub")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItem(placement: .navigationBarLeading) {
                     Button {
                         viewModel.scanLibrary()
                     } label: {
@@ -118,7 +115,7 @@ struct LibraryView: View {
                     .disabled(viewModel.isScanning || viewModel.isProcessing)
                 }
 
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItem(placement: .navigationBarTrailing) {
                     if !viewModel.candidates.isEmpty {
                         Menu {
                             Button("Select All") { viewModel.selectAllEligible(true) }
@@ -162,10 +159,8 @@ struct LibraryView: View {
             } message: {
                 Text(viewModel.deleteErrorAlertMessage ?? "")
             }
-            .onChange(of: scenePhase) { _, newPhase in
-                if newPhase == .active {
-                    viewModel.onAppBecameActive()
-                }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+                viewModel.onAppBecameActive()
             }
             .onAppear {
                 if viewModel.candidates.isEmpty && viewModel.settings.autoCompressOnOpen {

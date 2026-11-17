@@ -160,7 +160,17 @@ enum ProxyGenerator {
         exportSession.outputFileType = .mp4
         exportSession.shouldOptimizeForNetworkUse = true
 
-        await exportSession.export()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let lock = NSLock()
+            var hasResumed = false
+            exportSession.exportAsynchronously {
+                lock.lock()
+                defer { lock.unlock() }
+                guard !hasResumed else { return }
+                hasResumed = true
+                continuation.resume()
+            }
+        }
 
         guard exportSession.status == .completed else {
             try? FileManager.default.removeItem(at: proxyURL)

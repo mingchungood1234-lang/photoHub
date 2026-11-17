@@ -300,9 +300,9 @@ final class PhotoLibraryService {
                 lock.unlock()
             }
 
-            // Watchdog: if iOS never presented the native sheet within 15s while staying active,
+            // Watchdog: if iOS never presented the native sheet within 20s while staying active,
             // surface a clear diagnostic instead of leaving the UI stuck.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 15.0) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 20.0) {
                 lock.lock()
                 let alreadyDone = hasCompleted
                 let dialogShown = didObserveSystemDialog
@@ -312,7 +312,7 @@ final class PhotoLibraryService {
                 let isActive = (UIApplication.shared.applicationState == .active)
                 guard !dialogShown && isActive else { return }
 
-                let diag = "iOS did not display the Delete confirmation dialog within 15s (Auth: \(Self.authLabel(authStatus)), Deletable: \(deletableIds.count)/\(initialFetch.count)). Ensure Settings -> photoHub -> Photos is Full Access, check Screen Time restrictions, or tap 'Retry Delete Now'."
+                let diag = "iOS did not display the Delete confirmation dialog within 20s (Auth: \(Self.authLabel(authStatus)), Deletable: \(deletableIds.count)/\(initialFetch.count)). Ensure Settings -> photoHub -> Photos is Full Access, check Screen Time restrictions, or tap 'Retry Delete Now'."
                 finishOnce(.failure(PhotoLibraryError.proxyReplacementFailed(diag)))
             }
 
