@@ -4,6 +4,8 @@ import SwiftUI
 
 final class CompressorViewModel: ObservableObject {
     @Published var candidates: [PhotoCandidate] = []
+    @Published var pendingDeleteAssets: [PHAsset] = []
+    @Published var deleteErrorAlertMessage: String?
     @Published var isScanning: Bool = false
     @Published var isProcessing: Bool = false
     @Published var permissionStatus: PHAuthorizationStatus = .notDetermined
@@ -154,10 +156,12 @@ final class CompressorViewModel: ObservableObject {
             DispatchQueue.main.async {
                 self.isProcessing = false
                 let savedStr = ByteCountFormatter.string(fromByteCount: self.totalSavedBytes, countStyle: .file)
-                if failedCount > 0 && self.statusBanner == nil {
+                if !self.pendingDeleteAssets.isEmpty {
+                    self.statusBanner = "Backed up & compressed! Tap the red 'Delete Original Photo(s)' button below to remove \(self.pendingDeleteAssets.count) original(s) (\(savedStr))."
+                } else if failedCount > 0 && self.statusBanner == nil {
                     self.statusBanner = "Finished with \(failedCount) error(s). Space saved: \(savedStr)."
                 } else if failedCount == 0 {
-                    self.statusBanner = "Finished! Space saved: \(savedStr). Empty 'Recently Deleted' in Photos to reclaim storage immediately."
+                    self.statusBanner = "Finished! Space saved: \(savedStr)."
                 }
             }
             return
@@ -267,30 +271,32 @@ final class CompressorViewModel: ObservableObject {
                                 try? FileManager.default.removeItem(at: posterURL)
                             }
 
-                            // Step 5: Invoke PhotoKit replace/delete on a background queue (NEVER DispatchQueue.main!)
+                            // Step 5: Save compressed proxy to Photos (if enabled), then stage original asset for synchronous user-tap deletion
                             let keepLocal = self.settings.keepLocalProxyInPhotos
-                            self.updateStateOnMain(id: currentId, state: .replacingInPhotos)
+                            let savedBytes = keepLocal
+                                ? max(0, master.sizeBytes - proxy.sizeBytes)
+                                : master.sizeBytes
 
-                            DispatchQueue.global(qos: .userInitiated).async {
-                                self.photoService.replaceWithProxy(
+                            if keepLocal {
+                                self.updateStateOnMain(id: currentId, state: .replacingInPhotos)
+                                self.photoService.saveCompressedProxyToPhotos(
                                     originalAsset: candidate.asset,
                                     mediaType: candidate.mediaType,
-                                    proxyFileURL: proxy.fileURL,
-                                    keepLocalProxy: keepLocal
-                                ) { [weak self] replaceResult in
+                                    proxyFileURL: proxy.fileURL
+                                ) { [weak self] saveResult in
                                     try? FileManager.default.removeItem(at: proxy.fileURL)
                                     guard let self = self else { return }
 
-                                    switch replaceResult {
+                                    switch saveResult {
                                     case .success(let newAssetId):
-                                        self.tracker.markAsProxy(assetId: candidate.id, proxySha256: proxy.sha256)
-                                        self.tracker.markAsProxy(assetId: newAssetId, proxySha256: proxy.sha256)
-
-                                        let saved = keepLocal
-                                            ? max(0, master.sizeBytes - proxy.sizeBytes)
-                                            : master.sizeBytes
-                                        self.totalSavedBytes += saved
-                                        self.candidates.removeAll { $0.id == currentId }
+                                        if newAssetId != candidate.id {
+                                            self.tracker.markAsProxy(assetId: newAssetId, proxySha256: proxy.sha256)
+                                        }
+                                        self.stageOriginalForDeletion(
+                                            id: currentId,
+                                            asset: candidate.asset,
+                                            savedBytes: savedBytes
+                                        )
                                         self.completedCount += 1
                                         self.processNextItem(remainingIds: restIds, failedCount: failedCount, apiClient: apiClient)
 
@@ -300,6 +306,17 @@ final class CompressorViewModel: ObservableObject {
                                         self.completedCount += 1
                                         self.processNextItem(remainingIds: restIds, failedCount: failedCount + 1, apiClient: apiClient)
                                     }
+                                }
+                            } else {
+                                try? FileManager.default.removeItem(at: proxy.fileURL)
+                                DispatchQueue.main.async {
+                                    self.stageOriginalForDeletion(
+                                        id: currentId,
+                                        asset: candidate.asset,
+                                        savedBytes: savedBytes
+                                    )
+                                    self.completedCount += 1
+                                    self.processNextItem(remainingIds: restIds, failedCount: failedCount, apiClient: apiClient)
                                 }
                             }
                         } catch {
@@ -313,6 +330,64 @@ final class CompressorViewModel: ObservableObject {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    private func stageOriginalForDeletion(id: String, asset: PHAsset, savedBytes: Int64) {
+        if let idx = candidates.firstIndex(where: { $0.id == id }) {
+            candidates[idx].state = .readyToDelete(savedBytes: savedBytes)
+            candidates[idx].isSelected = false
+        }
+        if !pendingDeleteAssets.contains(where: { $0.localIdentifier == asset.localIdentifier }) {
+            pendingDeleteAssets.append(asset)
+        }
+        totalSavedBytes += savedBytes
+    }
+
+    /// Must be called directly from a SwiftUI `Button` tap action on the main thread (no async hop before `performChanges`).
+    func deleteOriginalsFromUserTap() {
+        let assetsToDelete = pendingDeleteAssets
+        guard !assetsToDelete.isEmpty else { return }
+
+        let idsToDelete = Set(assetsToDelete.map { $0.localIdentifier })
+        photoService.deleteOriginalAssetsFromUserTap(assetsToDelete) { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .success:
+                self.candidates.removeAll { idsToDelete.contains($0.id) }
+                self.pendingDeleteAssets.removeAll { idsToDelete.contains($0.localIdentifier) }
+                let savedStr = ByteCountFormatter.string(fromByteCount: self.totalSavedBytes, countStyle: .file)
+                self.statusBanner = "Deleted \(idsToDelete.count) original photo(s)! Space saved: \(savedStr). Empty 'Recently Deleted' in Photos to reclaim storage immediately."
+
+            case .failure(let error):
+                self.statusBanner = "Delete failed: \(error.localizedDescription)"
+                self.deleteErrorAlertMessage = error.localizedDescription
+            }
+        }
+    }
+
+    /// Must be called directly from a SwiftUI `Button` tap action on the main thread for a single row.
+    func deleteSingleOriginalFromUserTap(id: String) {
+        guard let asset = pendingDeleteAssets.first(where: { $0.localIdentifier == id })
+                ?? candidates.first(where: { $0.id == id })?.asset else {
+            return
+        }
+
+        photoService.deleteOriginalAssetsFromUserTap([asset]) { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .success:
+                self.candidates.removeAll { $0.id == id }
+                self.pendingDeleteAssets.removeAll { $0.localIdentifier == id }
+                if self.pendingDeleteAssets.isEmpty {
+                    let savedStr = ByteCountFormatter.string(fromByteCount: self.totalSavedBytes, countStyle: .file)
+                    self.statusBanner = "Deleted original photo! Space saved: \(savedStr)."
+                }
+
+            case .failure(let error):
+                self.statusBanner = "Delete failed: \(error.localizedDescription)"
+                self.deleteErrorAlertMessage = error.localizedDescription
             }
         }
     }

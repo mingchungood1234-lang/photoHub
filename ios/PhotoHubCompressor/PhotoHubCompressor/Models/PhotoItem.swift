@@ -46,7 +46,7 @@ enum PhotoCompressionState: Equatable {
 
     var isFinished: Bool {
         switch self {
-        case .completed, .alreadyProxy, .skipped:
+        case .completed, .readyToDelete, .alreadyProxy, .skipped:
             return true
         default:
             return false

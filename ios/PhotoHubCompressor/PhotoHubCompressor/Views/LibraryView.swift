@@ -87,6 +87,9 @@ struct LibraryView: View {
                                 item: item,
                                 onToggleSelect: {
                                     viewModel.toggleSelection(for: item.id)
+                                },
+                                onDeleteOriginal: {
+                                    viewModel.deleteSingleOriginalFromUserTap(id: item.id)
                                 }
                             )
                             .onAppear {
@@ -127,9 +130,22 @@ struct LibraryView: View {
                 }
             }
             .safeAreaInset(edge: .bottom) {
-                if viewModel.selectedCount > 0 {
+                if viewModel.selectedCount > 0 || !viewModel.pendingDeleteAssets.isEmpty {
                     actionBar
                 }
+            }
+            .alert(
+                "Delete Original Photo",
+                isPresented: Binding(
+                    get: { viewModel.deleteErrorAlertMessage != nil },
+                    set: { if !$0 { viewModel.deleteErrorAlertMessage = nil } }
+                )
+            ) {
+                Button("OK", role: .cancel) {
+                    viewModel.deleteErrorAlertMessage = nil
+                }
+            } message: {
+                Text(viewModel.deleteErrorAlertMessage ?? "")
             }
             .onAppear {
                 if viewModel.candidates.isEmpty && viewModel.settings.autoCompressOnOpen {
@@ -173,27 +189,48 @@ struct LibraryView: View {
     }
 
     private var actionBar: some View {
-        Button {
-            viewModel.startProcessingSelectedPhotos()
-        } label: {
-            HStack {
-                Image(systemName: "arrow.up.circle.fill")
-                Text("Upload & Compress \(viewModel.selectedCount) Item(s)")
-                    .fontWeight(.semibold)
+        VStack(spacing: 10) {
+            if !viewModel.pendingDeleteAssets.isEmpty {
+                Button(role: .destructive) {
+                    viewModel.deleteOriginalsFromUserTap()
+                } label: {
+                    HStack {
+                        Image(systemName: "trash.fill")
+                        Text("Delete \(viewModel.pendingDeleteAssets.count) Original Photo(s) from iPhone")
+                            .fontWeight(.semibold)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
             }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 14)
+
+            if viewModel.selectedCount > 0 {
+                Button {
+                    viewModel.startProcessingSelectedPhotos()
+                } label: {
+                    HStack {
+                        Image(systemName: "arrow.up.circle.fill")
+                        Text("Upload & Compress \(viewModel.selectedCount) Item(s)")
+                            .fontWeight(.semibold)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(viewModel.isProcessing)
+            }
         }
-        .buttonStyle(.borderedProminent)
         .padding()
         .background(.ultraThinMaterial)
-        .disabled(viewModel.isProcessing)
     }
 }
 
 private struct PhotoCandidateRow: View {
     let item: PhotoCandidate
     let onToggleSelect: () -> Void
+    let onDeleteOriginal: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
@@ -249,10 +286,25 @@ private struct PhotoCandidateRow: View {
             }
 
             Spacer()
+
+            if case .readyToDelete = item.state {
+                Button(role: .destructive) {
+                    onDeleteOriginal()
+                } label: {
+                    Label("Delete", systemImage: "trash.fill")
+                        .font(.caption.bold())
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+            }
         }
         .contentShape(Rectangle())
         .onTapGesture {
-            onToggleSelect()
+            if case .readyToDelete = item.state {
+                onDeleteOriginal()
+            } else {
+                onToggleSelect()
+            }
         }
         .padding(.vertical, 4)
     }
