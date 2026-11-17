@@ -32,6 +32,19 @@ struct GeneratedProxy {
     var posterFileURL: URL? = nil
 }
 
+private final class OnceFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+
+    func tryTrigger() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !done else { return false }
+        done = true
+        return true
+    }
+}
+
 enum ProxyGenerator {
     static func createProxy(
         from masterURL: URL,
@@ -160,14 +173,10 @@ enum ProxyGenerator {
         exportSession.outputFileType = .mp4
         exportSession.shouldOptimizeForNetworkUse = true
 
+        let once = OnceFlag()
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            let lock = NSLock()
-            var hasResumed = false
             exportSession.exportAsynchronously {
-                lock.lock()
-                defer { lock.unlock() }
-                guard !hasResumed else { return }
-                hasResumed = true
+                guard once.tryTrigger() else { return }
                 continuation.resume()
             }
         }
