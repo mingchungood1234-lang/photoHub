@@ -1,9 +1,13 @@
+import Photos
 import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var settings: AppSettings
     @State private var connectionStatus: String?
     @State private var isTesting: Bool = false
+    @State private var deleteDiagResult: String?
+    @State private var isTestingDelete: Bool = false
+    @State private var photosAuthText: String = PhotoLibraryService.currentReadWriteAuthLabel()
 
     private let resolutions = [0, 1280, 1920, 2048, 2560]
 
@@ -96,10 +100,45 @@ struct SettingsView: View {
                 }
 
                 Section("How Safety Works") {
-                    Text("1. Your iPhone computes the SHA-256 checksum of the full-resolution original.\n2. The original is uploaded to your server (or S3/MinIO).\n3. Only after the backend confirms the exact SHA-256 checksum on disk does the app replace the local photo with a lightweight proxy.")
+                    Text("1. Your iPhone computes the SHA-256 checksum of the full-resolution original.\n2. The original is uploaded to your server (or S3/MinIO).\n3. Only after the backend confirms the exact SHA-256 checksum on disk does the app request deletion via iOS Photos.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
+
+                Section("iOS Photos Diagnostics") {
+                    HStack {
+                        Text("Photos Permission")
+                        Spacer()
+                        Text(photosAuthText)
+                            .foregroundStyle(photosAuthText == "Full Access" ? .green : .orange)
+                    }
+
+                    Button {
+                        runDeleteDiagnostic()
+                    } label: {
+                        HStack {
+                            Text("Test Native Delete Alert (Latest Photo)")
+                            Spacer()
+                            if isTestingDelete { ProgressView() }
+                        }
+                    }
+                    .disabled(isTestingDelete)
+
+                    Button("Open iOS Settings for photoHub") {
+                        if let url = URL(string: UIApplication.openSettingsURLString) {
+                            UIApplication.shared.open(url)
+                        }
+                    }
+
+                    if let deleteDiagResult {
+                        Text(deleteDiagResult)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .onAppear {
+                photosAuthText = PhotoLibraryService.currentReadWriteAuthLabel()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .navigationTitle("Settings")
@@ -120,6 +159,16 @@ struct SettingsView: View {
             connectionStatus = "Connected! \(folderLabel) (\(info.indexedPhotos) photos, \(s3Note))"
         } catch {
             connectionStatus = "Failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func runDeleteDiagnostic() {
+        isTestingDelete = true
+        deleteDiagResult = "Requesting native iOS delete alert for newest photo (tap Don't Allow if you want to keep it)…"
+        PhotoLibraryService().testDeletePromptOnLatestAsset { message in
+            isTestingDelete = false
+            photosAuthText = PhotoLibraryService.currentReadWriteAuthLabel()
+            deleteDiagResult = message
         }
     }
 }

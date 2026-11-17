@@ -242,19 +242,23 @@ final class PhotoLibraryService {
             }
 
             var deletableIds: [String] = []
+            var blockedReasons: [String] = []
             for i in 0..<initialFetch.count {
                 let asset = initialFetch.object(at: i)
                 if asset.canPerform(.delete) {
                     deletableIds.append(asset.localIdentifier)
+                } else {
+                    blockedReasons.append("\(asset.pixelWidth)x\(asset.pixelHeight) src=\(asset.sourceType.rawValue)")
                 }
             }
 
             guard !deletableIds.isEmpty else {
                 let detail: String
                 if authStatus == .limited {
-                    detail = "Photos access is set to Limited Access, which blocks deleting originals. Open iOS Settings -> photoHub -> Photos and choose Full Access."
+                    detail = "Photos access is Limited Access, which blocks deleting originals. Open iOS Settings -> photoHub -> Photos -> Full Access."
                 } else {
-                    detail = "iOS reports \(initialFetch.count) photo(s) cannot be deleted by apps (canPerform(.delete) == false). They may be synced from a computer, in a Shared Album, or restricted by Screen Time."
+                    let info = blockedReasons.joined(separator: ", ")
+                    detail = "iOS reports canPerform(.delete) == false (\(info)). Assets may be synced from a computer, in a Shared Album, or restricted by Screen Time."
                 }
                 completion(.failure(PhotoLibraryError.proxyReplacementFailed(detail)))
                 return
@@ -300,9 +304,9 @@ final class PhotoLibraryService {
                 lock.unlock()
             }
 
-            // Watchdog: if iOS never presented the native sheet within 20s while staying active,
-            // surface a clear diagnostic instead of leaving the UI stuck.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 20.0) {
+            // Watchdog: if iOS never presented the native sheet within 8s while staying active,
+            // surface a clear diagnostic instead of leaving the user waiting silently.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) {
                 lock.lock()
                 let alreadyDone = hasCompleted
                 let dialogShown = didObserveSystemDialog
@@ -312,7 +316,10 @@ final class PhotoLibraryService {
                 let isActive = (UIApplication.shared.applicationState == .active)
                 guard !dialogShown && isActive else { return }
 
-                let diag = "iOS did not display the Delete confirmation dialog within 20s (Auth: \(Self.authLabel(authStatus)), Deletable: \(deletableIds.count)/\(initialFetch.count)). Ensure Settings -> photoHub -> Photos is Full Access, check Screen Time restrictions, or tap 'Retry'."
+                let firstAsset = deletableFetch.firstObject
+                let srcVal = firstAsset?.sourceType.rawValue ?? 0
+                let sizeStr = firstAsset.map { "\($0.pixelWidth)x\($0.pixelHeight)" } ?? "?"
+                let diag = "iOS did not pop up the system Delete dialog within 8s (Auth: \(Self.authLabel(authStatus)), Deletable: \(deletableIds.count)/\(initialFetch.count), Asset: \(sizeStr) src=\(srcVal)). Check Settings -> photoHub -> Photos (Full Access), Screen Time -> Content & Privacy Restrictions -> Photos, or restart iPhone if photolibraryd stalled."
                 finishOnce(.failure(PhotoLibraryError.proxyReplacementFailed(diag)))
             }
 
@@ -354,6 +361,41 @@ final class PhotoLibraryService {
             startDeleteOnMain()
         } else {
             DispatchQueue.main.async(execute: startDeleteOnMain)
+        }
+    }
+
+    static func currentReadWriteAuthLabel() -> String {
+        authLabel(PHPhotoLibrary.authorizationStatus(for: .readWrite))
+    }
+
+    func testDeletePromptOnLatestAsset(completion: @escaping (String) -> Void) {
+        requestAuthorization { status in
+            let authText = Self.authLabel(status)
+            guard status == .authorized || status == .limited else {
+                completion("Auth is \(authText). Change Settings -> photoHub -> Photos to Full Access.")
+                return
+            }
+
+            let opts = PHFetchOptions()
+            opts.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+            opts.fetchLimit = 1
+            let latest = PHAsset.fetchAssets(with: .image, options: opts)
+            guard let asset = latest.firstObject else {
+                completion("Auth: \(authText), but no photos found in library.")
+                return
+            }
+
+            let info = "Auth=\(authText), Size=\(asset.pixelWidth)x\(asset.pixelHeight), CanDelete=\(asset.canPerform(.delete)), Src=\(asset.sourceType.rawValue)"
+            self.deleteOriginalAssets([asset]) { result in
+                switch result {
+                case .success(.deleted(let ids)):
+                    completion("Prompt appeared and deleted \(ids.count) item(s)! (\(info))")
+                case .success(.cancelledByUser):
+                    completion("Native iOS Delete prompt DID appear! (User tapped Don't Allow; \(info))")
+                case .failure(let error):
+                    completion("Failed (\(info)): \(error.localizedDescription)")
+                }
+            }
         }
     }
 
