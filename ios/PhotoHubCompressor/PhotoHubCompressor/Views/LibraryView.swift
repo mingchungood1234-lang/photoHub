@@ -85,9 +85,6 @@ struct LibraryView: View {
                                 item: item,
                                 onToggleSelect: {
                                     viewModel.toggleSelection(for: item.id)
-                                },
-                                onDeleteOriginal: {
-                                    viewModel.deleteSingleOriginalFromUserTap(id: item.id)
                                 }
                             )
                             .onAppear {
@@ -128,7 +125,7 @@ struct LibraryView: View {
                 }
             }
             .safeAreaInset(edge: .bottom) {
-                if viewModel.selectedCount > 0 || (!viewModel.pendingDeleteAssets.isEmpty && !viewModel.isAwaitingDeleteConfirmation) {
+                if viewModel.selectedCount > 0 {
                     actionBar
                 }
             }
@@ -140,21 +137,21 @@ struct LibraryView: View {
                 )
             ) {
                 if !viewModel.pendingDeleteAssets.isEmpty {
-                    Button("Retry Delete Now") {
+                    Button("Retry") {
                         viewModel.deleteErrorAlertMessage = nil
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                            viewModel.deleteOriginalsFromUserTap()
+                            viewModel.retryPendingDeleteAlert()
                         }
                     }
                 }
                 Button("Open Settings") {
-                    viewModel.deleteErrorAlertMessage = nil
+                    viewModel.dismissPendingDeleteAfterError()
                     if let url = URL(string: UIApplication.openSettingsURLString) {
                         UIApplication.shared.open(url)
                     }
                 }
                 Button("OK", role: .cancel) {
-                    viewModel.deleteErrorAlertMessage = nil
+                    viewModel.dismissPendingDeleteAfterError()
                 }
             } message: {
                 Text(viewModel.deleteErrorAlertMessage ?? "")
@@ -204,39 +201,19 @@ struct LibraryView: View {
     }
 
     private var actionBar: some View {
-        VStack(spacing: 10) {
-            if !viewModel.pendingDeleteAssets.isEmpty && !viewModel.isAwaitingDeleteConfirmation {
-                Button(role: .destructive) {
-                    viewModel.deleteOriginalsFromUserTap()
-                } label: {
-                    HStack {
-                        Image(systemName: "trash.fill")
-                        Text("Delete \(viewModel.pendingDeleteAssets.count) Original Photo(s) from iPhone")
-                            .fontWeight(.semibold)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.red)
+        Button {
+            viewModel.startProcessingSelectedPhotos()
+        } label: {
+            HStack {
+                Image(systemName: "arrow.up.circle.fill")
+                Text("Upload & Compress \(viewModel.selectedCount) Item(s)")
+                    .fontWeight(.semibold)
             }
-
-            if viewModel.selectedCount > 0 {
-                Button {
-                    viewModel.startProcessingSelectedPhotos()
-                } label: {
-                    HStack {
-                        Image(systemName: "arrow.up.circle.fill")
-                        Text("Upload & Compress \(viewModel.selectedCount) Item(s)")
-                            .fontWeight(.semibold)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(viewModel.isProcessing)
-            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 14)
         }
+        .buttonStyle(.borderedProminent)
+        .disabled(viewModel.isProcessing)
         .padding()
         .background(.ultraThinMaterial)
     }
@@ -245,7 +222,6 @@ struct LibraryView: View {
 private struct PhotoCandidateRow: View {
     let item: PhotoCandidate
     let onToggleSelect: () -> Void
-    let onDeleteOriginal: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
@@ -301,25 +277,10 @@ private struct PhotoCandidateRow: View {
             }
 
             Spacer()
-
-            if case .readyToDelete = item.state {
-                Button(role: .destructive) {
-                    onDeleteOriginal()
-                } label: {
-                    Label("Delete", systemImage: "trash.fill")
-                        .font(.caption.bold())
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.red)
-            }
         }
         .contentShape(Rectangle())
         .onTapGesture {
-            if case .readyToDelete = item.state {
-                onDeleteOriginal()
-            } else {
-                onToggleSelect()
-            }
+            onToggleSelect()
         }
         .padding(.vertical, 4)
     }

@@ -33,7 +33,7 @@ enum PhotoCompressionState: Equatable {
             return "Replacing in Photos…"
         case .readyToDelete(let savedBytes):
             let formatted = ByteCountFormatter.string(fromByteCount: max(0, savedBytes), countStyle: .file)
-            return "Backed Up • Confirm Delete (\(formatted))"
+            return "Backed Up • Confirming with iOS (\(formatted))"
         case .completed(let savedBytes):
             let formatted = ByteCountFormatter.string(fromByteCount: max(0, savedBytes), countStyle: .file)
             return "Saved \(formatted)"

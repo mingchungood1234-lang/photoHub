@@ -312,7 +312,7 @@ final class PhotoLibraryService {
                 let isActive = (UIApplication.shared.applicationState == .active)
                 guard !dialogShown && isActive else { return }
 
-                let diag = "iOS did not display the Delete confirmation dialog within 20s (Auth: \(Self.authLabel(authStatus)), Deletable: \(deletableIds.count)/\(initialFetch.count)). Ensure Settings -> photoHub -> Photos is Full Access, check Screen Time restrictions, or tap 'Retry Delete Now'."
+                let diag = "iOS did not display the Delete confirmation dialog within 20s (Auth: \(Self.authLabel(authStatus)), Deletable: \(deletableIds.count)/\(initialFetch.count)). Ensure Settings -> photoHub -> Photos is Full Access, check Screen Time restrictions, or tap 'Retry'."
                 finishOnce(.failure(PhotoLibraryError.proxyReplacementFailed(diag)))
             }
 

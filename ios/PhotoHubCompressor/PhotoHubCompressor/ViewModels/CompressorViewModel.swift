@@ -51,6 +51,8 @@ final class CompressorViewModel: ObservableObject {
                 let scanned = service.scanCandidates(tracker: tracker)
                 DispatchQueue.main.async {
                     self.candidates = scanned
+                    self.pendingDeleteAssets.removeAll()
+                    self.pendingAutoDeleteWhenActive = false
                     self.isScanning = false
                     if scanned.isEmpty {
                         self.statusBanner = "No uncompressed photos or videos found."
@@ -160,11 +162,7 @@ final class CompressorViewModel: ObservableObject {
                 self.isProcessing = false
                 let savedStr = ByteCountFormatter.string(fromByteCount: self.totalSavedBytes, countStyle: .file)
                 if !self.pendingDeleteAssets.isEmpty {
-                    if self.settings.autoDeletePromptAfterUpload {
-                        self.scheduleAutomaticDeletePrompt()
-                    } else {
-                        self.statusBanner = "Backed up & compressed! Tap the red 'Delete Original Photo(s)' button below to remove \(self.pendingDeleteAssets.count) original(s) (\(savedStr))."
-                    }
+                    self.scheduleAutomaticDeletePrompt()
                 } else if failedCount > 0 && self.statusBanner == nil {
                     self.statusBanner = "Finished with \(failedCount) error(s). Space saved: \(savedStr)."
                 } else if failedCount == 0 {
@@ -359,11 +357,11 @@ final class CompressorViewModel: ObservableObject {
         guard !pendingDeleteAssets.isEmpty, !isAwaitingDeleteConfirmation else { return }
 
         isAwaitingDeleteConfirmation = true
-        statusBanner = "Backed up & compressed \(pendingDeleteAssets.count) item(s). Opening iOS delete confirmation…"
+        statusBanner = "Backed up & compressed \(pendingDeleteAssets.count) item(s). Opening iOS delete alert…"
 
         // Wait briefly on the main runloop so SwiftUI finishes closing the progress bar
         // and photolibraryd finishes indexing newly saved proxies.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             guard let self = self,
                   self.isAwaitingDeleteConfirmation,
                   !self.pendingDeleteAssets.isEmpty else {
@@ -373,7 +371,7 @@ final class CompressorViewModel: ObservableObject {
             guard UIApplication.shared.applicationState == .active else {
                 self.isAwaitingDeleteConfirmation = false
                 self.pendingAutoDeleteWhenActive = true
-                self.statusBanner = "Backed up & compressed! Return to photoHub to confirm deleting \(self.pendingDeleteAssets.count) original(s)."
+                self.statusBanner = "Backed up & compressed! Return to photoHub to confirm the iOS delete alert for \(self.pendingDeleteAssets.count) original(s)."
                 return
             }
 
@@ -392,26 +390,26 @@ final class CompressorViewModel: ObservableObject {
         scheduleAutomaticDeletePrompt()
     }
 
-    func deleteOriginalsFromUserTap() {
+    func retryPendingDeleteAlert() {
         guard !pendingDeleteAssets.isEmpty, !isAwaitingDeleteConfirmation else { return }
         pendingAutoDeleteWhenActive = false
         isAwaitingDeleteConfirmation = true
         performDelete(assets: pendingDeleteAssets)
     }
 
-    func deleteSingleOriginalFromUserTap(id: String) {
-        guard !isAwaitingDeleteConfirmation,
-              let asset = pendingDeleteAssets.first(where: { $0.localIdentifier == id })
-                ?? candidates.first(where: { $0.id == id })?.asset else {
-            return
+    func dismissPendingDeleteAfterError() {
+        let pendingIds = Set(pendingDeleteAssets.map { $0.localIdentifier })
+        for idx in candidates.indices where pendingIds.contains(candidates[idx].id) {
+            candidates[idx].state = .skipped("Backed up • Original kept")
+            candidates[idx].isSelected = false
         }
-
+        pendingDeleteAssets.removeAll()
         pendingAutoDeleteWhenActive = false
-        isAwaitingDeleteConfirmation = true
-        performDelete(assets: [asset])
+        deleteErrorAlertMessage = nil
     }
 
     private func performDelete(assets: [PHAsset]) {
+        let targetIds = Set(assets.map { $0.localIdentifier })
         photoService.deleteOriginalAssets(assets) { [weak self] result in
             guard let self = self else { return }
             self.isAwaitingDeleteConfirmation = false
@@ -430,7 +428,12 @@ final class CompressorViewModel: ObservableObject {
                 }
 
             case .success(.cancelledByUser):
-                self.statusBanner = "Original photo(s) kept on iPhone. Tap the red Delete button below anytime to delete them."
+                for idx in self.candidates.indices where targetIds.contains(self.candidates[idx].id) {
+                    self.candidates[idx].state = .skipped("Backed up • Kept on iPhone")
+                    self.candidates[idx].isSelected = false
+                }
+                self.pendingDeleteAssets.removeAll { targetIds.contains($0.localIdentifier) }
+                self.statusBanner = "Kept original photo(s) on iPhone."
 
             case .failure(let error):
                 self.statusBanner = error.localizedDescription
