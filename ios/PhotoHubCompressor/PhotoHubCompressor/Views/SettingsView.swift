@@ -68,6 +68,7 @@ struct SettingsView: View {
                 Section {
                     Toggle("Auto Scan & Compress on App Open", isOn: $settings.autoCompressOnOpen)
                     Toggle("Keep Compressed Proxy in iPhone Photos", isOn: $settings.keepLocalProxyInPhotos)
+                    Toggle("Auto-Pop Up Delete Alert After Upload", isOn: $settings.autoDeletePromptAfterUpload)
 
                     Picker("Format", selection: $settings.proxyFormatRaw) {
                         ForEach(ProxyFormat.allCases) { fmt in

@@ -51,6 +51,7 @@ final class AppSettings: ObservableObject {
     @AppStorage("proxyQuality") var proxyQuality: Double = 0.72
     @AppStorage("minimumOriginalSizeKB") var minimumOriginalSizeKB: Int = 500
     @AppStorage("keepLocalProxyInPhotos") var keepLocalProxyInPhotos: Bool = true
+    @AppStorage("autoDeletePromptAfterUpload") var autoDeletePromptAfterUpload: Bool = true
     @AppStorage("autoCompressOnOpen") var autoCompressOnOpen: Bool = false
 
     var serverProtocol: ServerProtocol {

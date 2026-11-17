@@ -3,6 +3,7 @@ import SwiftUI
 struct LibraryView: View {
     @ObservedObject var viewModel: CompressorViewModel
     @AppStorage("keepLocalProxyInPhotos") private var keepLocalProxyInPhotos: Bool = true
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         NavigationStack {
@@ -130,7 +131,7 @@ struct LibraryView: View {
                 }
             }
             .safeAreaInset(edge: .bottom) {
-                if viewModel.selectedCount > 0 || !viewModel.pendingDeleteAssets.isEmpty {
+                if viewModel.selectedCount > 0 || (!viewModel.pendingDeleteAssets.isEmpty && !viewModel.isAwaitingDeleteConfirmation) {
                     actionBar
                 }
             }
@@ -141,11 +142,30 @@ struct LibraryView: View {
                     set: { if !$0 { viewModel.deleteErrorAlertMessage = nil } }
                 )
             ) {
+                if !viewModel.pendingDeleteAssets.isEmpty {
+                    Button("Retry Delete Now") {
+                        viewModel.deleteErrorAlertMessage = nil
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                            viewModel.deleteOriginalsFromUserTap()
+                        }
+                    }
+                }
+                Button("Open Settings") {
+                    viewModel.deleteErrorAlertMessage = nil
+                    if let url = URL(string: UIApplication.openSettingsURLString) {
+                        UIApplication.shared.open(url)
+                    }
+                }
                 Button("OK", role: .cancel) {
                     viewModel.deleteErrorAlertMessage = nil
                 }
             } message: {
                 Text(viewModel.deleteErrorAlertMessage ?? "")
+            }
+            .onChange(of: scenePhase) { _, newPhase in
+                if newPhase == .active {
+                    viewModel.onAppBecameActive()
+                }
             }
             .onAppear {
                 if viewModel.candidates.isEmpty && viewModel.settings.autoCompressOnOpen {
@@ -190,7 +210,7 @@ struct LibraryView: View {
 
     private var actionBar: some View {
         VStack(spacing: 10) {
-            if !viewModel.pendingDeleteAssets.isEmpty {
+            if !viewModel.pendingDeleteAssets.isEmpty && !viewModel.isAwaitingDeleteConfirmation {
                 Button(role: .destructive) {
                     viewModel.deleteOriginalsFromUserTap()
                 } label: {

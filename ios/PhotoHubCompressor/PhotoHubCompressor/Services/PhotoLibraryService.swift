@@ -28,6 +28,11 @@ struct ExportedMaster {
     let mimeType: String
 }
 
+enum PhotoDeleteOutcome {
+    case deleted([String])
+    case cancelledByUser
+}
+
 final class PhotoLibraryService {
     func requestAuthorization(completion: @escaping (PHAuthorizationStatus) -> Void) {
         let current = PHPhotoLibrary.authorizationStatus(for: .readWrite)
@@ -211,39 +216,156 @@ final class PhotoLibraryService {
         })
     }
 
-    /// Step 2: Must be called synchronously inside a direct SwiftUI `Button` tap action on the main thread
-    /// so iOS 18 preserves the active UIEvent user-interaction token and displays the system Delete confirmation alert.
-    func deleteOriginalAssetsFromUserTap(
+    /// Step 2: Triggers the native iOS "Allow 'photoHub' to delete..." confirmation sheet on the main thread
+    /// using a fresh PHFetchResult<PHAsset>, observing whether iOS presents the system sheet and protecting against stalls.
+    func deleteOriginalAssets(
         _ assets: [PHAsset],
-        completion: @escaping (Result<Void, Error>) -> Void
+        completion: @escaping (Result<PhotoDeleteOutcome, Error>) -> Void
     ) {
-        let ids = assets.map { $0.localIdentifier }
-        guard !ids.isEmpty else {
-            completion(.success(()))
+        let requestedIds = Array(Set(assets.map { $0.localIdentifier }))
+        guard !requestedIds.isEmpty else {
+            DispatchQueue.main.async { completion(.success(.deleted([]))) }
             return
         }
 
-        let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
-        guard fetchResult.count > 0 else {
-            completion(.success(()))
-            return
-        }
+        let startDeleteOnMain = {
+            let authStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+            guard authStatus == .authorized || authStatus == .limited else {
+                completion(.failure(PhotoLibraryError.permissionDenied))
+                return
+            }
 
-        // Call performChanges synchronously on the current (main) thread within the user's Button tap event
-        PHPhotoLibrary.shared().performChanges({
-            PHAssetChangeRequest.deleteAssets(fetchResult)
-        }, completionHandler: { deleteSuccess, deleteError in
-            DispatchQueue.main.async {
-                if deleteSuccess {
-                    completion(.success(()))
-                } else {
-                    let nsErr = deleteError as NSError?
-                    let detail = nsErr.map { "\($0.localizedDescription) [\($0.domain):\($0.code)]" }
-                        ?? "Delete confirmation was cancelled or denied by iOS."
-                    completion(.failure(PhotoLibraryError.proxyReplacementFailed(detail)))
+            let initialFetch = PHAsset.fetchAssets(withLocalIdentifiers: requestedIds, options: nil)
+            guard initialFetch.count > 0 else {
+                completion(.success(.deleted(requestedIds)))
+                return
+            }
+
+            var deletableIds: [String] = []
+            for i in 0..<initialFetch.count {
+                let asset = initialFetch.object(at: i)
+                if asset.canPerform(.delete) {
+                    deletableIds.append(asset.localIdentifier)
                 }
             }
-        })
+
+            guard !deletableIds.isEmpty else {
+                let detail: String
+                if authStatus == .limited {
+                    detail = "Photos access is set to Limited Access, which blocks deleting originals. Open iOS Settings -> photoHub -> Photos and choose Full Access."
+                } else {
+                    detail = "iOS reports \(initialFetch.count) photo(s) cannot be deleted by apps (canPerform(.delete) == false). They may be synced from a computer, in a Shared Album, or restricted by Screen Time."
+                }
+                completion(.failure(PhotoLibraryError.proxyReplacementFailed(detail)))
+                return
+            }
+
+            let deletableFetch = PHAsset.fetchAssets(withLocalIdentifiers: deletableIds, options: nil)
+            guard deletableFetch.count > 0 else {
+                completion(.success(.deleted(requestedIds)))
+                return
+            }
+
+            let lock = NSLock()
+            var hasCompleted = false
+            var didObserveSystemDialog = false
+            var resignObserver: NSObjectProtocol?
+
+            let finishOnce: (Result<PhotoDeleteOutcome, Error>) -> Void = { result in
+                lock.lock()
+                if hasCompleted {
+                    lock.unlock()
+                    return
+                }
+                hasCompleted = true
+                let observerToRemove = resignObserver
+                resignObserver = nil
+                lock.unlock()
+
+                DispatchQueue.main.async {
+                    if let observerToRemove {
+                        NotificationCenter.default.removeObserver(observerToRemove)
+                    }
+                    completion(result)
+                }
+            }
+
+            resignObserver = NotificationCenter.default.addObserver(
+                forName: UIApplication.willResignActiveNotification,
+                object: nil,
+                queue: .main
+            ) { _ in
+                lock.lock()
+                didObserveSystemDialog = true
+                lock.unlock()
+            }
+
+            // Watchdog: if iOS never presented the native sheet within 15s while staying active,
+            // surface a clear diagnostic instead of leaving the UI stuck.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15.0) {
+                lock.lock()
+                let alreadyDone = hasCompleted
+                let dialogShown = didObserveSystemDialog
+                lock.unlock()
+
+                guard !alreadyDone else { return }
+                let isActive = (UIApplication.shared.applicationState == .active)
+                guard !dialogShown && isActive else { return }
+
+                let diag = "iOS did not display the Delete confirmation dialog within 15s (Auth: \(Self.authLabel(authStatus)), Deletable: \(deletableIds.count)/\(initialFetch.count)). Ensure Settings -> photoHub -> Photos is Full Access, check Screen Time restrictions, or tap 'Retry Delete Now'."
+                finishOnce(.failure(PhotoLibraryError.proxyReplacementFailed(diag)))
+            }
+
+            PHPhotoLibrary.shared().performChanges({
+                PHAssetChangeRequest.deleteAssets(deletableFetch)
+            }, completionHandler: { deleteSuccess, deleteError in
+                DispatchQueue.main.async {
+                    let remaining = PHAsset.fetchAssets(withLocalIdentifiers: deletableIds, options: nil)
+                    if deleteSuccess && remaining.count == 0 {
+                        finishOnce(.success(.deleted(deletableIds)))
+                        return
+                    }
+
+                    lock.lock()
+                    let dialogShown = didObserveSystemDialog
+                    lock.unlock()
+
+                    if let nsErr = deleteError as NSError? {
+                        if nsErr.domain == PHPhotosErrorDomain && nsErr.code == PHPhotosError.Code.userCancelled.rawValue {
+                            finishOnce(.success(.cancelledByUser))
+                            return
+                        }
+                        let detail = "\(nsErr.localizedDescription) [\(nsErr.domain):\(nsErr.code)] (Auth: \(Self.authLabel(authStatus)), DialogShown: \(dialogShown), Deletable: \(deletableIds.count))"
+                        finishOnce(.failure(PhotoLibraryError.proxyReplacementFailed(detail)))
+                    } else if !deleteSuccess && dialogShown {
+                        finishOnce(.success(.cancelledByUser))
+                    } else if !deleteSuccess {
+                        let detail = "iOS declined deletion without presenting a confirmation dialog (Auth: \(Self.authLabel(authStatus)), Deletable: \(deletableIds.count)/\(initialFetch.count)). Check Settings -> photoHub -> Photos -> Full Access and Screen Time restrictions."
+                        finishOnce(.failure(PhotoLibraryError.proxyReplacementFailed(detail)))
+                    } else {
+                        let detail = "Delete completed, but \(remaining.count) asset(s) still remain in Photos (Auth: \(Self.authLabel(authStatus)))."
+                        finishOnce(.failure(PhotoLibraryError.proxyReplacementFailed(detail)))
+                    }
+                }
+            })
+        }
+
+        if Thread.isMainThread {
+            startDeleteOnMain()
+        } else {
+            DispatchQueue.main.async(execute: startDeleteOnMain)
+        }
+    }
+
+    private static func authLabel(_ status: PHAuthorizationStatus) -> String {
+        switch status {
+        case .authorized: return "Full Access"
+        case .limited: return "Limited Access"
+        case .denied: return "Denied"
+        case .restricted: return "Restricted"
+        case .notDetermined: return "Not Determined"
+        @unknown default: return "Unknown(\(status.rawValue))"
+        }
     }
 
     private static func pickOriginalResource(from resources: [PHAssetResource]) -> PHAssetResource? {
