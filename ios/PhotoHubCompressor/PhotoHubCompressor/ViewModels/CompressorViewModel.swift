@@ -303,6 +303,7 @@ final class CompressorViewModel: ObservableObject {
                                     uploadedAt: nowISO,
                                     savedPath: checkResult.savedPath ?? master.filename,
                                     hasProxy: true,
+                                    hasPreview: previewFileForServer != nil,
                                     proxyHash: proxy.sha256,
                                     proxySize: candidate.mediaType == .video ? posterSize : proxy.sizeBytes,
                                     hasVideoProxy: candidate.mediaType == .video,

@@ -42,6 +42,7 @@ struct ServerPhoto: Codable, Identifiable, Hashable {
     let uploadedAt: String
     let savedPath: String
     let hasProxy: Bool?
+    let hasPreview: Bool?
     let proxyHash: String?
     let proxySize: Int64?
     let hasVideoProxy: Bool?
@@ -53,11 +54,16 @@ struct ServerPhoto: Codable, Identifiable, Hashable {
         let ext = URL(fileURLWithPath: originalName).pathExtension.lowercased()
         return ["mov", "mp4", "m4v", "3gp", "avi"].contains(ext)
     }
+
+    var needsProxy: Bool {
+        (hasProxy != true) || (hasPreview == false)
+    }
 }
 
 private struct ServerPhotosResponse: Decodable {
     let success: Bool
     let total: Int
+    let hasMore: Bool?
     let photos: [ServerPhoto]
 }
 
@@ -185,12 +191,51 @@ final class PhotoHubAPIClient {
         return try JSONDecoder().decode(WhoAmIResponse.self, from: data)
     }
 
-    func fetchServerPhotos(limit: Int = 200, offset: Int = 0) async throws -> [ServerPhoto] {
+    func fetchServerPhotos(limit: Int = 500, offset: Int = 0, sync: Bool = false) async throws -> [ServerPhoto] {
+        let page = try await fetchServerPhotosPage(limit: limit, offset: offset, sync: sync)
+        return page.photos
+    }
+
+    func fetchAllServerPhotos(sync: Bool = true) async throws -> [ServerPhoto] {
+        var collected: [ServerPhoto] = []
+        var seenHashes = Set<String>()
+        var offset = 0
+        let pageSize = 500
+
+        while true {
+            let page = try await fetchServerPhotosPage(
+                limit: pageSize,
+                offset: offset,
+                sync: sync && offset == 0
+            )
+            for item in page.photos {
+                let key = item.hash.lowercased()
+                if seenHashes.insert(key).inserted {
+                    collected.append(item)
+                }
+            }
+            if page.photos.isEmpty {
+                break
+            }
+            offset += page.photos.count
+            let serverHasMore = page.hasMore ?? (offset < page.total)
+            if !serverHasMore || offset >= page.total {
+                break
+            }
+        }
+        return collected
+    }
+
+    private func fetchServerPhotosPage(limit: Int, offset: Int, sync: Bool) async throws -> ServerPhotosResponse {
         var components = URLComponents(url: try makeURL("/api/photos"), resolvingAgainstBaseURL: false)
-        components?.queryItems = [
+        var queryItems = [
             URLQueryItem(name: "limit", value: String(limit)),
             URLQueryItem(name: "offset", value: String(offset)),
         ]
+        if sync {
+            queryItems.append(URLQueryItem(name: "sync", value: "1"))
+        }
+        components?.queryItems = queryItems
         guard let url = components?.url else {
             throw APIClientError.invalidServerURL
         }
@@ -202,8 +247,104 @@ final class PhotoHubAPIClient {
         defer { session.finishTasksAndInvalidate() }
         let (data, response) = try await session.data(for: request)
         try validateHTTP(response: response, data: data)
-        let decoded = try JSONDecoder().decode(ServerPhotosResponse.self, from: data)
-        return decoded.photos
+        return try JSONDecoder().decode(ServerPhotosResponse.self, from: data)
+    }
+
+    /// Downloads an un-proxied master from the server, generates a compressed proxy using Settings,
+    /// registers it back onto the server, and stores the local preview / MP4 proxy in `LocalProxyStore`.
+    func createAndRegisterProxy(for photo: ServerPhoto) async throws -> ServerPhoto {
+        let masterURL = try await downloadMasterToTempFile(
+            hash: photo.hash,
+            preferredFilename: photo.originalName
+        )
+        defer { cleanupTempShareURL(masterURL) }
+
+        let proxy: GeneratedProxy
+        let previewURL: URL?
+        let previewFormat: String
+        let videoProxyURL: URL?
+
+        if photo.isVideo {
+            proxy = try await ProxyGenerator.createVideoProxy(from: masterURL)
+            previewURL = proxy.posterFileURL
+            previewFormat = "jpeg"
+            videoProxyURL = proxy.fileURL
+        } else {
+            proxy = try ProxyGenerator.createProxy(
+                from: masterURL,
+                format: settings.proxyFormat,
+                maxPixelSize: settings.proxyMaxPixelSize,
+                quality: settings.proxyQuality
+            )
+            previewURL = proxy.fileURL
+            previewFormat = settings.proxyFormat.rawValue
+            videoProxyURL = nil
+        }
+
+        defer {
+            try? FileManager.default.removeItem(at: proxy.fileURL)
+            if let posterURL = proxy.posterFileURL {
+                try? FileManager.default.removeItem(at: posterURL)
+            }
+        }
+        cleanupTempShareURL(masterURL)
+
+        try await registerProxy(
+            masterHash: photo.hash,
+            proxyHash: proxy.sha256,
+            assetId: "",
+            proxyFileURL: previewURL,
+            proxyFormat: previewFormat,
+            videoProxyURL: videoProxyURL
+        )
+
+        if let previewURL {
+            LocalProxyStore.shared.copyPreviewFile(from: previewURL, forHash: photo.hash)
+        }
+        if photo.isVideo {
+            LocalProxyStore.shared.copyVideoProxy(from: proxy.fileURL, forHash: photo.hash)
+        }
+
+        let posterSize: Int64? = {
+            guard let previewURL,
+                  let values = try? previewURL.resourceValues(forKeys: [.fileSizeKey]),
+                  let size = values.fileSize else {
+                return nil
+            }
+            return Int64(size)
+        }()
+
+        let uploadedVideo: Bool = {
+            guard let videoProxyURL,
+                  let values = try? videoProxyURL.resourceValues(forKeys: [.fileSizeKey]),
+                  let size = values.fileSize else {
+                return false
+            }
+            return size > 0 && size <= 25 * 1024 * 1024
+        }()
+
+        let updated = ServerPhoto(
+            hash: photo.hash,
+            originalName: photo.originalName,
+            size: photo.size,
+            photoDate: photo.photoDate,
+            uploadedAt: photo.uploadedAt,
+            savedPath: photo.savedPath,
+            hasProxy: true,
+            hasPreview: previewURL != nil,
+            proxyHash: proxy.sha256,
+            proxySize: photo.isVideo ? posterSize : proxy.sizeBytes,
+            hasVideoProxy: photo.isVideo ? (uploadedVideo || photo.hasVideoProxy == true) : photo.hasVideoProxy,
+            videoProxySize: photo.isVideo ? proxy.sizeBytes : photo.videoProxySize
+        )
+
+        LocalProxyStore.shared.updatePhoto(
+            updated,
+            baseURL: settings.normalizedBaseURL,
+            apiKey: settings.apiKey,
+            notify: false
+        )
+        return updated
     }
 
     func downloadPhotoPreviewData(hash: String) async throws -> Data {

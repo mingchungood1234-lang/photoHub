@@ -626,7 +626,10 @@ async function createApp(configOverrides = {}) {
   app.get('/api/photos', async (req, res) => {
     try {
       const { hashIndex, folderName } = req.userContext;
-      const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 200));
+      if (req.query.sync === '1' || req.query.sync === 'true') {
+        await hashIndex.syncStorageDir();
+      }
+      const limit = Math.min(1000, Math.max(1, Number(req.query.limit) || 200));
       const offset = Math.max(0, Number(req.query.offset) || 0);
       const all = hashIndex.listMasters();
       const photos = all.slice(offset, offset + limit);
@@ -634,6 +637,7 @@ async function createApp(configOverrides = {}) {
         success: true,
         userFolder: folderName,
         total: all.length,
+        hasMore: offset + photos.length < all.length,
         photos,
       });
     } catch (err) {
@@ -644,7 +648,7 @@ async function createApp(configOverrides = {}) {
     }
   });
 
-  // Stream small compressed preview (proxy) when available, falling back to master
+  // Stream small compressed preview (proxy) when available, falling back to master for images
   app.get('/api/photo/:hash/preview', async (req, res) => {
     try {
       const { hashIndex, storageDir } = req.userContext;
@@ -666,6 +670,15 @@ async function createApp(configOverrides = {}) {
         }
       }
 
+      const ext = path.extname(record.originalName || record.relativePath || '').toLowerCase();
+      if (['.mov', '.mp4', '.m4v', '.3gp', '.avi'].includes(ext)) {
+        return res.status(404).json({
+          success: false,
+          needsProxy: true,
+          error: 'Compressed video preview not created yet',
+        });
+      }
+
       if (record.storageType === 's3' && isS3Configured(config.s3)) {
         const downloadUrl = createPresignedUrl({
           s3Config: config.s3,
@@ -677,6 +690,12 @@ async function createApp(configOverrides = {}) {
       }
 
       const fullPath = path.join(storageDir, record.relativePath);
+      if (!fs.existsSync(fullPath)) {
+        return res.status(404).json({
+          success: false,
+          error: 'Photo file not found on disk',
+        });
+      }
       res.setHeader('X-Photo-Variant', 'master');
       res.setHeader('X-Master-Sha256', lookupResult.masterHash);
       return fs.createReadStream(fullPath).pipe(res);

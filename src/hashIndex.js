@@ -25,6 +25,7 @@ class HashIndex {
     this.records = new Map(); // sha256 -> { hash, relativePath, originalName, size, photoDate, uploadedAt, proxyHash? }
     this.proxyToMaster = new Map(); // proxySha256 -> masterSha256
     this.writePromise = Promise.resolve();
+    this.syncPromise = null;
   }
 
   async init() {
@@ -73,54 +74,73 @@ class HashIndex {
    * and removes stale index entries whose files were deleted manually.
    */
   async syncStorageDir() {
-    let changed = false;
-    const indexedPaths = new Set();
-
-    for (const [hash, entry] of this.records.entries()) {
-      const fullPath = path.join(this.storageDir, entry.relativePath);
-      try {
-        const stat = await fsp.stat(fullPath);
-        if (!stat.isFile() || (entry.size && stat.size !== entry.size)) {
-          this.records.delete(hash);
-          changed = true;
-        } else {
-          indexedPaths.add(path.normalize(entry.relativePath));
-        }
-      } catch {
-        this.records.delete(hash);
-        changed = true;
-      }
+    if (this.syncPromise) {
+      return this.syncPromise;
     }
 
-    const walk = async (dir) => {
-      const entries = await fsp.readdir(dir, { withFileTypes: true });
-      for (const d of entries) {
-        const fullPath = path.join(dir, d.name);
-        if (d.isDirectory()) {
-          if (d.name === '.proxies') continue;
-          await walk(fullPath);
-        } else if (d.isFile() && !d.name.endsWith('.tmp')) {
-          const relPath = path.normalize(path.relative(this.storageDir, fullPath));
-          if (!indexedPaths.has(relPath)) {
-            const stat = await fsp.stat(fullPath);
-            const hash = await computeFileSha256(fullPath);
-            this.records.set(hash, {
-              hash,
-              relativePath: relPath.split(path.sep).join('/'),
-              originalName: d.name,
-              size: stat.size,
-              photoDate: stat.mtime.toISOString().slice(0, 10),
-              uploadedAt: (stat.birthtime || stat.mtime).toISOString(),
-            });
-            changed = true;
+    this.syncPromise = (async () => {
+      let changed = false;
+      const indexedPaths = new Set();
+
+      for (const [hash, entry] of this.records.entries()) {
+        if (entry && entry.storageType === 's3') {
+          if (entry.relativePath) {
+            indexedPaths.add(path.normalize(entry.relativePath));
           }
+          continue;
+        }
+        const fullPath = path.join(this.storageDir, entry.relativePath);
+        try {
+          const stat = await fsp.stat(fullPath);
+          if (!stat.isFile() || (entry.size && stat.size !== entry.size)) {
+            this.records.delete(hash);
+            changed = true;
+          } else {
+            indexedPaths.add(path.normalize(entry.relativePath));
+          }
+        } catch {
+          this.records.delete(hash);
+          changed = true;
         }
       }
-    };
 
-    await walk(this.storageDir);
-    if (changed) {
-      await this.persist();
+      const walk = async (dir) => {
+        const entries = await fsp.readdir(dir, { withFileTypes: true });
+        for (const d of entries) {
+          if (d.name.startsWith('.')) continue;
+          const fullPath = path.join(dir, d.name);
+          if (d.isDirectory()) {
+            await walk(fullPath);
+          } else if (d.isFile() && !d.name.endsWith('.tmp')) {
+            const relPath = path.normalize(path.relative(this.storageDir, fullPath));
+            if (!indexedPaths.has(relPath)) {
+              const stat = await fsp.stat(fullPath);
+              const hash = await computeFileSha256(fullPath);
+              this.records.set(hash, {
+                hash,
+                relativePath: relPath.split(path.sep).join('/'),
+                originalName: d.name,
+                size: stat.size,
+                photoDate: stat.mtime.toISOString().slice(0, 10),
+                uploadedAt: (stat.birthtime || stat.mtime).toISOString(),
+              });
+              indexedPaths.add(relPath);
+              changed = true;
+            }
+          }
+        }
+      };
+
+      await walk(this.storageDir);
+      if (changed) {
+        await this.persist();
+      }
+    })();
+
+    try {
+      await this.syncPromise;
+    } finally {
+      this.syncPromise = null;
     }
   }
 
@@ -271,7 +291,8 @@ class HashIndex {
         photoDate: entry.photoDate || '',
         uploadedAt: entry.uploadedAt || '',
         savedPath: entry.relativePath,
-        hasProxy: Boolean(entry.proxyHash),
+        hasProxy: Boolean(entry.proxyHash || entry.proxyRelativePath),
+        hasPreview: Boolean(entry.proxyRelativePath),
         proxyHash: entry.proxyHash || null,
         proxySize: entry.proxySize || null,
         hasVideoProxy: Boolean(entry.videoProxyRelativePath),

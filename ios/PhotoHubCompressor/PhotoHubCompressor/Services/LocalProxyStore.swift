@@ -79,6 +79,28 @@ final class LocalProxyStore {
     }
 
     func upsertPhoto(_ photo: ServerPhoto, baseURL: URL?, apiKey: String) {
+        mutateIndex(baseURL: baseURL, apiKey: apiKey, notify: true) { current in
+            current.removeAll { $0.hash.lowercased() == photo.hash.lowercased() }
+            current.insert(photo, at: 0)
+        }
+    }
+
+    func updatePhoto(_ photo: ServerPhoto, baseURL: URL?, apiKey: String, notify: Bool = false) {
+        mutateIndex(baseURL: baseURL, apiKey: apiKey, notify: notify) { current in
+            if let idx = current.firstIndex(where: { $0.hash.lowercased() == photo.hash.lowercased() }) {
+                current[idx] = photo
+            } else {
+                current.insert(photo, at: 0)
+            }
+        }
+    }
+
+    private func mutateIndex(
+        baseURL: URL?,
+        apiKey: String,
+        notify: Bool,
+        _ transform: (inout [ServerPhoto]) -> Void
+    ) {
         lock.lock()
         ensureDirectoriesExistLocked()
         let url = indexFileURL(baseURL: baseURL, apiKey: apiKey)
@@ -87,15 +109,16 @@ final class LocalProxyStore {
            let decoded = try? JSONDecoder().decode([ServerPhoto].self, from: existingData) {
             current = decoded
         }
-        current.removeAll { $0.hash.lowercased() == photo.hash.lowercased() }
-        current.insert(photo, at: 0)
+        transform(&current)
         if let encoded = try? JSONEncoder().encode(current) {
             try? encoded.write(to: url, options: .atomic)
         }
         lock.unlock()
 
-        DispatchQueue.main.async {
-            NotificationCenter.default.post(name: .localProxyStoreDidChange, object: nil)
+        if notify {
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .localProxyStoreDidChange, object: nil)
+            }
         }
     }
 

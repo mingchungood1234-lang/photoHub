@@ -354,8 +354,10 @@ test('iOS Proxy-Replacement Workflow: strict checksum, proxy registration, batch
     const listBody = await listRes.json();
     assert.equal(listBody.success, true);
     assert.equal(listBody.total, 1);
+    assert.equal(listBody.hasMore, false);
     assert.equal(listBody.photos[0].hash, masterHash);
     assert.equal(listBody.photos[0].hasProxy, true);
+    assert.equal(listBody.photos[0].hasPreview, false);
     assert.equal(listBody.photos[0].proxyHash, proxyHash);
     assert.equal(listBody.photos[0].hasVideoProxy, true);
     assert.equal(listBody.photos[0].videoProxySize, Buffer.from('FAKE_MP4_PROXY_STREAM').length);
@@ -456,5 +458,76 @@ test('iOS Proxy-Replacement Workflow: strict checksum, proxy registration, batch
       await s3Ctx.cleanup();
       await new Promise((resolve) => mockS3.close(resolve));
     }
+  });
+
+  await t.test('6. GET /api/photos?sync=1 discovers all server disk files, paginates cleanly, and guards un-proxied video /preview', async () => {
+    const manualPhotoDir = path.join(ctx.storageDir, '2026', '2026-11-18');
+    await fsp.mkdir(manualPhotoDir, { recursive: true });
+    const rawPhotoBytes = Buffer.from('MANUAL_SERVER_JPG_BYTES');
+    const rawVideoBytes = Buffer.from('MANUAL_SERVER_MOV_BYTES_RAW_STREAM');
+    await fsp.writeFile(path.join(manualPhotoDir, 'MANUAL_001.JPG'), rawPhotoBytes);
+    await fsp.writeFile(path.join(manualPhotoDir, 'MANUAL_002.MOV'), rawVideoBytes);
+    await fsp.writeFile(path.join(manualPhotoDir, '.DS_Store'), Buffer.from('junk'));
+
+    const page1Res = await ctx.request('/api/photos?sync=1&limit=2&offset=0');
+    assert.equal(page1Res.status, 200);
+    const page1 = await page1Res.json();
+    assert.equal(page1.success, true);
+    assert.equal(page1.total, 3);
+    assert.equal(page1.hasMore, true);
+    assert.equal(page1.photos.length, 2);
+
+    const page2Res = await ctx.request('/api/photos?limit=2&offset=2');
+    assert.equal(page2Res.status, 200);
+    const page2 = await page2Res.json();
+    assert.equal(page2.hasMore, false);
+    assert.equal(page2.photos.length, 1);
+
+    const allItems = [...page1.photos, ...page2.photos];
+    const manualPhoto = allItems.find((p) => p.originalName === 'MANUAL_001.JPG');
+    const manualVideo = allItems.find((p) => p.originalName === 'MANUAL_002.MOV');
+    assert.ok(manualPhoto, 'Manual JPG on disk should be discovered');
+    assert.ok(manualVideo, 'Manual MOV on disk should be discovered');
+    assert.equal(allItems.some((p) => p.originalName === '.DS_Store'), false);
+    assert.equal(manualPhoto.hasProxy, false);
+    assert.equal(manualPhoto.hasPreview, false);
+    assert.equal(manualVideo.hasProxy, false);
+    assert.equal(manualVideo.hasPreview, false);
+
+    // Un-proxied image falls back to master bytes on /preview; un-proxied video refuses raw stream with 404 needsProxy
+    const imgPrevRes = await ctx.request(`/api/photo/${manualPhoto.hash}/preview`);
+    assert.equal(imgPrevRes.status, 200);
+    assert.equal(imgPrevRes.headers['x-photo-variant'], 'master');
+    assert.equal(imgPrevRes.buffer.toString('utf8'), 'MANUAL_SERVER_JPG_BYTES');
+
+    const vidPrevRes = await ctx.request(`/api/photo/${manualVideo.hash}/preview`);
+    assert.equal(vidPrevRes.status, 404);
+    const vidPrevJson = await vidPrevRes.json();
+    assert.equal(vidPrevJson.needsProxy, true);
+
+    // Register a proxy afterwards and confirm /photos + /preview reflect proxied state
+    const manualProxyHash = crypto.createHash('sha256').update('SMALL_JPG_PROXY').digest('hex');
+    const regManual = await ctx.request('/api/proxy/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        masterHash: manualPhoto.hash,
+        proxyHash: manualProxyHash,
+        proxyFormat: 'jpeg',
+        proxyBase64: Buffer.from('SMALL_JPG_PROXY').toString('base64'),
+      }),
+    });
+    assert.equal(regManual.status, 200);
+
+    const afterRes = await ctx.request('/api/photos');
+    const afterBody = await afterRes.json();
+    const updatedManualPhoto = afterBody.photos.find((p) => p.hash === manualPhoto.hash);
+    assert.equal(updatedManualPhoto.hasProxy, true);
+    assert.equal(updatedManualPhoto.hasPreview, true);
+
+    const cachedPrevRes = await ctx.request(`/api/photo/${manualPhoto.hash}/preview`);
+    assert.equal(cachedPrevRes.status, 200);
+    assert.equal(cachedPrevRes.headers['x-photo-variant'], 'proxy');
+    assert.equal(cachedPrevRes.buffer.toString('utf8'), 'SMALL_JPG_PROXY');
   });
 });
