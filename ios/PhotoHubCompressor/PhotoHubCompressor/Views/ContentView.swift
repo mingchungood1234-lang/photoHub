@@ -28,5 +28,8 @@ struct ContentView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .ignoresSafeArea(.keyboard, edges: .bottom)
+        .onAppear {
+            LocalProxySyncManager.shared.syncFromServerOnLaunch(settings: settings)
+        }
     }
 }

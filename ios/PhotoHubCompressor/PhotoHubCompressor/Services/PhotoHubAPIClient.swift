@@ -290,7 +290,15 @@ final class PhotoHubAPIClient {
         if let serverUpdated = try? await generateProxyOnServer(for: photo) {
             if let previewData = try? await downloadPhotoPreviewData(hash: serverUpdated.hash),
                !previewData.isEmpty {
-                LocalProxyStore.shared.savePreviewData(previewData, forHash: serverUpdated.hash)
+                _ = LocalProxyStore.shared.cacheDownloadedPreview(previewData, forHash: serverUpdated.hash)
+            }
+            if settings.autoDownloadLocalVideos,
+               serverUpdated.isVideo,
+               serverUpdated.hasVideoProxy == true,
+               LocalProxyStore.shared.videoProxyURLIfExists(forHash: serverUpdated.hash) == nil,
+               let tempVideo = try? await downloadVideoProxyToTempFile(hash: serverUpdated.hash) {
+                _ = LocalProxyStore.shared.copyVideoProxy(from: tempVideo, forHash: serverUpdated.hash)
+                cleanupTempShareURL(tempVideo)
             }
             LocalProxyStore.shared.updatePhoto(
                 serverUpdated,

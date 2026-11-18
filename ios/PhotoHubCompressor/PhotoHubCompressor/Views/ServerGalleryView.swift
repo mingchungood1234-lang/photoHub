@@ -1,5 +1,4 @@
 import AVKit
-import ImageIO
 import Photos
 import SwiftUI
 
@@ -12,6 +11,7 @@ private enum ServerGalleryFilter: String, CaseIterable, Identifiable {
 
 struct ServerGalleryView: View {
     @ObservedObject var settings: AppSettings
+    @ObservedObject private var syncManager = LocalProxySyncManager.shared
 
     @State private var photos: [ServerPhoto] = []
     @State private var isLoading: Bool = false
@@ -100,6 +100,22 @@ struct ServerGalleryView: View {
                                 unproxiedBannerView
                                     .padding(.horizontal)
                                     .padding(.top, 4)
+                            }
+
+                            if syncManager.isSyncing && syncManager.totalCount > 0 {
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                    Text("Auto-downloading local proxies (\(syncManager.completedCount)/\(syncManager.totalCount))...")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                    Button("Stop") {
+                                        syncManager.cancel()
+                                    }
+                                    .font(.caption)
+                                }
+                                .padding(.horizontal)
+                                .padding(.top, 2)
                             }
 
                             if !unproxiedPhotos.isEmpty {
@@ -409,6 +425,7 @@ struct ServerGalleryView: View {
                 failedPreviewHashes.remove(photo.hash)
             }
             errorMessage = nil
+            LocalProxySyncManager.shared.startPrefetchIfNeeded(for: fetched, settings: settings)
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -433,11 +450,10 @@ struct ServerGalleryView: View {
 
         let client = PhotoHubAPIClient(settings: settings)
         if let rawData = try? await client.downloadPhotoPreviewData(hash: photo.hash),
-           let (smallImage, smallData) = Self.makeSmallCompressedPreview(from: rawData, maxPixelSize: 800, quality: 0.65) {
+           let (smallImage, smallData) = LocalProxyStore.shared.cacheDownloadedPreview(rawData, forHash: photo.hash) {
             imageCache[photo.hash] = smallImage
             compressedDataCache[photo.hash] = smallData
             failedPreviewHashes.remove(photo.hash)
-            LocalProxyStore.shared.savePreviewData(smallData, forHash: photo.hash)
         } else {
             failedPreviewHashes.insert(photo.hash)
         }
@@ -502,33 +518,6 @@ struct ServerGalleryView: View {
         } catch {
             pickerErrorMessage = "Download failed: \(error.localizedDescription)"
         }
-    }
-
-    static func makeSmallCompressedPreview(
-        from data: Data,
-        maxPixelSize: Int = 800,
-        quality: CGFloat = 0.65
-    ) -> (UIImage, Data)? {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
-            guard let img = UIImage(data: data),
-                  let jpg = img.jpegData(compressionQuality: quality) else { return nil }
-            return (UIImage(data: jpg) ?? img, jpg)
-        }
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
-        ]
-        guard let cgImg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
-            return nil
-        }
-        let uiImg = UIImage(cgImage: cgImg)
-        guard let smallJpg = uiImg.jpegData(compressionQuality: quality),
-              let decodedSmall = UIImage(data: smallJpg) else {
-            return nil
-        }
-        return (decodedSmall, smallJpg)
     }
 }
 
@@ -784,10 +773,9 @@ private struct ServerPhotoDetailView: View {
                     } else if !(currentPhoto.isVideo && currentPhoto.needsProxy) {
                         let client = PhotoHubAPIClient(settings: settings)
                         if let rawData = try? await client.downloadPhotoPreviewData(hash: currentPhoto.hash),
-                           let (smallImg, smallJpg) = ServerGalleryView.makeSmallCompressedPreview(from: rawData, maxPixelSize: 800, quality: 0.65) {
+                           let (smallImg, smallJpg) = LocalProxyStore.shared.cacheDownloadedPreview(rawData, forHash: currentPhoto.hash) {
                             previewImage = smallImg
                             compressedData = smallJpg
-                            LocalProxyStore.shared.savePreviewData(smallJpg, forHash: currentPhoto.hash)
                         }
                     }
                 }
@@ -922,7 +910,7 @@ private struct ServerPhotoDetailView: View {
         if dataToSave == nil {
             let client = PhotoHubAPIClient(settings: settings)
             if let raw = try? await client.downloadPhotoPreviewData(hash: currentPhoto.hash) {
-                dataToSave = ServerGalleryView.makeSmallCompressedPreview(from: raw, maxPixelSize: 800, quality: 0.65)?.1 ?? raw
+                dataToSave = LocalProxyStore.makeSmallCompressedPreview(from: raw, maxPixelSize: 800, quality: 0.65)?.1 ?? raw
             }
         }
         guard let dataToSave else {

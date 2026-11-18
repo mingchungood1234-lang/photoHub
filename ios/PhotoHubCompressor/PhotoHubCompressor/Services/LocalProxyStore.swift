@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import ImageIO
 import UIKit
 
 extension Notification.Name {
@@ -147,6 +148,51 @@ final class LocalProxyStore {
     func copyPreviewFile(from sourceURL: URL, forHash hash: String) {
         guard let data = try? Data(contentsOf: sourceURL), !data.isEmpty else { return }
         savePreviewData(data, forHash: hash)
+    }
+
+    @discardableResult
+    func cacheDownloadedPreview(
+        _ rawData: Data,
+        forHash hash: String,
+        maxPixelSize: Int = 800,
+        quality: CGFloat = 0.65
+    ) -> (UIImage, Data)? {
+        guard let (smallImg, smallData) = Self.makeSmallCompressedPreview(
+            from: rawData,
+            maxPixelSize: maxPixelSize,
+            quality: quality
+        ) else {
+            return nil
+        }
+        savePreviewData(smallData, forHash: hash)
+        return (smallImg, smallData)
+    }
+
+    static func makeSmallCompressedPreview(
+        from data: Data,
+        maxPixelSize: Int = 800,
+        quality: CGFloat = 0.65
+    ) -> (UIImage, Data)? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+            guard let img = UIImage(data: data),
+                  let jpg = img.jpegData(compressionQuality: quality) else { return nil }
+            return (UIImage(data: jpg) ?? img, jpg)
+        }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+        ]
+        guard let cgImg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+            return nil
+        }
+        let uiImg = UIImage(cgImage: cgImg)
+        guard let smallJpg = uiImg.jpegData(compressionQuality: quality),
+              let decodedSmall = UIImage(data: smallJpg) else {
+            return nil
+        }
+        return (decodedSmall, smallJpg)
     }
 
     // MARK: - Compressed Video Proxies (.mp4)

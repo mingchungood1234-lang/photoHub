@@ -52,6 +52,8 @@ final class AppSettings: ObservableObject {
     @AppStorage("minimumOriginalSizeKB") var minimumOriginalSizeKB: Int = 500
     @AppStorage("keepLocalProxyInPhotos") var keepLocalProxyInPhotos: Bool = true
     @AppStorage("autoCompressOnOpen") var autoCompressOnOpen: Bool = false
+    @AppStorage("autoDownloadLocalProxies") var autoDownloadLocalProxies: Bool = true
+    @AppStorage("autoDownloadLocalVideos") var autoDownloadLocalVideos: Bool = true
 
     var serverProtocol: ServerProtocol {
         get { ServerProtocol(rawValue: serverProtocolRaw) ?? .http }

@@ -147,7 +147,13 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
                     }
 
+                    Toggle("Auto-Download Proxied Photos Locally", isOn: $settings.autoDownloadLocalProxies)
+
+                    Toggle("Auto-Download Compressed Videos (.mp4)", isOn: $settings.autoDownloadLocalVideos)
+                        .disabled(!settings.autoDownloadLocalProxies)
+
                     Button(role: .destructive) {
+                        LocalProxySyncManager.shared.cancel()
                         LocalProxyStore.shared.clearAll()
                         localProxyCacheBytes = LocalProxyStore.shared.totalStorageBytes()
                     } label: {
