@@ -23,7 +23,12 @@ private enum BatchProxyOutcome: Sendable {
 
 struct ServerGalleryView: View {
     @ObservedObject var settings: AppSettings
-    @ObservedObject private var syncManager = LocalProxySyncManager.shared
+    @ObservedObject private var syncManager: LocalProxySyncManager
+
+    init(settings: AppSettings) {
+        self.settings = settings
+        self._syncManager = ObservedObject(wrappedValue: LocalProxySyncManager.shared)
+    }
 
     @State private var photos: [ServerPhoto] = []
     @State private var isLoading: Bool = false

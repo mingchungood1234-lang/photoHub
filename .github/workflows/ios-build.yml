@@ -22,13 +22,18 @@ jobs:
 
       - name: Select Xcode
         run: |
-          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          if [ -d /Applications/Xcode.app/Contents/Developer ]; then
+            sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          else
+            XCODE_APP=$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)
+            sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          fi
           xcodebuild -version
 
       - name: Generate Xcode project with XcodeGen
         working-directory: ios/PhotoHubCompressor
         run: |
-          brew install xcodegen
+          command -v xcodegen >/dev/null 2>&1 || HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
           rm -rf PhotoHubCompressor.xcodeproj
           xcodegen generate
 
