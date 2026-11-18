@@ -39,7 +39,8 @@ jobs:
 
       - name: Build unsigned iOS device app (.app)
         run: |
-          xcodebuild \
+          set -o pipefail
+          if ! xcodebuild \
             -project ios/PhotoHubCompressor/PhotoHubCompressor.xcodeproj \
             -scheme PhotoHubCompressor \
             -configuration Release \
@@ -48,7 +49,21 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
-            clean build
+            clean build 2>&1 | tee build.log; then
+            echo "=== XCODEBUILD ERRORS ==="
+            ERRORS=$(grep -nE -A 2 "error:|fatal error:" build.log | head -n 80 || true)
+            if [ -z "$ERRORS" ]; then
+              ERRORS=$(tail -n 80 build.log)
+            fi
+            echo "$ERRORS"
+            {
+              echo "### xcodebuild Failed (exit code 65)"
+              echo '```'
+              echo "$ERRORS"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 65
+          fi
 
       - name: Verify Info.plist privacy keys are in the built app
         run: |

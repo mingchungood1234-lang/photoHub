@@ -137,6 +137,7 @@ struct PhotoPickerSheet: UIViewControllerRepresentable {
 
     func updateUIViewController(_ uiViewController: PHPickerViewController, context: Context) {}
 
+    @MainActor
     final class Coordinator: NSObject, PHPickerViewControllerDelegate {
         private let onPick: (PickedMediaResult) -> Void
         private let onCancel: () -> Void
