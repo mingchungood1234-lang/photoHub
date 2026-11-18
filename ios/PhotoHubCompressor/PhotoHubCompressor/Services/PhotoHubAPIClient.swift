@@ -39,6 +39,7 @@ struct ServerPhoto: Codable, Identifiable, Hashable, Sendable {
     let originalName: String
     let size: Int64
     let photoDate: String
+    let takenAt: String?
     let uploadedAt: String
     let savedPath: String
     let hasProxy: Bool?
@@ -60,10 +61,16 @@ struct ServerPhoto: Codable, Identifiable, Hashable, Sendable {
     }
 
     var parsedCreationDate: Date? {
-        Self.parseDate(photoDate) ?? Self.parseDate(uploadedAt)
+        Self.parseDate(takenAt)
+            ?? Self.parseDate(photoDate)
+            ?? Self.parseDayFromSavedPath(savedPath)
+            ?? Self.parseDate(uploadedAt)
     }
 
     private static let dateParserLock = NSLock()
+    private static let pathDayRegex = try? NSRegularExpression(
+        pattern: #"(?:^|/)(\d{4})[-_/](\d{2})[-_/](\d{2})(?:/|$)"#
+    )
     private static let isoWithFractionFormatter: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -81,7 +88,22 @@ struct ServerPhoto: Codable, Identifiable, Hashable, Sendable {
         return f
     }()
 
-    private static func parseDate(_ raw: String) -> Date? {
+    private static func parseDayFromSavedPath(_ savedPath: String) -> Date? {
+        guard let regex = pathDayRegex else { return nil }
+        let norm = savedPath.replacingOccurrences(of: "\\", with: "/")
+        let nsRange = NSRange(norm.startIndex..<norm.endIndex, in: norm)
+        guard let match = regex.firstMatch(in: norm, range: nsRange),
+              match.numberOfRanges >= 4,
+              let rY = Range(match.range(at: 1), in: norm),
+              let rM = Range(match.range(at: 2), in: norm),
+              let rD = Range(match.range(at: 3), in: norm) else {
+            return nil
+        }
+        return parseDate("\(norm[rY])-\(norm[rM])-\(norm[rD])")
+    }
+
+    private static func parseDate(_ raw: String?) -> Date? {
+        guard let raw else { return nil }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         dateParserLock.lock()
@@ -411,6 +433,7 @@ final class PhotoHubAPIClient {
             originalName: photo.originalName,
             size: photo.size,
             photoDate: photo.photoDate,
+            takenAt: photo.takenAt,
             uploadedAt: photo.uploadedAt,
             savedPath: photo.savedPath,
             hasProxy: true,

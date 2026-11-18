@@ -35,10 +35,21 @@ function sanitizeFilename(rawName, mimeType, fallbackHash) {
 
 function parseDateFolder(rawDate) {
   let date = new Date();
-  if (rawDate) {
-    const parsed = new Date(rawDate);
-    if (!Number.isNaN(parsed.getTime())) {
-      date = parsed;
+  let hasExplicitTime = true;
+  if (rawDate !== undefined && rawDate !== null && String(rawDate).trim() !== '') {
+    const rawStr = String(rawDate).trim();
+    const ymdMatch = rawStr.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (ymdMatch) {
+      const y = Number(ymdMatch[1]);
+      const m = Number(ymdMatch[2]);
+      const d = Number(ymdMatch[3]);
+      date = new Date(y, m - 1, d, 12, 0, 0, 0);
+      hasExplicitTime = false;
+    } else {
+      const parsed = new Date(rawStr);
+      if (!Number.isNaN(parsed.getTime())) {
+        date = parsed;
+      }
     }
   }
   const yyyy = String(date.getFullYear());
@@ -48,6 +59,7 @@ function parseDateFolder(rawDate) {
     year: yyyy,
     dateFolder: `${yyyy}-${mm}-${dd}`,
     dateObj: date,
+    takenAt: hasExplicitTime ? date.toISOString() : null,
   };
 }
 
@@ -148,7 +160,7 @@ async function storeAndVerifyPhoto({
   }
 
   // 2. Determine date folder (YYYY/YYYY-MM-DD) and target filename
-  const { year, dateFolder, dateObj } = parseDateFolder(createdAt);
+  const { year, dateFolder, dateObj, takenAt } = parseDateFolder(createdAt);
   const safeName = sanitizeFilename(originalName, mimeType, actualHash);
 
   // Ensure base storage directory exists before creating subdirectories (especially important on remote / FUSE mounts)
@@ -223,6 +235,7 @@ async function storeAndVerifyPhoto({
     size: writtenStat.size,
     mtimeMs: writtenStat.mtimeMs,
     photoDate: dateFolder,
+    takenAt: takenAt || null,
     uploadedAt: new Date().toISOString(),
   };
 

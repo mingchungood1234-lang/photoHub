@@ -9,6 +9,22 @@ private enum ServerGalleryFilter: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+private enum ServerMediaTypeFilter: String, CaseIterable, Identifiable {
+    case all = "All Media"
+    case photos = "Photos Only"
+    case videos = "Videos Only"
+
+    var id: String { rawValue }
+}
+
+private enum ServerTimelineGrouping: String, CaseIterable, Identifiable {
+    case day = "Date & Year"
+    case month = "Month & Year"
+    case year = "Year Only"
+
+    var id: String { rawValue }
+}
+
 private enum BatchProxyOutcome: Sendable {
     case updated(ServerPhoto)
     case failed(String)
@@ -38,6 +54,13 @@ struct ServerGalleryView: View {
     @State private var compressedDataCache: [String: Data] = [:]
     @State private var failedPreviewHashes: Set<String> = []
     @State private var filterMode: ServerGalleryFilter = .all
+    @State private var mediaTypeFilter: ServerMediaTypeFilter = .all
+    @State private var timelineGrouping: ServerTimelineGrouping = .day
+    @State private var timelineData: ServerTimelineData = .empty
+    @State private var selectedYearAnchor: String?
+    @State private var isScrubbingTimeline: Bool = false
+    @State private var scrubSectionIndex: Int?
+    @State private var scrubFraction: CGFloat = 0
 
     @State private var isBatchProxying: Bool = false
     @State private var batchCompleted: Int = 0
@@ -53,20 +76,11 @@ struct ServerGalleryView: View {
     @State private var shareSheetItem: ShareSheetItem?
 
     private let columns = [
-        GridItem(.adaptive(minimum: 108, maximum: 160), spacing: 3)
+        GridItem(.adaptive(minimum: 108, maximum: 160), spacing: 2)
     ]
 
     private var unproxiedPhotos: [ServerPhoto] {
         photos.filter { $0.needsProxy }
-    }
-
-    private var displayedPhotos: [ServerPhoto] {
-        switch filterMode {
-        case .all:
-            return photos
-        case .needsProxy:
-            return unproxiedPhotos
-        }
     }
 
     var body: some View {
@@ -98,91 +112,128 @@ struct ServerGalleryView: View {
                         .buttonStyle(.borderedProminent)
                     }
                 } else {
-                    ScrollView {
-                        VStack(spacing: 8) {
-                            if let errorMessage {
-                                HStack(spacing: 8) {
-                                    Image(systemName: "wifi.slash")
-                                        .foregroundColor(.orange)
-                                    Text("Showing local proxy cache (\(errorMessage))")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                    Spacer()
-                                }
-                                .padding(.horizontal)
-                                .padding(.top, 6)
+                    ScrollViewReader { scrollProxy in
+                        VStack(spacing: 0) {
+                            if timelineData.years.count > 1 || (timelineData.years.count == 1 && timelineData.sections.count > 1) {
+                                yearQuickJumpBar(scrollProxy: scrollProxy)
                             }
 
-                            if !unproxiedPhotos.isEmpty || isBatchProxying || batchBannerMessage != nil {
-                                unproxiedBannerView
-                                    .padding(.horizontal)
-                                    .padding(.top, 4)
-                            }
-
-                            if (syncManager.isSyncing && (syncManager.totalCount > 0 || !syncManager.statusText.isEmpty)) || !syncManager.statusText.isEmpty {
-                                HStack(spacing: 8) {
-                                    if syncManager.isSyncing {
-                                        ProgressView()
-                                    } else {
-                                        Image(systemName: "photo.on.rectangle.angled")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    Text(
-                                        syncManager.statusText.isEmpty
-                                        ? "Auto-downloading local proxies (\(syncManager.completedCount)/\(syncManager.totalCount))..."
-                                        : syncManager.statusText
-                                    )
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    Spacer()
-                                    if syncManager.isSyncing {
-                                        Button("Stop") {
-                                            syncManager.cancel()
+                            ZStack(alignment: .trailing) {
+                                ScrollView {
+                                    LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
+                                        if let errorMessage {
+                                            HStack(spacing: 8) {
+                                                Image(systemName: "wifi.slash")
+                                                    .foregroundColor(.orange)
+                                                Text("Showing local proxy cache (\(errorMessage))")
+                                                    .font(.caption)
+                                                    .foregroundStyle(.secondary)
+                                                Spacer()
+                                            }
+                                            .padding(.horizontal)
+                                            .padding(.top, 6)
                                         }
-                                        .font(.caption)
-                                    }
-                                }
-                                .padding(.horizontal)
-                                .padding(.top, 2)
-                            }
 
-                            if !unproxiedPhotos.isEmpty {
-                                Picker("Filter", selection: $filterMode) {
-                                    Text("All (\(photos.count))").tag(ServerGalleryFilter.all)
-                                    Text("Needs Proxy (\(unproxiedPhotos.count))").tag(ServerGalleryFilter.needsProxy)
-                                }
-                                .pickerStyle(.segmented)
-                                .padding(.horizontal)
-                            }
-
-                            if displayedPhotos.isEmpty {
-                                Text("All photos on your server have compressed proxies.")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.secondary)
-                                    .padding(.vertical, 32)
-                            } else {
-                                LazyVGrid(columns: columns, spacing: 3) {
-                                    ForEach(displayedPhotos) { photo in
-                                        ServerThumbnailCell(
-                                            photo: photo,
-                                            image: imageCache[photo.hash],
-                                            showPlaceholder: failedPreviewHashes.contains(photo.hash) || (photo.isVideo && photo.needsProxy)
-                                        )
-                                        .onTapGesture {
-                                            selectedPhoto = photo
+                                        if !unproxiedPhotos.isEmpty || isBatchProxying || batchBannerMessage != nil {
+                                            unproxiedBannerView
+                                                .padding(.horizontal)
+                                                .padding(.top, 6)
                                         }
-                                        .task(id: "\(photo.hash)-\(photo.needsProxy ? 0 : 1)") {
-                                            await loadCompressedPreviewIfNeeded(for: photo)
+
+                                        if (syncManager.isSyncing && (syncManager.totalCount > 0 || !syncManager.statusText.isEmpty)) || !syncManager.statusText.isEmpty {
+                                            HStack(spacing: 8) {
+                                                if syncManager.isSyncing {
+                                                    ProgressView()
+                                                } else {
+                                                    Image(systemName: "photo.on.rectangle.angled")
+                                                        .font(.caption)
+                                                        .foregroundStyle(.secondary)
+                                                }
+                                                Text(
+                                                    syncManager.statusText.isEmpty
+                                                    ? "Auto-downloading local proxies (\(syncManager.completedCount)/\(syncManager.totalCount))..."
+                                                    : syncManager.statusText
+                                                )
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                                Spacer()
+                                                if syncManager.isSyncing {
+                                                    Button("Stop") {
+                                                        syncManager.cancel()
+                                                    }
+                                                    .font(.caption)
+                                                }
+                                            }
+                                            .padding(.horizontal)
+                                            .padding(.top, 6)
+                                        }
+
+                                        if !unproxiedPhotos.isEmpty {
+                                            Picker("Filter", selection: $filterMode) {
+                                                Text("All (\(photos.count))").tag(ServerGalleryFilter.all)
+                                                Text("Needs Proxy (\(unproxiedPhotos.count))").tag(ServerGalleryFilter.needsProxy)
+                                            }
+                                            .pickerStyle(.segmented)
+                                            .padding(.horizontal)
+                                            .padding(.top, 8)
+                                        }
+
+                                        if timelineData.sections.isEmpty {
+                                            Text(emptyFilteredMessage)
+                                                .font(.subheadline)
+                                                .foregroundStyle(.secondary)
+                                                .frame(maxWidth: .infinity, alignment: .center)
+                                                .padding(.vertical, 36)
+                                        } else {
+                                            ForEach(timelineData.sections) { section in
+                                                if section.startsNewYear && timelineGrouping != .year {
+                                                    yearBannerHeader(for: section)
+                                                        .id("year-\(section.yearLabel)")
+                                                } else if timelineGrouping == .year {
+                                                    Color.clear
+                                                        .frame(height: 0)
+                                                        .id("year-\(section.yearLabel)")
+                                                }
+
+                                                Color.clear
+                                                    .frame(height: 0)
+                                                    .id(section.anchorId)
+
+                                                Section {
+                                                    LazyVGrid(columns: columns, spacing: 2) {
+                                                        ForEach(section.photos) { photo in
+                                                            ServerThumbnailCell(
+                                                                photo: photo,
+                                                                image: imageCache[photo.hash],
+                                                                showPlaceholder: failedPreviewHashes.contains(photo.hash) || (photo.isVideo && photo.needsProxy)
+                                                            )
+                                                            .onTapGesture {
+                                                                selectedPhoto = photo
+                                                            }
+                                                            .task(id: "\(photo.hash)-\(photo.needsProxy ? 0 : 1)") {
+                                                                await loadCompressedPreviewIfNeeded(for: photo)
+                                                            }
+                                                        }
+                                                    }
+                                                    .padding(.horizontal, 2)
+                                                    .padding(.bottom, 8)
+                                                } header: {
+                                                    timelineSectionHeader(section)
+                                                }
+                                            }
                                         }
                                     }
+                                    .padding(.bottom, 12)
                                 }
-                                .padding(3)
+                                .refreshable {
+                                    await loadPhotos()
+                                }
+
+                                if timelineData.sections.count >= 4 {
+                                    immichTimelineScrubber(scrollProxy: scrollProxy)
+                                }
                             }
                         }
-                    }
-                    .refreshable {
-                        await loadPhotos()
                     }
                 }
             }
@@ -212,7 +263,23 @@ struct ServerGalleryView: View {
                     .disabled(isResolvingPick)
                 }
 
-                ToolbarItem(placement: .navigationBarTrailing) {
+                ToolbarItemGroup(placement: .navigationBarTrailing) {
+                    Menu {
+                        Picker("Timeline View", selection: $timelineGrouping) {
+                            ForEach(ServerTimelineGrouping.allCases) { mode in
+                                Text(mode.rawValue).tag(mode)
+                            }
+                        }
+
+                        Picker("Media Filter", selection: $mediaTypeFilter) {
+                            ForEach(ServerMediaTypeFilter.allCases) { media in
+                                Text(media.rawValue).tag(media)
+                            }
+                        }
+                    } label: {
+                        Image(systemName: mediaTypeFilter == .all ? "calendar" : "line.3.horizontal.decrease.circle.fill")
+                    }
+
                     Button {
                         Task { await loadPhotos() }
                     } label: {
@@ -228,6 +295,15 @@ struct ServerGalleryView: View {
             .onAppear {
                 loadFromLocalStore()
                 Task { await loadPhotos() }
+            }
+            .onChange(of: filterMode) { _ in
+                rebuildTimeline()
+            }
+            .onChange(of: mediaTypeFilter) { _ in
+                rebuildTimeline()
+            }
+            .onChange(of: timelineGrouping) { _ in
+                rebuildTimeline()
             }
             .onDisappear {
                 batchTask?.cancel()
@@ -426,9 +502,204 @@ struct ServerGalleryView: View {
         }
     }
 
+    private var emptyFilteredMessage: String {
+        if filterMode == .needsProxy && unproxiedPhotos.isEmpty {
+            return "All photos on your server have compressed proxies."
+        }
+        switch mediaTypeFilter {
+        case .all:
+            return "No items match the current filter."
+        case .photos:
+            return "No photos match the current filter."
+        case .videos:
+            return "No videos match the current filter."
+        }
+    }
+
+    @ViewBuilder
+    private func yearQuickJumpBar(scrollProxy: ScrollViewProxy) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(timelineData.years) { yr in
+                    let isSelected = selectedYearAnchor == yr.anchorId
+                    Button {
+                        selectedYearAnchor = yr.anchorId
+                        withAnimation(.easeInOut(duration: 0.25)) {
+                            scrollProxy.scrollTo(yr.anchorId, anchor: .top)
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text(yr.label)
+                                .font(.caption.weight(.semibold))
+                            Text("\(yr.itemCount)")
+                                .font(.caption2.monospacedDigit())
+                                .opacity(0.8)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(
+                            isSelected ? Color.accentColor : Color.secondary.opacity(0.14),
+                            in: Capsule()
+                        )
+                        .foregroundColor(isSelected ? .white : .primary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+        }
+        .background(.ultraThinMaterial)
+    }
+
+    @ViewBuilder
+    private func yearBannerHeader(for section: ServerTimelineSection) -> some View {
+        let yearInfo = timelineData.years.first(where: { $0.label == section.yearLabel })
+        let summaryText: String = {
+            guard let yearInfo else { return "" }
+            let picCount = max(0, yearInfo.itemCount - yearInfo.videoCount)
+            if picCount > 0 && yearInfo.videoCount > 0 {
+                return "\(picCount) photo\(picCount == 1 ? "" : "s") · \(yearInfo.videoCount) video\(yearInfo.videoCount == 1 ? "" : "s")"
+            } else if yearInfo.videoCount > 0 {
+                return "\(yearInfo.videoCount) video\(yearInfo.videoCount == 1 ? "" : "s")"
+            } else {
+                return "\(picCount) photo\(picCount == 1 ? "" : "s")"
+            }
+        }()
+
+        HStack(alignment: .firstTextBaseline) {
+            Text(section.yearLabel)
+                .font(.title2.weight(.bold))
+            Spacer()
+            if !summaryText.isEmpty {
+                Text(summaryText)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 14)
+        .padding(.bottom, 4)
+    }
+
+    @ViewBuilder
+    private func timelineSectionHeader(_ section: ServerTimelineSection) -> some View {
+        HStack(spacing: 6) {
+            Text(section.title)
+                .font(.subheadline.weight(.semibold))
+            Spacer()
+            if timelineGrouping == .day, section.year != nil {
+                Text("\(section.yearLabel) · \(section.subtitle)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text(section.subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(.ultraThinMaterial)
+    }
+
+    @ViewBuilder
+    private func immichTimelineScrubber(scrollProxy: ScrollViewProxy) -> some View {
+        GeometryReader { geo in
+            let totalHeight = max(1, geo.size.height)
+            let handleSpan = max(1, totalHeight - 24)
+            let halfBubbleSpan = max(0, totalHeight / 2 - 20)
+            let count = timelineData.sections.count
+
+            ZStack(alignment: .topTrailing) {
+                VStack(spacing: 0) {
+                    ForEach(timelineData.years.prefix(8)) { yr in
+                        Text(yr.year.map { String($0) } ?? "?")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(.secondary)
+                            .frame(maxHeight: .infinity)
+                    }
+                }
+                .frame(width: 30, height: totalHeight)
+                .background(.ultraThinMaterial, in: Capsule())
+
+                if isScrubbingTimeline {
+                    Capsule()
+                        .fill(Color.accentColor)
+                        .frame(width: 6, height: 24)
+                        .offset(x: -2, y: max(0, min(handleSpan, scrubFraction * handleSpan)))
+                }
+            }
+            .frame(width: 34, height: totalHeight)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        let fraction = max(0, min(1, value.location.y / totalHeight))
+                        scrubFraction = fraction
+                        isScrubbingTimeline = true
+                        let idx = min(count - 1, max(0, Int((fraction * CGFloat(count - 1)).rounded())))
+                        if scrubSectionIndex != idx {
+                            scrubSectionIndex = idx
+                            let target = timelineData.sections[idx]
+                            selectedYearAnchor = "year-\(target.yearLabel)"
+                            scrollProxy.scrollTo(target.anchorId, anchor: .top)
+                        }
+                    }
+                    .onEnded { _ in
+                        isScrubbingTimeline = false
+                    }
+            )
+            .overlay(alignment: .leading) {
+                if isScrubbingTimeline,
+                   let idx = scrubSectionIndex,
+                   timelineData.sections.indices.contains(idx) {
+                    let sec = timelineData.sections[idx]
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text(sec.scrubLabel)
+                            .font(.caption.weight(.bold))
+                            .foregroundColor(.white)
+                        Text(sec.subtitle)
+                            .font(.caption2)
+                            .foregroundColor(.white.opacity(0.8))
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.black.opacity(0.82), in: RoundedRectangle(cornerRadius: 10))
+                    .shadow(radius: 4)
+                    .fixedSize()
+                    .offset(
+                        x: -148,
+                        y: max(-halfBubbleSpan, min(halfBubbleSpan, (scrubFraction - 0.5) * totalHeight))
+                    )
+                    .allowsHitTesting(false)
+                }
+            }
+        }
+        .frame(width: 34)
+        .padding(.vertical, 44)
+        .padding(.trailing, 4)
+    }
+
+    private func rebuildTimeline() {
+        let built = ServerTimelineBuilder.build(
+            photos: photos,
+            filterMode: filterMode,
+            mediaTypeFilter: mediaTypeFilter,
+            grouping: timelineGrouping
+        )
+        timelineData = built
+        if let selectedYearAnchor,
+           built.years.contains(where: { $0.anchorId == selectedYearAnchor }) {
+            return
+        }
+        selectedYearAnchor = built.years.first?.anchorId
+    }
+
     private func applyUpdatedPhoto(_ updated: ServerPhoto) {
         if let idx = photos.firstIndex(where: { $0.hash.lowercased() == updated.hash.lowercased() }) {
             photos[idx] = updated
+            rebuildTimeline()
         }
         failedPreviewHashes.remove(updated.hash)
         if let data = LocalProxyStore.shared.previewData(forHash: updated.hash),
@@ -445,6 +716,7 @@ struct ServerGalleryView: View {
         )
         if !cached.isEmpty || photos.isEmpty {
             photos = cached
+            rebuildTimeline()
         }
         for photo in cached {
             if imageCache[photo.hash] == nil,
@@ -468,6 +740,7 @@ struct ServerGalleryView: View {
                 apiKey: settings.apiKey
             )
             photos = fetched
+            rebuildTimeline()
             for photo in fetched where !photo.needsProxy {
                 failedPreviewHashes.remove(photo.hash)
             }
@@ -568,6 +841,241 @@ struct ServerGalleryView: View {
     }
 }
 
+private struct ServerTimelineYearSummary: Identifiable, Equatable {
+    let year: Int?
+    let label: String
+    let anchorId: String
+    let itemCount: Int
+    let videoCount: Int
+
+    var id: String { anchorId }
+}
+
+private struct ServerTimelineSection: Identifiable {
+    let id: String
+    let anchorId: String
+    let year: Int?
+    let yearLabel: String
+    let startsNewYear: Bool
+    let title: String
+    let scrubLabel: String
+    let subtitle: String
+    let photos: [ServerPhoto]
+}
+
+private struct ServerTimelineData {
+    let sections: [ServerTimelineSection]
+    let years: [ServerTimelineYearSummary]
+
+    static let empty = ServerTimelineData(sections: [], years: [])
+}
+
+@MainActor
+private enum ServerTimelineBuilder {
+    private static let sameYearDayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.setLocalizedDateFormatFromTemplate("EEEMMMd")
+        return f
+    }()
+
+    private static let otherYearDayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.setLocalizedDateFormatFromTemplate("yMMMd")
+        return f
+    }()
+
+    private static let monthYearFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.setLocalizedDateFormatFromTemplate("yMMMM")
+        return f
+    }()
+
+    private static let scrubMonthYearFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.setLocalizedDateFormatFromTemplate("yMMM")
+        return f
+    }()
+
+    static func build(
+        photos: [ServerPhoto],
+        filterMode: ServerGalleryFilter,
+        mediaTypeFilter: ServerMediaTypeFilter,
+        grouping: ServerTimelineGrouping
+    ) -> ServerTimelineData {
+        let filtered = photos.filter { photo in
+            if filterMode == .needsProxy && !photo.needsProxy {
+                return false
+            }
+            switch mediaTypeFilter {
+            case .all:
+                return true
+            case .photos:
+                return !photo.isVideo
+            case .videos:
+                return photo.isVideo
+            }
+        }
+        guard !filtered.isEmpty else { return .empty }
+
+        let paired = filtered.map { ($0, $0.parsedCreationDate) }.sorted { lhs, rhs in
+            switch (lhs.1, rhs.1) {
+            case let (ld?, rd?):
+                if ld != rd { return ld > rd }
+            case (.some, .none):
+                return true
+            case (.none, .some):
+                return false
+            case (.none, .none):
+                break
+            }
+            if lhs.0.originalName != rhs.0.originalName {
+                return lhs.0.originalName > rhs.0.originalName
+            }
+            return lhs.0.hash > rhs.0.hash
+        }
+
+        let calendar = Calendar.current
+        let currentYear = calendar.component(.year, from: Date())
+
+        struct TempBucket {
+            let key: String
+            let year: Int?
+            let yearLabel: String
+            let title: String
+            let scrubLabel: String
+            var photos: [ServerPhoto]
+        }
+
+        var buckets: [TempBucket] = []
+
+        for (photo, date) in paired {
+            let key: String
+            let year: Int?
+            let yearLabel: String
+            let title: String
+            let scrubLabel: String
+
+            if let date {
+                let comps = calendar.dateComponents([.year, .month, .day], from: date)
+                let y = comps.year ?? currentYear
+                let m = comps.month ?? 1
+                let d = comps.day ?? 1
+                year = y
+                yearLabel = String(y)
+
+                switch grouping {
+                case .day:
+                    key = String(format: "%04d-%02d-%02d", y, m, d)
+                    if calendar.isDateInToday(date) {
+                        title = "Today"
+                    } else if calendar.isDateInYesterday(date) {
+                        title = "Yesterday"
+                    } else if y == currentYear {
+                        title = sameYearDayFormatter.string(from: date)
+                    } else {
+                        title = otherYearDayFormatter.string(from: date)
+                    }
+                    scrubLabel = otherYearDayFormatter.string(from: date)
+                case .month:
+                    key = String(format: "%04d-%02d", y, m)
+                    title = monthYearFormatter.string(from: date)
+                    scrubLabel = scrubMonthYearFormatter.string(from: date)
+                case .year:
+                    key = String(y)
+                    title = String(y)
+                    scrubLabel = String(y)
+                }
+            } else {
+                key = "undated"
+                year = nil
+                yearLabel = "Undated"
+                title = "Undated"
+                scrubLabel = "Undated"
+            }
+
+            if let lastIdx = buckets.indices.last, buckets[lastIdx].key == key {
+                buckets[lastIdx].photos.append(photo)
+            } else {
+                buckets.append(
+                    TempBucket(
+                        key: key,
+                        year: year,
+                        yearLabel: yearLabel,
+                        title: title,
+                        scrubLabel: scrubLabel,
+                        photos: [photo]
+                    )
+                )
+            }
+        }
+
+        var sections: [ServerTimelineSection] = []
+        sections.reserveCapacity(buckets.count)
+
+        var yearSummaries: [ServerTimelineYearSummary] = []
+        var yearIndexMap: [String: Int] = [:]
+        var prevYearLabel: String?
+
+        for bucket in buckets {
+            let startsNewYear = (bucket.yearLabel != prevYearLabel)
+            prevYearLabel = bucket.yearLabel
+
+            let totalCount = bucket.photos.count
+            let videoCount = bucket.photos.reduce(into: 0) { count, item in
+                if item.isVideo { count += 1 }
+            }
+            let photoCount = max(0, totalCount - videoCount)
+
+            let subtitle: String
+            if photoCount > 0 && videoCount > 0 {
+                subtitle = "\(photoCount) photo\(photoCount == 1 ? "" : "s") · \(videoCount) video\(videoCount == 1 ? "" : "s")"
+            } else if videoCount > 0 {
+                subtitle = "\(videoCount) video\(videoCount == 1 ? "" : "s")"
+            } else {
+                subtitle = "\(photoCount) photo\(photoCount == 1 ? "" : "s")"
+            }
+
+            sections.append(
+                ServerTimelineSection(
+                    id: bucket.key,
+                    anchorId: "sec-\(bucket.key)",
+                    year: bucket.year,
+                    yearLabel: bucket.yearLabel,
+                    startsNewYear: startsNewYear,
+                    title: bucket.title,
+                    scrubLabel: bucket.scrubLabel,
+                    subtitle: subtitle,
+                    photos: bucket.photos
+                )
+            )
+
+            if let existingIdx = yearIndexMap[bucket.yearLabel] {
+                let prev = yearSummaries[existingIdx]
+                yearSummaries[existingIdx] = ServerTimelineYearSummary(
+                    year: prev.year,
+                    label: prev.label,
+                    anchorId: prev.anchorId,
+                    itemCount: prev.itemCount + totalCount,
+                    videoCount: prev.videoCount + videoCount
+                )
+            } else {
+                yearIndexMap[bucket.yearLabel] = yearSummaries.count
+                yearSummaries.append(
+                    ServerTimelineYearSummary(
+                        year: bucket.year,
+                        label: bucket.yearLabel,
+                        anchorId: "year-\(bucket.yearLabel)",
+                        itemCount: totalCount,
+                        videoCount: videoCount
+                    )
+                )
+            }
+        }
+
+        return ServerTimelineData(sections: sections, years: yearSummaries)
+    }
+}
+
 private struct ServerThumbnailCell: View {
     let photo: ServerPhoto
     let image: UIImage?
@@ -654,6 +1162,13 @@ private struct ServerPhotoDetailView: View {
     @State private var saveMessage: String?
     @State private var shareSheetItem: ShareSheetItem?
 
+    private static let detailDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return f
+    }()
+
     private var needsProxyAction: Bool {
         currentPhoto.needsProxy || (currentPhoto.isVideo && localVideoProxyURL == nil && currentPhoto.hasVideoProxy != true && !isLoadingVideo)
     }
@@ -736,6 +1251,12 @@ private struct ServerPhotoDetailView: View {
                     Text("\(currentPhoto.originalName) \(currentPhoto.needsProxy ? "(Needs Proxy)" : "(Local Compressed Proxy)")")
                         .font(.headline)
                         .lineLimit(1)
+
+                    if let captureDate = currentPhoto.parsedCreationDate {
+                        Text(Self.detailDateFormatter.string(from: captureDate))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
 
                     let localVideoBytes: Int64? = {
                         guard let url = localVideoProxyURL,

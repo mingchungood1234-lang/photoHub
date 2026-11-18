@@ -343,6 +343,7 @@ final class CompressorViewModel: ObservableObject {
                     originalName: master.filename,
                     size: master.sizeBytes,
                     photoDate: photoISO,
+                    takenAt: photoISO,
                     uploadedAt: nowISO,
                     savedPath: checkResult.savedPath ?? master.filename,
                     hasProxy: true,

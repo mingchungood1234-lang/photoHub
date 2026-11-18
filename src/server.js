@@ -510,7 +510,7 @@ async function createApp(configOverrides = {}) {
         expectedSha256: expectedHash,
       });
 
-      const { dateFolder } = parseDateFolder(createdAt);
+      const { dateFolder, takenAt } = parseDateFolder(createdAt);
       const { hashIndex, folderName } = req.userContext;
       const record = await hashIndex.set(actualSha256, {
         hash: actualSha256,
@@ -520,6 +520,7 @@ async function createApp(configOverrides = {}) {
         originalName: fileName || path.basename(objectKey),
         size,
         photoDate: dateFolder,
+        takenAt: takenAt || null,
         uploadedAt: new Date().toISOString(),
       });
 
@@ -810,13 +811,41 @@ async function createApp(configOverrides = {}) {
       }
       const limit = Math.min(1000, Math.max(1, Number(req.query.limit) || 200));
       const offset = Math.max(0, Number(req.query.offset) || 0);
-      const all = hashIndex.listMasters();
+      let all = hashIndex.listMasters();
+
+      const yearCountsMap = new Map();
+      for (const item of all) {
+        if (item.year) {
+          yearCountsMap.set(item.year, (yearCountsMap.get(item.year) || 0) + 1);
+        }
+      }
+      const years = Array.from(yearCountsMap.entries())
+        .sort((a, b) => b[0] - a[0])
+        .map(([year, count]) => ({ year, count }));
+
+      if (req.query.year && /^\d{4}$/.test(String(req.query.year).trim())) {
+        const targetYear = Number(String(req.query.year).trim());
+        all = all.filter((item) => item.year === targetYear);
+      }
+      if (req.query.mediaType === 'video' || req.query.mediaType === 'photo') {
+        const wantVideo = req.query.mediaType === 'video';
+        all = all.filter((item) => {
+          const ext = path.extname(item.originalName || item.savedPath || '').toLowerCase();
+          const isVid = ['.mov', '.mp4', '.m4v', '.3gp', '.avi'].includes(ext);
+          return wantVideo ? isVid : !isVid;
+        });
+      }
+      if (req.query.order === 'asc') {
+        all = all.slice().reverse();
+      }
+
       const photos = all.slice(offset, offset + limit);
       return res.json({
         success: true,
         userFolder: folderName,
         total: all.length,
         hasMore: offset + photos.length < all.length,
+        years,
         photos,
       });
     } catch (err) {

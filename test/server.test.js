@@ -610,4 +610,129 @@ test('iOS Proxy-Replacement Workflow: strict checksum, proxy registration, batch
       assert.equal(genPrevRes.buffer.length, genBody.photo.proxySize);
     }
   });
+
+  await t.test('8. Chronological timeline ordering by date, takenAt, path/filename/EXIF inference, and /api/photos year filter', async () => {
+    const timelineCtx = await startTestServer();
+    try {
+      // Upload morning photo BEFORE afternoon photo on same day; API must still list afternoon photo FIRST
+      const morningBytes = Buffer.from('same-day-morning-photo');
+      const afternoonBytes = Buffer.from('same-day-afternoon-video');
+      const morningForm = new FormData();
+      morningForm.append('photo', new Blob([morningBytes], { type: 'image/jpeg' }), 'MORNING.JPG');
+      morningForm.append('createdAt', '2025-07-04T12:15:00Z');
+      await timelineCtx.request('/api/upload', { method: 'POST', body: morningForm });
+
+      // Slight delay / upload order reverse check: upload an older-date photo AFTER
+      const olderUploadForm = new FormData();
+      olderUploadForm.append('photo', new Blob([Buffer.from('older-day-uploaded-later')], { type: 'image/jpeg' }), 'EARLIER_DATE.JPG');
+      olderUploadForm.append('createdAt', '2024-02-20T12:00:00Z');
+      await timelineCtx.request('/api/upload', { method: 'POST', body: olderUploadForm });
+
+      const afternoonForm = new FormData();
+      afternoonForm.append('photo', new Blob([afternoonBytes], { type: 'video/mp4' }), 'AFTERNOON.MP4');
+      afternoonForm.append('createdAt', '2025-07-04T14:45:00Z');
+      await timelineCtx.request('/api/upload', { method: 'POST', body: afternoonForm });
+
+      // Drop disk files into historical path, filename date, and EXIF JPEG (with current mtime = today)
+      const histDir = path.join(timelineCtx.storageDir, '2022', '2022-05-03');
+      await fsp.mkdir(histDir, { recursive: true });
+      await fsp.writeFile(path.join(histDir, 'VACATION_CLIP.MOV'), Buffer.from('fake-historical-mov'));
+
+      const unorganizedDir = path.join(timelineCtx.storageDir, 'imports');
+      await fsp.mkdir(unorganizedDir, { recursive: true });
+      await fsp.writeFile(path.join(unorganizedDir, 'VID_20231102_091530.mp4'), Buffer.from('filename-dated-mp4'));
+
+      // Build minimal valid JPEG with APP1 EXIF DateTimeOriginal = "2021:03:14 15:09:26"
+      const tiff = Buffer.alloc(64);
+      tiff.write('II', 0, 'ascii');
+      tiff.writeUInt16LE(0x002a, 2);
+      tiff.writeUInt32LE(8, 4);
+      // IFD0 at offset 8
+      tiff.writeUInt16LE(1, 8);
+      tiff.writeUInt16LE(0x8769, 10);
+      tiff.writeUInt16LE(4, 12);
+      tiff.writeUInt32LE(1, 14);
+      tiff.writeUInt32LE(26, 18);
+      tiff.writeUInt32LE(0, 22);
+      // ExifIFD at offset 26
+      tiff.writeUInt16LE(1, 26);
+      tiff.writeUInt16LE(0x9003, 28);
+      tiff.writeUInt16LE(2, 30);
+      tiff.writeUInt32LE(20, 32);
+      tiff.writeUInt32LE(44, 36);
+      tiff.writeUInt32LE(0, 40);
+      tiff.write('2021:03:14 15:09:26\0', 44, 'ascii');
+
+      const exifHeader = Buffer.from('Exif\0\0', 'ascii');
+      const segLen = 2 + exifHeader.length + tiff.length;
+      const app1 = Buffer.alloc(4);
+      app1[0] = 0xff;
+      app1[1] = 0xe1;
+      app1.writeUInt16BE(segLen, 2);
+      const exifJpg = Buffer.concat([
+        Buffer.from([0xff, 0xd8]),
+        app1,
+        exifHeader,
+        tiff,
+        Buffer.from([0xff, 0xd9]),
+      ]);
+      await fsp.writeFile(path.join(unorganizedDir, 'IMG_UNORGANIZED.JPG'), exifJpg);
+
+      const syncRes = await timelineCtx.request('/api/photos?sync=1');
+      assert.equal(syncRes.status, 200);
+      const syncBody = await syncRes.json();
+      assert.equal(syncBody.total, 6);
+
+      // Should be strictly ordered newest -> oldest across years & intra-day takenAt!
+      const orderedNames = syncBody.photos.map((p) => p.originalName);
+      assert.deepEqual(orderedNames, [
+        'AFTERNOON.MP4',
+        'MORNING.JPG',
+        'EARLIER_DATE.JPG',
+        'VID_20231102_091530.mp4',
+        'VACATION_CLIP.MOV',
+        'IMG_UNORGANIZED.JPG',
+      ]);
+
+      const exifEntry = syncBody.photos.find((p) => p.originalName === 'IMG_UNORGANIZED.JPG');
+      assert.equal(exifEntry.photoDate, '2021-03-14');
+      assert.equal(exifEntry.year, 2021);
+      assert.ok(exifEntry.takenAt);
+
+      const histEntry = syncBody.photos.find((p) => p.originalName === 'VACATION_CLIP.MOV');
+      assert.equal(histEntry.photoDate, '2022-05-03');
+      assert.equal(histEntry.year, 2022);
+
+      const fnEntry = syncBody.photos.find((p) => p.originalName === 'VID_20231102_091530.mp4');
+      assert.equal(fnEntry.photoDate, '2023-11-02');
+      assert.equal(fnEntry.year, 2023);
+
+      // Years summary array sorted newest first
+      assert.deepEqual(
+        syncBody.years.map((y) => [y.year, y.count]),
+        [
+          [2025, 2],
+          [2024, 1],
+          [2023, 1],
+          [2022, 1],
+          [2021, 1],
+        ]
+      );
+
+      // Optional year & mediaType query filters
+      const videosOnly = await (await timelineCtx.request('/api/photos?mediaType=video')).json();
+      assert.deepEqual(
+        videosOnly.photos.map((p) => p.originalName),
+        ['AFTERNOON.MP4', 'VID_20231102_091530.mp4', 'VACATION_CLIP.MOV']
+      );
+
+      const y2025 = await (await timelineCtx.request('/api/photos?year=2025&order=asc')).json();
+      assert.deepEqual(
+        y2025.photos.map((p) => p.originalName),
+        ['MORNING.JPG', 'AFTERNOON.MP4']
+      );
+    } finally {
+      await timelineCtx.cleanup();
+    }
+  });
 });
