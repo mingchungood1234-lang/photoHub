@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 private struct LocalPrefetchWorkItem: Sendable {
@@ -143,7 +144,7 @@ final class LocalProxySyncManager: ObservableObject {
                     while !Task.isCancelled, let item = await queue.next() {
                         if item.downloadPreview,
                            let rawData = try? await client.downloadPhotoPreviewData(hash: item.hash) {
-                            _ = LocalProxyStore.shared.cacheDownloadedPreview(rawData, forHash: item.hash)
+                            _ = LocalProxyStore.shared.cacheDownloadedPreviewData(rawData, forHash: item.hash)
                         }
 
                         if item.downloadVideo,

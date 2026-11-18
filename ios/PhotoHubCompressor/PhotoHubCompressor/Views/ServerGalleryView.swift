@@ -9,6 +9,18 @@ private enum ServerGalleryFilter: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+private enum BatchProxyOutcome: Sendable {
+    case updated(ServerPhoto)
+    case failed(String)
+
+    var displayName: String {
+        switch self {
+        case .updated(let photo): return photo.originalName
+        case .failed(let name): return name
+        }
+    }
+}
+
 struct ServerGalleryView: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject private var syncManager = LocalProxySyncManager.shared
@@ -314,54 +326,44 @@ struct ServerGalleryView: View {
             let videoSemaphore = AsyncSemaphore(value: 1)
             let workerCount = min(3, targets.count)
 
-            let counts: (Int, Int) = await withTaskGroup(of: (Int, Int).self) { group in
+            var succeeded = 0
+            var failed = 0
+
+            await withTaskGroup(of: BatchProxyOutcome?.self) { group in
                 for _ in 0..<workerCount {
                     group.addTask {
-                        var workerOk = 0
-                        var workerFail = 0
-
-                        while !Task.isCancelled, let item = await queue.next() {
-                            await MainActor.run {
-                                batchStatusText = item.originalName
-                            }
-                            if item.isVideo {
-                                await videoSemaphore.acquire()
-                            }
-                            do {
-                                let updated = try await client.createAndRegisterProxy(for: item)
-                                if item.isVideo {
-                                    await videoSemaphore.release()
-                                }
-                                await MainActor.run {
-                                    applyUpdatedPhoto(updated)
-                                    batchCompleted += 1
-                                }
-                                workerOk += 1
-                            } catch {
-                                if item.isVideo {
-                                    await videoSemaphore.release()
-                                }
-                                await MainActor.run {
-                                    batchCompleted += 1
-                                }
-                                workerFail += 1
-                            }
-                        }
-                        return (workerOk, workerFail)
+                        await Self.processNextBatchProxyItem(
+                            queue: queue,
+                            client: client,
+                            videoSemaphore: videoSemaphore
+                        )
                     }
                 }
 
-                var totalOk = 0
-                var totalFail = 0
-                for await (ok, fail) in group {
-                    totalOk += ok
-                    totalFail += fail
+                for await outcome in group {
+                    guard let outcome else { continue }
+                    switch outcome {
+                    case .updated(let updated):
+                        applyUpdatedPhoto(updated)
+                        succeeded += 1
+                    case .failed:
+                        failed += 1
+                    }
+                    batchCompleted += 1
+                    batchStatusText = outcome.displayName
+
+                    if !Task.isCancelled {
+                        group.addTask {
+                            await Self.processNextBatchProxyItem(
+                                queue: queue,
+                                client: client,
+                                videoSemaphore: videoSemaphore
+                            )
+                        }
+                    }
                 }
-                return (totalOk, totalFail)
             }
 
-            let succeeded = counts.0
-            let failed = counts.1
             let cancelled = Task.isCancelled
             isBatchProxying = false
             batchStatusText = ""
@@ -376,6 +378,31 @@ struct ServerGalleryView: View {
             if unproxiedPhotos.isEmpty && filterMode == .needsProxy {
                 filterMode = .all
             }
+        }
+    }
+
+    private static func processNextBatchProxyItem(
+        queue: AsyncWorkQueue<ServerPhoto>,
+        client: PhotoHubAPIClient,
+        videoSemaphore: AsyncSemaphore
+    ) async -> BatchProxyOutcome? {
+        guard !Task.isCancelled, let item = await queue.next() else {
+            return nil
+        }
+        if item.isVideo {
+            await videoSemaphore.acquire()
+        }
+        do {
+            let updated = try await client.createAndRegisterProxy(for: item)
+            if item.isVideo {
+                await videoSemaphore.release()
+            }
+            return .updated(updated)
+        } catch {
+            if item.isVideo {
+                await videoSemaphore.release()
+            }
+            return .failed(item.originalName)
         }
     }
 

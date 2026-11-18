@@ -151,6 +151,16 @@ final class LocalProxyStore {
     }
 
     @discardableResult
+    func cacheDownloadedPreviewData(
+        _ rawData: Data,
+        forHash hash: String,
+        maxPixelSize: Int = 800,
+        quality: CGFloat = 0.65
+    ) -> Data? {
+        cacheDownloadedPreview(rawData, forHash: hash, maxPixelSize: maxPixelSize, quality: quality)?.1
+    }
+
+    @discardableResult
     func cacheDownloadedPreview(
         _ rawData: Data,
         forHash hash: String,
