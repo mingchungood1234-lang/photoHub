@@ -392,6 +392,83 @@ final class PhotoLibraryService {
         authLabel(PHPhotoLibrary.authorizationStatus(for: .readWrite))
     }
 
+    static func canWriteToPhotosLibrary() -> Bool {
+        let rw = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        if rw == .authorized || rw == .limited {
+            return true
+        }
+        return PHPhotoLibrary.authorizationStatus(for: .addOnly) == .authorized
+    }
+
+    static func requestWriteAuthorizationAsync() async -> Bool {
+        if canWriteToPhotosLibrary() {
+            return true
+        }
+        return await withCheckedContinuation { continuation in
+            PHPhotoLibrary.requestAuthorization(for: .readWrite) { status in
+                continuation.resume(returning: status == .authorized || status == .limited)
+            }
+        }
+    }
+
+    /// Saves a server-backed compressed proxy (JPEG/HEIC image or MP4 video) into Apple Photos,
+    /// preserving original creation date and registering its asset ID in `LocalProxyTracker.shared`
+    /// so it is never re-uploaded and can always be resolved back to its server master for Share Original.
+    static func saveServerProxyToPhotosAsync(
+        photo: ServerPhoto,
+        imageData: Data? = nil,
+        videoURL: URL? = nil
+    ) async throws -> String {
+        if photo.isVideo && videoURL == nil && imageData == nil {
+            throw PhotoLibraryError.proxyReplacementFailed("Missing video proxy file to save.")
+        }
+        if !photo.isVideo && imageData == nil {
+            throw PhotoLibraryError.proxyReplacementFailed("Missing image proxy data to save.")
+        }
+
+        let targetCreationDate = photo.parsedCreationDate
+
+        return try await withCheckedThrowingContinuation { continuation in
+            var createdLocalId: String?
+            PHPhotoLibrary.shared().performChanges({
+                let createRequest: PHAssetChangeRequest?
+                if photo.isVideo, let videoURL {
+                    createRequest = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: videoURL)
+                } else if let imageData {
+                    if let img = UIImage(data: imageData) {
+                        createRequest = PHAssetChangeRequest.creationRequestForAsset(from: img)
+                    } else {
+                        let req = PHAssetCreationRequest.forAsset()
+                        req.addResource(with: .photo, data: imageData, options: nil)
+                        createRequest = req
+                    }
+                } else {
+                    createRequest = nil
+                }
+
+                createRequest?.creationDate = targetCreationDate
+                createdLocalId = createRequest?.placeholderForCreatedAsset?.localIdentifier
+            }, completionHandler: { success, error in
+                if success {
+                    if let createdLocalId, !createdLocalId.isEmpty {
+                        LocalProxyTracker.shared.markAsProxy(
+                            assetId: createdLocalId,
+                            proxySha256: photo.proxyHash ?? "",
+                            masterHash: photo.hash,
+                            originalName: photo.originalName
+                        )
+                    } else {
+                        LocalProxyTracker.shared.markMasterHandledForPhotos(photo.hash)
+                    }
+                    continuation.resume(returning: createdLocalId ?? "")
+                } else {
+                    let message = error?.localizedDescription ?? "Could not save proxy to iPhone Photos."
+                    continuation.resume(throwing: PhotoLibraryError.proxyReplacementFailed(message))
+                }
+            })
+        }
+    }
+
     func testDeletePromptOnLatestAsset(completion: @escaping (String) -> Void) {
         requestAuthorization { status in
             let authText = Self.authLabel(status)

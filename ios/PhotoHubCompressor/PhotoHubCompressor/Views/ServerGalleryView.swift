@@ -119,17 +119,29 @@ struct ServerGalleryView: View {
                                     .padding(.top, 4)
                             }
 
-                            if syncManager.isSyncing && syncManager.totalCount > 0 {
+                            if (syncManager.isSyncing && (syncManager.totalCount > 0 || !syncManager.statusText.isEmpty)) || !syncManager.statusText.isEmpty {
                                 HStack(spacing: 8) {
-                                    ProgressView()
-                                    Text("Auto-downloading local proxies (\(syncManager.completedCount)/\(syncManager.totalCount))...")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                    Spacer()
-                                    Button("Stop") {
-                                        syncManager.cancel()
+                                    if syncManager.isSyncing {
+                                        ProgressView()
+                                    } else {
+                                        Image(systemName: "photo.on.rectangle.angled")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
                                     }
+                                    Text(
+                                        syncManager.statusText.isEmpty
+                                        ? "Auto-downloading local proxies (\(syncManager.completedCount)/\(syncManager.totalCount))..."
+                                        : syncManager.statusText
+                                    )
                                     .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    Spacer()
+                                    if syncManager.isSyncing {
+                                        Button("Stop") {
+                                            syncManager.cancel()
+                                        }
+                                        .font(.caption)
+                                    }
                                 }
                                 .padding(.horizontal)
                                 .padding(.top, 2)
@@ -380,6 +392,9 @@ struct ServerGalleryView: View {
             } else {
                 batchBannerMessage = "Created compressed proxies for all \(succeeded) item(s)."
             }
+            if succeeded > 0 && !cancelled {
+                LocalProxySyncManager.shared.startPrefetchIfNeeded(for: photos, settings: settings)
+            }
             if unproxiedPhotos.isEmpty && filterMode == .needsProxy {
                 filterMode = .all
             }
@@ -501,7 +516,7 @@ struct ServerGalleryView: View {
             isResolvingPick = false
         }
 
-        let tracker = LocalProxyTracker()
+        let tracker = LocalProxyTracker.shared
         let client = PhotoHubAPIClient(settings: settings)
 
         var resolvedMasterHash: String?
@@ -917,59 +932,86 @@ private struct ServerPhotoDetailView: View {
         isBusy = true
         busyLabel = "Saving proxy to Photos..."
         saveMessage = nil
+        defer {
+            isBusy = false
+            busyLabel = ""
+        }
 
-        if currentPhoto.isVideo,
-           let videoURL = localVideoProxyURL ?? LocalProxyStore.shared.videoProxyURLIfExists(forHash: currentPhoto.hash) {
-            PHPhotoLibrary.shared().performChanges({
-                PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: videoURL)
-            }) { success, error in
-                DispatchQueue.main.async {
-                    isBusy = false
-                    busyLabel = ""
-                    if success {
-                        let sizeBytes = (try? videoURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { Int64($0) } ?? 0
-                        let sizeStr = ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
-                        saveMessage = "Saved compressed video proxy (\(sizeStr)) to Photos."
+        let authorized = await PhotoLibraryService.requestWriteAuthorizationAsync()
+        guard authorized else {
+            saveMessage = "Photos library permission is required."
+            return
+        }
+
+        if LocalProxyTracker.shared.liveProxyAssetId(forMasterHash: currentPhoto.hash) != nil {
+            saveMessage = "Already saved in iPhone Photos."
+            return
+        }
+
+        do {
+            if currentPhoto.isVideo {
+                var videoURL = localVideoProxyURL ?? LocalProxyStore.shared.videoProxyURLIfExists(forHash: currentPhoto.hash)
+                var tempDownloadURL: URL?
+                defer {
+                    if let tempDownloadURL {
+                        try? FileManager.default.removeItem(at: tempDownloadURL)
+                    }
+                }
+
+                if videoURL == nil, !currentPhoto.needsProxy {
+                    busyLabel = "Downloading compressed MP4 proxy..."
+                    let client = PhotoHubAPIClient(settings: settings)
+                    let downloaded = try await client.downloadVideoProxyToTempFile(hash: currentPhoto.hash)
+                    if let cached = LocalProxyStore.shared.copyVideoProxy(from: downloaded, forHash: currentPhoto.hash) {
+                        videoURL = cached
+                        localVideoProxyURL = cached
+                        try? FileManager.default.removeItem(at: downloaded)
                     } else {
-                        saveMessage = "Failed: \(error?.localizedDescription ?? "Unknown error")"
+                        tempDownloadURL = downloaded
+                        videoURL = downloaded
+                    }
+                }
+
+                if let videoURL {
+                    busyLabel = "Saving video proxy to Photos..."
+                    _ = try await PhotoLibraryService.saveServerProxyToPhotosAsync(
+                        photo: currentPhoto,
+                        videoURL: videoURL
+                    )
+                    let sizeBytes = (try? videoURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { Int64($0) } ?? 0
+                    let sizeStr = ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
+                    saveMessage = "Saved compressed video proxy (\(sizeStr)) to Photos."
+                    return
+                }
+            }
+
+            var dataToSave = compressedData ?? initialCompressedData
+            if dataToSave == nil {
+                if let cached = LocalProxyStore.shared.previewData(forHash: currentPhoto.hash) {
+                    dataToSave = LocalProxyStore.makeSmallCompressedPreview(from: cached, maxPixelSize: 800, quality: 0.65)?.1 ?? cached
+                } else {
+                    busyLabel = "Downloading compressed preview..."
+                    let client = PhotoHubAPIClient(settings: settings)
+                    if let raw = try? await client.downloadPhotoPreviewData(hash: currentPhoto.hash) {
+                        dataToSave = LocalProxyStore.makeSmallCompressedPreview(from: raw, maxPixelSize: 800, quality: 0.65)?.1 ?? raw
                     }
                 }
             }
-            return
-        }
 
-        var dataToSave = compressedData ?? initialCompressedData
-        if dataToSave == nil {
-            let client = PhotoHubAPIClient(settings: settings)
-            if let raw = try? await client.downloadPhotoPreviewData(hash: currentPhoto.hash) {
-                dataToSave = LocalProxyStore.makeSmallCompressedPreview(from: raw, maxPixelSize: 800, quality: 0.65)?.1 ?? raw
+            guard let dataToSave else {
+                saveMessage = "Preview still loading."
+                return
             }
-        }
-        guard let dataToSave else {
-            isBusy = false
-            busyLabel = ""
-            saveMessage = "Preview still loading."
-            return
-        }
 
-        PHPhotoLibrary.shared().performChanges({
-            if let img = UIImage(data: dataToSave) {
-                PHAssetChangeRequest.creationRequestForAsset(from: img)
-            } else {
-                let req = PHAssetCreationRequest.forAsset()
-                req.addResource(with: .photo, data: dataToSave, options: nil)
-            }
-        }) { success, error in
-            DispatchQueue.main.async {
-                isBusy = false
-                busyLabel = ""
-                if success {
-                    let sizeStr = ByteCountFormatter.string(fromByteCount: Int64(dataToSave.count), countStyle: .file)
-                    saveMessage = "Saved compressed proxy (\(sizeStr)) to Photos."
-                } else {
-                    saveMessage = "Failed: \(error?.localizedDescription ?? "Unknown error")"
-                }
-            }
+            busyLabel = "Saving proxy to Photos..."
+            _ = try await PhotoLibraryService.saveServerProxyToPhotosAsync(
+                photo: currentPhoto,
+                imageData: dataToSave
+            )
+            let sizeStr = ByteCountFormatter.string(fromByteCount: Int64(dataToSave.count), countStyle: .file)
+            saveMessage = "Saved compressed proxy (\(sizeStr)) to Photos."
+        } catch {
+            saveMessage = "Failed: \(error.localizedDescription)"
         }
     }
 

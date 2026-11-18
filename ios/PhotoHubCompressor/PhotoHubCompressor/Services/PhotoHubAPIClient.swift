@@ -58,6 +58,42 @@ struct ServerPhoto: Codable, Identifiable, Hashable, Sendable {
     var needsProxy: Bool {
         (hasProxy != true) || (hasPreview == false)
     }
+
+    var parsedCreationDate: Date? {
+        Self.parseDate(photoDate) ?? Self.parseDate(uploadedAt)
+    }
+
+    private static let dateParserLock = NSLock()
+    private static let isoWithFractionFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private static let isoPlainFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+    private static let dayOnlyFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    private static func parseDate(_ raw: String) -> Date? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        dateParserLock.lock()
+        defer { dateParserLock.unlock() }
+        if let d = isoWithFractionFormatter.date(from: trimmed) ?? isoPlainFormatter.date(from: trimmed) {
+            return d
+        }
+        if let day = dayOnlyFormatter.date(from: trimmed) {
+            return day.addingTimeInterval(12 * 3600)
+        }
+        return nil
+    }
 }
 
 private struct ServerPhotosResponse: Decodable {

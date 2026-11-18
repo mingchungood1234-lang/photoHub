@@ -54,6 +54,7 @@ final class AppSettings: ObservableObject {
     @AppStorage("autoCompressOnOpen") var autoCompressOnOpen: Bool = false
     @AppStorage("autoDownloadLocalProxies") var autoDownloadLocalProxies: Bool = true
     @AppStorage("autoDownloadLocalVideos") var autoDownloadLocalVideos: Bool = true
+    @AppStorage("autoSaveProxiesToPhotosApp") var autoSaveProxiesToPhotosApp: Bool = true
 
     var serverProtocol: ServerProtocol {
         get { ServerProtocol(rawValue: serverProtocolRaw) ?? .http }

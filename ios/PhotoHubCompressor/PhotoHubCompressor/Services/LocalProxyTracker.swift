@@ -1,8 +1,11 @@
 import Foundation
+import Photos
 
 /// Persists locally compressed proxy identifiers, SHA-256 hashes, and master-hash mappings
 /// so proxies are never re-uploaded and can be resolved back to their original master on the server.
 final class LocalProxyTracker {
+    static let shared = LocalProxyTracker()
+
     private let lock = NSLock()
     private let defaults = UserDefaults.standard
     private let assetIdsKey = "photohub_proxy_asset_ids"
@@ -10,19 +13,25 @@ final class LocalProxyTracker {
     private let assetToMasterKey = "photohub_proxy_asset_to_master"
     private let assetToFilenameKey = "photohub_proxy_asset_to_filename"
     private let proxyHashToMasterKey = "photohub_proxy_hash_to_master"
+    private let masterToAssetKey = "photohub_master_to_proxy_asset"
+    private let autoHandledPhotosKey = "photohub_auto_handled_photos_masters"
 
     private var assetIds: Set<String>
     private var proxyHashes: Set<String>
     private var assetToMaster: [String: String]
     private var assetToFilename: [String: String]
     private var proxyHashToMaster: [String: String]
+    private var masterToAssetId: [String: String]
+    private var autoHandledPhotosMasters: Set<String>
 
-    init() {
+    private init() {
         self.assetIds = Set(defaults.stringArray(forKey: assetIdsKey) ?? [])
         self.proxyHashes = Set(defaults.stringArray(forKey: proxyHashesKey) ?? [])
         self.assetToMaster = defaults.dictionary(forKey: assetToMasterKey) as? [String: String] ?? [:]
         self.assetToFilename = defaults.dictionary(forKey: assetToFilenameKey) as? [String: String] ?? [:]
         self.proxyHashToMaster = defaults.dictionary(forKey: proxyHashToMasterKey) as? [String: String] ?? [:]
+        self.masterToAssetId = defaults.dictionary(forKey: masterToAssetKey) as? [String: String] ?? [:]
+        self.autoHandledPhotosMasters = Set(defaults.stringArray(forKey: autoHandledPhotosKey) ?? [])
     }
 
     func isKnownProxy(assetId: String) -> Bool {
@@ -52,6 +61,31 @@ final class LocalProxyTracker {
         return proxyHashToMaster[sha256.lowercased()]
     }
 
+    func isMasterHandledForPhotos(_ masterHash: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return autoHandledPhotosMasters.contains(masterHash.lowercased())
+    }
+
+    func markMasterHandledForPhotos(_ masterHash: String) {
+        let normMaster = masterHash.lowercased()
+        guard !normMaster.isEmpty else { return }
+        lock.lock()
+        autoHandledPhotosMasters.insert(normMaster)
+        defaults.set(Array(autoHandledPhotosMasters), forKey: autoHandledPhotosKey)
+        lock.unlock()
+    }
+
+    /// Returns the local `PHAsset.localIdentifier` if a proxy for `masterHash` still physically exists in Apple Photos.
+    func liveProxyAssetId(forMasterHash masterHash: String) -> String? {
+        lock.lock()
+        let savedId = masterToAssetId[masterHash.lowercased()]
+        lock.unlock()
+        guard let savedId, !savedId.isEmpty else { return nil }
+        let fetched = PHAsset.fetchAssets(withLocalIdentifiers: [savedId], options: nil)
+        return fetched.firstObject?.localIdentifier
+    }
+
     func markAsProxy(
         assetId: String,
         proxySha256: String,
@@ -63,16 +97,25 @@ final class LocalProxyTracker {
 
         let normProxy = proxySha256.lowercased()
         assetIds.insert(assetId)
-        proxyHashes.insert(normProxy)
         defaults.set(Array(assetIds), forKey: assetIdsKey)
-        defaults.set(Array(proxyHashes), forKey: proxyHashesKey)
+
+        if !normProxy.isEmpty {
+            proxyHashes.insert(normProxy)
+            defaults.set(Array(proxyHashes), forKey: proxyHashesKey)
+        }
 
         if let masterHash, !masterHash.isEmpty {
             let normMaster = masterHash.lowercased()
             assetToMaster[assetId] = normMaster
-            proxyHashToMaster[normProxy] = normMaster
+            masterToAssetId[normMaster] = assetId
+            autoHandledPhotosMasters.insert(normMaster)
             defaults.set(assetToMaster, forKey: assetToMasterKey)
-            defaults.set(proxyHashToMaster, forKey: proxyHashToMasterKey)
+            defaults.set(masterToAssetId, forKey: masterToAssetKey)
+            defaults.set(Array(autoHandledPhotosMasters), forKey: autoHandledPhotosKey)
+            if !normProxy.isEmpty {
+                proxyHashToMaster[normProxy] = normMaster
+                defaults.set(proxyHashToMaster, forKey: proxyHashToMasterKey)
+            }
         }
 
         if let originalName, !originalName.isEmpty {
@@ -89,10 +132,14 @@ final class LocalProxyTracker {
         assetToMaster.removeAll()
         assetToFilename.removeAll()
         proxyHashToMaster.removeAll()
+        masterToAssetId.removeAll()
+        autoHandledPhotosMasters.removeAll()
         defaults.removeObject(forKey: assetIdsKey)
         defaults.removeObject(forKey: proxyHashesKey)
         defaults.removeObject(forKey: assetToMasterKey)
         defaults.removeObject(forKey: assetToFilenameKey)
         defaults.removeObject(forKey: proxyHashToMasterKey)
+        defaults.removeObject(forKey: masterToAssetKey)
+        defaults.removeObject(forKey: autoHandledPhotosKey)
     }
 }

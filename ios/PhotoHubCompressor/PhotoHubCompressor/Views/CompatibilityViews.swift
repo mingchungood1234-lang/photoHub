@@ -158,7 +158,7 @@ struct PhotoPickerSheet: UIViewControllerRepresentable {
             let isVideo = provider.hasItemConformingToTypeIdentifier(UTType.movie.identifier)
 
             // Fast path: if this asset is already mapped in LocalProxyTracker, avoid copying a potentially large media file.
-            if let assetId, LocalProxyTracker().masterLookup(forAssetId: assetId) != nil {
+            if let assetId, LocalProxyTracker.shared.masterLookup(forAssetId: assetId) != nil {
                 onPick(PickedMediaResult(assetId: assetId, copiedFileURL: nil, isVideo: isVideo))
                 return
             }

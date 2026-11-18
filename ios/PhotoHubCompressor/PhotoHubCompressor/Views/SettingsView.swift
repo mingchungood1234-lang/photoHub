@@ -3,7 +3,13 @@ import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var settings: AppSettings
+    @ObservedObject private var syncManager: LocalProxySyncManager
     @State private var connectionStatus: String?
+
+    init(settings: AppSettings) {
+        self.settings = settings
+        self._syncManager = ObservedObject(wrappedValue: LocalProxySyncManager.shared)
+    }
     @State private var isTesting: Bool = false
     @State private var deleteDiagResult: String?
     @State private var isTestingDelete: Bool = false
@@ -139,18 +145,51 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    Toggle("Auto-Save Proxies to iPhone Photos", isOn: $settings.autoSaveProxiesToPhotosApp)
+
+                    if syncManager.isSyncing {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                            Text(
+                                syncManager.statusText.isEmpty
+                                ? "Downloading (\(syncManager.completedCount)/\(syncManager.totalCount))..."
+                                : syncManager.statusText
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Stop") {
+                                syncManager.cancel()
+                            }
+                            .font(.caption)
+                        }
+                    } else {
+                        Button {
+                            LocalProxySyncManager.shared.downloadAllMissingToPhotos(settings: settings)
+                        } label: {
+                            Label("Download All Proxies to iPhone Photos", systemImage: "square.and.arrow.down.on.square")
+                        }
+                        .disabled(settings.normalizedBaseURL == nil)
+
+                        if !syncManager.statusText.isEmpty {
+                            Text(syncManager.statusText)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
                     HStack {
-                        Text("Cached Proxies on iPhone")
+                        Text("Cached Proxies in App")
                         Spacer()
                         Text(ByteCountFormatter.string(fromByteCount: localProxyCacheBytes, countStyle: .file))
                             .font(.subheadline.weight(.medium))
                             .foregroundStyle(.secondary)
                     }
 
-                    Toggle("Auto-Download Proxied Photos Locally", isOn: $settings.autoDownloadLocalProxies)
+                    Toggle("Auto-Cache Proxies in App", isOn: $settings.autoDownloadLocalProxies)
 
                     Toggle("Auto-Download Compressed Videos (.mp4)", isOn: $settings.autoDownloadLocalVideos)
-                        .disabled(!settings.autoDownloadLocalProxies)
+                        .disabled(!settings.autoDownloadLocalProxies && !settings.autoSaveProxiesToPhotosApp)
 
                     Button(role: .destructive) {
                         LocalProxySyncManager.shared.cancel()
@@ -163,7 +202,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Local Proxy Storage")
                 } footer: {
-                    Text("Compressed image previews and compressed MP4 video proxies are saved locally inside the app so the Server tab opens them immediately. Clearing the cache does not delete any originals on your server or proxies saved in iPhone Photos.")
+                    Text("Compressed image previews and MP4 video proxies are saved into your iPhone Photos app automatically without re-uploading them or creating duplicates, and cached locally inside the app for instant browsing. Clearing the in-app cache does not delete server originals or items saved in iPhone Photos.")
                 }
             }
             .onAppear {

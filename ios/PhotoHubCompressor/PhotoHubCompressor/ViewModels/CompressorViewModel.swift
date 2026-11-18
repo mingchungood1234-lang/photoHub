@@ -18,7 +18,7 @@ final class CompressorViewModel: ObservableObject {
 
     let settings: AppSettings
     private let photoService = PhotoLibraryService()
-    private let tracker = LocalProxyTracker()
+    private let tracker = LocalProxyTracker.shared
     private var pendingAutoDeleteWhenActive: Bool = false
 
     init(settings: AppSettings) {
@@ -385,6 +385,9 @@ final class CompressorViewModel: ObservableObject {
                         originalName: master.filename
                     )
                 }
+            } else {
+                // Respect user's choice when "Keep Compressed Proxy in iPhone Photos" is OFF
+                self.tracker.markMasterHandledForPhotos(master.sha256)
             }
 
             await MainActor.run {
