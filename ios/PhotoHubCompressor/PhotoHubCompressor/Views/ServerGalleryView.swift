@@ -76,7 +76,7 @@ struct ServerGalleryView: View {
     @State private var shareSheetItem: ShareSheetItem?
 
     private let columns = [
-        GridItem(.adaptive(minimum: 108, maximum: 160), spacing: 2)
+        GridItem(.adaptive(minimum: 100, maximum: 140), spacing: 2)
     ]
 
     private var unproxiedPhotos: [ServerPhoto] {
@@ -87,7 +87,7 @@ struct ServerGalleryView: View {
         AdaptiveNavigationStack {
             Group {
                 if isLoading && photos.isEmpty {
-                    ProgressView("Loading all server photos...")
+                    ProgressView("Loading photos...")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if let errorMessage, photos.isEmpty {
                     CompatibleEmptyStateView(
@@ -104,7 +104,7 @@ struct ServerGalleryView: View {
                     CompatibleEmptyStateView(
                         title: "No Backups Yet",
                         systemImage: "cloud",
-                        description: "Upload photos or store them on your PhotoHub server to browse and proxy them here."
+                        description: "Upload photos or store them on your PhotoHub server to browse them here."
                     ) {
                         Button("Refresh") {
                             Task { await loadPhotos() }
@@ -114,7 +114,7 @@ struct ServerGalleryView: View {
                 } else {
                     ScrollViewReader { scrollProxy in
                         VStack(spacing: 0) {
-                            if timelineData.years.count > 1 || (timelineData.years.count == 1 && timelineData.sections.count > 1) {
+                            if timelineData.years.count > 1 {
                                 yearQuickJumpBar(scrollProxy: scrollProxy)
                             }
 
@@ -122,68 +122,63 @@ struct ServerGalleryView: View {
                                 ScrollView {
                                     LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
                                         if let errorMessage {
-                                            HStack(spacing: 8) {
+                                            HStack(spacing: 6) {
                                                 Image(systemName: "wifi.slash")
+                                                    .font(.caption)
                                                     .foregroundColor(.orange)
-                                                Text("Showing local proxy cache (\(errorMessage))")
+                                                Text("Offline cache · \(errorMessage)")
                                                     .font(.caption)
                                                     .foregroundStyle(.secondary)
+                                                    .lineLimit(1)
                                                 Spacer()
                                             }
-                                            .padding(.horizontal)
-                                            .padding(.top, 6)
+                                            .padding(.horizontal, 12)
+                                            .padding(.vertical, 6)
                                         }
 
                                         if !unproxiedPhotos.isEmpty || isBatchProxying || batchBannerMessage != nil {
                                             unproxiedBannerView
-                                                .padding(.horizontal)
-                                                .padding(.top, 6)
+                                                .padding(.horizontal, 12)
+                                                .padding(.vertical, 6)
                                         }
 
-                                        if (syncManager.isSyncing && (syncManager.totalCount > 0 || !syncManager.statusText.isEmpty)) || !syncManager.statusText.isEmpty {
+                                        if syncManager.isSyncing {
                                             HStack(spacing: 8) {
-                                                if syncManager.isSyncing {
-                                                    ProgressView()
-                                                } else {
-                                                    Image(systemName: "photo.on.rectangle.angled")
-                                                        .font(.caption)
-                                                        .foregroundStyle(.secondary)
-                                                }
+                                                ProgressView()
+                                                    .scaleEffect(0.85)
                                                 Text(
                                                     syncManager.statusText.isEmpty
-                                                    ? "Auto-downloading local proxies (\(syncManager.completedCount)/\(syncManager.totalCount))..."
+                                                    ? "Syncing proxies (\(syncManager.completedCount)/\(syncManager.totalCount))..."
                                                     : syncManager.statusText
                                                 )
                                                 .font(.caption)
                                                 .foregroundStyle(.secondary)
+                                                .lineLimit(1)
                                                 Spacer()
-                                                if syncManager.isSyncing {
-                                                    Button("Stop") {
-                                                        syncManager.cancel()
-                                                    }
-                                                    .font(.caption)
+                                                Button("Stop") {
+                                                    syncManager.cancel()
                                                 }
+                                                .font(.caption.weight(.medium))
                                             }
-                                            .padding(.horizontal)
-                                            .padding(.top, 6)
-                                        }
-
-                                        if !unproxiedPhotos.isEmpty {
-                                            Picker("Filter", selection: $filterMode) {
-                                                Text("All (\(photos.count))").tag(ServerGalleryFilter.all)
-                                                Text("Needs Proxy (\(unproxiedPhotos.count))").tag(ServerGalleryFilter.needsProxy)
-                                            }
-                                            .pickerStyle(.segmented)
-                                            .padding(.horizontal)
-                                            .padding(.top, 8)
+                                            .padding(.horizontal, 12)
+                                            .padding(.vertical, 6)
                                         }
 
                                         if timelineData.sections.isEmpty {
-                                            Text(emptyFilteredMessage)
-                                                .font(.subheadline)
-                                                .foregroundStyle(.secondary)
-                                                .frame(maxWidth: .infinity, alignment: .center)
-                                                .padding(.vertical, 36)
+                                            VStack(spacing: 10) {
+                                                Text(emptyFilteredMessage)
+                                                    .font(.subheadline)
+                                                    .foregroundStyle(.secondary)
+                                                if filterMode != .all || mediaTypeFilter != .all {
+                                                    Button("Show All") {
+                                                        filterMode = .all
+                                                        mediaTypeFilter = .all
+                                                    }
+                                                    .font(.subheadline.weight(.medium))
+                                                }
+                                            }
+                                            .frame(maxWidth: .infinity, alignment: .center)
+                                            .padding(.vertical, 44)
                                         } else {
                                             ForEach(timelineData.sections) { section in
                                                 if section.startsNewYear && timelineGrouping != .year {
@@ -215,8 +210,7 @@ struct ServerGalleryView: View {
                                                             }
                                                         }
                                                     }
-                                                    .padding(.horizontal, 2)
-                                                    .padding(.bottom, 8)
+                                                    .padding(.bottom, 6)
                                                 } header: {
                                                     timelineSectionHeader(section)
                                                 }
@@ -229,7 +223,7 @@ struct ServerGalleryView: View {
                                     await loadPhotos()
                                 }
 
-                                if timelineData.sections.count >= 4 {
+                                if timelineData.sections.count >= 6 {
                                     immichTimelineScrubber(scrollProxy: scrollProxy)
                                 }
                             }
@@ -252,7 +246,7 @@ struct ServerGalleryView: View {
                     }
                 }
             }
-            .navigationTitle("Server (\(photos.count))")
+            .navigationTitle("Server")
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button {
@@ -271,13 +265,21 @@ struct ServerGalleryView: View {
                             }
                         }
 
-                        Picker("Media Filter", selection: $mediaTypeFilter) {
+                        Picker("Media Type", selection: $mediaTypeFilter) {
                             ForEach(ServerMediaTypeFilter.allCases) { media in
                                 Text(media.rawValue).tag(media)
                             }
                         }
+
+                        if !unproxiedPhotos.isEmpty || filterMode == .needsProxy {
+                            Picker("Proxy Status", selection: $filterMode) {
+                                Text("All (\(photos.count))").tag(ServerGalleryFilter.all)
+                                Text("Needs Proxy (\(unproxiedPhotos.count))").tag(ServerGalleryFilter.needsProxy)
+                            }
+                        }
                     } label: {
-                        Image(systemName: mediaTypeFilter == .all ? "calendar" : "line.3.horizontal.decrease.circle.fill")
+                        let isFiltered = (filterMode != .all || mediaTypeFilter != .all)
+                        Image(systemName: isFiltered ? "line.3.horizontal.decrease.circle.fill" : "ellipsis.circle")
                     }
 
                     Button {
@@ -351,54 +353,64 @@ struct ServerGalleryView: View {
 
     @ViewBuilder
     private var unproxiedBannerView: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        HStack(spacing: 10) {
             if isBatchProxying {
-                HStack(spacing: 10) {
-                    ProgressView()
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Creating Proxies (\(batchCompleted)/\(batchTotal))")
-                            .font(.subheadline.weight(.semibold))
-                        if !batchStatusText.isEmpty {
-                            Text(batchStatusText)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                    }
-                    Spacer()
-                    Button("Stop") {
-                        batchTask?.cancel()
-                    }
-                    .buttonStyle(.bordered)
+                ProgressView()
+                    .scaleEffect(0.85)
+                Text("Creating proxies \(batchCompleted)/\(batchTotal)")
+                    .font(.caption.weight(.medium))
+                Spacer()
+                Button("Stop") {
+                    batchTask?.cancel()
                 }
+                .font(.caption.weight(.semibold))
             } else if !unproxiedPhotos.isEmpty {
-                HStack(spacing: 10) {
-                    Image(systemName: "wand.and.stars")
-                        .foregroundColor(.orange)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("\(unproxiedPhotos.count) server item(s) need proxies")
-                            .font(.subheadline.weight(.semibold))
-                        Text("Create lightweight previews & MP4 video proxies cleanly.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                Button {
+                    filterMode = (filterMode == .needsProxy) ? .all : .needsProxy
+                } label: {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(Color.orange)
+                            .frame(width: 7, height: 7)
+                        Text(
+                            filterMode == .needsProxy
+                            ? "Showing \(unproxiedPhotos.count) unproxied · Tap for All"
+                            : "\(unproxiedPhotos.count) missing proxy"
+                        )
+                        .font(.caption.weight(.medium))
+                        .foregroundColor(.primary)
                     }
-                    Spacer()
-                    Button("Proxy Missing") {
-                        startBatchProxy()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
                 }
-            }
+                .buttonStyle(.plain)
 
-            if let batchBannerMessage {
-                Text(batchBannerMessage)
+                Spacer()
+
+                Button("Proxy All") {
+                    startBatchProxy()
+                }
+                .font(.caption.weight(.semibold))
+            } else if let msg = batchBannerMessage {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.caption)
+                    .foregroundColor(.green)
+                Text(msg)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer()
+                Button {
+                    batchBannerMessage = nil
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
             }
         }
-        .padding(12)
-        .background(Color.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 12))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.secondary.opacity(0.09), in: Capsule())
     }
 
     private func startBatchProxy() {
@@ -528,20 +540,15 @@ struct ServerGalleryView: View {
                             scrollProxy.scrollTo(yr.anchorId, anchor: .top)
                         }
                     } label: {
-                        HStack(spacing: 4) {
-                            Text(yr.label)
-                                .font(.caption.weight(.semibold))
-                            Text("\(yr.itemCount)")
-                                .font(.caption2.monospacedDigit())
-                                .opacity(0.8)
-                        }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(
-                            isSelected ? Color.accentColor : Color.secondary.opacity(0.14),
-                            in: Capsule()
-                        )
-                        .foregroundColor(isSelected ? .white : .primary)
+                        Text(yr.label)
+                            .font(.caption.weight(.semibold))
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 5)
+                            .background(
+                                isSelected ? Color.accentColor : Color.secondary.opacity(0.12),
+                                in: Capsule()
+                            )
+                            .foregroundColor(isSelected ? .white : .primary)
                     }
                     .buttonStyle(.plain)
                 }
@@ -555,31 +562,19 @@ struct ServerGalleryView: View {
     @ViewBuilder
     private func yearBannerHeader(for section: ServerTimelineSection) -> some View {
         let yearInfo = timelineData.years.first(where: { $0.label == section.yearLabel })
-        let summaryText: String = {
-            guard let yearInfo else { return "" }
-            let picCount = max(0, yearInfo.itemCount - yearInfo.videoCount)
-            if picCount > 0 && yearInfo.videoCount > 0 {
-                return "\(picCount) photo\(picCount == 1 ? "" : "s") · \(yearInfo.videoCount) video\(yearInfo.videoCount == 1 ? "" : "s")"
-            } else if yearInfo.videoCount > 0 {
-                return "\(yearInfo.videoCount) video\(yearInfo.videoCount == 1 ? "" : "s")"
-            } else {
-                return "\(picCount) photo\(picCount == 1 ? "" : "s")"
-            }
-        }()
-
         HStack(alignment: .firstTextBaseline) {
             Text(section.yearLabel)
                 .font(.title2.weight(.bold))
             Spacer()
-            if !summaryText.isEmpty {
-                Text(summaryText)
-                    .font(.caption.weight(.medium))
+            if let yearInfo {
+                Text("\(yearInfo.itemCount)")
+                    .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
         }
         .padding(.horizontal, 12)
-        .padding(.top, 14)
-        .padding(.bottom, 4)
+        .padding(.top, 16)
+        .padding(.bottom, 2)
     }
 
     @ViewBuilder
@@ -588,15 +583,9 @@ struct ServerGalleryView: View {
             Text(section.title)
                 .font(.subheadline.weight(.semibold))
             Spacer()
-            if timelineGrouping == .day, section.year != nil {
-                Text("\(section.yearLabel) · \(section.subtitle)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } else {
-                Text(section.subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            Text("\(section.photos.count)")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
@@ -607,30 +596,18 @@ struct ServerGalleryView: View {
     private func immichTimelineScrubber(scrollProxy: ScrollViewProxy) -> some View {
         GeometryReader { geo in
             let totalHeight = max(1, geo.size.height)
-            let handleSpan = max(1, totalHeight - 24)
+            let handleSpan = max(1, totalHeight - 36)
             let halfBubbleSpan = max(0, totalHeight / 2 - 20)
             let count = timelineData.sections.count
 
             ZStack(alignment: .topTrailing) {
-                VStack(spacing: 0) {
-                    ForEach(timelineData.years.prefix(8)) { yr in
-                        Text(yr.year.map { String($0) } ?? "?")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundStyle(.secondary)
-                            .frame(maxHeight: .infinity)
-                    }
-                }
-                .frame(width: 30, height: totalHeight)
-                .background(.ultraThinMaterial, in: Capsule())
-
-                if isScrubbingTimeline {
-                    Capsule()
-                        .fill(Color.accentColor)
-                        .frame(width: 6, height: 24)
-                        .offset(x: -2, y: max(0, min(handleSpan, scrubFraction * handleSpan)))
-                }
+                Capsule()
+                    .fill(isScrubbingTimeline ? Color.accentColor : Color.primary.opacity(0.28))
+                    .frame(width: isScrubbingTimeline ? 6 : 4, height: 36)
+                    .padding(.trailing, 3)
+                    .offset(y: max(0, min(handleSpan, scrubFraction * handleSpan)))
             }
-            .frame(width: 34, height: totalHeight)
+            .frame(width: 24, height: totalHeight, alignment: .topTrailing)
             .contentShape(Rectangle())
             .gesture(
                 DragGesture(minimumDistance: 0)
@@ -655,30 +632,25 @@ struct ServerGalleryView: View {
                    let idx = scrubSectionIndex,
                    timelineData.sections.indices.contains(idx) {
                     let sec = timelineData.sections[idx]
-                    VStack(alignment: .trailing, spacing: 2) {
-                        Text(sec.scrubLabel)
-                            .font(.caption.weight(.bold))
-                            .foregroundColor(.white)
-                        Text(sec.subtitle)
-                            .font(.caption2)
-                            .foregroundColor(.white.opacity(0.8))
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(Color.black.opacity(0.82), in: RoundedRectangle(cornerRadius: 10))
-                    .shadow(radius: 4)
-                    .fixedSize()
-                    .offset(
-                        x: -148,
-                        y: max(-halfBubbleSpan, min(halfBubbleSpan, (scrubFraction - 0.5) * totalHeight))
-                    )
-                    .allowsHitTesting(false)
+                    Text(sec.scrubLabel)
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(Color.black.opacity(0.82), in: Capsule())
+                        .shadow(radius: 4)
+                        .fixedSize()
+                        .offset(
+                            x: -138,
+                            y: max(-halfBubbleSpan, min(halfBubbleSpan, (scrubFraction - 0.5) * totalHeight))
+                        )
+                        .allowsHitTesting(false)
                 }
             }
         }
-        .frame(width: 34)
-        .padding(.vertical, 44)
-        .padding(.trailing, 4)
+        .frame(width: 24)
+        .padding(.vertical, 40)
+        .padding(.trailing, 2)
     }
 
     private func rebuildTimeline() {
@@ -1083,9 +1055,9 @@ private struct ServerThumbnailCell: View {
 
     var body: some View {
         GeometryReader { geo in
-            ZStack(alignment: .bottomTrailing) {
+            ZStack {
                 Rectangle()
-                    .fill(Color.secondary.opacity(0.15))
+                    .fill(Color.secondary.opacity(0.12))
 
                 if let image {
                     Image(uiImage: image)
@@ -1094,32 +1066,35 @@ private struct ServerThumbnailCell: View {
                         .frame(width: geo.size.width, height: geo.size.height)
                         .clipped()
                 } else if showPlaceholder {
-                    VStack(spacing: 4) {
-                        Image(systemName: photo.isVideo ? "video.fill" : "photo")
-                            .font(.title2)
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    Image(systemName: photo.isVideo ? "video" : "photo")
+                        .font(.title3)
+                        .foregroundStyle(.secondary)
                 } else {
                     ProgressView()
+                        .scaleEffect(0.8)
                 }
-
+            }
+            .overlay(alignment: .bottomTrailing) {
                 if photo.isVideo && image != nil {
-                    Image(systemName: "play.circle.fill")
-                        .font(.title3)
-                        .foregroundColor(.white.opacity(0.92))
-                        .shadow(color: .black.opacity(0.5), radius: 2)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                    Image(systemName: "play.fill")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.white)
+                        .padding(6)
+                        .background(Color.black.opacity(0.48), in: Circle())
+                        .padding(5)
                 }
-
-                Text(photo.needsProxy ? "NO PROXY" : (photo.isVideo ? "VIDEO" : "PROXY"))
-                    .font(.system(size: 9, weight: .bold))
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 2)
-                    .background(photo.needsProxy ? Color.orange.opacity(0.9) : Color.black.opacity(0.65))
-                    .foregroundColor(.white)
-                    .cornerRadius(4)
-                    .padding(4)
+            }
+            .overlay(alignment: .topTrailing) {
+                if photo.needsProxy {
+                    Circle()
+                        .fill(Color.orange)
+                        .frame(width: 8, height: 8)
+                        .overlay(
+                            Circle()
+                                .stroke(Color.white.opacity(0.85), lineWidth: 1)
+                        )
+                        .padding(6)
+                }
             }
             .frame(width: geo.size.width, height: geo.size.height)
             .clipped()
@@ -1248,16 +1223,6 @@ private struct ServerPhotoDetailView: View {
                 }
 
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("\(currentPhoto.originalName) \(currentPhoto.needsProxy ? "(Needs Proxy)" : "(Local Compressed Proxy)")")
-                        .font(.headline)
-                        .lineLimit(1)
-
-                    if let captureDate = currentPhoto.parsedCreationDate {
-                        Text(Self.detailDateFormatter.string(from: captureDate))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-
                     let localVideoBytes: Int64? = {
                         guard let url = localVideoProxyURL,
                               let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
@@ -1269,17 +1234,41 @@ private struct ServerPhotoDetailView: View {
                     let previewBytes = localVideoBytes ?? dataBytes ?? currentPhoto.videoProxySize ?? currentPhoto.proxySize
                     let smallStr = previewBytes.map {
                         ByteCountFormatter.string(fromByteCount: $0, countStyle: .file)
-                    } ?? (currentPhoto.needsProxy ? "Not created yet" : "Compressed")
+                    } ?? (currentPhoto.needsProxy ? "No Proxy" : "Proxy")
                     let masterStr = ByteCountFormatter.string(fromByteCount: currentPhoto.size, countStyle: .file)
-                    Text("Local Proxy: \(smallStr) • Original Master: \(masterStr)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+
+                    HStack(alignment: .center) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(
+                                currentPhoto.parsedCreationDate.map { Self.detailDateFormatter.string(from: $0) }
+                                ?? currentPhoto.originalName
+                            )
+                            .font(.subheadline.weight(.semibold))
+                            .lineLimit(1)
+
+                            Text("\(smallStr) proxy · \(masterStr) original")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Spacer()
+
+                        Text(currentPhoto.needsProxy ? "Needs Proxy" : "Proxy Ready")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(
+                                (currentPhoto.needsProxy ? Color.orange : Color.green).opacity(0.16),
+                                in: Capsule()
+                            )
+                            .foregroundColor(currentPhoto.needsProxy ? .orange : .green)
+                    }
 
                     if needsProxyAction {
                         Button {
                             Task { await createProxyForCurrentItem() }
                         } label: {
-                            Label(currentPhoto.isVideo ? "Create Compressed Video Proxy" : "Create Compressed Proxy", systemImage: "wand.and.stars")
+                            Label(currentPhoto.isVideo ? "Create Video Proxy" : "Create Proxy", systemImage: "wand.and.stars")
                                 .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.bordered)
@@ -1322,7 +1311,7 @@ private struct ServerPhotoDetailView: View {
                 .padding(.horizontal)
                 .padding(.bottom, 8)
             }
-            .navigationTitle("Server Proxy")
+            .navigationTitle(currentPhoto.originalName)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
