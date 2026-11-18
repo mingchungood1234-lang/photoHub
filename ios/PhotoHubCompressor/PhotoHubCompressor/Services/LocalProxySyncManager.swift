@@ -83,7 +83,8 @@ final class LocalProxySyncManager: ObservableObject {
         lock.lock()
         activeTask?.cancel()
         let task = Task.detached(priority: .utility) { [weak self] in
-            await self?.prefetchMissingProxies(
+            guard let self else { return }
+            await self.prefetchMissingProxies(
                 photos: photos,
                 client: client,
                 includeVideos: includeVideos
