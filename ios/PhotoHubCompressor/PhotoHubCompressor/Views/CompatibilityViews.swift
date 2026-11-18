@@ -99,9 +99,10 @@ struct ShareSheet: UIViewControllerRepresentable {
 
     func makeUIViewController(context: Context) -> UIActivityViewController {
         let controller = UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+        let finishShare = onComplete
         controller.completionWithItemsHandler = { _, _, _, _ in
             DispatchQueue.main.async {
-                onComplete()
+                finishShare()
             }
         }
         return controller
@@ -170,6 +171,7 @@ struct PhotoPickerSheet: UIViewControllerRepresentable {
                 typeId = provider.registeredTypeIdentifiers.first ?? UTType.data.identifier
             }
 
+            let finishPick = onPick
             provider.loadFileRepresentation(forTypeIdentifier: typeId) { url, _ in
                 var copiedURL: URL?
                 if let url {
@@ -181,8 +183,9 @@ struct PhotoPickerSheet: UIViewControllerRepresentable {
                         copiedURL = dest
                     }
                 }
+                let result = PickedMediaResult(assetId: assetId, copiedFileURL: copiedURL, isVideo: isVideo)
                 DispatchQueue.main.async {
-                    self.onPick(PickedMediaResult(assetId: assetId, copiedFileURL: copiedURL, isVideo: isVideo))
+                    finishPick(result)
                 }
             }
         }

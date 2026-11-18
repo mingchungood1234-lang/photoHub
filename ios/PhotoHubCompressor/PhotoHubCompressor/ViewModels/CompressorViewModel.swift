@@ -286,9 +286,14 @@ final class CompressorViewModel: ObservableObject {
                             let iso = ISO8601DateFormatter()
                             let nowISO = iso.string(from: Date())
                             let photoISO = candidate.creationDate.map { iso.string(from: $0) } ?? nowISO
-                            let posterSize = previewFileForServer.flatMap {
-                                try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize
-                            }.map { Int64($0) }
+                            let posterSize: Int64? = {
+                                guard let previewURL = previewFileForServer,
+                                      let values = try? previewURL.resourceValues(forKeys: [.fileSizeKey]),
+                                      let size = values.fileSize else {
+                                    return nil
+                                }
+                                return Int64(size)
+                            }()
                             LocalProxyStore.shared.upsertPhoto(
                                 ServerPhoto(
                                     hash: master.sha256,

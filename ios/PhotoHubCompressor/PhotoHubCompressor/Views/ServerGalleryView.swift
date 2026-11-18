@@ -248,7 +248,7 @@ struct ServerGalleryView: View {
 
         if resolvedMasterHash == nil, let fileURL = picked.copiedFileURL {
             do {
-                let sha = try ProxyGenerator.computeFileSHA256(fileURL: fileURL)
+                let sha = try ProxyGenerator.computeFileSHA256(url: fileURL)
                 if let knownMaster = tracker.masterHash(forProxySha256: sha) {
                     resolvedMasterHash = knownMaster
                 } else {
@@ -278,12 +278,7 @@ struct ServerGalleryView: View {
             let tempMasterURL = try await client.downloadMasterToTempFile(
                 hash: masterHash,
                 preferredFilename: resolvedFilename
-            ) { progress in
-                let pct = Int(progress * 100)
-                DispatchQueue.main.async {
-                    self.pickStatusText = "Downloading original (\(pct)%)..."
-                }
-            }
+            )
             shareSheetItem = ShareSheetItem(fileURL: tempMasterURL)
         } catch {
             pickerErrorMessage = "Download failed: \(error.localizedDescription)"
@@ -407,7 +402,7 @@ private struct ServerPhotoDetailView: View {
                             }
                             .padding(.horizontal, 12)
                             .padding(.vertical, 6)
-                            .background(.black.opacity(0.7), in: Capsule())
+                            .background(Color.black.opacity(0.7), in: Capsule())
                             .padding(.bottom, 10)
                         }
                     }
@@ -583,12 +578,7 @@ private struct ServerPhotoDetailView: View {
             let tempURL = try await client.downloadMasterToTempFile(
                 hash: photo.hash,
                 preferredFilename: photo.originalName
-            ) { progress in
-                let pct = Int(progress * 100)
-                DispatchQueue.main.async {
-                    self.busyLabel = "Fetching original (\(pct)%)..."
-                }
-            }
+            )
             shareSheetItem = ShareSheetItem(fileURL: tempURL)
         } catch {
             saveMessage = "Share failed: \(error.localizedDescription)"
@@ -664,12 +654,7 @@ private struct ServerPhotoDetailView: View {
             let tempURL = try await client.downloadMasterToTempFile(
                 hash: photo.hash,
                 preferredFilename: photo.originalName
-            ) { progress in
-                let pct = Int(progress * 100)
-                DispatchQueue.main.async {
-                    self.busyLabel = "Restoring original (\(pct)%)..."
-                }
-            }
+            )
             let fileSize = (try? tempURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { Int64($0) } ?? photo.size
             let isVideo = photo.isVideo
 

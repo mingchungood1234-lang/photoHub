@@ -234,14 +234,12 @@ final class PhotoHubAPIClient {
 
     func downloadMasterToTempFile(
         hash: String,
-        preferredFilename: String? = nil,
-        onProgress: @escaping (Double) -> Void = { _ in }
+        preferredFilename: String? = nil
     ) async throws -> URL {
         try await downloadToTempFile(
             path: "/api/photo/\(hash)",
             preferredFilename: preferredFilename,
-            fallbackFilename: "photo_\(String(hash.prefix(8))).jpg",
-            onProgress: onProgress
+            fallbackFilename: "photo_\(String(hash.prefix(8))).jpg"
         )
     }
 
@@ -256,15 +254,14 @@ final class PhotoHubAPIClient {
     private func downloadToTempFile(
         path: String,
         preferredFilename: String?,
-        fallbackFilename: String,
-        onProgress: @escaping (Double) -> Void = { _ in }
+        fallbackFilename: String
     ) async throws -> URL {
         let url = try makeURL(path)
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         applyAuth(to: &request)
 
-        let session = makeSession(onProgress: onProgress)
+        let session = makeSession()
         defer { session.finishTasksAndInvalidate() }
         let (tempURL, response) = try await session.download(for: request)
 
@@ -275,10 +272,14 @@ final class PhotoHubAPIClient {
         }
 
         let serverSuggestedName = extractFilename(from: response)
-        let candidateName = preferredFilename?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let rawFilename = (candidateName?.isEmpty == false ? candidateName : nil)
-            ?? serverSuggestedName
-            ?? fallbackFilename
+        let nonEmptyPreferred: String? = {
+            guard let trimmed = preferredFilename?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !trimmed.isEmpty else {
+                return nil
+            }
+            return trimmed
+        }()
+        let rawFilename = nonEmptyPreferred ?? serverSuggestedName ?? fallbackFilename
         let safeFilename = URL(fileURLWithPath: rawFilename).lastPathComponent
         let destFilename = safeFilename.isEmpty ? fallbackFilename : safeFilename
 
