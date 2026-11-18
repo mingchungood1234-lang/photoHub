@@ -246,11 +246,13 @@ final class CompressorViewModel: ObservableObject {
                             let proxy: GeneratedProxy
                             let previewFileForServer: URL?
                             let previewFormatForServer: String
+                            let videoProxyFileForServer: URL?
 
                             if candidate.mediaType == .video {
                                 proxy = try await ProxyGenerator.createVideoProxy(from: master.fileURL)
                                 previewFileForServer = proxy.posterFileURL
                                 previewFormatForServer = "jpeg"
+                                videoProxyFileForServer = proxy.fileURL
                             } else {
                                 proxy = try ProxyGenerator.createProxy(
                                     from: master.fileURL,
@@ -260,18 +262,51 @@ final class CompressorViewModel: ObservableObject {
                                 )
                                 previewFileForServer = proxy.fileURL
                                 previewFormatForServer = format.rawValue
+                                videoProxyFileForServer = nil
                             }
 
                             try? FileManager.default.removeItem(at: master.fileURL)
 
-                            // Step 4: Register proxy on server
+                            // Step 4: Register proxy on server (and persist locally for instant Server tab viewing)
                             try? await apiClient.registerProxy(
                                 masterHash: master.sha256,
                                 proxyHash: proxy.sha256,
                                 assetId: candidate.id,
                                 proxyFileURL: previewFileForServer,
-                                proxyFormat: previewFormatForServer
+                                proxyFormat: previewFormatForServer,
+                                videoProxyURL: videoProxyFileForServer
                             )
+
+                            if let previewURL = previewFileForServer {
+                                LocalProxyStore.shared.copyPreviewFile(from: previewURL, forHash: master.sha256)
+                            }
+                            if candidate.mediaType == .video {
+                                LocalProxyStore.shared.copyVideoProxy(from: proxy.fileURL, forHash: master.sha256)
+                            }
+                            let iso = ISO8601DateFormatter()
+                            let nowISO = iso.string(from: Date())
+                            let photoISO = candidate.creationDate.map { iso.string(from: $0) } ?? nowISO
+                            let posterSize = previewFileForServer.flatMap {
+                                try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize
+                            }.map { Int64($0) }
+                            LocalProxyStore.shared.upsertPhoto(
+                                ServerPhoto(
+                                    hash: master.sha256,
+                                    originalName: master.filename,
+                                    size: master.sizeBytes,
+                                    photoDate: photoISO,
+                                    uploadedAt: nowISO,
+                                    savedPath: checkResult.savedPath ?? master.filename,
+                                    hasProxy: true,
+                                    proxyHash: proxy.sha256,
+                                    proxySize: candidate.mediaType == .video ? posterSize : proxy.sizeBytes,
+                                    hasVideoProxy: candidate.mediaType == .video,
+                                    videoProxySize: candidate.mediaType == .video ? proxy.sizeBytes : nil
+                                ),
+                                baseURL: self.settings.normalizedBaseURL,
+                                apiKey: self.settings.apiKey
+                            )
+
                             if let posterURL = proxy.posterFileURL {
                                 try? FileManager.default.removeItem(at: posterURL)
                             }
@@ -296,7 +331,12 @@ final class CompressorViewModel: ObservableObject {
                                         switch saveResult {
                                         case .success(let newAssetId):
                                             if newAssetId != candidate.id {
-                                                self.tracker.markAsProxy(assetId: newAssetId, proxySha256: proxy.sha256)
+                                                self.tracker.markAsProxy(
+                                                    assetId: newAssetId,
+                                                    proxySha256: proxy.sha256,
+                                                    masterHash: master.sha256,
+                                                    originalName: master.filename
+                                                )
                                             }
                                             self.stageOriginalForDeletion(
                                                 id: currentId,

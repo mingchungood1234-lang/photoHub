@@ -8,6 +8,7 @@ struct SettingsView: View {
     @State private var deleteDiagResult: String?
     @State private var isTestingDelete: Bool = false
     @State private var photosAuthText: String = PhotoLibraryService.currentReadWriteAuthLabel()
+    @State private var localProxyCacheBytes: Int64 = LocalProxyStore.shared.totalStorageBytes()
 
     private let resolutions = [0, 1280, 1920, 2048, 2560]
 
@@ -136,9 +137,35 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+
+                Section {
+                    HStack {
+                        Text("Cached Proxies on iPhone")
+                        Spacer()
+                        Text(ByteCountFormatter.string(fromByteCount: localProxyCacheBytes, countStyle: .file))
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Button(role: .destructive) {
+                        LocalProxyStore.shared.clearAll()
+                        localProxyCacheBytes = LocalProxyStore.shared.totalStorageBytes()
+                    } label: {
+                        Text("Clear Local Proxy Cache")
+                    }
+                    .disabled(localProxyCacheBytes == 0)
+                } header: {
+                    Text("Local Proxy Storage")
+                } footer: {
+                    Text("Compressed image previews and compressed MP4 video proxies are saved locally inside the app so the Server tab opens them immediately. Clearing the cache does not delete any originals on your server or proxies saved in iPhone Photos.")
+                }
             }
             .onAppear {
                 photosAuthText = PhotoLibraryService.currentReadWriteAuthLabel()
+                localProxyCacheBytes = LocalProxyStore.shared.totalStorageBytes()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .localProxyStoreDidChange)) { _ in
+                localProxyCacheBytes = LocalProxyStore.shared.totalStorageBytes()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .navigationTitle("Settings")

@@ -542,11 +542,17 @@ async function createApp(configOverrides = {}) {
     }
   });
 
-  // Register a lightweight local proxy hash (and optional compressed preview image) against a verified master photo
+  // Register a lightweight local proxy hash (and optional compressed preview/video proxy) against a verified master photo
   app.post('/api/proxy/register', async (req, res) => {
     try {
-      const { masterHash, proxyHash, assetId, proxyBase64, proxyFormat } =
-        req.body || {};
+      const {
+        masterHash,
+        proxyHash,
+        assetId,
+        proxyBase64,
+        proxyFormat,
+        videoProxyBase64,
+      } = req.body || {};
       if (!masterHash || !proxyHash) {
         return res.status(400).json({
           success: false,
@@ -557,6 +563,7 @@ async function createApp(configOverrides = {}) {
       const { hashIndex, storageDir } = req.userContext;
       const normMaster = String(masterHash).trim().toLowerCase();
       let proxyMeta = {};
+      const proxiesDir = path.join(storageDir, '.proxies');
 
       if (proxyBase64 && typeof proxyBase64 === 'string') {
         const proxyBuf = Buffer.from(proxyBase64, 'base64');
@@ -565,15 +572,24 @@ async function createApp(configOverrides = {}) {
             String(proxyFormat || '').toLowerCase() === 'heic'
               ? '.heic'
               : '.jpg';
-          const proxiesDir = path.join(storageDir, '.proxies');
           await fs.promises.mkdir(proxiesDir, { recursive: true });
           const proxyFileName = `${normMaster}${ext}`;
           const proxyFullPath = path.join(proxiesDir, proxyFileName);
           await fs.promises.writeFile(proxyFullPath, proxyBuf);
-          proxyMeta = {
-            proxyRelativePath: `.proxies/${proxyFileName}`,
-            proxySize: proxyBuf.length,
-          };
+          proxyMeta.proxyRelativePath = `.proxies/${proxyFileName}`;
+          proxyMeta.proxySize = proxyBuf.length;
+        }
+      }
+
+      if (videoProxyBase64 && typeof videoProxyBase64 === 'string') {
+        const videoBuf = Buffer.from(videoProxyBase64, 'base64');
+        if (videoBuf.length > 0) {
+          await fs.promises.mkdir(proxiesDir, { recursive: true });
+          const videoFileName = `${normMaster}.mp4`;
+          const videoFullPath = path.join(proxiesDir, videoFileName);
+          await fs.promises.writeFile(videoFullPath, videoBuf);
+          proxyMeta.videoProxyRelativePath = `.proxies/${videoFileName}`;
+          proxyMeta.videoProxySize = videoBuf.length;
         }
       }
 
@@ -595,6 +611,7 @@ async function createApp(configOverrides = {}) {
         masterHash: updated.diskHash || updated.hash,
         proxyHash: updated.proxyHash,
         proxySize: updated.proxySize || null,
+        videoProxySize: updated.videoProxySize || null,
         savedPath: updated.relativePath,
       });
     } catch (err) {
@@ -663,6 +680,41 @@ async function createApp(configOverrides = {}) {
       res.setHeader('X-Photo-Variant', 'master');
       res.setHeader('X-Master-Sha256', lookupResult.masterHash);
       return fs.createReadStream(fullPath).pipe(res);
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: err.message,
+      });
+    }
+  });
+
+  // Stream small compressed video proxy (.mp4) when available
+  app.get('/api/photo/:hash/video-proxy', async (req, res) => {
+    try {
+      const { hashIndex, storageDir } = req.userContext;
+      const lookupResult = await hashIndex.lookup(req.params.hash);
+      if (lookupResult.status === 'missing' || !lookupResult.record) {
+        return res.status(404).json({
+          success: false,
+          error: 'Photo not found',
+        });
+      }
+
+      const record = lookupResult.record;
+      if (record.videoProxyRelativePath) {
+        const videoProxyPath = path.join(storageDir, record.videoProxyRelativePath);
+        if (fs.existsSync(videoProxyPath)) {
+          res.setHeader('X-Photo-Variant', 'video-proxy');
+          res.setHeader('X-Master-Sha256', lookupResult.masterHash);
+          res.setHeader('Content-Type', 'video/mp4');
+          return res.sendFile(path.resolve(videoProxyPath));
+        }
+      }
+
+      return res.status(404).json({
+        success: false,
+        error: 'Compressed video proxy not available for this item',
+      });
     } catch (err) {
       return res.status(500).json({
         success: false,

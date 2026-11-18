@@ -221,6 +221,12 @@ class HashIndex {
     if (proxyMeta.proxySize) {
       record.proxySize = Number(proxyMeta.proxySize);
     }
+    if (proxyMeta.videoProxyRelativePath) {
+      record.videoProxyRelativePath = proxyMeta.videoProxyRelativePath;
+    }
+    if (proxyMeta.videoProxySize) {
+      record.videoProxySize = Number(proxyMeta.videoProxySize);
+    }
     record.proxyRegisteredAt = new Date().toISOString();
 
     this.records.set(normMaster, record);
@@ -268,6 +274,8 @@ class HashIndex {
         hasProxy: Boolean(entry.proxyHash),
         proxyHash: entry.proxyHash || null,
         proxySize: entry.proxySize || null,
+        hasVideoProxy: Boolean(entry.videoProxyRelativePath),
+        videoProxySize: entry.videoProxySize || null,
       });
     }
     items.sort((a, b) => {

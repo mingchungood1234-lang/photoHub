@@ -58,10 +58,13 @@ async function startTestServer(extraOverrides = {}) {
           const chunks = [];
           res.on('data', (c) => chunks.push(c));
           res.on('end', () => {
-            const raw = Buffer.concat(chunks).toString('utf8');
+            const buffer = Buffer.concat(chunks);
+            const raw = buffer.toString('utf8');
             resolve({
               status: res.statusCode,
-               async json() {
+              headers: res.headers,
+              buffer,
+              async json() {
                 return JSON.parse(raw);
               },
             });
@@ -303,6 +306,7 @@ test('iOS Proxy-Replacement Workflow: strict checksum, proxy registration, batch
   });
 
   await t.test('3. Register proxy hash and verify batch check distinguishes master vs proxy vs missing', async () => {
+    const sampleVideoProxy = Buffer.from('FAKE_MP4_PROXY_STREAM');
     const regRes = await ctx.request('/api/proxy/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -310,6 +314,7 @@ test('iOS Proxy-Replacement Workflow: strict checksum, proxy registration, batch
         masterHash,
         proxyHash,
         assetId: 'LOCAL-ASSET-123',
+        videoProxyBase64: sampleVideoProxy.toString('base64'),
       }),
     });
     assert.equal(regRes.status, 200);
@@ -317,6 +322,7 @@ test('iOS Proxy-Replacement Workflow: strict checksum, proxy registration, batch
     assert.equal(regBody.success, true);
     assert.equal(regBody.masterHash, masterHash);
     assert.equal(regBody.proxyHash, proxyHash);
+    assert.equal(regBody.videoProxySize, sampleVideoProxy.length);
 
     const missingHash = 'f'.repeat(64);
     const batchRes = await ctx.request('/api/check/batch', {
@@ -342,7 +348,7 @@ test('iOS Proxy-Replacement Workflow: strict checksum, proxy registration, batch
     assert.equal(batchBody.results[missingHash].exists, false);
   });
 
-  await t.test('4. List backed-up photos via GET /api/photos and check 404 on unknown GET /api/photo/:hash', async () => {
+  await t.test('4. List backed-up photos via GET /api/photos, stream video proxy, and check 404 on unknown GET /api/photo/:hash', async () => {
     const listRes = await ctx.request('/api/photos');
     assert.equal(listRes.status, 200);
     const listBody = await listRes.json();
@@ -351,6 +357,16 @@ test('iOS Proxy-Replacement Workflow: strict checksum, proxy registration, batch
     assert.equal(listBody.photos[0].hash, masterHash);
     assert.equal(listBody.photos[0].hasProxy, true);
     assert.equal(listBody.photos[0].proxyHash, proxyHash);
+    assert.equal(listBody.photos[0].hasVideoProxy, true);
+    assert.equal(listBody.photos[0].videoProxySize, Buffer.from('FAKE_MP4_PROXY_STREAM').length);
+
+    const vpRes = await ctx.request(`/api/photo/${masterHash}/video-proxy`);
+    assert.equal(vpRes.status, 200);
+    assert.equal(vpRes.headers['x-photo-variant'], 'video-proxy');
+    assert.equal(vpRes.buffer.toString('utf8'), 'FAKE_MP4_PROXY_STREAM');
+
+    const missingVp = await ctx.request(`/api/photo/${'a'.repeat(64)}/video-proxy`);
+    assert.equal(missingVp.status, 404);
 
     const notFound = await ctx.request(`/api/photo/${'a'.repeat(64)}`);
     assert.equal(notFound.status, 404);

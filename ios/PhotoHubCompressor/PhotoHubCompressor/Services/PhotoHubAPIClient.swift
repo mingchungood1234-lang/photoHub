@@ -34,7 +34,7 @@ struct WhoAmIResponse: Decodable {
     let s3Enabled: Bool?
 }
 
-struct ServerPhoto: Decodable, Identifiable, Hashable {
+struct ServerPhoto: Codable, Identifiable, Hashable {
     let hash: String
     let originalName: String
     let size: Int64
@@ -44,8 +44,15 @@ struct ServerPhoto: Decodable, Identifiable, Hashable {
     let hasProxy: Bool?
     let proxyHash: String?
     let proxySize: Int64?
+    let hasVideoProxy: Bool?
+    let videoProxySize: Int64?
 
     var id: String { hash }
+
+    var isVideo: Bool {
+        let ext = URL(fileURLWithPath: originalName).pathExtension.lowercased()
+        return ["mov", "mp4", "m4v", "3gp", "avi"].contains(ext)
+    }
 }
 
 private struct ServerPhotosResponse: Decodable {
@@ -225,6 +232,81 @@ final class PhotoHubAPIClient {
         return data
     }
 
+    func downloadMasterToTempFile(
+        hash: String,
+        preferredFilename: String? = nil,
+        onProgress: @escaping (Double) -> Void = { _ in }
+    ) async throws -> URL {
+        try await downloadToTempFile(
+            path: "/api/photo/\(hash)",
+            preferredFilename: preferredFilename,
+            fallbackFilename: "photo_\(String(hash.prefix(8))).jpg",
+            onProgress: onProgress
+        )
+    }
+
+    func downloadVideoProxyToTempFile(hash: String) async throws -> URL {
+        try await downloadToTempFile(
+            path: "/api/photo/\(hash)/video-proxy",
+            preferredFilename: "\(String(hash.prefix(16))).mp4",
+            fallbackFilename: "\(String(hash.prefix(16))).mp4"
+        )
+    }
+
+    private func downloadToTempFile(
+        path: String,
+        preferredFilename: String?,
+        fallbackFilename: String,
+        onProgress: @escaping (Double) -> Void = { _ in }
+    ) async throws -> URL {
+        let url = try makeURL(path)
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        applyAuth(to: &request)
+
+        let session = makeSession(onProgress: onProgress)
+        defer { session.finishTasksAndInvalidate() }
+        let (tempURL, response) = try await session.download(for: request)
+
+        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            let errData = (try? Data(contentsOf: tempURL, options: .mappedIfSafe)) ?? Data()
+            try? FileManager.default.removeItem(at: tempURL)
+            try validateHTTP(response: response, data: errData)
+        }
+
+        let serverSuggestedName = extractFilename(from: response)
+        let candidateName = preferredFilename?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawFilename = (candidateName?.isEmpty == false ? candidateName : nil)
+            ?? serverSuggestedName
+            ?? fallbackFilename
+        let safeFilename = URL(fileURLWithPath: rawFilename).lastPathComponent
+        let destFilename = safeFilename.isEmpty ? fallbackFilename : safeFilename
+
+        let shareDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("photohub_share_\(UUID().uuidString.prefix(8))", isDirectory: true)
+        try FileManager.default.createDirectory(at: shareDir, withIntermediateDirectories: true)
+        let destURL = shareDir.appendingPathComponent(destFilename)
+        try? FileManager.default.removeItem(at: destURL)
+        try FileManager.default.moveItem(at: tempURL, to: destURL)
+        return destURL
+    }
+
+    private func extractFilename(from response: URLResponse) -> String? {
+        guard let http = response as? HTTPURLResponse,
+              let disposition = http.value(forHTTPHeaderField: "Content-Disposition") else {
+            return nil
+        }
+        guard let range = disposition.range(of: "filename=") else {
+            return nil
+        }
+        var value = String(disposition[range.upperBound...])
+        if let semi = value.firstIndex(of: ";") {
+            value = String(value[..<semi])
+        }
+        value = value.trimmingCharacters(in: CharacterSet(charactersIn: " \"'"))
+        return value.removingPercentEncoding ?? value
+    }
+
     func checkHash(_ sha256: String) async throws -> CheckResponse {
         let url = try makeURL("/api/check/\(sha256)")
         var request = URLRequest(url: url)
@@ -361,7 +443,8 @@ final class PhotoHubAPIClient {
         proxyHash: String,
         assetId: String,
         proxyFileURL: URL? = nil,
-        proxyFormat: String = "heic"
+        proxyFormat: String = "heic",
+        videoProxyURL: URL? = nil
     ) async throws {
         let url = try makeURL("/api/proxy/register")
         var request = URLRequest(url: url)
@@ -377,6 +460,14 @@ final class PhotoHubAPIClient {
         ]
         if let proxyFileURL, let data = try? Data(contentsOf: proxyFileURL) {
             payload["proxyBase64"] = data.base64EncodedString()
+        }
+        if let videoProxyURL,
+           let attrs = try? FileManager.default.attributesOfItem(atPath: videoProxyURL.path),
+           let fileSize = (attrs[.size] as? NSNumber)?.int64Value,
+           fileSize > 0,
+           fileSize <= 25 * 1024 * 1024,
+           let videoData = try? Data(contentsOf: videoProxyURL) {
+            payload["videoProxyBase64"] = videoData.base64EncodedString()
         }
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
