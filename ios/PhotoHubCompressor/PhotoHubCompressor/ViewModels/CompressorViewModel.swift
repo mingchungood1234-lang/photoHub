@@ -134,6 +134,13 @@ final class CompressorViewModel: ObservableObject {
         statusBanner = nil
 
         let apiClient = PhotoHubAPIClient(settings: settings)
+        let format = settings.proxyFormat
+        let maxPx = settings.proxyMaxPixelSize
+        let quality = settings.proxyQuality
+        let uploadMode = settings.uploadMode
+        let keepLocal = settings.keepLocalProxyInPhotos
+        let normalizedBaseURL = settings.normalizedBaseURL
+        let apiKey = settings.apiKey
 
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self = self else { return }
@@ -148,17 +155,45 @@ final class CompressorViewModel: ObservableObject {
                 return
             }
 
-            self.processNextItem(remainingIds: targetIds, failedCount: 0, apiClient: apiClient)
-        }
-    }
+            let queue = AsyncWorkQueue(targetIds)
+            let videoSemaphore = AsyncSemaphore(value: 1)
+            let photosSaveSemaphore = AsyncSemaphore(value: 1)
+            let workerCount = min(3, targetIds.count)
 
-    private func processNextItem(
-        remainingIds: [String],
-        failedCount: Int,
-        apiClient: PhotoHubAPIClient
-    ) {
-        guard let currentId = remainingIds.first else {
-            DispatchQueue.main.async {
+            let failedCount = await withTaskGroup(of: Int.self) { group in
+                for _ in 0..<workerCount {
+                    group.addTask {
+                        var workerFailures = 0
+                        while let nextId = await queue.next() {
+                            let ok = await self.processSingleCandidate(
+                                id: nextId,
+                                apiClient: apiClient,
+                                format: format,
+                                maxPx: maxPx,
+                                quality: quality,
+                                uploadMode: uploadMode,
+                                keepLocal: keepLocal,
+                                normalizedBaseURL: normalizedBaseURL,
+                                apiKey: apiKey,
+                                videoSemaphore: videoSemaphore,
+                                photosSaveSemaphore: photosSaveSemaphore
+                            )
+                            if !ok {
+                                workerFailures += 1
+                            }
+                        }
+                        return workerFailures
+                    }
+                }
+
+                var totalFailures = 0
+                for await workerFailures in group {
+                    totalFailures += workerFailures
+                }
+                return totalFailures
+            }
+
+            await MainActor.run {
                 self.isProcessing = false
                 let savedStr = ByteCountFormatter.string(fromByteCount: self.totalSavedBytes, countStyle: .file)
                 if !self.pendingDeleteAssets.isEmpty {
@@ -169,221 +204,205 @@ final class CompressorViewModel: ObservableObject {
                     self.statusBanner = "Finished! Space saved: \(savedStr)."
                 }
             }
-            return
+        }
+    }
+
+    private func processSingleCandidate(
+        id currentId: String,
+        apiClient: PhotoHubAPIClient,
+        format: ProxyFormat,
+        maxPx: Int,
+        quality: Double,
+        uploadMode: UploadMode,
+        keepLocal: Bool,
+        normalizedBaseURL: URL?,
+        apiKey: String,
+        videoSemaphore: AsyncSemaphore,
+        photosSaveSemaphore: AsyncSemaphore
+    ) async -> Bool {
+        let candidate: PhotoCandidate? = await MainActor.run {
+            guard let index = self.candidates.firstIndex(where: { $0.id == currentId }) else {
+                return nil
+            }
+            self.candidates[index].state = .hashing
+            return self.candidates[index]
         }
 
-        let restIds = Array(remainingIds.dropFirst())
+        guard let candidate else {
+            await MainActor.run { self.completedCount += 1 }
+            return true
+        }
 
-        DispatchQueue.main.async {
-            guard let index = self.candidates.firstIndex(where: { $0.id == currentId }) else {
-                self.completedCount += 1
-                self.processNextItem(remainingIds: restIds, failedCount: failedCount, apiClient: apiClient)
-                return
-            }
+        do {
+            // Step 1: Export full-resolution original & compute SHA-256
+            let master = try await photoService.exportOriginalMasterAsync(for: candidate.asset)
+            defer { try? FileManager.default.removeItem(at: master.fileURL) }
 
-            let candidate = self.candidates[index]
-            self.candidates[index].state = .hashing
+            // Step 2: Check server & upload if not already backed up
+            let checkResult = try await apiClient.checkHash(master.sha256)
+            let needsUpload = !(checkResult.exists && checkResult.isMaster == true && checkResult.canReplaceWithProxy == true)
 
-            // Step 1: Export original master via callback
-            self.photoService.exportOriginalMaster(for: candidate.asset) { [weak self] exportResult in
-                guard let self = self else { return }
+            if needsUpload {
+                self.updateStateOnMain(id: currentId, state: .uploading(0))
+                let progressHandler: (Double) -> Void = { [weak self] progress in
+                    self?.updateStateOnMain(id: currentId, state: .uploading(progress))
+                }
 
-                switch exportResult {
-                case .failure(let error):
-                    DispatchQueue.main.async {
-                        self.updateState(id: currentId, state: .failed(error.localizedDescription))
-                        self.statusBanner = error.localizedDescription
-                        self.completedCount += 1
-                        self.processNextItem(remainingIds: restIds, failedCount: failedCount + 1, apiClient: apiClient)
-                    }
-
-                case .success(let master):
-                    // Step 2: Upload master & generate proxy on background Task
-                    Task.detached(priority: .userInitiated) { [weak self] in
-                        guard let self = self else {
-                            try? FileManager.default.removeItem(at: master.fileURL)
-                            return
-                        }
-
-                        do {
-                            let checkResult = try await apiClient.checkHash(master.sha256)
-                            let needsUpload = !(checkResult.exists && checkResult.isMaster == true && checkResult.canReplaceWithProxy == true)
-
-                            if needsUpload {
-                                self.updateStateOnMain(id: currentId, state: .uploading(0))
-                                let progressHandler: (Double) -> Void = { [weak self] progress in
-                                    self?.updateStateOnMain(id: currentId, state: .uploading(progress))
-                                }
-
-                                switch self.settings.uploadMode {
-                                case .directVPS:
-                                    _ = try await apiClient.uploadMasterDirect(
-                                        fileURL: master.fileURL,
-                                        filename: master.filename,
-                                        mimeType: master.mimeType,
-                                        createdAt: candidate.creationDate,
-                                        expectedSha256: master.sha256,
-                                        onProgress: progressHandler
-                                    )
-                                case .s3Presigned:
-                                    _ = try await apiClient.uploadMasterPresigned(
-                                        fileURL: master.fileURL,
-                                        filename: master.filename,
-                                        mimeType: master.mimeType,
-                                        createdAt: candidate.creationDate,
-                                        expectedSha256: master.sha256,
-                                        onProgress: progressHandler
-                                    )
-                                }
-                            }
-
-                            // Step 3: Create lightweight proxy
-                            self.updateStateOnMain(id: currentId, state: .creatingProxy)
-                            let format = self.settings.proxyFormat
-                            let maxPx = self.settings.proxyMaxPixelSize
-                            let quality = self.settings.proxyQuality
-
-                            let proxy: GeneratedProxy
-                            let previewFileForServer: URL?
-                            let previewFormatForServer: String
-                            let videoProxyFileForServer: URL?
-
-                            if candidate.mediaType == .video {
-                                proxy = try await ProxyGenerator.createVideoProxy(from: master.fileURL)
-                                previewFileForServer = proxy.posterFileURL
-                                previewFormatForServer = "jpeg"
-                                videoProxyFileForServer = proxy.fileURL
-                            } else {
-                                proxy = try ProxyGenerator.createProxy(
-                                    from: master.fileURL,
-                                    format: format,
-                                    maxPixelSize: maxPx,
-                                    quality: quality
-                                )
-                                previewFileForServer = proxy.fileURL
-                                previewFormatForServer = format.rawValue
-                                videoProxyFileForServer = nil
-                            }
-
-                            try? FileManager.default.removeItem(at: master.fileURL)
-
-                            // Step 4: Register proxy on server (and persist locally for instant Server tab viewing)
-                            try? await apiClient.registerProxy(
-                                masterHash: master.sha256,
-                                proxyHash: proxy.sha256,
-                                assetId: candidate.id,
-                                proxyFileURL: previewFileForServer,
-                                proxyFormat: previewFormatForServer,
-                                videoProxyURL: videoProxyFileForServer
-                            )
-
-                            if let previewURL = previewFileForServer {
-                                LocalProxyStore.shared.copyPreviewFile(from: previewURL, forHash: master.sha256)
-                            }
-                            if candidate.mediaType == .video {
-                                LocalProxyStore.shared.copyVideoProxy(from: proxy.fileURL, forHash: master.sha256)
-                            }
-                            let iso = ISO8601DateFormatter()
-                            let nowISO = iso.string(from: Date())
-                            let photoISO = candidate.creationDate.map { iso.string(from: $0) } ?? nowISO
-                            let posterSize: Int64? = {
-                                guard let previewURL = previewFileForServer,
-                                      let values = try? previewURL.resourceValues(forKeys: [.fileSizeKey]),
-                                      let size = values.fileSize else {
-                                    return nil
-                                }
-                                return Int64(size)
-                            }()
-                            LocalProxyStore.shared.upsertPhoto(
-                                ServerPhoto(
-                                    hash: master.sha256,
-                                    originalName: master.filename,
-                                    size: master.sizeBytes,
-                                    photoDate: photoISO,
-                                    uploadedAt: nowISO,
-                                    savedPath: checkResult.savedPath ?? master.filename,
-                                    hasProxy: true,
-                                    hasPreview: previewFileForServer != nil,
-                                    proxyHash: proxy.sha256,
-                                    proxySize: candidate.mediaType == .video ? posterSize : proxy.sizeBytes,
-                                    hasVideoProxy: candidate.mediaType == .video,
-                                    videoProxySize: candidate.mediaType == .video ? proxy.sizeBytes : nil
-                                ),
-                                baseURL: self.settings.normalizedBaseURL,
-                                apiKey: self.settings.apiKey
-                            )
-
-                            if let posterURL = proxy.posterFileURL {
-                                try? FileManager.default.removeItem(at: posterURL)
-                            }
-
-                            // Step 5: Save compressed proxy to Photos (if enabled), then stage original asset for synchronous user-tap deletion
-                            let keepLocal = self.settings.keepLocalProxyInPhotos
-                            let savedBytes = keepLocal
-                                ? max(0, master.sizeBytes - proxy.sizeBytes)
-                                : master.sizeBytes
-
-                            if keepLocal {
-                                self.updateStateOnMain(id: currentId, state: .replacingInPhotos)
-                                DispatchQueue.main.async {
-                                    self.photoService.saveCompressedProxyToPhotos(
-                                        originalAsset: candidate.asset,
-                                        mediaType: candidate.mediaType,
-                                        proxyFileURL: proxy.fileURL
-                                    ) { [weak self] saveResult in
-                                        try? FileManager.default.removeItem(at: proxy.fileURL)
-                                        guard let self = self else { return }
-
-                                        switch saveResult {
-                                        case .success(let newAssetId):
-                                            if newAssetId != candidate.id {
-                                                self.tracker.markAsProxy(
-                                                    assetId: newAssetId,
-                                                    proxySha256: proxy.sha256,
-                                                    masterHash: master.sha256,
-                                                    originalName: master.filename
-                                                )
-                                            }
-                                            self.stageOriginalForDeletion(
-                                                id: currentId,
-                                                asset: candidate.asset,
-                                                savedBytes: savedBytes
-                                            )
-                                            self.completedCount += 1
-                                            self.processNextItem(remainingIds: restIds, failedCount: failedCount, apiClient: apiClient)
-
-                                        case .failure(let error):
-                                            self.updateState(id: currentId, state: .failed(error.localizedDescription))
-                                            self.statusBanner = error.localizedDescription
-                                            self.completedCount += 1
-                                            self.processNextItem(remainingIds: restIds, failedCount: failedCount + 1, apiClient: apiClient)
-                                        }
-                                    }
-                                }
-                            } else {
-                                try? FileManager.default.removeItem(at: proxy.fileURL)
-                                DispatchQueue.main.async {
-                                    self.stageOriginalForDeletion(
-                                        id: currentId,
-                                        asset: candidate.asset,
-                                        savedBytes: savedBytes
-                                    )
-                                    self.completedCount += 1
-                                    self.processNextItem(remainingIds: restIds, failedCount: failedCount, apiClient: apiClient)
-                                }
-                            }
-                        } catch {
-                            try? FileManager.default.removeItem(at: master.fileURL)
-                            DispatchQueue.main.async {
-                                self.updateState(id: currentId, state: .failed(error.localizedDescription))
-                                self.statusBanner = error.localizedDescription
-                                self.completedCount += 1
-                                self.processNextItem(remainingIds: restIds, failedCount: failedCount + 1, apiClient: apiClient)
-                            }
-                        }
-                    }
+                switch uploadMode {
+                case .directVPS:
+                    _ = try await apiClient.uploadMasterDirect(
+                        fileURL: master.fileURL,
+                        filename: master.filename,
+                        mimeType: master.mimeType,
+                        createdAt: candidate.creationDate,
+                        expectedSha256: master.sha256,
+                        onProgress: progressHandler
+                    )
+                case .s3Presigned:
+                    _ = try await apiClient.uploadMasterPresigned(
+                        fileURL: master.fileURL,
+                        filename: master.filename,
+                        mimeType: master.mimeType,
+                        createdAt: candidate.creationDate,
+                        expectedSha256: master.sha256,
+                        onProgress: progressHandler
+                    )
                 }
             }
+
+            // Step 3: Create lightweight proxy (limit heavy video transcoding to 1 at a time)
+            self.updateStateOnMain(id: currentId, state: .creatingProxy)
+            let proxy: GeneratedProxy
+            let previewFileForServer: URL?
+            let previewFormatForServer: String
+            let videoProxyFileForServer: URL?
+
+            if candidate.mediaType == .video {
+                await videoSemaphore.acquire()
+                do {
+                    proxy = try await ProxyGenerator.createVideoProxy(from: master.fileURL)
+                    await videoSemaphore.release()
+                } catch {
+                    await videoSemaphore.release()
+                    throw error
+                }
+                previewFileForServer = proxy.posterFileURL
+                previewFormatForServer = "jpeg"
+                videoProxyFileForServer = proxy.fileURL
+            } else {
+                proxy = try ProxyGenerator.createProxy(
+                    from: master.fileURL,
+                    format: format,
+                    maxPixelSize: maxPx,
+                    quality: quality
+                )
+                previewFileForServer = proxy.fileURL
+                previewFormatForServer = format.rawValue
+                videoProxyFileForServer = nil
+            }
+
+            try? FileManager.default.removeItem(at: master.fileURL)
+            defer {
+                try? FileManager.default.removeItem(at: proxy.fileURL)
+                if let posterURL = proxy.posterFileURL {
+                    try? FileManager.default.removeItem(at: posterURL)
+                }
+            }
+
+            // Step 4: Register proxy on server (streams video proxy binary) & persist in LocalProxyStore
+            try? await apiClient.registerProxy(
+                masterHash: master.sha256,
+                proxyHash: proxy.sha256,
+                assetId: candidate.id,
+                proxyFileURL: previewFileForServer,
+                proxyFormat: previewFormatForServer,
+                videoProxyURL: videoProxyFileForServer
+            )
+
+            if let previewURL = previewFileForServer {
+                LocalProxyStore.shared.copyPreviewFile(from: previewURL, forHash: master.sha256)
+            }
+            if candidate.mediaType == .video {
+                LocalProxyStore.shared.copyVideoProxy(from: proxy.fileURL, forHash: master.sha256)
+            }
+
+            let iso = ISO8601DateFormatter()
+            let nowISO = iso.string(from: Date())
+            let photoISO = candidate.creationDate.map { iso.string(from: $0) } ?? nowISO
+            let posterSize: Int64? = {
+                guard let previewURL = previewFileForServer,
+                      let values = try? previewURL.resourceValues(forKeys: [.fileSizeKey]),
+                      let size = values.fileSize else {
+                    return nil
+                }
+                return Int64(size)
+            }()
+            LocalProxyStore.shared.upsertPhoto(
+                ServerPhoto(
+                    hash: master.sha256,
+                    originalName: master.filename,
+                    size: master.sizeBytes,
+                    photoDate: photoISO,
+                    uploadedAt: nowISO,
+                    savedPath: checkResult.savedPath ?? master.filename,
+                    hasProxy: true,
+                    hasPreview: previewFileForServer != nil,
+                    proxyHash: proxy.sha256,
+                    proxySize: candidate.mediaType == .video ? posterSize : proxy.sizeBytes,
+                    hasVideoProxy: candidate.mediaType == .video,
+                    videoProxySize: candidate.mediaType == .video ? proxy.sizeBytes : nil
+                ),
+                baseURL: normalizedBaseURL,
+                apiKey: apiKey
+            )
+
+            // Step 5: Save compressed proxy to Photos (serialized for photolibraryd stability)
+            let savedBytes = keepLocal
+                ? max(0, master.sizeBytes - proxy.sizeBytes)
+                : master.sizeBytes
+
+            if keepLocal {
+                self.updateStateOnMain(id: currentId, state: .replacingInPhotos)
+                await photosSaveSemaphore.acquire()
+                let newAssetId: String
+                do {
+                    newAssetId = try await photoService.saveCompressedProxyToPhotosAsync(
+                        originalAsset: candidate.asset,
+                        mediaType: candidate.mediaType,
+                        proxyFileURL: proxy.fileURL
+                    )
+                    await photosSaveSemaphore.release()
+                } catch {
+                    await photosSaveSemaphore.release()
+                    throw error
+                }
+
+                if newAssetId != candidate.id {
+                    self.tracker.markAsProxy(
+                        assetId: newAssetId,
+                        proxySha256: proxy.sha256,
+                        masterHash: master.sha256,
+                        originalName: master.filename
+                    )
+                }
+            }
+
+            await MainActor.run {
+                self.stageOriginalForDeletion(
+                    id: currentId,
+                    asset: candidate.asset,
+                    savedBytes: savedBytes
+                )
+                self.completedCount += 1
+            }
+            return true
+        } catch {
+            await MainActor.run {
+                self.updateState(id: currentId, state: .failed(error.localizedDescription))
+                self.statusBanner = error.localizedDescription
+                self.completedCount += 1
+            }
+            return false
         }
     }
 

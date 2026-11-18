@@ -221,6 +221,7 @@ async function storeAndVerifyPhoto({
     relativePath,
     originalName: finalFileName,
     size: writtenStat.size,
+    mtimeMs: writtenStat.mtimeMs,
     photoDate: dateFolder,
     uploadedAt: new Date().toISOString(),
   };

@@ -34,7 +34,7 @@ struct WhoAmIResponse: Decodable {
     let s3Enabled: Bool?
 }
 
-struct ServerPhoto: Codable, Identifiable, Hashable {
+struct ServerPhoto: Codable, Identifiable, Hashable, Sendable {
     let hash: String
     let originalName: String
     let size: Int64
@@ -99,11 +99,33 @@ private struct PresignResponse: Decodable {
     let error: String?
 }
 
-private final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate {
+private final class SessionTrustDelegate: NSObject, URLSessionDelegate {
+    let allowSelfSignedHTTPS: Bool
+
+    init(allowSelfSignedHTTPS: Bool) {
+        self.allowSelfSignedHTTPS = allowSelfSignedHTTPS
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        if allowSelfSignedHTTPS,
+           challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+           let serverTrust = challenge.protectionSpace.serverTrust {
+            completionHandler(.useCredential, URLCredential(trust: serverTrust))
+            return
+        }
+        completionHandler(.performDefaultHandling, nil)
+    }
+}
+
+private final class TaskUploadProgressDelegate: NSObject, URLSessionTaskDelegate {
     private let onProgress: (Double) -> Void
     private let allowSelfSignedHTTPS: Bool
 
-    init(allowSelfSignedHTTPS: Bool = false, onProgress: @escaping (Double) -> Void = { _ in }) {
+    init(allowSelfSignedHTTPS: Bool = false, onProgress: @escaping (Double) -> Void) {
         self.allowSelfSignedHTTPS = allowSelfSignedHTTPS
         self.onProgress = onProgress
     }
@@ -122,6 +144,7 @@ private final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate {
 
     func urlSession(
         _ session: URLSession,
+        task: URLSessionTask,
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
@@ -135,7 +158,28 @@ private final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate {
     }
 }
 
+private struct GenerateProxyResponse: Decodable {
+    let success: Bool
+    let photo: ServerPhoto?
+}
+
 final class PhotoHubAPIClient {
+    private static let sharedStandardSession: URLSession = makeSharedSession(allowSelfSigned: false)
+    private static let sharedSelfSignedSession: URLSession = makeSharedSession(allowSelfSigned: true)
+
+    private static func makeSharedSession(allowSelfSigned: Bool) -> URLSession {
+        let config = URLSessionConfiguration.default
+        config.httpMaximumConnectionsPerHost = 6
+        config.waitsForConnectivity = true
+        config.timeoutIntervalForRequest = 120
+        config.timeoutIntervalForResource = 600
+        return URLSession(
+            configuration: config,
+            delegate: SessionTrustDelegate(allowSelfSignedHTTPS: allowSelfSigned),
+            delegateQueue: nil
+        )
+    }
+
     private let settings: AppSettings
     private let isoFormatter: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
@@ -147,12 +191,8 @@ final class PhotoHubAPIClient {
         self.settings = settings
     }
 
-    private func makeSession(onProgress: @escaping (Double) -> Void = { _ in }) -> URLSession {
-        let delegate = UploadProgressDelegate(
-            allowSelfSignedHTTPS: settings.allowSelfSignedHTTPS,
-            onProgress: onProgress
-        )
-        return URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+    private var pooledSession: URLSession {
+        settings.allowSelfSignedHTTPS ? Self.sharedSelfSignedSession : Self.sharedStandardSession
     }
 
     private func makeURL(_ path: String) throws -> URL {
@@ -171,9 +211,7 @@ final class PhotoHubAPIClient {
 
     func checkHealth() async throws -> HealthResponse {
         let url = try makeURL("/api/health")
-        let session = makeSession()
-        defer { session.finishTasksAndInvalidate() }
-        let (data, response) = try await session.data(from: url)
+        let (data, response) = try await pooledSession.data(from: url)
         try validateHTTP(response: response, data: data)
         return try JSONDecoder().decode(HealthResponse.self, from: data)
     }
@@ -184,9 +222,7 @@ final class PhotoHubAPIClient {
         request.httpMethod = "GET"
         applyAuth(to: &request)
 
-        let session = makeSession()
-        defer { session.finishTasksAndInvalidate() }
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await pooledSession.data(for: request)
         try validateHTTP(response: response, data: data)
         return try JSONDecoder().decode(WhoAmIResponse.self, from: data)
     }
@@ -243,16 +279,28 @@ final class PhotoHubAPIClient {
         request.httpMethod = "GET"
         applyAuth(to: &request)
 
-        let session = makeSession()
-        defer { session.finishTasksAndInvalidate() }
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await pooledSession.data(for: request)
         try validateHTTP(response: response, data: data)
         return try JSONDecoder().decode(ServerPhotosResponse.self, from: data)
     }
 
-    /// Downloads an un-proxied master from the server, generates a compressed proxy using Settings,
-    /// registers it back onto the server, and stores the local preview / MP4 proxy in `LocalProxyStore`.
+    /// Generates a proxy on-demand: tries fast server-side compression (`POST /api/proxy/generate`) first
+    /// so large masters stay on server disk; transparently falls back to iPhone-side compression if needed.
     func createAndRegisterProxy(for photo: ServerPhoto) async throws -> ServerPhoto {
+        if let serverUpdated = try? await generateProxyOnServer(for: photo) {
+            if let previewData = try? await downloadPhotoPreviewData(hash: serverUpdated.hash),
+               !previewData.isEmpty {
+                LocalProxyStore.shared.savePreviewData(previewData, forHash: serverUpdated.hash)
+            }
+            LocalProxyStore.shared.updatePhoto(
+                serverUpdated,
+                baseURL: settings.normalizedBaseURL,
+                apiKey: settings.apiKey,
+                notify: false
+            )
+            return serverUpdated
+        }
+
         let masterURL = try await downloadMasterToTempFile(
             hash: photo.hash,
             preferredFilename: photo.originalName
@@ -314,15 +362,6 @@ final class PhotoHubAPIClient {
             return Int64(size)
         }()
 
-        let uploadedVideo: Bool = {
-            guard let videoProxyURL,
-                  let values = try? videoProxyURL.resourceValues(forKeys: [.fileSizeKey]),
-                  let size = values.fileSize else {
-                return false
-            }
-            return size > 0 && size <= 25 * 1024 * 1024
-        }()
-
         let updated = ServerPhoto(
             hash: photo.hash,
             originalName: photo.originalName,
@@ -334,7 +373,7 @@ final class PhotoHubAPIClient {
             hasPreview: previewURL != nil,
             proxyHash: proxy.sha256,
             proxySize: photo.isVideo ? posterSize : proxy.sizeBytes,
-            hasVideoProxy: photo.isVideo ? (uploadedVideo || photo.hasVideoProxy == true) : photo.hasVideoProxy,
+            hasVideoProxy: photo.isVideo ? true : photo.hasVideoProxy,
             videoProxySize: photo.isVideo ? proxy.sizeBytes : photo.videoProxySize
         )
 
@@ -347,15 +386,35 @@ final class PhotoHubAPIClient {
         return updated
     }
 
+    private func generateProxyOnServer(for photo: ServerPhoto) async throws -> ServerPhoto {
+        let url = try makeURL("/api/proxy/generate")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 180
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyAuth(to: &request)
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "masterHash": photo.hash,
+            "maxPixelSize": settings.proxyMaxPixelSize,
+            "quality": settings.proxyQuality,
+        ])
+
+        let (data, response) = try await pooledSession.data(for: request)
+        try validateHTTP(response: response, data: data)
+        let decoded = try JSONDecoder().decode(GenerateProxyResponse.self, from: data)
+        guard decoded.success, let updated = decoded.photo else {
+            throw APIClientError.invalidResponse
+        }
+        return updated
+    }
+
     func downloadPhotoPreviewData(hash: String) async throws -> Data {
         let url = try makeURL("/api/photo/\(hash)/preview")
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         applyAuth(to: &request)
 
-        let session = makeSession()
-        defer { session.finishTasksAndInvalidate() }
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await pooledSession.data(for: request)
         try validateHTTP(response: response, data: data)
         return data
     }
@@ -366,9 +425,7 @@ final class PhotoHubAPIClient {
         request.httpMethod = "GET"
         applyAuth(to: &request)
 
-        let session = makeSession()
-        defer { session.finishTasksAndInvalidate() }
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await pooledSession.data(for: request)
         try validateHTTP(response: response, data: data)
         return data
     }
@@ -402,9 +459,7 @@ final class PhotoHubAPIClient {
         request.httpMethod = "GET"
         applyAuth(to: &request)
 
-        let session = makeSession()
-        defer { session.finishTasksAndInvalidate() }
-        let (tempURL, response) = try await session.download(for: request)
+        let (tempURL, response) = try await pooledSession.download(for: request)
 
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             let errData = (try? Data(contentsOf: tempURL, options: .mappedIfSafe)) ?? Data()
@@ -455,9 +510,7 @@ final class PhotoHubAPIClient {
         request.httpMethod = "GET"
         applyAuth(to: &request)
 
-        let session = makeSession()
-        defer { session.finishTasksAndInvalidate() }
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await pooledSession.data(for: request)
         try validateHTTP(response: response, data: data)
         return try JSONDecoder().decode(CheckResponse.self, from: data)
     }
@@ -487,10 +540,11 @@ final class PhotoHubAPIClient {
             request.setValue(isoFormatter.string(from: createdAt), forHTTPHeaderField: "X-Photo-Date")
         }
 
-        let session = makeSession(onProgress: onProgress)
-        defer { session.finishTasksAndInvalidate() }
-
-        let (data, response) = try await session.upload(for: request, fromFile: fileURL)
+        let progressDelegate = TaskUploadProgressDelegate(
+            allowSelfSignedHTTPS: settings.allowSelfSignedHTTPS,
+            onProgress: onProgress
+        )
+        let (data, response) = try await pooledSession.upload(for: request, fromFile: fileURL, delegate: progressDelegate)
         try validateHTTP(response: response, data: data)
 
         let decoded = try JSONDecoder().decode(UploadConfirmResponse.self, from: data)
@@ -521,10 +575,7 @@ final class PhotoHubAPIClient {
             "expectedHash": expectedSha256,
         ])
 
-        let metaSession = makeSession()
-        defer { metaSession.finishTasksAndInvalidate() }
-
-        let (presignData, presignResp) = try await metaSession.data(for: presignReq)
+        let (presignData, presignResp) = try await pooledSession.data(for: presignReq)
         try validateHTTP(response: presignResp, data: presignData)
         let presign = try JSONDecoder().decode(PresignResponse.self, from: presignData)
 
@@ -554,10 +605,11 @@ final class PhotoHubAPIClient {
         putReq.httpMethod = "PUT"
         putReq.timeoutInterval = 300
 
-        let session = makeSession(onProgress: onProgress)
-        defer { session.finishTasksAndInvalidate() }
-
-        let (putData, putResp) = try await session.upload(for: putReq, fromFile: fileURL)
+        let progressDelegate = TaskUploadProgressDelegate(
+            allowSelfSignedHTTPS: settings.allowSelfSignedHTTPS,
+            onProgress: onProgress
+        )
+        let (putData, putResp) = try await pooledSession.upload(for: putReq, fromFile: fileURL, delegate: progressDelegate)
         try validateHTTP(response: putResp, data: putData)
 
         // 3. Ask backend to verify checksum of uploaded S3 object
@@ -573,7 +625,7 @@ final class PhotoHubAPIClient {
             "createdAt": dateStr,
         ])
 
-        let (confirmData, confirmResp) = try await metaSession.data(for: confirmReq)
+        let (confirmData, confirmResp) = try await pooledSession.data(for: confirmReq)
         try validateHTTP(response: confirmResp, data: confirmData)
         let confirmed = try JSONDecoder().decode(UploadConfirmResponse.self, from: confirmData)
         try ensureChecksumConfirmed(confirmed, expectedSha256: expectedSha256)
@@ -603,19 +655,54 @@ final class PhotoHubAPIClient {
         if let proxyFileURL, let data = try? Data(contentsOf: proxyFileURL) {
             payload["proxyBase64"] = data.base64EncodedString()
         }
-        if let videoProxyURL,
-           let attrs = try? FileManager.default.attributesOfItem(atPath: videoProxyURL.path),
-           let fileSize = (attrs[.size] as? NSNumber)?.int64Value,
-           fileSize > 0,
-           fileSize <= 25 * 1024 * 1024,
-           let videoData = try? Data(contentsOf: videoProxyURL) {
-            payload["videoProxyBase64"] = videoData.base64EncodedString()
-        }
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
-        let session = makeSession()
-        defer { session.finishTasksAndInvalidate() }
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await pooledSession.data(for: request)
+        try validateHTTP(response: response, data: data)
+
+        // Stream raw binary MP4 proxy from disk directly (avoids ~33% base64 JSON bloat & 25MB limit).
+        if let videoProxyURL {
+            do {
+                try await uploadVideoProxyBinary(
+                    masterHash: masterHash,
+                    proxyHash: proxyHash,
+                    assetId: assetId,
+                    videoProxyURL: videoProxyURL
+                )
+            } catch APIClientError.httpError(404, _) {
+                // Backward-compatible fallback for older backends without POST /api/proxy/:masterHash/video
+                if let attrs = try? FileManager.default.attributesOfItem(atPath: videoProxyURL.path),
+                   let fileSize = (attrs[.size] as? NSNumber)?.int64Value,
+                   fileSize > 0,
+                   fileSize <= 25 * 1024 * 1024,
+                   let videoData = try? Data(contentsOf: videoProxyURL) {
+                    payload["videoProxyBase64"] = videoData.base64EncodedString()
+                    request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+                    let (fallbackData, fallbackResp) = try await pooledSession.data(for: request)
+                    try validateHTTP(response: fallbackResp, data: fallbackData)
+                }
+            }
+        }
+    }
+
+    private func uploadVideoProxyBinary(
+        masterHash: String,
+        proxyHash: String,
+        assetId: String,
+        videoProxyURL: URL
+    ) async throws {
+        let url = try makeURL("/api/proxy/\(masterHash)/video")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 300
+        request.setValue("video/mp4", forHTTPHeaderField: "Content-Type")
+        request.setValue(proxyHash, forHTTPHeaderField: "X-Proxy-Hash")
+        if !assetId.isEmpty {
+            request.setValue(assetId, forHTTPHeaderField: "X-Asset-Id")
+        }
+        applyAuth(to: &request)
+
+        let (data, response) = try await pooledSession.upload(for: request, fromFile: videoProxyURL)
         try validateHTTP(response: response, data: data)
     }
 

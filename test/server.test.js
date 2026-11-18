@@ -530,4 +530,84 @@ test('iOS Proxy-Replacement Workflow: strict checksum, proxy registration, batch
     assert.equal(cachedPrevRes.headers['x-photo-variant'], 'proxy');
     assert.equal(cachedPrevRes.buffer.toString('utf8'), 'SMALL_JPG_PROXY');
   });
+
+  await t.test('7. Raw binary video proxy streaming upload & server-side sharp proxy generation', async () => {
+    const manualPhotoDir = path.join(ctx.storageDir, '2026', '2026-11-18');
+    await fsp.mkdir(manualPhotoDir, { recursive: true });
+
+    // Create a valid PNG image on server disk using sharp (32x32 red square)
+    let sharpLib = null;
+    try {
+      sharpLib = require('sharp');
+    } catch {
+      sharpLib = null;
+    }
+
+    const listBefore = await ctx.request('/api/photos?sync=1');
+    const beforeBody = await listBefore.json();
+    const videoItem = beforeBody.photos.find((p) => p.originalName === 'MANUAL_002.MOV');
+    assert.ok(videoItem);
+
+    // Stream compressed binary MP4 proxy without base64 bloat
+    const rawMp4 = Buffer.from('RAW_BINARY_MP4_PROXY_STREAM_DATA_XYZ');
+    const mp4Sha = crypto.createHash('sha256').update(rawMp4).digest('hex');
+    const binUpRes = await ctx.request(`/api/proxy/${videoItem.hash}/video`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'video/mp4',
+        'X-Proxy-Hash': mp4Sha,
+      },
+      body: rawMp4,
+    });
+    assert.equal(binUpRes.status, 200);
+    const binUpBody = await binUpRes.json();
+    assert.equal(binUpBody.success, true);
+    assert.equal(binUpBody.videoProxySize, rawMp4.length);
+
+    const streamRes = await ctx.request(`/api/photo/${videoItem.hash}/video-proxy`);
+    assert.equal(streamRes.status, 200);
+    assert.equal(streamRes.buffer.toString('utf8'), 'RAW_BINARY_MP4_PROXY_STREAM_DATA_XYZ');
+
+    if (sharpLib) {
+      const realPng = await sharpLib({
+        create: {
+          width: 64,
+          height: 64,
+          channels: 3,
+          background: { r: 220, g: 40, b: 40 },
+        },
+      })
+        .png()
+        .toBuffer();
+      const pngPath = path.join(manualPhotoDir, 'REAL_IMG_003.PNG');
+      await fsp.writeFile(pngPath, realPng);
+
+      const syncRes = await ctx.request('/api/photos?sync=1');
+      const syncBody = await syncRes.json();
+      const realPhoto = syncBody.photos.find((p) => p.originalName === 'REAL_IMG_003.PNG');
+      assert.ok(realPhoto);
+      assert.equal(realPhoto.hasProxy, false);
+
+      const genRes = await ctx.request('/api/proxy/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          masterHash: realPhoto.hash,
+          maxPixelSize: 32,
+          quality: 0.7,
+        }),
+      });
+      assert.equal(genRes.status, 200);
+      const genBody = await genRes.json();
+      assert.equal(genBody.success, true);
+      assert.equal(genBody.photo.hasProxy, true);
+      assert.equal(genBody.photo.hasPreview, true);
+      assert.ok(genBody.photo.proxySize > 0);
+
+      const genPrevRes = await ctx.request(`/api/photo/${realPhoto.hash}/preview`);
+      assert.equal(genPrevRes.status, 200);
+      assert.equal(genPrevRes.headers['x-photo-variant'], 'proxy');
+      assert.equal(genPrevRes.buffer.length, genBody.photo.proxySize);
+    }
+  });
 });

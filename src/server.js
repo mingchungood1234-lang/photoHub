@@ -2,6 +2,7 @@ const fs = require('fs');
 const http = require('http');
 const https = require('https');
 const path = require('path');
+const crypto = require('crypto');
 const express = require('express');
 const multer = require('multer');
 const { getConfig } = require('./config');
@@ -16,6 +17,10 @@ const {
   createPresignedUrl,
   verifyS3ObjectChecksum,
 } = require('./s3');
+const {
+  getCapabilities: getProxyCapabilities,
+  generateServerSideProxy,
+} = require('./proxyWorker');
 
 async function createApp(configOverrides = {}) {
   const config = getConfig(configOverrides);
@@ -622,6 +627,180 @@ async function createApp(configOverrides = {}) {
     }
   });
 
+  // Stream raw binary compressed MP4 video proxy straight to .proxies/<hash>.mp4 (avoids JSON/base64 bloat)
+  app.post('/api/proxy/:masterHash/video', async (req, res) => {
+    req.pause();
+    let tmpPath = null;
+    try {
+      const { hashIndex, storageDir } = req.userContext;
+      const lookupResult = await hashIndex.lookup(req.params.masterHash, { allowStatFastPath: true });
+      if (lookupResult.status === 'missing' || !lookupResult.record) {
+        return res.status(404).json({
+          success: false,
+          error: 'Master photo not found',
+        });
+      }
+
+      const normMaster = lookupResult.masterHash.replace(/[^a-f0-9_-]/gi, '');
+      const proxiesDir = path.join(storageDir, '.proxies');
+      await fs.promises.mkdir(proxiesDir, { recursive: true });
+      const videoFileName = `${normMaster}.mp4`;
+      const videoFullPath = path.join(proxiesDir, videoFileName);
+      tmpPath = `${videoFullPath}.${process.pid}.${Date.now()}.tmp`;
+
+      const providedProxyHash = String(req.headers['x-proxy-hash'] || '').trim().toLowerCase();
+      const assetId = String(req.headers['x-asset-id'] || '').trim();
+      const shaHasher = providedProxyHash ? null : crypto.createHash('sha256');
+
+      let totalBytes = 0;
+      await new Promise((resolve, reject) => {
+        const ws = fs.createWriteStream(tmpPath);
+        let settled = false;
+        const fail = (err) => {
+          if (settled) return;
+          settled = true;
+          req.unpipe(ws);
+          ws.destroy();
+          reject(err);
+        };
+        ws.on('error', fail);
+        req.on('error', fail);
+        req.on('data', (chunk) => {
+          totalBytes += chunk.length;
+          if (totalBytes > config.maxFileSizeBytes) {
+            const err = new Error('Video proxy exceeds maximum upload size');
+            err.statusCode = 413;
+            fail(err);
+            return;
+          }
+          if (shaHasher) shaHasher.update(chunk);
+        });
+        ws.on('finish', () => {
+          if (settled) return;
+          settled = true;
+          resolve();
+        });
+        req.resume();
+        req.pipe(ws);
+      });
+
+      if (totalBytes === 0) {
+        await fs.promises.unlink(tmpPath).catch(() => {});
+        return res.status(400).json({
+          success: false,
+          error: 'Empty video proxy stream',
+        });
+      }
+
+      await fs.promises.rename(tmpPath, videoFullPath);
+      tmpPath = null;
+
+      const resolvedProxyHash =
+        providedProxyHash ||
+        lookupResult.record.proxyHash ||
+        (shaHasher ? shaHasher.digest('hex') : normMaster);
+
+      const updated = await hashIndex.registerProxy(
+        lookupResult.masterHash,
+        resolvedProxyHash,
+        assetId,
+        {
+          videoProxyRelativePath: `.proxies/${videoFileName}`,
+          videoProxySize: totalBytes,
+        }
+      );
+
+      return res.json({
+        success: true,
+        masterHash: lookupResult.masterHash,
+        proxyHash: updated?.proxyHash || resolvedProxyHash,
+        videoProxySize: totalBytes,
+      });
+    } catch (err) {
+      if (tmpPath) {
+        await fs.promises.unlink(tmpPath).catch(() => {});
+      }
+      return res.status(err.statusCode || 500).json({
+        success: false,
+        error: err.message,
+      });
+    }
+  });
+
+  // Server-side proxy generation using sharp / ffmpeg directly from disk (no full-master transfer back to iPhone)
+  app.post('/api/proxy/generate', async (req, res) => {
+    try {
+      const { masterHash, maxPixelSize, quality } = req.body || {};
+      if (!masterHash) {
+        return res.status(400).json({
+          success: false,
+          error: 'masterHash is required',
+        });
+      }
+
+      const { hashIndex, storageDir } = req.userContext;
+      const lookupResult = await hashIndex.lookup(masterHash, { allowStatFastPath: true });
+      if (lookupResult.status === 'missing' || !lookupResult.record) {
+        return res.status(404).json({
+          success: false,
+          error: 'Master photo not found',
+        });
+      }
+
+      const record = lookupResult.record;
+      if (record.storageType === 's3') {
+        return res.status(501).json({
+          success: false,
+          fallbackToClient: true,
+          error: 'Server-side proxy generation requires local disk storage',
+        });
+      }
+
+      const fullPath = path.join(storageDir, record.relativePath);
+      if (!fs.existsSync(fullPath)) {
+        return res.status(404).json({
+          success: false,
+          error: 'Master photo file not found on disk',
+        });
+      }
+
+      const proxiesDir = path.join(storageDir, '.proxies');
+      const generated = await generateServerSideProxy({
+        sourcePath: fullPath,
+        proxiesDir,
+        masterHash: lookupResult.masterHash,
+        originalName: record.originalName || fullPath,
+        maxPixelSize,
+        quality,
+      });
+
+      const updated = await hashIndex.registerProxy(
+        lookupResult.masterHash,
+        generated.proxyHash,
+        record.assetId || '',
+        generated
+      );
+      if (!updated) {
+        return res.status(404).json({
+          success: false,
+          error: 'Master photo not found',
+        });
+      }
+
+      return res.json({
+        success: true,
+        capabilities: await getProxyCapabilities(),
+        photo: hashIndex.formatMasterSummary(updated, lookupResult.masterHash),
+      });
+    } catch (err) {
+      return res.status(err.statusCode || 500).json({
+        success: false,
+        fallbackToClient: Boolean(err.fallbackToClient),
+        error: err.message,
+      });
+    }
+  });
+
   // List all backed-up master photos for the authenticated user
   app.get('/api/photos', async (req, res) => {
     try {
@@ -652,7 +831,7 @@ async function createApp(configOverrides = {}) {
   app.get('/api/photo/:hash/preview', async (req, res) => {
     try {
       const { hashIndex, storageDir } = req.userContext;
-      const lookupResult = await hashIndex.lookup(req.params.hash);
+      const lookupResult = await hashIndex.lookup(req.params.hash, { allowStatFastPath: true });
       if (lookupResult.status === 'missing' || !lookupResult.record) {
         return res.status(404).json({
           success: false,
@@ -711,7 +890,7 @@ async function createApp(configOverrides = {}) {
   app.get('/api/photo/:hash/video-proxy', async (req, res) => {
     try {
       const { hashIndex, storageDir } = req.userContext;
-      const lookupResult = await hashIndex.lookup(req.params.hash);
+      const lookupResult = await hashIndex.lookup(req.params.hash, { allowStatFastPath: true });
       if (lookupResult.status === 'missing' || !lookupResult.record) {
         return res.status(404).json({
           success: false,
@@ -746,7 +925,7 @@ async function createApp(configOverrides = {}) {
   app.get('/api/photo/:hash', async (req, res) => {
     try {
       const { hashIndex, storageDir } = req.userContext;
-      const lookupResult = await hashIndex.lookup(req.params.hash);
+      const lookupResult = await hashIndex.lookup(req.params.hash, { allowStatFastPath: true });
       if (lookupResult.status === 'missing' || !lookupResult.record) {
         return res.status(404).json({
           success: false,

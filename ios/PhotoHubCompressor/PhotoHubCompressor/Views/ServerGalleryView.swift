@@ -294,22 +294,58 @@ struct ServerGalleryView: View {
 
         batchTask = Task {
             let client = PhotoHubAPIClient(settings: settings)
-            var succeeded = 0
-            var failed = 0
+            let queue = AsyncWorkQueue(targets)
+            let videoSemaphore = AsyncSemaphore(value: 1)
+            let workerCount = min(3, targets.count)
 
-            for item in targets {
-                if Task.isCancelled { break }
-                batchStatusText = item.originalName
-                do {
-                    let updated = try await client.createAndRegisterProxy(for: item)
-                    applyUpdatedPhoto(updated)
-                    succeeded += 1
-                } catch {
-                    failed += 1
+            let counts: (Int, Int) = await withTaskGroup(of: (Int, Int).self) { group in
+                for _ in 0..<workerCount {
+                    group.addTask {
+                        var workerOk = 0
+                        var workerFail = 0
+
+                        while !Task.isCancelled, let item = await queue.next() {
+                            await MainActor.run {
+                                batchStatusText = item.originalName
+                            }
+                            if item.isVideo {
+                                await videoSemaphore.acquire()
+                            }
+                            do {
+                                let updated = try await client.createAndRegisterProxy(for: item)
+                                if item.isVideo {
+                                    await videoSemaphore.release()
+                                }
+                                await MainActor.run {
+                                    applyUpdatedPhoto(updated)
+                                    batchCompleted += 1
+                                }
+                                workerOk += 1
+                            } catch {
+                                if item.isVideo {
+                                    await videoSemaphore.release()
+                                }
+                                await MainActor.run {
+                                    batchCompleted += 1
+                                }
+                                workerFail += 1
+                            }
+                        }
+                        return (workerOk, workerFail)
+                    }
                 }
-                batchCompleted += 1
+
+                var totalOk = 0
+                var totalFail = 0
+                for await (ok, fail) in group {
+                    totalOk += ok
+                    totalFail += fail
+                }
+                return (totalOk, totalFail)
             }
 
+            let succeeded = counts.0
+            let failed = counts.1
             let cancelled = Task.isCancelled
             isBatchProxying = false
             batchStatusText = ""

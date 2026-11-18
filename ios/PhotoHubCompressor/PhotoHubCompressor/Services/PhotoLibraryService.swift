@@ -173,6 +173,14 @@ final class PhotoLibraryService {
         }
     }
 
+    func exportOriginalMasterAsync(for asset: PHAsset) async throws -> ExportedMaster {
+        try await withCheckedThrowingContinuation { continuation in
+            exportOriginalMaster(for: asset) { result in
+                continuation.resume(with: result)
+            }
+        }
+    }
+
     /// Step 1: Saves the compressed proxy into the native iOS Photos library (proven working on device).
     func saveCompressedProxyToPhotos(
         originalAsset: PHAsset,
@@ -214,6 +222,22 @@ final class PhotoLibraryService {
                 }
             }
         })
+    }
+
+    func saveCompressedProxyToPhotosAsync(
+        originalAsset: PHAsset,
+        mediaType: PHAssetMediaType,
+        proxyFileURL: URL
+    ) async throws -> String {
+        try await withCheckedThrowingContinuation { continuation in
+            saveCompressedProxyToPhotos(
+                originalAsset: originalAsset,
+                mediaType: mediaType,
+                proxyFileURL: proxyFileURL
+            ) { result in
+                continuation.resume(with: result)
+            }
+        }
     }
 
     /// Step 2: Triggers the native iOS "Allow 'photoHub' to delete..." confirmation sheet on the main thread

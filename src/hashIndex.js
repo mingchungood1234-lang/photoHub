@@ -121,6 +121,7 @@ class HashIndex {
                 relativePath: relPath.split(path.sep).join('/'),
                 originalName: d.name,
                 size: stat.size,
+                mtimeMs: stat.mtimeMs,
                 photoDate: stat.mtime.toISOString().slice(0, 10),
                 uploadedAt: (stat.birthtime || stat.mtime).toISOString(),
               });
@@ -145,10 +146,11 @@ class HashIndex {
   }
 
   /**
-   * Checks if a hash exists in the index AND verifies that the file still physically exists on disk
-   * with the exact expected byte size and SHA-256 hash.
+   * Checks if a hash exists in the index AND verifies that the file still physically exists on disk.
+   * Pass `allowStatFastPath: true` for already-verified routes like proxy registration or streaming reads
+   * so large video files aren't re-hashed when byte size and mtimeMs match cleanly.
    */
-  async verifyExisting(rawHash) {
+  async verifyExisting(rawHash, { allowStatFastPath = false } = {}) {
     if (!rawHash || typeof rawHash !== 'string') return null;
     const hash = rawHash.trim().toLowerCase();
     const record = this.records.get(hash);
@@ -166,6 +168,13 @@ class HashIndex {
         await this.persist();
         return null;
       }
+      if (
+        allowStatFastPath &&
+        typeof record.mtimeMs === 'number' &&
+        stat.mtimeMs === record.mtimeMs
+      ) {
+        return record;
+      }
       const diskHash = await computeFileSha256(fullPath);
       const expectedDiskHash = record.diskHash || hash;
       if (diskHash !== expectedDiskHash) {
@@ -173,6 +182,7 @@ class HashIndex {
         await this.persist();
         return null;
       }
+      record.mtimeMs = stat.mtimeMs;
       return record;
     } catch {
       this.records.delete(hash);
@@ -184,13 +194,13 @@ class HashIndex {
   /**
    * Resolves a hash as either a verified master photo, a known compressed proxy, or missing.
    */
-  async lookup(rawHash) {
+  async lookup(rawHash, options = {}) {
     if (!rawHash || typeof rawHash !== 'string') {
       return { status: 'missing', record: null, masterHash: null };
     }
     const normalized = rawHash.trim().toLowerCase();
 
-    const masterRecord = await this.verifyExisting(normalized);
+    const masterRecord = await this.verifyExisting(normalized, options);
     if (masterRecord) {
       return {
         status: 'master',
@@ -201,7 +211,7 @@ class HashIndex {
 
     const mappedMasterHash = this.proxyToMaster.get(normalized);
     if (mappedMasterHash) {
-      const verifiedMaster = await this.verifyExisting(mappedMasterHash);
+      const verifiedMaster = await this.verifyExisting(mappedMasterHash, options);
       if (verifiedMaster) {
         return {
           status: 'proxy',
@@ -222,7 +232,7 @@ class HashIndex {
       throw new Error('masterHash and proxyHash are required');
     }
 
-    const record = await this.verifyExisting(normMaster);
+    const record = await this.verifyExisting(normMaster, { allowStatFastPath: true });
     if (!record) {
       return null;
     }
@@ -271,6 +281,24 @@ class HashIndex {
     return this.records.size;
   }
 
+  formatMasterSummary(entry, fallbackHash = '') {
+    const canonicalHash = (entry.diskHash || entry.hash || fallbackHash).toLowerCase();
+    return {
+      hash: canonicalHash,
+      originalName: entry.originalName,
+      size: entry.size || 0,
+      photoDate: entry.photoDate || '',
+      uploadedAt: entry.uploadedAt || '',
+      savedPath: entry.relativePath,
+      hasProxy: Boolean(entry.proxyHash || entry.proxyRelativePath),
+      hasPreview: Boolean(entry.proxyRelativePath),
+      proxyHash: entry.proxyHash || null,
+      proxySize: entry.proxySize || null,
+      hasVideoProxy: Boolean(entry.videoProxyRelativePath),
+      videoProxySize: entry.videoProxySize || null,
+    };
+  }
+
   /**
    * Returns a deduplicated list of backed-up master photo records, sorted newest first.
    */
@@ -284,20 +312,7 @@ class HashIndex {
       if (key !== canonicalHash && this.records.has(canonicalHash)) continue;
       if (seenPaths.has(entry.relativePath)) continue;
       seenPaths.add(entry.relativePath);
-      items.push({
-        hash: canonicalHash,
-        originalName: entry.originalName,
-        size: entry.size || 0,
-        photoDate: entry.photoDate || '',
-        uploadedAt: entry.uploadedAt || '',
-        savedPath: entry.relativePath,
-        hasProxy: Boolean(entry.proxyHash || entry.proxyRelativePath),
-        hasPreview: Boolean(entry.proxyRelativePath),
-        proxyHash: entry.proxyHash || null,
-        proxySize: entry.proxySize || null,
-        hasVideoProxy: Boolean(entry.videoProxyRelativePath),
-        videoProxySize: entry.videoProxySize || null,
-      });
+      items.push(this.formatMasterSummary(entry, key));
     }
     items.sort((a, b) => {
       const dateCmp = String(b.photoDate).localeCompare(String(a.photoDate));
