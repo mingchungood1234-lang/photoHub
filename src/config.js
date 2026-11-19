@@ -184,6 +184,17 @@ function getConfig(overrides = {}) {
     }
   }
 
+  const userFolderMap = parsePairMap(
+    overrides.userFolders ?? process.env.USER_FOLDERS ?? '',
+    (v) => {
+      const trimmed = String(v || '').trim();
+      if (trimmed === '/' || trimmed.toLowerCase() === 'root' || trimmed === '.') {
+        return '__ROOT__';
+      }
+      return sanitizeUserFolder(trimmed);
+    }
+  );
+
   return {
     port: Number(overrides.port ?? process.env.PORT ?? 3000),
     protocol: String(overrides.protocol ?? process.env.PROTOCOL ?? 'http')
@@ -199,6 +210,7 @@ function getConfig(overrides = {}) {
     hashIndexFile: path.join(dataDir, 'hash-index.json'),
     apiKey: (overrides.apiKey ?? process.env.API_KEY ?? '').trim(),
     userKeyMap, // Map<apiKey, folderName>
+    userFolderMap, // Map<lowercaseEmail, safeFolder | '__ROOT__'>
     requireAuth:
       String(overrides.requireAuth ?? process.env.REQUIRE_AUTH ?? 'false')
         .trim()

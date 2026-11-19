@@ -373,32 +373,50 @@ class HashIndex {
         }
       }
 
+      const ignoredDirs = new Set([
+        '@eaDir',
+        '#recycle',
+        'lost+found',
+        '$RECYCLE.BIN',
+        'System Volume Information',
+      ]);
+
       const walk = async (dir) => {
-        const entries = await fsp.readdir(dir, { withFileTypes: true });
+        let entries;
+        try {
+          entries = await fsp.readdir(dir, { withFileTypes: true });
+        } catch (err) {
+          console.warn(`[hashIndex] Skipping unreadable directory ${dir}:`, err.message);
+          return;
+        }
         for (const d of entries) {
-          if (d.name.startsWith('.')) continue;
+          if (d.name.startsWith('.') || ignoredDirs.has(d.name)) continue;
           const fullPath = path.join(dir, d.name);
           if (d.isDirectory()) {
             await walk(fullPath);
           } else if (d.isFile() && !d.name.endsWith('.tmp')) {
             const relPath = path.normalize(path.relative(this.storageDir, fullPath));
             if (!indexedPaths.has(relPath)) {
-              const stat = await fsp.stat(fullPath);
-              const hash = await computeFileSha256(fullPath);
-              const relSlash = relPath.split(path.sep).join('/');
-              const inferred = await inferDiskMediaDates(relSlash, d.name, stat, fullPath);
-              this.records.set(hash, {
-                hash,
-                relativePath: relSlash,
-                originalName: d.name,
-                size: stat.size,
-                mtimeMs: stat.mtimeMs,
-                photoDate: inferred.photoDate,
-                takenAt: inferred.takenAt,
-                uploadedAt: (stat.birthtime || stat.mtime).toISOString(),
-              });
-              indexedPaths.add(relPath);
-              changed = true;
+              try {
+                const stat = await fsp.stat(fullPath);
+                const hash = await computeFileSha256(fullPath);
+                const relSlash = relPath.split(path.sep).join('/');
+                const inferred = await inferDiskMediaDates(relSlash, d.name, stat, fullPath);
+                this.records.set(hash, {
+                  hash,
+                  relativePath: relSlash,
+                  originalName: d.name,
+                  size: stat.size,
+                  mtimeMs: stat.mtimeMs,
+                  photoDate: inferred.photoDate,
+                  takenAt: inferred.takenAt,
+                  uploadedAt: (stat.birthtime || stat.mtime).toISOString(),
+                });
+                indexedPaths.add(relPath);
+                changed = true;
+              } catch (err) {
+                console.warn(`[hashIndex] Skipping unreadable file ${fullPath}:`, err.message);
+              }
             }
           }
         }

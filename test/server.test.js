@@ -944,4 +944,76 @@ test('Google OAuth PKCE Login, Gateway Node Routing, and Cross-Node Session Veri
     const upBody = await upRes.json();
     assert.equal(upBody.userFolder, nodeWho.userFolder);
   });
+
+  await t.test('3. USER_FOLDERS maps Google login to pre-existing root "/" or named folder on disk', async () => {
+    const rootCtx = await startTestServer({
+      publicUrl: 'https://photohub.test',
+      googleClientId: 'cid',
+      googleClientSecret: 'csec',
+      authSessionSecret: sharedSecret,
+      userFolders: 'owner@gmail.com=/,alice@gmail.com=legacy_alice',
+      exchangeGoogleCodeForProfile: async ({ code }) =>
+        code === 'owner_code'
+          ? { sub: 'sub-owner', email: 'owner@gmail.com', name: 'Owner' }
+          : { sub: 'sub-legacy-alice', email: 'alice@gmail.com', name: 'Alice' },
+    });
+    try {
+      // Pre-existing photos placed directly inside HOST_STORAGE_DIR root & legacy_alice subfolder
+      const rootPhotoDir = path.join(rootCtx.storageDir, '2025', '2025-11-10');
+      const aliceLegacyDir = path.join(rootCtx.storageDir, 'legacy_alice', '2024', '2024-08-01');
+      await fsp.mkdir(rootPhotoDir, { recursive: true });
+      await fsp.mkdir(aliceLegacyDir, { recursive: true });
+      await fsp.writeFile(path.join(rootPhotoDir, 'EXISTING_ROOT.JPG'), Buffer.from('root-existing-photo'));
+      await fsp.writeFile(path.join(aliceLegacyDir, 'EXISTING_ALICE.JPG'), Buffer.from('alice-legacy-photo'));
+
+      const codeVerifier = 'pkce_verifier_secret_random_string_at_least_32_chars_long';
+      const challenge = crypto
+        .createHash('sha256')
+        .update(codeVerifier, 'utf8')
+        .digest('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/g, '');
+
+      async function loginWith(code) {
+        const start = await rootCtx.request(
+          `/api/auth/google/start?code_challenge=${encodeURIComponent(challenge)}&redirect_uri=${encodeURIComponent('photohub://auth/callback')}`
+        );
+        const state = new URL(start.headers.location).searchParams.get('state');
+        const cb = await rootCtx.request(
+          `/api/auth/google/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`
+        );
+        const oneTimeCode = new URL(cb.headers.location).searchParams.get('code');
+        const ex = await rootCtx.request('/api/auth/exchange', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: oneTimeCode, codeVerifier }),
+        });
+        return ex.json();
+      }
+
+      const ownerSession = await loginWith('owner_code');
+      assert.equal(ownerSession.user.folderName, '');
+      const ownerPhotos = await (
+        await rootCtx.request('/api/photos?sync=1', {
+          headers: { Authorization: `Bearer ${ownerSession.token}` },
+        })
+      ).json();
+      assert.ok(ownerPhotos.photos.some((p) => p.originalName === 'EXISTING_ROOT.JPG'));
+
+      const aliceSession = await loginWith('alice_code');
+      assert.equal(aliceSession.user.folderName, 'legacy_alice');
+      const alicePhotos = await (
+        await rootCtx.request('/api/photos?sync=1', {
+          headers: { Authorization: `Bearer ${aliceSession.token}` },
+        })
+      ).json();
+      assert.deepEqual(
+        alicePhotos.photos.map((p) => p.originalName),
+        ['EXISTING_ALICE.JPG']
+      );
+    } finally {
+      await rootCtx.cleanup();
+    }
+  });
 });

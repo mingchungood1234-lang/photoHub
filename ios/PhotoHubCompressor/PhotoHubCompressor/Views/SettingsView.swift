@@ -349,8 +349,9 @@ struct SettingsView: View {
         do {
             let info = try await PhotoHubAPIClient(settings: settings).whoami()
             settings.serverStorage = info.storage
+            let folderNote = info.userFolder.map { "/\($0)" } ?? "/ (root)"
             let s3Note = (info.s3Enabled == true) ? "S3" : "Direct"
-            connectionStatus = "Connected (\(info.indexedPhotos) photos, \(s3Note))"
+            connectionStatus = "Connected · Folder: \(folderNote) · \(info.indexedPhotos) items (\(s3Note))"
         } catch {
             connectionStatus = "Offline: \(error.localizedDescription)"
         }

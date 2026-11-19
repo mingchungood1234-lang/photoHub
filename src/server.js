@@ -30,6 +30,7 @@ const {
   isAllowedAppRedirectUri,
   selectNodeForUser,
   resolveQuotaBytes,
+  resolveConfiguredUserFolder,
   UserDirectory,
   OneTimeExchangeStore,
   exchangeGoogleCodeForProfile,
@@ -47,15 +48,26 @@ async function createApp(configOverrides = {}) {
   const googleExchangeFn =
     configOverrides.exchangeGoogleCodeForProfile || exchangeGoogleCodeForProfile;
 
-  // Default (root) HashIndex used when single API_KEY or no auth is configured
+  // Default (root) HashIndex used when single API_KEY, USER_FOLDERS=...=/, or no auth is configured
   const defaultHashIndex = new HashIndex({
     storageDir: config.storageDir,
     hashIndexFile: config.hashIndexFile,
     scanStorageOnStartup:
       config.userKeyMap.size === 0 ? config.scanStorageOnStartup : false,
   });
-  if (config.userKeyMap.size === 0 || config.apiKey) {
-    await defaultHashIndex.init();
+  let defaultIndexPromise = null;
+  async function ensureDefaultHashIndexReady() {
+    if (!defaultIndexPromise) {
+      defaultIndexPromise = defaultHashIndex.init();
+    }
+    return defaultIndexPromise;
+  }
+  if (
+    config.userKeyMap.size === 0 ||
+    config.apiKey ||
+    Array.from(config.userFolderMap.values()).includes('__ROOT__')
+  ) {
+    await ensureDefaultHashIndexReady();
   }
 
   // Per-user HashIndex instances (for USER_KEYS and dynamically provisioned Google users)
@@ -287,7 +299,7 @@ async function createApp(configOverrides = {}) {
           sub: user.sub,
           email: user.email,
           name: user.name,
-          folderName: user.folderName,
+          folderName: user.folderName ?? '__ROOT__',
           nodeId: user.nodeId,
         },
         sessionSecret,
@@ -303,7 +315,7 @@ async function createApp(configOverrides = {}) {
           user: {
             email: user.email,
             name: user.name,
-            folderName: user.folderName,
+            folderName: user.folderName || '',
             quotaBytes: user.quotaBytes > 0 ? user.quotaBytes : null,
           },
         },
@@ -353,9 +365,34 @@ async function createApp(configOverrides = {}) {
       if (
         sessionPayload &&
         sessionPayload.typ === 'session' &&
-        sessionPayload.folderName
+        (sessionPayload.folderName !== undefined || sessionPayload.email)
       ) {
-        const folderCtx = await getOrCreateFolderContext(sessionPayload.folderName);
+        const configuredFolder = resolveConfiguredUserFolder(
+          sessionPayload.email,
+          config
+        );
+        const effectiveFolder = configuredFolder.matched
+          ? configuredFolder.folderName
+          : (sessionPayload.folderName === '__ROOT__' || !sessionPayload.folderName
+              ? null
+              : sessionPayload.folderName);
+
+        if (!effectiveFolder) {
+          await ensureDefaultHashIndexReady();
+          req.userContext = {
+            folderName: null,
+            storageDir: config.storageDir,
+            hashIndex: defaultHashIndex,
+            sub: sessionPayload.sub || null,
+            email: sessionPayload.email || null,
+            name: sessionPayload.name || null,
+            nodeId: sessionPayload.nodeId || 'primary',
+            authType: 'google_session',
+          };
+          return next();
+        }
+
+        const folderCtx = await getOrCreateFolderContext(effectiveFolder);
         req.userContext = {
           ...folderCtx,
           sub: sessionPayload.sub || null,
@@ -447,7 +484,7 @@ async function createApp(configOverrides = {}) {
       user: {
         email: email || null,
         name: name || null,
-        folderName: folderName || null,
+        folderName: folderName || '',
       },
     });
   });

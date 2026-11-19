@@ -199,6 +199,18 @@ function resolveQuotaBytes({ email, folderName, apiKey }, config) {
   return Math.max(0, Number(config.defaultQuotaBytes) || 0);
 }
 
+function resolveConfiguredUserFolder(email, config) {
+  const lower = String(email || '').trim().toLowerCase();
+  if (!lower || !(config.userFolderMap instanceof Map) || !config.userFolderMap.has(lower)) {
+    return { matched: false, folderName: null };
+  }
+  const mapped = config.userFolderMap.get(lower);
+  if (mapped === '__ROOT__' || !mapped) {
+    return { matched: true, folderName: null };
+  }
+  return { matched: true, folderName: mapped };
+}
+
 class UserDirectory {
   constructor(dataDir) {
     this.filePath = path.join(dataDir, 'users.json');
@@ -213,7 +225,7 @@ class UserDirectory {
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed === 'object') {
         for (const [sub, rec] of Object.entries(parsed)) {
-          if (rec && rec.folderName) {
+          if (rec && (rec.folderName !== undefined || rec.email)) {
             this.usersBySub.set(sub, rec);
           }
         }
@@ -234,8 +246,12 @@ class UserDirectory {
     const cleanEmail = String(email || '').trim().toLowerCase();
     const existing = this.usersBySub.get(cleanSub);
 
-    const folderName =
-      (existing && existing.folderName) || sanitizeGoogleFolderName(cleanEmail, cleanSub);
+    const configured = resolveConfiguredUserFolder(cleanEmail, config);
+    const folderName = configured.matched
+      ? configured.folderName
+      : (existing && existing.folderName !== undefined
+          ? existing.folderName
+          : sanitizeGoogleFolderName(cleanEmail, cleanSub));
     const { nodeId, serverUrl } = selectNodeForUser({
       sub: cleanSub,
       email: cleanEmail,
@@ -417,6 +433,7 @@ module.exports = {
   sanitizeGoogleFolderName,
   selectNodeForUser,
   resolveQuotaBytes,
+  resolveConfiguredUserFolder,
   UserDirectory,
   OneTimeExchangeStore,
   isGoogleUserAllowed,

@@ -195,7 +195,7 @@ final class AppSettings: ObservableObject {
             KeychainStore.set(nodeId, forKey: SessionKeys.assignedNodeId)
             assignedNodeId = nodeId
         }
-        if let folderName, !folderName.isEmpty, folderName != userFolder {
+        if let folderName, folderName != userFolder {
             KeychainStore.set(folderName, forKey: SessionKeys.userFolder)
             userFolder = folderName
         }
