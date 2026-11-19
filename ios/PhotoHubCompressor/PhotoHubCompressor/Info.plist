@@ -30,7 +30,7 @@
 		<true/>
 	</dict>
 	<key>PhotoHubGatewayURL</key>
-	<string>https://photohub.example.com</string>
+	<string>https://photohub.mingchun.us.ci</string>
 	<key>PhotoHubPinnedCertSHA256</key>
 	<array/>
 	<key>CFBundleURLTypes</key>

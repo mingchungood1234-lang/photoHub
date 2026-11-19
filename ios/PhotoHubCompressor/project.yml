@@ -36,7 +36,7 @@ targets:
         NSLocalNetworkUsageDescription: photoHub needs local network access to upload photos to your self-hosted server.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
-        PhotoHubGatewayURL: "https://photohub.example.com"
+        PhotoHubGatewayURL: "https://photohub.mingchun.us.ci"
         PhotoHubPinnedCertSHA256: []
         CFBundleURLTypes:
           - CFBundleTypeRole: Editor
