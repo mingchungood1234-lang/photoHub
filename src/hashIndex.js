@@ -579,13 +579,9 @@ class HashIndex {
     };
   }
 
-  /**
-   * Returns a deduplicated list of backed-up master photo records, sorted newest first
-   * by capture day, full capture timestamp (`takenAt`), and upload timestamp.
-   */
-  listMasters() {
+  _getUniqueMasterRecords() {
     const seenPaths = new Set();
-    const items = [];
+    const list = [];
     for (const [key, entry] of this.records.entries()) {
       if (!entry || !entry.relativePath) continue;
       // Skip alias keys (where key != diskHash) so each photo appears once
@@ -593,8 +589,36 @@ class HashIndex {
       if (key !== canonicalHash && this.records.has(canonicalHash)) continue;
       if (seenPaths.has(entry.relativePath)) continue;
       seenPaths.add(entry.relativePath);
-      items.push(this.formatMasterSummary(entry, key));
+      list.push({ key, canonicalHash, entry });
     }
+    return list;
+  }
+
+  getStorageUsage() {
+    let mastersBytes = 0;
+    let proxiesBytes = 0;
+    const unique = this._getUniqueMasterRecords();
+    for (const { entry } of unique) {
+      mastersBytes += Number(entry.size) || 0;
+      proxiesBytes += Number(entry.proxySize) || 0;
+      proxiesBytes += Number(entry.videoProxySize) || 0;
+    }
+    return {
+      itemCount: unique.length,
+      mastersBytes,
+      proxiesBytes,
+      usedBytes: mastersBytes + proxiesBytes,
+    };
+  }
+
+  /**
+   * Returns a deduplicated list of backed-up master photo records, sorted newest first
+   * by capture day, full capture timestamp (`takenAt`), and upload timestamp.
+   */
+  listMasters() {
+    const items = this._getUniqueMasterRecords().map(({ key, entry }) =>
+      this.formatMasterSummary(entry, key)
+    );
     items.sort((a, b) => {
       const aDay = String(
         a.photoDate || (a.takenAt || '').slice(0, 10) || (a.uploadedAt || '').slice(0, 10)

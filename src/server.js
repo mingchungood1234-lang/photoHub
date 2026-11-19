@@ -1,4 +1,5 @@
 const fs = require('fs');
+const fsp = require('fs/promises');
 const http = require('http');
 const https = require('https');
 const path = require('path');
@@ -9,6 +10,7 @@ const { getConfig } = require('./config');
 const { HashIndex } = require('./hashIndex');
 const {
   storeAndVerifyPhoto,
+  assertWithinQuota,
   sanitizeFilename,
   parseDateFolder,
 } = require('./storage');
@@ -21,9 +23,29 @@ const {
   getCapabilities: getProxyCapabilities,
   generateServerSideProxy,
 } = require('./proxyWorker');
+const {
+  resolveSessionSecret,
+  signToken,
+  verifyToken,
+  isAllowedAppRedirectUri,
+  selectNodeForUser,
+  resolveQuotaBytes,
+  UserDirectory,
+  OneTimeExchangeStore,
+  exchangeGoogleCodeForProfile,
+} = require('./auth');
 
 async function createApp(configOverrides = {}) {
   const config = getConfig(configOverrides);
+  const sessionSecret = await resolveSessionSecret(
+    config.authSessionSecret,
+    config.dataDir
+  );
+  const userDirectory = new UserDirectory(config.dataDir);
+  await userDirectory.init();
+  const exchangeStore = new OneTimeExchangeStore();
+  const googleExchangeFn =
+    configOverrides.exchangeGoogleCodeForProfile || exchangeGoogleCodeForProfile;
 
   // Default (root) HashIndex used when single API_KEY or no auth is configured
   const defaultHashIndex = new HashIndex({
@@ -36,32 +58,107 @@ async function createApp(configOverrides = {}) {
     await defaultHashIndex.init();
   }
 
-  // Per-user HashIndex instances for each folder in USER_KEYS
+  // Per-user HashIndex instances (for USER_KEYS and dynamically provisioned Google users)
   const folderContexts = new Map(); // folderName -> { folderName, storageDir, hashIndex }
+  const pendingFolderInits = new Map();
+
+  async function getOrCreateFolderContext(folderName) {
+    if (folderContexts.has(folderName)) {
+      return folderContexts.get(folderName);
+    }
+    if (pendingFolderInits.has(folderName)) {
+      return pendingFolderInits.get(folderName);
+    }
+    const initPromise = (async () => {
+      const userStorageDir = path.join(config.storageDir, folderName);
+      const fileSlug = folderName.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const userHashIndexFile = path.join(
+        config.dataDir,
+        `hash-index-${fileSlug}.json`
+      );
+      const userHashIndex = new HashIndex({
+        storageDir: userStorageDir,
+        hashIndexFile: userHashIndexFile,
+        scanStorageOnStartup: config.scanStorageOnStartup,
+      });
+      await userHashIndex.init();
+      const ctx = {
+        folderName,
+        storageDir: userStorageDir,
+        hashIndex: userHashIndex,
+      };
+      folderContexts.set(folderName, ctx);
+      pendingFolderInits.delete(folderName);
+      return ctx;
+    })();
+    pendingFolderInits.set(folderName, initPromise);
+    return initPromise;
+  }
+
   for (const folderName of new Set(config.userKeyMap.values())) {
-    const userStorageDir = path.join(config.storageDir, folderName);
-    const fileSlug = folderName.replace(/[^a-zA-Z0-9_-]/g, '_');
-    const userHashIndexFile = path.join(
-      config.dataDir,
-      `hash-index-${fileSlug}.json`
+    await getOrCreateFolderContext(folderName);
+  }
+
+  function resolveRequestBaseUrl(req) {
+    if (config.publicUrl) return config.publicUrl;
+    const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http')
+      .split(',')[0]
+      .trim();
+    const host = String(
+      req.headers['x-forwarded-host'] || req.get('host') || `localhost:${config.port}`
+    )
+      .split(',')[0]
+      .trim();
+    return `${proto}://${host}`;
+  }
+
+  function getQuotaBytesForContext(userCtx) {
+    return resolveQuotaBytes(
+      {
+        email: userCtx && userCtx.email,
+        folderName: userCtx && userCtx.folderName,
+        apiKey: userCtx && userCtx.apiKey,
+      },
+      config
     );
-    const userHashIndex = new HashIndex({
-      storageDir: userStorageDir,
-      hashIndexFile: userHashIndexFile,
-      scanStorageOnStartup: config.scanStorageOnStartup,
-    });
-    await userHashIndex.init();
-    folderContexts.set(folderName, {
-      folderName,
-      storageDir: userStorageDir,
-      hashIndex: userHashIndex,
-    });
+  }
+
+  async function buildStorageSummary(userCtx) {
+    const usage = userCtx.hashIndex.getStorageUsage();
+    const quotaBytes = getQuotaBytesForContext(userCtx);
+    let diskTotalBytes = null;
+    let diskFreeBytes = null;
+    try {
+      if (typeof fsp.statfs === 'function') {
+        await fsp.mkdir(userCtx.storageDir, { recursive: true });
+        const fsStats = await fsp.statfs(userCtx.storageDir);
+        const blockSize = Number(fsStats.bsize) || 4096;
+        diskTotalBytes = (Number(fsStats.blocks) || 0) * blockSize;
+        diskFreeBytes = (Number(fsStats.bavail) || 0) * blockSize;
+      }
+    } catch {
+      // Ignore statfs errors on unsupported filesystems/mounts
+    }
+    const remainingBytes =
+      quotaBytes > 0 ? Math.max(0, quotaBytes - usage.usedBytes) : diskFreeBytes;
+    return {
+      usedBytes: usage.usedBytes,
+      mastersBytes: usage.mastersBytes,
+      proxiesBytes: usage.proxiesBytes,
+      itemCount: usage.itemCount,
+      quotaBytes: quotaBytes > 0 ? quotaBytes : null,
+      remainingBytes,
+      diskTotalBytes,
+      diskFreeBytes,
+    };
   }
 
   const app = express();
+  app.set('trust proxy', 1);
   app.locals.config = config;
   app.locals.hashIndex = defaultHashIndex;
   app.locals.folderContexts = folderContexts;
+  app.locals.sessionSecret = sessionSecret;
 
   // Parse JSON bodies for /api/check
   app.use(express.json({ limit: '50mb' }));
@@ -97,50 +194,230 @@ async function createApp(configOverrides = {}) {
     });
   });
 
-  // API Key & Multi-User routing middleware
-  app.use('/api', (req, res, next) => {
-    const providedKey = String(
-      req.headers['x-api-key'] ||
-        req.query.apiKey ||
-        (req.headers.authorization &&
-        req.headers.authorization.startsWith('Bearer ')
-          ? req.headers.authorization.slice(7)
-          : '') ||
-        ''
+  // Public Auth discovery & Google OAuth 2.0 + PKCE flow for iOS ASWebAuthenticationSession
+  app.get('/api/auth/config', (req, res) => {
+    return res.json({
+      success: true,
+      googleEnabled: Boolean(config.googleClientId && config.googleClientSecret),
+      hasStorageNodes: config.storageNodes.length > 0,
+      nodeCount: config.storageNodes.length || 1,
+    });
+  });
+
+  app.get('/api/auth/google/start', (req, res) => {
+    if (!config.googleClientId || !config.googleClientSecret) {
+      return res.status(501).json({
+        success: false,
+        error:
+          'Google Login is not configured on this server. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env.',
+      });
+    }
+
+    const codeChallenge = String(req.query.code_challenge || '').trim();
+    const redirectUri = String(
+      req.query.redirect_uri || 'photohub://auth/callback'
     ).trim();
 
-    // 1. Check if providedKey matches a user in USER_KEYS
-    if (config.userKeyMap.size > 0 && config.userKeyMap.has(providedKey)) {
-      const folderName = config.userKeyMap.get(providedKey);
-      req.userContext = folderContexts.get(folderName);
-      return next();
+    if (!codeChallenge || codeChallenge.length < 32 || !isAllowedAppRedirectUri(redirectUri)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Valid PKCE code_challenge and photohub://auth redirect_uri are required.',
+      });
     }
 
-    // 2. Fallback to single API_KEY if configured
-    if (config.apiKey && providedKey === config.apiKey) {
-      req.userContext = {
-        folderName: null,
-        storageDir: config.storageDir,
-        hashIndex: defaultHashIndex,
-      };
-      return next();
+    const baseUrl = resolveRequestBaseUrl(req);
+    const state = signToken(
+      {
+        typ: 'oauth_state',
+        nonce: crypto.randomBytes(16).toString('hex'),
+        codeChallenge,
+        redirectUri,
+        baseUrl,
+      },
+      sessionSecret,
+      600
+    );
+
+    const authUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+    authUrl.searchParams.set('client_id', config.googleClientId);
+    authUrl.searchParams.set('redirect_uri', `${baseUrl}/api/auth/google/callback`);
+    authUrl.searchParams.set('response_type', 'code');
+    authUrl.searchParams.set('scope', 'openid email profile');
+    authUrl.searchParams.set('state', state);
+    authUrl.searchParams.set('prompt', 'select_account');
+
+    return res.redirect(authUrl.toString());
+  });
+
+  app.get('/api/auth/google/callback', async (req, res) => {
+    const statePayload = verifyToken(String(req.query.state || ''), sessionSecret);
+    if (!statePayload || statePayload.typ !== 'oauth_state' || !isAllowedAppRedirectUri(statePayload.redirectUri)) {
+      return res.status(400).send('Invalid or expired OAuth state.');
     }
 
-    // 3. If neither USER_KEYS nor API_KEY is configured, allow open access to root storageDir
-    if (config.userKeyMap.size === 0 && !config.apiKey) {
-      req.userContext = {
-        folderName: null,
-        storageDir: config.storageDir,
-        hashIndex: defaultHashIndex,
-      };
-      return next();
+    const appRedirect = new URL(statePayload.redirectUri);
+    const oauthError = req.query.error;
+    if (oauthError) {
+      appRedirect.searchParams.set('error', String(oauthError));
+      return res.redirect(appRedirect.toString());
     }
 
-    return res.status(401).json({
-      success: false,
-      canDelete: false,
-      error: 'Unauthorized: Invalid or missing API key',
+    const googleCode = String(req.query.code || '').trim();
+    if (!googleCode) {
+      appRedirect.searchParams.set('error', 'Missing authorization code from Google.');
+      return res.redirect(appRedirect.toString());
+    }
+
+    try {
+      const profile = await googleExchangeFn({
+        code: googleCode,
+        redirectUri: `${statePayload.baseUrl}/api/auth/google/callback`,
+        config,
+      });
+
+      const user = await userDirectory.upsertGoogleUser({
+        ...profile,
+        publicBaseUrl: statePayload.baseUrl,
+        config,
+      });
+
+      const sessionToken = signToken(
+        {
+          typ: 'session',
+          sub: user.sub,
+          email: user.email,
+          name: user.name,
+          folderName: user.folderName,
+          nodeId: user.nodeId,
+        },
+        sessionSecret,
+        config.sessionTtlSeconds
+      );
+
+      const oneTimeCode = exchangeStore.issue({
+        codeChallenge: statePayload.codeChallenge,
+        sessionPayload: {
+          token: sessionToken,
+          serverUrl: user.assignedUrl || statePayload.baseUrl,
+          nodeId: user.nodeId,
+          user: {
+            email: user.email,
+            name: user.name,
+            folderName: user.folderName,
+            quotaBytes: user.quotaBytes > 0 ? user.quotaBytes : null,
+          },
+        },
+      });
+
+      appRedirect.searchParams.set('code', oneTimeCode);
+      return res.redirect(appRedirect.toString());
+    } catch (err) {
+      appRedirect.searchParams.set('error', err.message || 'Google login failed');
+      return res.redirect(appRedirect.toString());
+    }
+  });
+
+  app.post('/api/auth/exchange', (req, res) => {
+    const { code, codeVerifier } = req.body || {};
+    const session = exchangeStore.consume({ code, codeVerifier });
+    if (!session) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid, expired, or mismatched authorization code.',
+      });
+    }
+    return res.json({
+      success: true,
+      token: session.token,
+      serverUrl: session.serverUrl,
+      nodeId: session.nodeId,
+      user: session.user,
     });
+  });
+
+  // Bearer Session Token, Multi-User Key, & API Key routing middleware
+  app.use('/api', async (req, res, next) => {
+    try {
+      const authHeader = String(req.headers.authorization || '').trim();
+      const bearerToken = authHeader.startsWith('Bearer ')
+        ? authHeader.slice(7).trim()
+        : '';
+      const providedKey = String(
+        req.headers['x-api-key'] || req.query.apiKey || bearerToken || ''
+      ).trim();
+
+      // 1. Check signed Google session Bearer/JWT token first
+      const sessionPayload = providedKey
+        ? verifyToken(providedKey, sessionSecret)
+        : null;
+      if (
+        sessionPayload &&
+        sessionPayload.typ === 'session' &&
+        sessionPayload.folderName
+      ) {
+        const folderCtx = await getOrCreateFolderContext(sessionPayload.folderName);
+        req.userContext = {
+          ...folderCtx,
+          sub: sessionPayload.sub || null,
+          email: sessionPayload.email || null,
+          name: sessionPayload.name || null,
+          nodeId: sessionPayload.nodeId || 'primary',
+          authType: 'google_session',
+        };
+        return next();
+      }
+
+      // 2. Check if providedKey matches a user in USER_KEYS
+      if (config.userKeyMap.size > 0 && config.userKeyMap.has(providedKey)) {
+        const folderName = config.userKeyMap.get(providedKey);
+        const folderCtx = await getOrCreateFolderContext(folderName);
+        req.userContext = {
+          ...folderCtx,
+          apiKey: providedKey,
+          nodeId: 'primary',
+          authType: 'api_key',
+        };
+        return next();
+      }
+
+      // 3. Fallback to single API_KEY if configured
+      if (config.apiKey && providedKey === config.apiKey) {
+        req.userContext = {
+          folderName: null,
+          apiKey: providedKey,
+          storageDir: config.storageDir,
+          hashIndex: defaultHashIndex,
+          nodeId: 'primary',
+          authType: 'api_key',
+        };
+        return next();
+      }
+
+      // 4. Open access ONLY when no authentication mechanism is configured
+      const authRequired =
+        config.userKeyMap.size > 0 ||
+        Boolean(config.apiKey) ||
+        Boolean(config.googleClientId) ||
+        config.requireAuth;
+      if (!authRequired) {
+        req.userContext = {
+          folderName: null,
+          storageDir: config.storageDir,
+          hashIndex: defaultHashIndex,
+          nodeId: 'primary',
+          authType: 'open',
+        };
+        return next();
+      }
+
+      return res.status(401).json({
+        success: false,
+        canDelete: false,
+        error: 'Unauthorized: Sign in with Google or provide a valid session token.',
+      });
+    } catch (err) {
+      return next(err);
+    }
   });
 
   const upload = multer({
@@ -148,15 +425,66 @@ async function createApp(configOverrides = {}) {
     limits: { fileSize: config.maxFileSizeBytes },
   });
 
-  // Verify API/User key and report which folder this key routes to
-  app.get('/api/whoami', (req, res) => {
-    const { folderName, hashIndex } = req.userContext;
+  // Resolve current assigned storage node URL for an authenticated session (supports multi-instance routing)
+  app.post('/api/auth/resolve', (req, res) => {
+    const baseUrl = resolveRequestBaseUrl(req);
+    const { folderName, email, name, sub, nodeId } = req.userContext;
+    const existingUser = sub ? userDirectory.getBySub(sub) : null;
+    const resolved = email
+      ? selectNodeForUser({
+          sub: sub || existingUser?.sub,
+          email,
+          publicBaseUrl: baseUrl,
+          config,
+          existingNodeId: existingUser?.nodeId || nodeId,
+        })
+      : { nodeId: nodeId || 'primary', serverUrl: baseUrl };
+
     return res.json({
       success: true,
-      userFolder: folderName || null,
-      indexedPhotos: hashIndex.size(),
-      s3Enabled: isS3Configured(config.s3),
+      serverUrl: resolved.serverUrl || baseUrl,
+      nodeId: resolved.nodeId,
+      user: {
+        email: email || null,
+        name: name || null,
+        folderName: folderName || null,
+      },
     });
+  });
+
+  // Dedicated server storage quota & usage report
+  app.get('/api/storage', async (req, res) => {
+    try {
+      const storage = await buildStorageSummary(req.userContext);
+      return res.json({
+        success: true,
+        userFolder: req.userContext.folderName || null,
+        nodeId: req.userContext.nodeId || 'primary',
+        ...storage,
+      });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // Verify session / key and report folder, capabilities, and storage usage
+  app.get('/api/whoami', async (req, res) => {
+    try {
+      const { folderName, hashIndex, email, name, nodeId } = req.userContext;
+      const storage = await buildStorageSummary(req.userContext);
+      return res.json({
+        success: true,
+        userFolder: folderName || null,
+        email: email || null,
+        name: name || null,
+        nodeId: nodeId || 'primary',
+        indexedPhotos: hashIndex.size(),
+        s3Enabled: isS3Configured(config.s3),
+        storage,
+      });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
   });
 
   // Pre-upload duplicate check by SHA-256 hash (GET or POST)
@@ -353,6 +681,7 @@ async function createApp(configOverrides = {}) {
             .toLowerCase() === 'true';
 
         const { storageDir, hashIndex, folderName } = req.userContext;
+        const quotaBytes = getQuotaBytesForContext(req.userContext);
 
         // If the Shortcut uploaded multiple files in a single request (e.g., passing Photos directly without a Repeat loop)
         if (Array.isArray(req.files) && req.files.length > 1) {
@@ -366,6 +695,7 @@ async function createApp(configOverrides = {}) {
               expectedHash: '',
               storageDir,
               hashIndex,
+              quotaBytes,
             });
             itemResult.userFolder = folderName;
             results.push(itemResult);
@@ -395,6 +725,7 @@ async function createApp(configOverrides = {}) {
           strictChecksum,
           storageDir,
           hashIndex,
+          quotaBytes,
         });
 
         result.userFolder = folderName;
@@ -416,6 +747,7 @@ async function createApp(configOverrides = {}) {
           canReplaceWithProxy: false,
           checksumVerified: false,
           error: err.message,
+          ...(err.storage ? { storage: err.storage } : {}),
         });
       }
     }
@@ -433,7 +765,7 @@ async function createApp(configOverrides = {}) {
         });
       }
 
-      const { fileName, mimeType, createdAt, expectedHash } = req.body || {};
+      const { fileName, mimeType, createdAt, expectedHash, fileSize } = req.body || {};
       const cleanHash = String(expectedHash || '').trim().toLowerCase();
       if (!cleanHash || cleanHash.length !== 64) {
         return res.status(400).json({
@@ -455,6 +787,9 @@ async function createApp(configOverrides = {}) {
         });
       }
 
+      const quotaBytes = getQuotaBytesForContext(req.userContext);
+      assertWithinQuota(hashIndex, quotaBytes, Number(fileSize) || 0);
+
       const { year, dateFolder } = parseDateFolder(createdAt);
       const safeName = sanitizeFilename(fileName, mimeType, cleanHash);
       const prefix = folderName ? `${folderName}/` : '';
@@ -475,9 +810,10 @@ async function createApp(configOverrides = {}) {
         expiresIn: 900,
       });
     } catch (err) {
-      return res.status(500).json({
+      return res.status(err.statusCode || 500).json({
         success: false,
         error: err.message,
+        ...(err.storage ? { storage: err.storage } : {}),
       });
     }
   });
@@ -510,8 +846,11 @@ async function createApp(configOverrides = {}) {
         expectedSha256: expectedHash,
       });
 
-      const { dateFolder, takenAt } = parseDateFolder(createdAt);
       const { hashIndex, folderName } = req.userContext;
+      const quotaBytes = getQuotaBytesForContext(req.userContext);
+      assertWithinQuota(hashIndex, quotaBytes, size);
+
+      const { dateFolder, takenAt } = parseDateFolder(createdAt);
       const record = await hashIndex.set(actualSha256, {
         hash: actualSha256,
         diskHash: actualSha256,
@@ -544,6 +883,7 @@ async function createApp(configOverrides = {}) {
         checksumVerified: false,
         canReplaceWithProxy: false,
         error: err.message,
+        ...(err.storage ? { storage: err.storage } : {}),
       });
     }
   });

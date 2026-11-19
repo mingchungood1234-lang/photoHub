@@ -718,6 +718,9 @@ struct ServerGalleryView: View {
             }
             errorMessage = nil
             LocalProxySyncManager.shared.startPrefetchIfNeeded(for: fetched, settings: settings)
+        } catch APIClientError.httpError(401, _) {
+            LocalProxySyncManager.shared.cancel()
+            settings.signOut()
         } catch {
             errorMessage = error.localizedDescription
         }

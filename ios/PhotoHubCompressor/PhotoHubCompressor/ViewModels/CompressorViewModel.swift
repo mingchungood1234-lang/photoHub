@@ -146,11 +146,23 @@ final class CompressorViewModel: ObservableObject {
             guard let self = self else { return }
 
             do {
-                _ = try await apiClient.whoami()
+                let info = try await apiClient.whoami()
+                await MainActor.run {
+                    self.settings.serverStorage = info.storage
+                }
+            } catch APIClientError.httpError(401, _) {
+                await MainActor.run {
+                    self.isProcessing = false
+                    self.statusBanner = "Session expired. Please sign in again."
+                    LocalProxySyncManager.shared.cancel()
+                    self.settings.signOut()
+                }
+                return
             } catch {
                 await MainActor.run {
                     self.isProcessing = false
-                    self.statusBanner = "Server/Key check failed (\(self.settings.serverURL)): \(error.localizedDescription)"
+                    let hostLabel = normalizedBaseURL?.host ?? "server"
+                    self.statusBanner = "Server check failed (\(hostLabel)): \(error.localizedDescription)"
                 }
                 return
             }
@@ -191,6 +203,12 @@ final class CompressorViewModel: ObservableObject {
                     totalFailures += workerFailures
                 }
                 return totalFailures
+            }
+
+            if let updatedInfo = try? await apiClient.whoami() {
+                await MainActor.run {
+                    self.settings.serverStorage = updatedInfo.storage
+                }
             }
 
             await MainActor.run {

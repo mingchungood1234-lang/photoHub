@@ -29,6 +29,23 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
+	<key>PhotoHubGatewayURL</key>
+	<string>https://photohub.example.com</string>
+	<key>PhotoHubPinnedCertSHA256</key>
+	<array/>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLName</key>
+			<string>com.photohub.compressor.auth</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>photohub</string>
+			</array>
+		</dict>
+	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>photoHub needs local network access to upload photos to your self-hosted server on your Wi-Fi network.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>

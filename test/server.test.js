@@ -736,3 +736,212 @@ test('iOS Proxy-Replacement Workflow: strict checksum, proxy registration, batch
     }
   });
 });
+
+test('Storage Quota Reporting & Upload Enforcement', async (t) => {
+  const ctx = await startTestServer({
+    userKeys: 'alice_key:alice,bob_key:bob',
+    userQuotaBytes: { alice: 60, bob: 200 },
+  });
+  t.after(() => ctx.cleanup());
+
+  await t.test('1. Reports per-user quota and usage in /api/whoami and /api/storage', async () => {
+    const fileA = Buffer.alloc(40, 0x41);
+    const up = new FormData();
+    up.append('photo', new Blob([fileA], { type: 'image/jpeg' }), 'FIRST.JPG');
+    const upRes = await ctx.request('/api/upload?apiKey=alice_key', {
+      method: 'POST',
+      body: up,
+    });
+    assert.equal(upRes.status, 200);
+
+    const whoRes = await ctx.request('/api/whoami', {
+      headers: { 'X-API-Key': 'alice_key' },
+    });
+    assert.equal(whoRes.status, 200);
+    const who = await whoRes.json();
+    assert.equal(who.storage.usedBytes, 40);
+    assert.equal(who.storage.quotaBytes, 60);
+    assert.equal(who.storage.remainingBytes, 20);
+    assert.equal(who.storage.itemCount, 1);
+
+    const stRes = await ctx.request('/api/storage', {
+      headers: { 'X-API-Key': 'alice_key' },
+    });
+    assert.equal(stRes.status, 200);
+    const st = await stRes.json();
+    assert.equal(st.usedBytes, 40);
+    assert.equal(st.quotaBytes, 60);
+    assert.equal(st.remainingBytes, 20);
+  });
+
+  await t.test('2. Blocks new uploads exceeding quota with HTTP 507 while allowing duplicates', async () => {
+    const tooBig = Buffer.alloc(25, 0x42);
+    const failForm = new FormData();
+    failForm.append('photo', new Blob([tooBig], { type: 'image/jpeg' }), 'OVER_QUOTA.JPG');
+    const failRes = await ctx.request('/api/upload?apiKey=alice_key', {
+      method: 'POST',
+      body: failForm,
+    });
+    assert.equal(failRes.status, 507);
+    const failBody = await failRes.json();
+    assert.equal(failBody.success, false);
+    assert.equal(failBody.canDelete, false);
+    assert.ok(failBody.storage);
+
+    // Duplicate of FIRST.JPG still succeeds without increasing used space
+    const dupForm = new FormData();
+    dupForm.append('photo', new Blob([Buffer.alloc(40, 0x41)], { type: 'image/jpeg' }), 'FIRST_DUP.JPG');
+    const dupRes = await ctx.request('/api/upload?apiKey=alice_key', {
+      method: 'POST',
+      body: dupForm,
+    });
+    assert.equal(dupRes.status, 200);
+    const dupBody = await dupRes.json();
+    assert.equal(dupBody.isDuplicate, true);
+  });
+});
+
+test('Google OAuth PKCE Login, Gateway Node Routing, and Cross-Node Session Verification', async (t) => {
+  const sharedSecret = 'test-shared-hmac-secret-between-gateway-and-nodes-1234567890';
+  const gatewayCtx = await startTestServer({
+    publicUrl: 'https://gateway.photohub.test',
+    googleClientId: 'google-client-id.apps.googleusercontent.com',
+    googleClientSecret: 'google-client-secret-only-on-server',
+    authSessionSecret: sharedSecret,
+    defaultQuotaBytes: 1024 * 1024,
+    storageNodes: 'node1=https://s1.photohub.test,node2=https://s2.photohub.test',
+    userNodeMap: 'alice@gmail.com=node2',
+    exchangeGoogleCodeForProfile: async ({ code }) => {
+      assert.equal(code, 'mock_google_auth_code');
+      return {
+        sub: 'google-sub-alice-001',
+        email: 'alice@gmail.com',
+        name: 'Alice Photo',
+      };
+    },
+  });
+  t.after(() => gatewayCtx.cleanup());
+
+  // Second pure storage node sharing ONLY AUTH_SESSION_SECRET (no Google OAuth keys needed on worker!)
+  const node2Ctx = await startTestServer({
+    requireAuth: true,
+    authSessionSecret: sharedSecret,
+    defaultQuotaBytes: 1024 * 1024,
+  });
+  t.after(() => node2Ctx.cleanup());
+
+  await t.test('1. Public /api/auth/config advertises Google login without exposing secrets', async () => {
+    const cfgRes = await gatewayCtx.request('/api/auth/config');
+    assert.equal(cfgRes.status, 200);
+    const cfg = await cfgRes.json();
+    assert.equal(cfg.googleEnabled, true);
+    assert.equal(cfg.hasStorageNodes, true);
+    assert.equal(cfg.nodeCount, 2);
+    assert.equal(JSON.stringify(cfg).includes('google-client-secret'), false);
+
+    // Unauthenticated API requests must fail closed with 401 on both gateway and worker node
+    const unauthGw = await gatewayCtx.request('/api/photos');
+    assert.equal(unauthGw.status, 401);
+    const unauthNode2 = await node2Ctx.request('/api/whoami');
+    assert.equal(unauthNode2.status, 401);
+  });
+
+  await t.test('2. Full PKCE start -> Google callback -> exchange mints JWT routed to node2 & rejected on wrong verifier', async () => {
+    const codeVerifier = 'pkce_verifier_secret_random_string_at_least_32_chars_long';
+    const codeChallenge = crypto
+      .createHash('sha256')
+      .update(codeVerifier, 'utf8')
+      .digest('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/g, '');
+
+    const startRes = await gatewayCtx.request(
+      `/api/auth/google/start?code_challenge=${encodeURIComponent(codeChallenge)}&redirect_uri=${encodeURIComponent('photohub://auth/callback')}`
+    );
+    assert.equal(startRes.status, 302);
+    const googleRedirect = new URL(startRes.headers.location);
+    assert.equal(googleRedirect.hostname, 'accounts.google.com');
+    assert.equal(
+      googleRedirect.searchParams.get('redirect_uri'),
+      'https://gateway.photohub.test/api/auth/google/callback'
+    );
+    const signedState = googleRedirect.searchParams.get('state');
+    assert.ok(signedState);
+
+    const cbRes = await gatewayCtx.request(
+      `/api/auth/google/callback?code=mock_google_auth_code&state=${encodeURIComponent(signedState)}`
+    );
+    assert.equal(cbRes.status, 302);
+    const appRedirect = new URL(cbRes.headers.location);
+    assert.equal(appRedirect.protocol, 'photohub:');
+    assert.equal(appRedirect.hostname, 'auth');
+    const oneTimeCode = appRedirect.searchParams.get('code');
+    assert.ok(oneTimeCode);
+
+    // Wrong PKCE verifier is rejected (and single-use code is consumed)
+    const badExRes = await gatewayCtx.request('/api/auth/exchange', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        code: oneTimeCode,
+        codeVerifier: 'wrong_verifier_string_32_chars_plus_000000000',
+      }),
+    });
+    assert.equal(badExRes.status, 401);
+
+    // Fresh OAuth start + callback -> valid PKCE exchange -> cross-node authentication on node2
+    const startRes2 = await gatewayCtx.request(
+      `/api/auth/google/start?code_challenge=${encodeURIComponent(codeChallenge)}&redirect_uri=${encodeURIComponent('photohub://auth/callback')}`
+    );
+    const state2 = new URL(startRes2.headers.location).searchParams.get('state');
+    const cbRes2 = await gatewayCtx.request(
+      `/api/auth/google/callback?code=mock_google_auth_code&state=${encodeURIComponent(state2)}`
+    );
+    const oneTimeCode2 = new URL(cbRes2.headers.location).searchParams.get('code');
+
+    const exRes = await gatewayCtx.request('/api/auth/exchange', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: oneTimeCode2, codeVerifier }),
+    });
+    assert.equal(exRes.status, 200);
+    const session = await exRes.json();
+    assert.equal(session.success, true);
+    assert.equal(session.serverUrl, 'https://s2.photohub.test');
+    assert.equal(session.nodeId, 'node2');
+    assert.equal(session.user.email, 'alice@gmail.com');
+    assert.ok(session.token);
+
+    // Replay of the same one-time code must fail
+    const replayRes = await gatewayCtx.request('/api/auth/exchange', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: oneTimeCode2, codeVerifier }),
+    });
+    assert.equal(replayRes.status, 401);
+
+    // Storage node 2 accepts gateway-minted Bearer JWT, auto-creates user's folder, & enforces quota
+    const nodeWho = await (
+      await node2Ctx.request('/api/whoami', {
+        headers: { Authorization: `Bearer ${session.token}` },
+      })
+    ).json();
+    assert.equal(nodeWho.success, true);
+    assert.equal(nodeWho.email, 'alice@gmail.com');
+    assert.ok(nodeWho.userFolder.startsWith('google_alice_'));
+    assert.equal(nodeWho.storage.quotaBytes, 1024 * 1024);
+
+    // Upload directly to node2 using Bearer JWT
+    const upForm = new FormData();
+    upForm.append('photo', new Blob([Buffer.from('google-node2-photo-bytes')], { type: 'image/jpeg' }), 'G_IMG.JPG');
+    const upRes = await node2Ctx.request('/api/upload', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${session.token}` },
+      body: upForm,
+    });
+    assert.equal(upRes.status, 200);
+    const upBody = await upRes.json();
+    assert.equal(upBody.userFolder, nodeWho.userFolder);
+  });
+});

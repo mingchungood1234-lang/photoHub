@@ -93,6 +93,23 @@ async function writePhotoFile(targetDir, targetPath, finalFileName, buffer) {
   }
 }
 
+function assertWithinQuota(hashIndex, quotaBytes, incomingBytes = 0) {
+  const limit = Number(quotaBytes) || 0;
+  if (limit <= 0) return null;
+  const usage = hashIndex.getStorageUsage();
+  if (usage.usedBytes + (Number(incomingBytes) || 0) > limit) {
+    const err = new Error('Storage quota exceeded. Free up space or increase your storage limit.');
+    err.statusCode = 507;
+    err.storage = {
+      ...usage,
+      quotaBytes: limit,
+      remainingBytes: Math.max(0, limit - usage.usedBytes),
+    };
+    throw err;
+  }
+  return usage;
+}
+
 /**
  * Stores a photo buffer into STORAGE_DIR/YYYY/YYYY-MM-DD/<filename>,
  * verifies its SHA-256 on disk, and updates the HashIndex.
@@ -107,6 +124,7 @@ async function storeAndVerifyPhoto({
   strictChecksum = false,
   storageDir,
   hashIndex,
+  quotaBytes = 0,
 }) {
   if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
     const err = new Error('Uploaded photo buffer is empty');
@@ -158,6 +176,8 @@ async function storeAndVerifyPhoto({
       photoDate: existingRecord.photoDate,
     };
   }
+
+  assertWithinQuota(hashIndex, quotaBytes, buffer.length);
 
   // 2. Determine date folder (YYYY/YYYY-MM-DD) and target filename
   const { year, dateFolder, dateObj, takenAt } = parseDateFolder(createdAt);
@@ -267,6 +287,7 @@ async function storeAndVerifyPhoto({
 
 module.exports = {
   storeAndVerifyPhoto,
+  assertWithinQuota,
   sanitizeFilename,
   parseDateFolder,
 };

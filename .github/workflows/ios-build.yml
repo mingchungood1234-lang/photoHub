@@ -36,6 +36,16 @@ jobs:
           command -v xcodegen >/dev/null 2>&1 || HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
           rm -rf PhotoHubCompressor.xcodeproj
           xcodegen generate
+          if [ -n "${{ vars.PHOTOHUB_GATEWAY_URL }}" ]; then
+            /usr/libexec/PlistBuddy -c "Set :PhotoHubGatewayURL ${{ vars.PHOTOHUB_GATEWAY_URL }}" PhotoHubCompressor/Info.plist
+          fi
+          if [ -n "${{ vars.PHOTOHUB_PINNED_CERT_SHA256 }}" ]; then
+            /usr/libexec/PlistBuddy -c "Delete :PhotoHubPinnedCertSHA256" PhotoHubCompressor/Info.plist 2>/dev/null || true
+            /usr/libexec/PlistBuddy -c "Add :PhotoHubPinnedCertSHA256 array" PhotoHubCompressor/Info.plist
+            for PIN in $(echo "${{ vars.PHOTOHUB_PINNED_CERT_SHA256 }}" | tr ',' ' '); do
+              /usr/libexec/PlistBuddy -c "Add :PhotoHubPinnedCertSHA256: string $PIN" PhotoHubCompressor/Info.plist
+            done
+          fi
 
       - name: Build unsigned iOS device app (.app)
         run: |

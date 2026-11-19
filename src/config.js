@@ -60,6 +60,89 @@ function sanitizeUserFolder(rawFolder) {
   return normalized;
 }
 
+function parseListCsv(raw) {
+  if (!raw || typeof raw !== 'string') return new Set();
+  return new Set(
+    raw
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean)
+  );
+}
+
+/**
+ * Parses STORAGE_NODES="node1=https://s1.example.com,node2=https://s2.example.com"
+ * into [{ id, url }].
+ */
+function parseStorageNodes(rawNodes) {
+  if (Array.isArray(rawNodes)) {
+    return rawNodes
+      .map((item) => ({
+        id: String(item.id || '').trim(),
+        url: String(item.url || '').trim().replace(/\/+$/, ''),
+      }))
+      .filter((item) => item.id && item.url);
+  }
+  if (!rawNodes || typeof rawNodes !== 'string') return [];
+
+  const nodes = [];
+  const seen = new Set();
+  for (const entry of rawNodes.split(',')) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+    const eqIdx = trimmed.indexOf('=');
+    const id = (eqIdx !== -1 ? trimmed.slice(0, eqIdx) : `node${nodes.length + 1}`).trim();
+    const url = (eqIdx !== -1 ? trimmed.slice(eqIdx + 1) : trimmed).trim().replace(/\/+$/, '');
+    if (id && url && !seen.has(id)) {
+      seen.add(id);
+      nodes.push({ id, url });
+    }
+  }
+  return nodes;
+}
+
+/**
+ * Parses comma-separated pairs like "alice@gmail.com=node2" or "mingchun:50".
+ */
+function parsePairMap(raw, valueTransform = (v) => v) {
+  const map = new Map();
+  if (raw instanceof Map) {
+    for (const [k, v] of raw.entries()) {
+      const cleanKey = String(k || '').trim().toLowerCase();
+      if (cleanKey) map.set(cleanKey, valueTransform(v));
+    }
+    return map;
+  }
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    for (const [k, v] of Object.entries(raw)) {
+      const cleanKey = String(k || '').trim().toLowerCase();
+      if (cleanKey) map.set(cleanKey, valueTransform(v));
+    }
+    return map;
+  }
+  if (!raw || typeof raw !== 'string') return map;
+
+  for (const entry of raw.split(',')) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+    const eqIdx = trimmed.indexOf('=');
+    const sepIdx = eqIdx !== -1 ? eqIdx : trimmed.indexOf(':');
+    if (sepIdx === -1) continue;
+    const key = trimmed.slice(0, sepIdx).trim().toLowerCase();
+    const val = trimmed.slice(sepIdx + 1).trim();
+    if (key && val !== '') {
+      map.set(key, valueTransform(val));
+    }
+  }
+  return map;
+}
+
+function gbToBytes(rawGb) {
+  const num = Number(rawGb);
+  if (!Number.isFinite(num) || num <= 0) return 0;
+  return Math.round(num * 1024 * 1024 * 1024);
+}
+
 function getConfig(overrides = {}) {
   const rootDir = path.resolve(__dirname, '..');
   const defaultStorage =
@@ -86,6 +169,21 @@ function getConfig(overrides = {}) {
         ? rawEnvMaxMb
         : 50000;
 
+  const defaultQuotaBytes =
+    overrides.defaultQuotaBytes !== undefined
+      ? Math.max(0, Number(overrides.defaultQuotaBytes) || 0)
+      : gbToBytes(overrides.defaultQuotaGb ?? process.env.DEFAULT_QUOTA_GB ?? 0);
+
+  const userQuotaMap = parsePairMap(
+    overrides.userQuotas ?? process.env.USER_QUOTAS ?? '',
+    (v) => gbToBytes(v)
+  );
+  if (overrides.userQuotaBytes) {
+    for (const [k, v] of parsePairMap(overrides.userQuotaBytes, (x) => Math.max(0, Number(x) || 0))) {
+      userQuotaMap.set(k, v);
+    }
+  }
+
   return {
     port: Number(overrides.port ?? process.env.PORT ?? 3000),
     protocol: String(overrides.protocol ?? process.env.PROTOCOL ?? 'http')
@@ -93,11 +191,52 @@ function getConfig(overrides = {}) {
       .toLowerCase(),
     sslCertPath: (overrides.sslCertPath ?? process.env.SSL_CERT_PATH ?? '').trim(),
     sslKeyPath: (overrides.sslKeyPath ?? process.env.SSL_KEY_PATH ?? '').trim(),
+    publicUrl: String(overrides.publicUrl ?? process.env.PUBLIC_URL ?? '')
+      .trim()
+      .replace(/\/+$/, ''),
     storageDir,
     dataDir,
     hashIndexFile: path.join(dataDir, 'hash-index.json'),
     apiKey: (overrides.apiKey ?? process.env.API_KEY ?? '').trim(),
     userKeyMap, // Map<apiKey, folderName>
+    requireAuth:
+      String(overrides.requireAuth ?? process.env.REQUIRE_AUTH ?? 'false')
+        .trim()
+        .toLowerCase() === 'true',
+    googleClientId: String(
+      overrides.googleClientId ?? process.env.GOOGLE_CLIENT_ID ?? ''
+    ).trim(),
+    googleClientSecret: String(
+      overrides.googleClientSecret ?? process.env.GOOGLE_CLIENT_SECRET ?? ''
+    ).trim(),
+    allowedGoogleDomains:
+      overrides.allowedGoogleDomains instanceof Set
+        ? overrides.allowedGoogleDomains
+        : parseListCsv(
+            overrides.allowedGoogleDomains ?? process.env.ALLOWED_GOOGLE_DOMAINS ?? ''
+          ),
+    allowedGoogleEmails:
+      overrides.allowedGoogleEmails instanceof Set
+        ? overrides.allowedGoogleEmails
+        : parseListCsv(
+            overrides.allowedGoogleEmails ?? process.env.ALLOWED_GOOGLE_EMAILS ?? ''
+          ),
+    authSessionSecret: String(
+      overrides.authSessionSecret ?? process.env.AUTH_SESSION_SECRET ?? ''
+    ).trim(),
+    sessionTtlSeconds: Math.max(
+      60,
+      Number(overrides.sessionTtlSeconds ?? process.env.AUTH_SESSION_TTL_SECONDS ?? 30 * 24 * 3600) || 30 * 24 * 3600
+    ),
+    storageNodes: parseStorageNodes(
+      overrides.storageNodes ?? process.env.STORAGE_NODES ?? ''
+    ),
+    userNodeMap: parsePairMap(
+      overrides.userNodeMap ?? process.env.USER_NODE_MAP ?? '',
+      (v) => String(v).trim()
+    ),
+    defaultQuotaBytes,
+    userQuotaMap, // Map<lowercaseIdentifier, quotaBytes>
     maxFileSizeBytes: effectiveMaxMb * 1024 * 1024,
     // Set SCAN_STORAGE_ON_STARTUP=false if using a large remote rclone/gdrive mount to avoid slow startup scans
     scanStorageOnStartup:
@@ -123,4 +262,4 @@ function getConfig(overrides = {}) {
   };
 }
 
-module.exports = { getConfig, resolvePath, parseUserKeys };
+module.exports = { getConfig, resolvePath, parseUserKeys, sanitizeUserFolder };

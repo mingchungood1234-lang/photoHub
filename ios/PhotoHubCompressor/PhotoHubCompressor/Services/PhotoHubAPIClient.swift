@@ -1,4 +1,6 @@
+import CryptoKit
 import Foundation
+import Security
 
 enum APIClientError: LocalizedError {
     case invalidServerURL
@@ -9,7 +11,7 @@ enum APIClientError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidServerURL:
-            return "Invalid server URL in Settings."
+            return "Server connection is not configured for this build."
         case .httpError(let code, let message):
             return "Server returned HTTP \(code): \(message)"
         case .checksumNotConfirmed(let detail):
@@ -27,11 +29,42 @@ struct HealthResponse: Decodable {
     let s3Enabled: Bool?
 }
 
+struct AuthUserProfile: Decodable {
+    let email: String
+    let name: String
+    let folderName: String
+}
+
+struct GoogleExchangeResponse: Decodable {
+    let success: Bool
+    let token: String
+    let serverUrl: String
+    let nodeId: String?
+    let user: AuthUserProfile
+}
+
+struct AuthResolveUser: Decodable {
+    let email: String?
+    let name: String?
+    let folderName: String?
+}
+
+struct AuthResolveResponse: Decodable {
+    let success: Bool
+    let serverUrl: String
+    let nodeId: String?
+    let user: AuthResolveUser?
+}
+
 struct WhoAmIResponse: Decodable {
     let success: Bool
     let userFolder: String?
+    let email: String?
+    let name: String?
+    let nodeId: String?
     let indexedPhotos: Int
     let s3Enabled: Bool?
+    let storage: ServerStorageInfo?
 }
 
 struct ServerPhoto: Codable, Identifiable, Hashable, Sendable {
@@ -157,11 +190,111 @@ private struct PresignResponse: Decodable {
     let error: String?
 }
 
+private enum TrustPinningHelper {
+    private static let rsa2048SpkiHeader: [UInt8] = [
+        0x30, 0x82, 0x01, 0x22, 0x30, 0x0D, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86,
+        0xF7, 0x0D, 0x01, 0x01, 0x01, 0x05, 0x00, 0x03, 0x82, 0x01, 0x0F, 0x00,
+    ]
+    private static let rsa4096SpkiHeader: [UInt8] = [
+        0x30, 0x82, 0x02, 0x22, 0x30, 0x0D, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86,
+        0xF7, 0x0D, 0x01, 0x01, 0x01, 0x05, 0x00, 0x03, 0x82, 0x02, 0x0F, 0x00,
+    ]
+    private static let ecP256SpkiHeader: [UInt8] = [
+        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02,
+        0x01, 0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07, 0x03,
+        0x42, 0x00,
+    ]
+    private static let ecP384SpkiHeader: [UInt8] = [
+        0x30, 0x76, 0x30, 0x10, 0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02,
+        0x01, 0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x22, 0x03, 0x62, 0x00,
+    ]
+
+    static func evaluate(
+        challenge: URLAuthenticationChallenge,
+        allowSelfSignedHTTPS: Bool,
+        pinnedHashes: [String],
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              let serverTrust = challenge.protectionSpace.serverTrust else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+
+        if allowSelfSignedHTTPS {
+            completionHandler(.useCredential, URLCredential(trust: serverTrust))
+            return
+        }
+
+        guard !pinnedHashes.isEmpty else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+
+        let policies = [SecPolicyCreateSSL(true, challenge.protectionSpace.host as CFString)]
+        SecTrustSetPolicies(serverTrust, policies as CFTypeRef)
+        guard SecTrustEvaluateWithError(serverTrust, nil) else {
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        }
+
+        let pinSet = Set(pinnedHashes)
+        let certificates = (SecTrustCopyCertificateChain(serverTrust) as? [SecCertificate]) ?? []
+        for cert in certificates {
+            let certHash = sha256Base64(SecCertificateCopyData(cert) as Data)
+            if pinSet.contains(certHash) {
+                completionHandler(.useCredential, URLCredential(trust: serverTrust))
+                return
+            }
+            if let key = SecCertificateCopyKey(cert),
+               let rawKeyData = SecKeyCopyExternalRepresentation(key, nil) as Data? {
+                let rawHash = sha256Base64(rawKeyData)
+                if pinSet.contains(rawHash) {
+                    completionHandler(.useCredential, URLCredential(trust: serverTrust))
+                    return
+                }
+                if let spkiHeader = spkiHeader(for: key) {
+                    var spkiData = Data(spkiHeader)
+                    spkiData.append(rawKeyData)
+                    if pinSet.contains(sha256Base64(spkiData)) {
+                        completionHandler(.useCredential, URLCredential(trust: serverTrust))
+                        return
+                    }
+                }
+            }
+        }
+
+        completionHandler(.cancelAuthenticationChallenge, nil)
+    }
+
+    private static func sha256Base64(_ data: Data) -> String {
+        Data(SHA256.hash(data: data)).base64EncodedString()
+    }
+
+    private static func spkiHeader(for key: SecKey) -> [UInt8]? {
+        guard let attrs = SecKeyCopyAttributes(key) as? [CFString: Any],
+              let keyType = attrs[kSecAttrKeyType] as? String,
+              let keySize = attrs[kSecAttrKeySizeInBits] as? Int else {
+            return nil
+        }
+        if keyType == (kSecAttrKeyTypeRSA as String) {
+            if keySize == 2048 { return rsa2048SpkiHeader }
+            if keySize == 4096 { return rsa4096SpkiHeader }
+        } else if keyType == (kSecAttrKeyTypeECSECPrimeRandom as String) {
+            if keySize == 256 { return ecP256SpkiHeader }
+            if keySize == 384 { return ecP384SpkiHeader }
+        }
+        return nil
+    }
+}
+
 private final class SessionTrustDelegate: NSObject, URLSessionDelegate {
     let allowSelfSignedHTTPS: Bool
+    let pinnedHashes: [String]
 
-    init(allowSelfSignedHTTPS: Bool) {
+    init(allowSelfSignedHTTPS: Bool, pinnedHashes: [String]) {
         self.allowSelfSignedHTTPS = allowSelfSignedHTTPS
+        self.pinnedHashes = pinnedHashes
     }
 
     func urlSession(
@@ -169,22 +302,27 @@ private final class SessionTrustDelegate: NSObject, URLSessionDelegate {
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        if allowSelfSignedHTTPS,
-           challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-           let serverTrust = challenge.protectionSpace.serverTrust {
-            completionHandler(.useCredential, URLCredential(trust: serverTrust))
-            return
-        }
-        completionHandler(.performDefaultHandling, nil)
+        TrustPinningHelper.evaluate(
+            challenge: challenge,
+            allowSelfSignedHTTPS: allowSelfSignedHTTPS,
+            pinnedHashes: pinnedHashes,
+            completionHandler: completionHandler
+        )
     }
 }
 
 private final class TaskUploadProgressDelegate: NSObject, URLSessionTaskDelegate {
     private let onProgress: (Double) -> Void
     private let allowSelfSignedHTTPS: Bool
+    private let pinnedHashes: [String]
 
-    init(allowSelfSignedHTTPS: Bool = false, onProgress: @escaping (Double) -> Void) {
+    init(
+        allowSelfSignedHTTPS: Bool = false,
+        pinnedHashes: [String] = AppSettings.buildPinnedCertHashes,
+        onProgress: @escaping (Double) -> Void
+    ) {
         self.allowSelfSignedHTTPS = allowSelfSignedHTTPS
+        self.pinnedHashes = pinnedHashes
         self.onProgress = onProgress
     }
 
@@ -206,13 +344,12 @@ private final class TaskUploadProgressDelegate: NSObject, URLSessionTaskDelegate
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        if allowSelfSignedHTTPS,
-           challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-           let serverTrust = challenge.protectionSpace.serverTrust {
-            completionHandler(.useCredential, URLCredential(trust: serverTrust))
-            return
-        }
-        completionHandler(.performDefaultHandling, nil)
+        TrustPinningHelper.evaluate(
+            challenge: challenge,
+            allowSelfSignedHTTPS: allowSelfSignedHTTPS,
+            pinnedHashes: pinnedHashes,
+            completionHandler: completionHandler
+        )
     }
 }
 
@@ -233,7 +370,10 @@ final class PhotoHubAPIClient {
         config.timeoutIntervalForResource = 600
         return URLSession(
             configuration: config,
-            delegate: SessionTrustDelegate(allowSelfSignedHTTPS: allowSelfSigned),
+            delegate: SessionTrustDelegate(
+                allowSelfSignedHTTPS: allowSelfSigned,
+                pinnedHashes: AppSettings.buildPinnedCertHashes
+            ),
             delegateQueue: nil
         )
     }
@@ -261,9 +401,9 @@ final class PhotoHubAPIClient {
     }
 
     private func applyAuth(to request: inout URLRequest) {
-        let key = settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !key.isEmpty {
-            request.setValue(key, forHTTPHeaderField: "X-API-Key")
+        let token = settings.authToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !token.isEmpty {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
     }
 
@@ -272,6 +412,34 @@ final class PhotoHubAPIClient {
         let (data, response) = try await pooledSession.data(from: url)
         try validateHTTP(response: response, data: data)
         return try JSONDecoder().decode(HealthResponse.self, from: data)
+    }
+
+    func exchangeGoogleAuthCode(
+        code: String,
+        codeVerifier: String,
+        gatewayURL: URL
+    ) async throws -> GoogleExchangeResponse {
+        let url = gatewayURL.appendingPathComponent("api/auth/exchange")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "code": code,
+            "codeVerifier": codeVerifier,
+        ])
+        let (data, response) = try await pooledSession.data(for: request)
+        try validateHTTP(response: response, data: data)
+        return try JSONDecoder().decode(GoogleExchangeResponse.self, from: data)
+    }
+
+    func resolveAssignedNode(gatewayURL: URL) async throws -> AuthResolveResponse {
+        let url = gatewayURL.appendingPathComponent("api/auth/resolve")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        applyAuth(to: &request)
+        let (data, response) = try await pooledSession.data(for: request)
+        try validateHTTP(response: response, data: data)
+        return try JSONDecoder().decode(AuthResolveResponse.self, from: data)
     }
 
     func whoami() async throws -> WhoAmIResponse {
@@ -634,12 +802,14 @@ final class PhotoHubAPIClient {
         presignReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
         applyAuth(to: &presignReq)
 
+        let fileSize = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         let dateStr = createdAt.map { isoFormatter.string(from: $0) } ?? ""
         presignReq.httpBody = try JSONSerialization.data(withJSONObject: [
             "fileName": filename,
             "mimeType": mimeType,
             "createdAt": dateStr,
             "expectedHash": expectedSha256,
+            "fileSize": fileSize,
         ])
 
         let (presignData, presignResp) = try await pooledSession.data(for: presignReq)

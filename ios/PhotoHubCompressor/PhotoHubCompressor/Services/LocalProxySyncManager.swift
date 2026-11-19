@@ -40,7 +40,8 @@ final class LocalProxySyncManager: ObservableObject {
 
     /// Fetches the server gallery index on launch and auto-caches / auto-saves proxied items.
     func syncFromServerOnLaunch(settings: AppSettings) {
-        guard (settings.autoDownloadLocalProxies || settings.autoSaveProxiesToPhotosApp),
+        guard settings.isSignedIn,
+              (settings.autoDownloadLocalProxies || settings.autoSaveProxiesToPhotosApp),
               settings.normalizedBaseURL != nil else {
             return
         }
