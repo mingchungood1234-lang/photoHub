@@ -1151,6 +1151,10 @@ private struct ServerPhotoDetailView: View {
         currentPhoto.needsProxy || (currentPhoto.isVideo && localVideoProxyURL == nil && currentPhoto.hasVideoProxy != true && !isLoadingVideo)
     }
 
+    private var isOriginalProtected: Bool {
+        currentPhoto.isProtectedOriginal || LocalProxyTracker.shared.isRestoredMasterHash(currentPhoto.hash)
+    }
+
     var body: some View {
         AdaptiveNavigationStack {
             VStack(spacing: 12) {
@@ -1265,6 +1269,15 @@ private struct ServerPhotoDetailView: View {
 
                         Spacer()
 
+                        if isOriginalProtected {
+                            Text("Original Kept")
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(Color.blue.opacity(0.16), in: Capsule())
+                                .foregroundColor(.blue)
+                        }
+
                         Text(currentPhoto.needsProxy ? "Needs Proxy" : "Proxy Ready")
                             .font(.caption2.weight(.semibold))
                             .padding(.horizontal, 8)
@@ -1274,6 +1287,24 @@ private struct ServerPhotoDetailView: View {
                                 in: Capsule()
                             )
                             .foregroundColor(currentPhoto.needsProxy ? .orange : .green)
+                    }
+
+                    if isOriginalProtected {
+                        HStack(spacing: 8) {
+                            Image(systemName: "lock.shield.fill")
+                                .foregroundColor(.blue)
+                            Text("Restored original is protected from auto re-compression.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Allow Re-Proxy") {
+                                Task { await updateOriginalProtection(false) }
+                            }
+                            .font(.caption2.weight(.semibold))
+                            .disabled(isBusy)
+                        }
+                        .padding(8)
+                        .background(Color.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
                     }
 
                     if needsProxyAction {
@@ -1541,6 +1572,10 @@ private struct ServerPhotoDetailView: View {
         isBusy = true
         busyLabel = "Downloading full-resolution original..."
         saveMessage = nil
+        defer {
+            isBusy = false
+            busyLabel = ""
+        }
 
         do {
             let client = PhotoHubAPIClient(settings: settings)
@@ -1548,33 +1583,78 @@ private struct ServerPhotoDetailView: View {
                 hash: currentPhoto.hash,
                 preferredFilename: currentPhoto.originalName
             )
+            defer { cleanupTempShareURL(tempURL) }
+
             let fileSize = (try? tempURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { Int64($0) } ?? currentPhoto.size
             let isVideo = currentPhoto.isVideo
+            let targetFilename = currentPhoto.originalName
+            let targetDate = currentPhoto.parsedCreationDate
 
-            PHPhotoLibrary.shared().performChanges({
-                if isVideo {
-                    PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: tempURL)
-                } else {
-                    let request = PHAssetCreationRequest.forAsset()
-                    request.addResource(with: .photo, fileURL: tempURL, options: nil)
-                }
-            }) { success, error in
-                cleanupTempShareURL(tempURL)
-                DispatchQueue.main.async {
-                    isBusy = false
-                    busyLabel = ""
-                    if success {
-                        let sizeStr = ByteCountFormatter.string(fromByteCount: fileSize, countStyle: .file)
-                        saveMessage = "Restored full-resolution original (\(sizeStr)) to iPhone Photos."
+            let createdLocalId: String? = try await withCheckedThrowingContinuation { continuation in
+                var placeholderId: String?
+                PHPhotoLibrary.shared().performChanges({
+                    let request: PHAssetChangeRequest?
+                    if isVideo {
+                        request = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: tempURL)
                     } else {
-                        saveMessage = "Restore failed: \(error?.localizedDescription ?? "Unknown error")"
+                        let creationReq = PHAssetCreationRequest.forAsset()
+                        let options = PHAssetResourceCreationOptions()
+                        options.originalFilename = targetFilename
+                        creationReq.addResource(with: .photo, fileURL: tempURL, options: options)
+                        request = creationReq
+                    }
+                    request?.creationDate = targetDate
+                    placeholderId = request?.placeholderForCreatedAsset?.localIdentifier
+                }) { success, error in
+                    if success {
+                        continuation.resume(returning: placeholderId)
+                    } else {
+                        let msg = error?.localizedDescription ?? "Unknown error"
+                        continuation.resume(throwing: PhotoLibraryError.proxyReplacementFailed(msg))
                     }
                 }
             }
+
+            // Record both locally (asset ID + hash) and on the server so neither this iPhone nor
+            // another iPhone sharing the account will re-compress or delete the restored original.
+            LocalProxyTracker.shared.markRestoredOriginal(
+                assetId: createdLocalId,
+                masterHash: currentPhoto.hash
+            )
+            if let updated = try? await client.setOriginalProtected(masterHash: currentPhoto.hash, protected: true) {
+                currentPhoto = updated
+                onPhotoUpdated(updated)
+            }
+
+            let sizeStr = ByteCountFormatter.string(fromByteCount: fileSize, countStyle: .file)
+            saveMessage = "Restored original (\(sizeStr)) to Photos & protected it from re-proxying."
         } catch {
+            saveMessage = "Restore failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func updateOriginalProtection(_ protected: Bool) async {
+        isBusy = true
+        busyLabel = protected ? "Protecting original..." : "Allowing re-proxy..."
+        saveMessage = nil
+        defer {
             isBusy = false
             busyLabel = ""
-            saveMessage = "Download failed: \(error.localizedDescription)"
+        }
+
+        if !protected {
+            LocalProxyTracker.shared.clearRestoredProtection(masterHash: currentPhoto.hash)
+        }
+        do {
+            let client = PhotoHubAPIClient(settings: settings)
+            let updated = try await client.setOriginalProtected(masterHash: currentPhoto.hash, protected: protected)
+            currentPhoto = updated
+            onPhotoUpdated(updated)
+            saveMessage = protected
+                ? "Protected: this original won't be auto re-proxied."
+                : "Unlocked: this photo can be compressed into a proxy again."
+        } catch {
+            saveMessage = "Failed to update protection: \(error.localizedDescription)"
         }
     }
 }

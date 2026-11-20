@@ -305,6 +305,13 @@ class HashIndex {
             if (entry.proxyHash && typeof entry.proxyHash === 'string') {
               this.proxyToMaster.set(entry.proxyHash.toLowerCase(), normalizedHash);
             }
+            if (Array.isArray(entry.proxyHashes)) {
+              for (const pHash of entry.proxyHashes) {
+                if (typeof pHash === 'string' && pHash.trim()) {
+                  this.proxyToMaster.set(pHash.trim().toLowerCase(), normalizedHash);
+                }
+              }
+            }
           }
         }
       }
@@ -527,11 +534,18 @@ class HashIndex {
       return null;
     }
 
-    if (record.proxyHash && record.proxyHash !== normProxy) {
-      this.proxyToMaster.delete(record.proxyHash.toLowerCase());
+    const knownProxyHashes = new Set(
+      Array.isArray(record.proxyHashes)
+        ? record.proxyHashes.map((h) => String(h || '').trim().toLowerCase()).filter(Boolean)
+        : []
+    );
+    if (record.proxyHash && typeof record.proxyHash === 'string') {
+      knownProxyHashes.add(record.proxyHash.trim().toLowerCase());
     }
+    knownProxyHashes.add(normProxy);
 
     record.proxyHash = normProxy;
+    record.proxyHashes = Array.from(knownProxyHashes);
     if (assetId) {
       record.assetId = String(assetId);
     }
@@ -550,7 +564,27 @@ class HashIndex {
     record.proxyRegisteredAt = new Date().toISOString();
 
     this.records.set(normMaster, record);
-    this.proxyToMaster.set(normProxy, normMaster);
+    for (const pHash of record.proxyHashes) {
+      this.proxyToMaster.set(pHash, normMaster);
+    }
+    await this.persist();
+    return record;
+  }
+
+  /**
+   * Marks or clears whether a master photo was intentionally restored on device and should
+   * not be re-proxied or auto-deleted by background/batch compression.
+   */
+  async setOriginalProtected(masterHash, keepOriginal = true) {
+    const lookupResult = await this.lookup(masterHash, { allowStatFastPath: true });
+    if (lookupResult.status === 'missing' || !lookupResult.record) {
+      return null;
+    }
+    const normMaster = (lookupResult.masterHash || String(masterHash || '')).trim().toLowerCase();
+    const record = this.records.get(normMaster) || lookupResult.record;
+    record.keepOriginalOnDevice = Boolean(keepOriginal);
+    record.originalProtectedAt = keepOriginal ? new Date().toISOString() : null;
+    this.records.set(normMaster, record);
     await this.persist();
     return record;
   }
@@ -594,6 +628,7 @@ class HashIndex {
       proxySize: entry.proxySize || null,
       hasVideoProxy: Boolean(entry.videoProxyRelativePath),
       videoProxySize: entry.videoProxySize || null,
+      keepOriginalOnDevice: Boolean(entry.keepOriginalOnDevice),
     };
   }
 

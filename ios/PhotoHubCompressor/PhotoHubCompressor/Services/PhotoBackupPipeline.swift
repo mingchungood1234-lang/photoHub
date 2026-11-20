@@ -9,6 +9,12 @@ struct BackupPipelineOutcome: Sendable {
     let filename: String
 }
 
+enum BackupPipelineResult: Sendable {
+    case backedUp(BackupPipelineOutcome)
+    case skippedExistingProxy(masterHash: String?)
+    case skippedProtectedOriginal(masterHash: String?)
+}
+
 enum PhotoBackupPipeline {
     static func sortCandidates(_ items: [PhotoCandidate], by mode: CandidateSortMode) -> [PhotoCandidate] {
         items.sorted { lhs, rhs in
@@ -67,13 +73,61 @@ enum PhotoBackupPipeline {
         videoSemaphore: AsyncSemaphore,
         photosSaveSemaphore: AsyncSemaphore,
         onStageChange: @Sendable @escaping (PhotoCompressionState) -> Void
-    ) async throws -> BackupPipelineOutcome {
+    ) async throws -> BackupPipelineResult {
+        // Fast local metadata guard before any export/iCloud download
+        if let proxyMatch = PhotoLibraryService.proxyHashPrefixFromAssetResources(candidate.asset) {
+            tracker.markAsProxy(
+                assetId: candidate.id,
+                proxySha256: "",
+                masterHash: nil,
+                originalName: proxyMatch.filename
+            )
+            return .skippedExistingProxy(masterHash: nil)
+        }
+        if tracker.isRestoredOriginal(assetId: candidate.id) {
+            return .skippedProtectedOriginal(masterHash: nil)
+        }
+
         // Step 1: Export full-resolution original & compute SHA-256
         let master = try await photoService.exportOriginalMasterAsync(for: candidate.asset)
         defer { try? FileManager.default.removeItem(at: master.fileURL) }
 
+        // Step 1b: Inspect embedded EXIF/QuickTime proxy marker (catches iCloud-synced proxies even if renamed/re-encoded)
+        if let embeddedMasterHash = await ProxyGenerator.extractEmbeddedProxyMasterHash(
+            fromFileURL: master.fileURL,
+            isVideo: candidate.mediaType == .video
+        ) {
+            tracker.markAsProxy(
+                assetId: candidate.id,
+                proxySha256: master.sha256,
+                masterHash: embeddedMasterHash,
+                originalName: master.filename
+            )
+            return .skippedExistingProxy(masterHash: embeddedMasterHash)
+        }
+
         // Step 2: Check server & upload original if not already verified on server
         let checkResult = try await apiClient.checkHash(master.sha256)
+        if checkResult.isProxy == true {
+            tracker.markAsProxy(
+                assetId: candidate.id,
+                proxySha256: master.sha256,
+                masterHash: checkResult.masterHash,
+                originalName: master.filename
+            )
+            return .skippedExistingProxy(masterHash: checkResult.masterHash)
+        }
+
+        let resolvedMasterHash = checkResult.masterHash ?? master.sha256
+        let isProtectedOriginal = (checkResult.keepOriginalOnDevice == true)
+            || (checkResult.isProtectedOriginal == true)
+            || tracker.isRestoredMasterHash(master.sha256)
+            || tracker.isRestoredMasterHash(resolvedMasterHash)
+        if isProtectedOriginal {
+            tracker.markRestoredOriginal(assetId: candidate.id, masterHash: resolvedMasterHash)
+            return .skippedProtectedOriginal(masterHash: resolvedMasterHash)
+        }
+
         let needsUpload = !(checkResult.exists && checkResult.isMaster == true && checkResult.canReplaceWithProxy == true)
 
         if needsUpload {
@@ -114,7 +168,7 @@ enum PhotoBackupPipeline {
         if candidate.mediaType == .video {
             await videoSemaphore.acquire()
             do {
-                proxy = try await ProxyGenerator.createVideoProxy(from: master.fileURL)
+                proxy = try await ProxyGenerator.createVideoProxy(from: master.fileURL, masterHash: master.sha256)
                 await videoSemaphore.release()
             } catch {
                 await videoSemaphore.release()
@@ -128,7 +182,8 @@ enum PhotoBackupPipeline {
                 from: master.fileURL,
                 format: format,
                 maxPixelSize: maxPixelSize,
-                quality: quality
+                quality: quality,
+                masterHash: master.sha256
             )
             previewFileForServer = proxy.fileURL
             previewFormatForServer = format.rawValue
@@ -137,10 +192,8 @@ enum PhotoBackupPipeline {
 
         try? FileManager.default.removeItem(at: master.fileURL)
         defer {
-            try? FileManager.default.removeItem(at: proxy.fileURL)
-            if let posterURL = proxy.posterFileURL {
-                try? FileManager.default.removeItem(at: posterURL)
-            }
+            ProxyGenerator.cleanupTempFile(proxy.fileURL)
+            ProxyGenerator.cleanupTempFile(proxy.posterFileURL)
         }
 
         // Step 4: Register proxy on server & cache locally
@@ -185,7 +238,8 @@ enum PhotoBackupPipeline {
                 proxyHash: proxy.sha256,
                 proxySize: candidate.mediaType == .video ? posterSize : proxy.sizeBytes,
                 hasVideoProxy: candidate.mediaType == .video,
-                videoProxySize: candidate.mediaType == .video ? proxy.sizeBytes : nil
+                videoProxySize: candidate.mediaType == .video ? proxy.sizeBytes : nil,
+                keepOriginalOnDevice: false
             ),
             baseURL: normalizedBaseURL,
             apiKey: cacheScopeKey
@@ -224,12 +278,14 @@ enum PhotoBackupPipeline {
             tracker.markMasterHandledForPhotos(master.sha256)
         }
 
-        return BackupPipelineOutcome(
-            masterSha256: master.sha256,
-            masterBytes: master.sizeBytes,
-            proxyBytes: proxy.sizeBytes,
-            savedBytes: savedBytes,
-            filename: master.filename
+        return .backedUp(
+            BackupPipelineOutcome(
+                masterSha256: master.sha256,
+                masterBytes: master.sizeBytes,
+                proxyBytes: proxy.sizeBytes,
+                savedBytes: savedBytes,
+                filename: master.filename
+            )
         )
     }
 }

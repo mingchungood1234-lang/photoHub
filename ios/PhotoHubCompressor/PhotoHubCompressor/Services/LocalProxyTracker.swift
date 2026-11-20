@@ -15,6 +15,9 @@ final class LocalProxyTracker {
     private let proxyHashToMasterKey = "photohub_proxy_hash_to_master"
     private let masterToAssetKey = "photohub_master_to_proxy_asset"
     private let autoHandledPhotosKey = "photohub_auto_handled_photos_masters"
+    private let restoredAssetIdsKey = "photohub_restored_asset_ids"
+    private let restoredMastersKey = "photohub_restored_master_hashes"
+    private let restoredAssetToMasterKey = "photohub_restored_asset_to_master"
 
     private var assetIds: Set<String>
     private var proxyHashes: Set<String>
@@ -23,6 +26,9 @@ final class LocalProxyTracker {
     private var proxyHashToMaster: [String: String]
     private var masterToAssetId: [String: String]
     private var autoHandledPhotosMasters: Set<String>
+    private var restoredAssetIds: Set<String>
+    private var restoredMasterHashes: Set<String>
+    private var restoredAssetToMaster: [String: String]
 
     private init() {
         self.assetIds = Set(defaults.stringArray(forKey: assetIdsKey) ?? [])
@@ -32,6 +38,9 @@ final class LocalProxyTracker {
         self.proxyHashToMaster = defaults.dictionary(forKey: proxyHashToMasterKey) as? [String: String] ?? [:]
         self.masterToAssetId = defaults.dictionary(forKey: masterToAssetKey) as? [String: String] ?? [:]
         self.autoHandledPhotosMasters = Set(defaults.stringArray(forKey: autoHandledPhotosKey) ?? [])
+        self.restoredAssetIds = Set(defaults.stringArray(forKey: restoredAssetIdsKey) ?? [])
+        self.restoredMasterHashes = Set(defaults.stringArray(forKey: restoredMastersKey) ?? [])
+        self.restoredAssetToMaster = defaults.dictionary(forKey: restoredAssetToMasterKey) as? [String: String] ?? [:]
     }
 
     func isKnownProxy(assetId: String) -> Bool {
@@ -124,6 +133,54 @@ final class LocalProxyTracker {
         }
     }
 
+    func isRestoredOriginal(assetId: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return restoredAssetIds.contains(assetId)
+    }
+
+    func isRestoredMasterHash(_ masterHash: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return restoredMasterHashes.contains(masterHash.lowercased())
+    }
+
+    func markRestoredOriginal(assetId: String?, masterHash: String) {
+        let normMaster = masterHash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        lock.lock()
+        if let assetId, !assetId.isEmpty {
+            restoredAssetIds.insert(assetId)
+            defaults.set(Array(restoredAssetIds), forKey: restoredAssetIdsKey)
+            if !normMaster.isEmpty {
+                restoredAssetToMaster[assetId] = normMaster
+                defaults.set(restoredAssetToMaster, forKey: restoredAssetToMasterKey)
+            }
+        }
+        if !normMaster.isEmpty {
+            restoredMasterHashes.insert(normMaster)
+            defaults.set(Array(restoredMasterHashes), forKey: restoredMastersKey)
+        }
+        lock.unlock()
+    }
+
+    func clearRestoredProtection(masterHash: String) {
+        let normMaster = masterHash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normMaster.isEmpty else { return }
+        lock.lock()
+        restoredMasterHashes.remove(normMaster)
+        let matchingAssetIds = restoredAssetToMaster
+            .filter { $0.value == normMaster }
+            .map(\.key)
+        for assetId in matchingAssetIds {
+            restoredAssetIds.remove(assetId)
+            restoredAssetToMaster.removeValue(forKey: assetId)
+        }
+        defaults.set(Array(restoredMasterHashes), forKey: restoredMastersKey)
+        defaults.set(Array(restoredAssetIds), forKey: restoredAssetIdsKey)
+        defaults.set(restoredAssetToMaster, forKey: restoredAssetToMasterKey)
+        lock.unlock()
+    }
+
     func clearAll() {
         lock.lock()
         defer { lock.unlock() }
@@ -134,6 +191,9 @@ final class LocalProxyTracker {
         proxyHashToMaster.removeAll()
         masterToAssetId.removeAll()
         autoHandledPhotosMasters.removeAll()
+        restoredAssetIds.removeAll()
+        restoredMasterHashes.removeAll()
+        restoredAssetToMaster.removeAll()
         defaults.removeObject(forKey: assetIdsKey)
         defaults.removeObject(forKey: proxyHashesKey)
         defaults.removeObject(forKey: assetToMasterKey)
@@ -141,5 +201,8 @@ final class LocalProxyTracker {
         defaults.removeObject(forKey: proxyHashToMasterKey)
         defaults.removeObject(forKey: masterToAssetKey)
         defaults.removeObject(forKey: autoHandledPhotosKey)
+        defaults.removeObject(forKey: restoredAssetIdsKey)
+        defaults.removeObject(forKey: restoredMastersKey)
+        defaults.removeObject(forKey: restoredAssetToMasterKey)
     }
 }

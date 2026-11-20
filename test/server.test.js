@@ -1024,3 +1024,113 @@ test('Google OAuth PKCE Login, Gateway Node Routing, and Cross-Node Session Veri
     }
   });
 });
+
+test('Multi-device proxy dedupe (proxyHashes) & Restored Original protection', async (t) => {
+  const ctx = await startTestServer();
+  t.after(() => ctx.cleanup());
+
+  const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
+  const masterBytes = Buffer.from('FAKE-MASTER-ORIGINAL-HEIC-BYTES-2026-001');
+  const proxy1Bytes = Buffer.from('FAKE-PROXY-IPHONE-A-BYTES-001');
+  const proxy2Bytes = Buffer.from('FAKE-PROXY-IPHONE-B-REENCODED-002');
+  const masterHash = sha256(masterBytes);
+  const proxy1Hash = sha256(proxy1Bytes);
+  const proxy2Hash = sha256(proxy2Bytes);
+
+  // 1. Upload original master from iPhone A
+  const form = new FormData();
+  form.append('expectedHash', masterHash);
+  form.append('strictChecksum', 'true');
+  form.append('photo', new Blob([masterBytes], { type: 'image/jpeg' }), 'IMG_4200.JPG');
+  const upRes = await ctx.request('/api/upload', { method: 'POST', body: form });
+  assert.equal(upRes.status, 200);
+
+  // 2. Register proxy from iPhone A and a second proxy hash (e.g. iCloud re-encode) from iPhone B
+  const reg1 = await ctx.request('/api/proxy/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      masterHash,
+      proxyHash: proxy1Hash,
+      previewBase64: proxy1Bytes.toString('base64'),
+    }),
+  });
+  assert.equal(reg1.status, 200);
+
+  const reg2 = await ctx.request('/api/proxy/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      masterHash,
+      proxyHash: proxy2Hash,
+    }),
+  });
+  assert.equal(reg2.status, 200);
+
+  // Both proxy hashes remain mapped to the same master and cannot be re-proxied or deleted
+  const checkBoth = await (
+    await ctx.request('/api/check/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hashes: [masterHash, proxy1Hash, proxy2Hash] }),
+    })
+  ).json();
+
+  assert.equal(checkBoth.results[proxy1Hash].exists, true);
+  assert.equal(checkBoth.results[proxy1Hash].isProxy, true);
+  assert.equal(checkBoth.results[proxy1Hash].masterHash, masterHash);
+  assert.equal(checkBoth.results[proxy1Hash].canReplaceWithProxy, false);
+  assert.equal(checkBoth.results[proxy1Hash].canDelete, false);
+
+  assert.equal(checkBoth.results[proxy2Hash].exists, true);
+  assert.equal(checkBoth.results[proxy2Hash].isProxy, true);
+  assert.equal(checkBoth.results[proxy2Hash].masterHash, masterHash);
+  assert.equal(checkBoth.results[proxy2Hash].canReplaceWithProxy, false);
+
+  // Uploading proxy1Bytes directly must NOT store a duplicate master file on server
+  const dupForm = new FormData();
+  dupForm.append('photo', new Blob([proxy1Bytes], { type: 'image/jpeg' }), 'PHOTOHUB_PROXY.jpg');
+  const dupUpRes = await ctx.request('/api/upload', { method: 'POST', body: dupForm });
+  assert.equal(dupUpRes.status, 200);
+  const dupUpBody = await dupUpRes.json();
+  assert.equal(dupUpBody.isProxy, true);
+  assert.equal(dupUpBody.status, 'existing_proxy');
+  assert.equal(dupUpBody.canReplaceWithProxy, false);
+
+  const photosBefore = await (await ctx.request('/api/photos')).json();
+  assert.equal(photosBefore.total, 1);
+
+  // 3. Protect original (triggered when user taps Restore)
+  const protRes = await ctx.request(`/api/photo/${masterHash}/protect-original`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ keepOriginalOnDevice: true }),
+  });
+  assert.equal(protRes.status, 200);
+  const protBody = await protRes.json();
+  assert.equal(protBody.keepOriginalOnDevice, true);
+  assert.equal(protBody.photo.keepOriginalOnDevice, true);
+
+  // Check endpoint & GET /api/photos reflect protection across all devices
+  const checkProtected = await (await ctx.request(`/api/check/${masterHash}`)).json();
+  assert.equal(checkProtected.isMaster, true);
+  assert.equal(checkProtected.isProtectedOriginal, true);
+  assert.equal(checkProtected.keepOriginalOnDevice, true);
+  assert.equal(checkProtected.canReplaceWithProxy, false);
+  assert.equal(checkProtected.canDelete, false);
+
+  const listProtected = await (await ctx.request('/api/photos')).json();
+  assert.equal(listProtected.photos[0].keepOriginalOnDevice, true);
+
+  // 4. Clearing protection restores ability to compress/proxy again if user unlocks manually
+  const unlockRes = await ctx.request(`/api/photo/${masterHash}/protect-original`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ keepOriginalOnDevice: false }),
+  });
+  assert.equal(unlockRes.status, 200);
+  const checkUnlocked = await (await ctx.request(`/api/check/${masterHash}`)).json();
+  assert.equal(checkUnlocked.isProtectedOriginal, false);
+  assert.equal(checkUnlocked.canReplaceWithProxy, true);
+  assert.equal(checkUnlocked.canDelete, true);
+});

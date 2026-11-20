@@ -146,7 +146,29 @@ async function storeAndVerifyPhoto({
     throw err;
   }
 
-  // 1. Duplicate check: check both actual uploaded file hash and optional client hash
+  // 1. Proxy guard: never store a known proxy hash as a new master original
+  const proxyCheck = await hashIndex.lookup(actualHash, { allowStatFastPath: true });
+  if (proxyCheck.status === 'proxy' && proxyCheck.record) {
+    return {
+      success: true,
+      backedUp: true,
+      canDelete: false,
+      canReplaceWithProxy: false,
+      checksumVerified: false,
+      isDuplicate: true,
+      isProxy: true,
+      status: 'existing_proxy',
+      message: 'Uploaded bytes match an existing compressed proxy; master is already stored.',
+      hash: actualHash,
+      masterHash: proxyCheck.masterHash,
+      serverSha256: proxyCheck.masterHash,
+      savedPath: proxyCheck.record.relativePath,
+      originalName: proxyCheck.record.originalName,
+      size: proxyCheck.record.size,
+    };
+  }
+
+  // 2. Duplicate check: check both actual uploaded file hash and optional client hash
   const existingRecord =
     (await hashIndex.verifyExisting(actualHash)) ||
     (!strictChecksum && cleanClientHash
@@ -158,11 +180,14 @@ async function storeAndVerifyPhoto({
     if (cleanClientHash && cleanClientHash !== existingRecord.hash) {
       await hashIndex.set(cleanClientHash, existingRecord);
     }
+    const isProtectedOriginal = Boolean(existingRecord.keepOriginalOnDevice);
     return {
       success: true,
       backedUp: true,
-      canDelete: true,
-      canReplaceWithProxy: true,
+      canDelete: !isProtectedOriginal,
+      canReplaceWithProxy: !isProtectedOriginal,
+      isProtectedOriginal,
+      keepOriginalOnDevice: isProtectedOriginal,
       checksumVerified: true,
       isDuplicate: true,
       status: 'duplicate_verified',

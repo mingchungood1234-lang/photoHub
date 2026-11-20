@@ -81,8 +81,13 @@ struct ServerPhoto: Codable, Identifiable, Hashable, Sendable {
     let proxySize: Int64?
     let hasVideoProxy: Bool?
     let videoProxySize: Int64?
+    let keepOriginalOnDevice: Bool?
 
     var id: String { hash }
+
+    var isProtectedOriginal: Bool {
+        keepOriginalOnDevice == true
+    }
 
     var isVideo: Bool {
         let ext = URL(fileURLWithPath: originalName).pathExtension.lowercased()
@@ -163,9 +168,17 @@ struct CheckResponse: Decodable {
     let exists: Bool
     let isMaster: Bool?
     let isProxy: Bool?
+    let isProtectedOriginal: Bool?
+    let keepOriginalOnDevice: Bool?
     let canReplaceWithProxy: Bool?
     let masterHash: String?
     let savedPath: String?
+}
+
+private struct ProtectOriginalResponse: Decodable {
+    let success: Bool
+    let keepOriginalOnDevice: Bool?
+    let photo: ServerPhoto?
 }
 
 struct UploadConfirmResponse: Decodable {
@@ -609,7 +622,8 @@ final class PhotoHubAPIClient {
             proxyHash: proxy.sha256,
             proxySize: photo.isVideo ? posterSize : proxy.sizeBytes,
             hasVideoProxy: photo.isVideo ? true : photo.hasVideoProxy,
-            videoProxySize: photo.isVideo ? proxy.sizeBytes : photo.videoProxySize
+            videoProxySize: photo.isVideo ? proxy.sizeBytes : photo.videoProxySize,
+            keepOriginalOnDevice: photo.keepOriginalOnDevice
         )
 
         LocalProxyStore.shared.updatePhoto(
@@ -748,6 +762,31 @@ final class PhotoHubAPIClient {
         let (data, response) = try await pooledSession.data(for: request)
         try validateHTTP(response: response, data: data)
         return try JSONDecoder().decode(CheckResponse.self, from: data)
+    }
+
+    func setOriginalProtected(masterHash: String, protected: Bool) async throws -> ServerPhoto {
+        let url = try makeURL("/api/photo/\(masterHash)/protect-original")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyAuth(to: &request)
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "keepOriginalOnDevice": protected,
+        ])
+
+        let (data, response) = try await pooledSession.data(for: request)
+        try validateHTTP(response: response, data: data)
+        let decoded = try JSONDecoder().decode(ProtectOriginalResponse.self, from: data)
+        guard decoded.success, let updated = decoded.photo else {
+            throw APIClientError.invalidResponse
+        }
+        LocalProxyStore.shared.updatePhoto(
+            updated,
+            baseURL: settings.normalizedBaseURL,
+            apiKey: settings.apiKey,
+            notify: true
+        )
+        return updated
     }
 
     func uploadMasterDirect(

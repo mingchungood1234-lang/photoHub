@@ -173,6 +173,9 @@ final class LocalProxySyncManager: ObservableObject {
         let store = LocalProxyStore.shared
         let tracker = LocalProxyTracker.shared
         let canWritePhotos = saveToPhotosApp && PhotoLibraryService.canWriteToPhotosLibrary()
+        let existingProxyPrefixes = canWritePhotos
+            ? PhotoLibraryService.scanExistingProxyPrefixesInPhotos()
+            : [:]
 
         var workItems: [LocalPrefetchWorkItem] = []
 
@@ -187,8 +190,26 @@ final class LocalProxySyncManager: ObservableObject {
                 && hasServerVideoProxy
                 && store.videoProxyURLIfExists(forHash: photo.hash) == nil
 
+            let prefixTag = ProxyGenerator.proxyPrefixTag(forMasterHash: photo.hash)
+            let iCloudSyncedProxyAssetId = existingProxyPrefixes[prefixTag]
+            if let iCloudSyncedProxyAssetId {
+                tracker.markAsProxy(
+                    assetId: iCloudSyncedProxyAssetId,
+                    proxySha256: photo.proxyHash ?? "",
+                    masterHash: photo.hash,
+                    originalName: photo.originalName
+                )
+            }
+
+            let isRestoredProtected = (photo.keepOriginalOnDevice == true)
+                || tracker.isRestoredMasterHash(photo.hash)
+
             let alreadyInPhotos: Bool
-            if forceAllMissingInPhotos {
+            if isRestoredProtected {
+                alreadyInPhotos = true
+            } else if iCloudSyncedProxyAssetId != nil {
+                alreadyInPhotos = true
+            } else if forceAllMissingInPhotos {
                 alreadyInPhotos = tracker.liveProxyAssetId(forMasterHash: photo.hash) != nil
             } else {
                 alreadyInPhotos = tracker.isMasterHandledForPhotos(photo.hash)

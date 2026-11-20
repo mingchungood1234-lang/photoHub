@@ -524,24 +524,36 @@ async function createApp(configOverrides = {}) {
     }
   });
 
+  const formatCheckPayload = (lookupResult, reqHash, folderName) => {
+    const record = lookupResult.record;
+    const exists = lookupResult.status !== 'missing';
+    const isMaster = lookupResult.status === 'master';
+    const isProxy = lookupResult.status === 'proxy';
+    const keepOriginalOnDevice = Boolean(record && record.keepOriginalOnDevice);
+    return {
+      exists,
+      isMaster,
+      isProxy,
+      isProtectedOriginal: keepOriginalOnDevice,
+      keepOriginalOnDevice,
+      canDelete: isMaster && !keepOriginalOnDevice,
+      canReplaceWithProxy: isMaster && !keepOriginalOnDevice,
+      masterHash: lookupResult.masterHash,
+      ...(folderName !== undefined ? { userFolder: folderName } : {}),
+      ...(reqHash !== undefined ? { hash: reqHash } : {}),
+      savedPath: record ? record.relativePath : null,
+    };
+  };
+
   // Pre-upload duplicate check by SHA-256 hash (GET or POST)
   app.get('/api/check/:hash', async (req, res) => {
     try {
       const { hashIndex, folderName } = req.userContext;
       const lookupResult = await hashIndex.lookup(req.params.hash);
-      const record = lookupResult.record;
-      const exists = lookupResult.status !== 'missing';
+      const reqHash = String(req.params.hash || '').trim().toLowerCase();
       return res.json({
         success: true,
-        exists,
-        isMaster: lookupResult.status === 'master',
-        isProxy: lookupResult.status === 'proxy',
-        canDelete: exists,
-        canReplaceWithProxy: lookupResult.status === 'master',
-        masterHash: lookupResult.masterHash,
-        userFolder: folderName,
-        hash: String(req.params.hash || '').trim().toLowerCase(),
-        savedPath: record ? record.relativePath : null,
+        ...formatCheckPayload(lookupResult, reqHash, folderName),
       });
     } catch (err) {
       return res.status(500).json({
@@ -568,19 +580,9 @@ async function createApp(configOverrides = {}) {
       }
       const { hashIndex, folderName } = req.userContext;
       const lookupResult = await hashIndex.lookup(hash);
-      const record = lookupResult.record;
-      const exists = lookupResult.status !== 'missing';
       return res.json({
         success: true,
-        exists,
-        isMaster: lookupResult.status === 'master',
-        isProxy: lookupResult.status === 'proxy',
-        canDelete: exists,
-        canReplaceWithProxy: lookupResult.status === 'master',
-        masterHash: lookupResult.masterHash,
-        userFolder: folderName,
-        hash: hash.trim().toLowerCase(),
-        savedPath: record ? record.relativePath : null,
+        ...formatCheckPayload(lookupResult, hash.trim().toLowerCase(), folderName),
       });
     } catch (err) {
       return res.status(500).json({
@@ -616,16 +618,7 @@ async function createApp(configOverrides = {}) {
         if (typeof rawHash !== 'string' || !rawHash.trim()) continue;
         const normalized = rawHash.trim().toLowerCase();
         const lookupResult = await hashIndex.lookup(normalized);
-        const exists = lookupResult.status !== 'missing';
-        results[normalized] = {
-          exists,
-          isMaster: lookupResult.status === 'master',
-          isProxy: lookupResult.status === 'proxy',
-          canDelete: exists,
-          canReplaceWithProxy: lookupResult.status === 'master',
-          masterHash: lookupResult.masterHash,
-          savedPath: lookupResult.record ? lookupResult.record.relativePath : null,
-        };
+        results[normalized] = formatCheckPayload(lookupResult, undefined, undefined);
       }
 
       return res.json({
@@ -812,13 +805,21 @@ async function createApp(configOverrides = {}) {
       }
 
       const { hashIndex, folderName } = req.userContext;
-      const existing = await hashIndex.verifyExisting(cleanHash);
-      if (existing) {
+      const lookupResult = await hashIndex.lookup(cleanHash);
+      if (lookupResult.status !== 'missing' && lookupResult.record) {
+        const existing = lookupResult.record;
+        const isProxy = lookupResult.status === 'proxy';
+        const keepOriginalOnDevice = Boolean(existing.keepOriginalOnDevice);
         return res.json({
           success: true,
           alreadyExists: true,
-          checksumVerified: true,
-          canReplaceWithProxy: true,
+          isProxy,
+          isProtectedOriginal: keepOriginalOnDevice,
+          keepOriginalOnDevice,
+          checksumVerified: !isProxy,
+          canDelete: !isProxy && !keepOriginalOnDevice,
+          canReplaceWithProxy: !isProxy && !keepOriginalOnDevice,
+          masterHash: lookupResult.masterHash,
           serverSha256: existing.diskHash || existing.hash,
           savedPath: existing.relativePath,
         });
@@ -1318,6 +1319,39 @@ async function createApp(configOverrides = {}) {
       return res.status(404).json({
         success: false,
         error: 'Compressed video proxy not available for this item',
+      });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: err.message,
+      });
+    }
+  });
+
+  // Mark or clear whether a master photo was restored on device and should be protected from re-proxying
+  app.post('/api/photo/:hash/protect-original', async (req, res) => {
+    try {
+      const { hashIndex } = req.userContext;
+      const body = req.body || {};
+      const keepOriginal =
+        body.keepOriginalOnDevice !== undefined
+          ? Boolean(body.keepOriginalOnDevice)
+          : body.protected !== undefined
+            ? Boolean(body.protected)
+            : true;
+
+      const updated = await hashIndex.setOriginalProtected(req.params.hash, keepOriginal);
+      if (!updated) {
+        return res.status(404).json({
+          success: false,
+          error: 'Photo not found',
+        });
+      }
+
+      return res.json({
+        success: true,
+        keepOriginalOnDevice: Boolean(updated.keepOriginalOnDevice),
+        photo: hashIndex.formatMasterSummary(updated, req.params.hash),
       });
     } catch (err) {
       return res.status(500).json({

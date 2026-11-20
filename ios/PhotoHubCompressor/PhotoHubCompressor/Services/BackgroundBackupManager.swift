@@ -210,7 +210,8 @@ final class BackgroundBackupManager: ObservableObject {
 
             let photoService = PhotoLibraryService()
             let tracker = LocalProxyTracker.shared
-            let rawCandidates = photoService.scanCandidates(tracker: tracker)
+            let cachedServerPhotos = LocalProxyStore.shared.cachedPhotos(baseURL: baseURL, apiKey: cacheScope)
+            let rawCandidates = photoService.scanCandidates(tracker: tracker, knownServerPhotos: cachedServerPhotos)
             let prioritized = PhotoBackupPipeline
                 .sortCandidates(rawCandidates, by: .largestVideosFirst)
                 .filter { !existingStagedIds.contains($0.id) }
@@ -222,7 +223,7 @@ final class BackgroundBackupManager: ObservableObject {
             for candidate in prioritized {
                 if Task.isCancelled { break }
                 do {
-                    let outcome = try await PhotoBackupPipeline.backupAndProxyAsset(
+                    let result = try await PhotoBackupPipeline.backupAndProxyAsset(
                         candidate: candidate,
                         photoService: photoService,
                         apiClient: apiClient,
@@ -239,17 +240,22 @@ final class BackgroundBackupManager: ObservableObject {
                         onStageChange: { _ in }
                     )
 
-                    let entry = StagedCleanupItem(
-                        id: candidate.id,
-                        filename: outcome.filename,
-                        masterSha256: outcome.masterSha256,
-                        savedBytes: outcome.savedBytes,
-                        verifiedAt: Date()
-                    )
-                    await MainActor.run {
-                        self?.appendStagedItem(entry)
+                    switch result {
+                    case .backedUp(let outcome):
+                        let entry = StagedCleanupItem(
+                            id: candidate.id,
+                            filename: outcome.filename,
+                            masterSha256: outcome.masterSha256,
+                            savedBytes: outcome.savedBytes,
+                            verifiedAt: Date()
+                        )
+                        await MainActor.run {
+                            self?.appendStagedItem(entry)
+                        }
+                        processedNew += 1
+                    case .skippedExistingProxy, .skippedProtectedOriginal:
+                        break
                     }
-                    processedNew += 1
                 } catch APIClientError.httpError(507, _) {
                     await MainActor.run {
                         self?.updateSummary("Overnight backup stopped: server storage limit reached.")

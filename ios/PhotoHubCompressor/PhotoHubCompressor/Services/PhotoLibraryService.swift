@@ -45,7 +45,43 @@ final class PhotoLibraryService {
         }
     }
 
-    func scanCandidates(tracker: LocalProxyTracker) -> [PhotoCandidate] {
+    /// Reads the original filename stored in Photos SQLite/CoreData without downloading iCloud media bytes.
+    static func proxyHashPrefixFromAssetResources(_ asset: PHAsset) -> (prefix: String, filename: String)? {
+        let resources = PHAssetResource.assetResources(for: asset)
+        for resource in resources {
+            if let prefix = ProxyGenerator.extractMasterHashPrefix(fromProxyFilename: resource.originalFilename) {
+                return (prefix, resource.originalFilename)
+            }
+        }
+        return nil
+    }
+
+    /// Scans local Photos metadata (zero iCloud download) for any synced or locally created
+    /// `PHOTOHUB_PROXY_<prefix>` assets, returning `prefix16 -> PHAsset.localIdentifier`.
+    static func scanExistingProxyPrefixesInPhotos() -> [String: String] {
+        let fetchOptions = PHFetchOptions()
+        fetchOptions.predicate = NSPredicate(
+            format: "mediaType == %d OR mediaType == %d",
+            PHAssetMediaType.image.rawValue,
+            PHAssetMediaType.video.rawValue
+        )
+        let assets = PHAsset.fetchAssets(with: fetchOptions)
+        var map: [String: String] = [:]
+        for i in 0..<assets.count {
+            autoreleasepool {
+                let asset = assets.object(at: i)
+                if let match = proxyHashPrefixFromAssetResources(asset) {
+                    map[match.prefix] = asset.localIdentifier
+                }
+            }
+        }
+        return map
+    }
+
+    func scanCandidates(
+        tracker: LocalProxyTracker,
+        knownServerPhotos: [ServerPhoto] = []
+    ) -> [PhotoCandidate] {
         let fetchOptions = PHFetchOptions()
         fetchOptions.predicate = NSPredicate(
             format: "mediaType == %d OR mediaType == %d",
@@ -62,11 +98,32 @@ final class PhotoLibraryService {
         }
         candidates.reserveCapacity(min(totalCount, 500))
 
+        var prefixToServerPhoto: [String: ServerPhoto] = [:]
+        prefixToServerPhoto.reserveCapacity(knownServerPhotos.count)
+        for serverPhoto in knownServerPhotos {
+            let prefix = ProxyGenerator.proxyPrefixTag(forMasterHash: serverPhoto.hash)
+            if prefix.count >= 8 {
+                prefixToServerPhoto[prefix] = serverPhoto
+            }
+        }
+
         for i in 0..<totalCount {
             autoreleasepool {
                 let asset = assets.object(at: i)
                 let localId = asset.localIdentifier
-                if tracker.isKnownProxy(assetId: localId) {
+                if tracker.isKnownProxy(assetId: localId) || tracker.isRestoredOriginal(assetId: localId) {
+                    return
+                }
+
+                // Detect PhotoHub proxies synced across iPhones via iCloud Photos without triggering downloads
+                if let proxyMatch = Self.proxyHashPrefixFromAssetResources(asset) {
+                    let matchedServerPhoto = prefixToServerPhoto[proxyMatch.prefix]
+                    tracker.markAsProxy(
+                        assetId: localId,
+                        proxySha256: matchedServerPhoto?.proxyHash ?? "",
+                        masterHash: matchedServerPhoto?.hash,
+                        originalName: matchedServerPhoto?.originalName ?? proxyMatch.filename
+                    )
                     return
                 }
 
@@ -223,17 +280,18 @@ final class PhotoLibraryService {
         let originalLocation = originalAsset.location
         let originalFavorite = originalAsset.isFavorite
 
-        let preloadedImage: UIImage? = (mediaType == .image) ? UIImage(contentsOfFile: proxyFileURL.path) : nil
         var createdLocalIdentifier: String?
 
         PHPhotoLibrary.shared().performChanges({
             let createRequest: PHAssetChangeRequest?
             if mediaType == .video {
                 createRequest = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: proxyFileURL)
-            } else if let img = preloadedImage {
+            } else if let fileReq = PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: proxyFileURL) {
+                createRequest = fileReq
+            } else if let img = UIImage(contentsOfFile: proxyFileURL.path) {
                 createRequest = PHAssetChangeRequest.creationRequestForAsset(from: img)
             } else {
-                createRequest = PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: proxyFileURL)
+                createRequest = nil
             }
 
             createRequest?.creationDate = originalDate
@@ -457,13 +515,24 @@ final class PhotoLibraryService {
         }
 
         let targetCreationDate = photo.parsedCreationDate
+        var tempTaggedURL: URL?
+        if photo.isVideo, let videoURL {
+            tempTaggedURL = ProxyGenerator.writeTaggedVideoCopy(from: videoURL, masterHash: photo.hash)
+        } else if let imageData {
+            tempTaggedURL = ProxyGenerator.writeTaggedProxyImageData(imageData, masterHash: photo.hash)
+        }
+
+        let resolvedFileURL = tempTaggedURL
 
         return try await withCheckedThrowingContinuation { continuation in
             var createdLocalId: String?
             PHPhotoLibrary.shared().performChanges({
                 let createRequest: PHAssetChangeRequest?
-                if photo.isVideo, let videoURL {
-                    createRequest = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: videoURL)
+                if photo.isVideo, let targetVideoURL = resolvedFileURL ?? videoURL {
+                    createRequest = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: targetVideoURL)
+                } else if let targetImageURL = resolvedFileURL,
+                          let fileReq = PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: targetImageURL) {
+                    createRequest = fileReq
                 } else if let imageData {
                     if let img = UIImage(data: imageData) {
                         createRequest = PHAssetChangeRequest.creationRequestForAsset(from: img)
@@ -479,6 +548,7 @@ final class PhotoLibraryService {
                 createRequest?.creationDate = targetCreationDate
                 createdLocalId = createRequest?.placeholderForCreatedAsset?.localIdentifier
             }, completionHandler: { success, error in
+                ProxyGenerator.cleanupTempFile(resolvedFileURL)
                 if success {
                     if let createdLocalId, !createdLocalId.isEmpty {
                         LocalProxyTracker.shared.markAsProxy(

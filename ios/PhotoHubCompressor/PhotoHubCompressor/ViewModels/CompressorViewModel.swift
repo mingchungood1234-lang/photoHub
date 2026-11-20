@@ -76,8 +76,12 @@ final class CompressorViewModel: ObservableObject {
                 let service = self.photoService
                 let tracker = self.tracker
                 let mode = self.sortMode
+                let cachedServerPhotos = LocalProxyStore.shared.cachedPhotos(
+                    baseURL: self.settings.normalizedBaseURL,
+                    apiKey: self.settings.apiKey
+                )
                 Task.detached(priority: .userInitiated) { [weak self] in
-                    let raw = service.scanCandidates(tracker: tracker)
+                    let raw = service.scanCandidates(tracker: tracker, knownServerPhotos: cachedServerPhotos)
                     let sorted = PhotoBackupPipeline.sortCandidates(raw, by: mode)
                     await MainActor.run {
                         guard let self else { return }
@@ -112,8 +116,12 @@ final class CompressorViewModel: ObservableObject {
                 let service = self.photoService
                 let tracker = self.tracker
                 let mode = self.sortMode
+                let cachedServerPhotos = LocalProxyStore.shared.cachedPhotos(
+                    baseURL: self.settings.normalizedBaseURL,
+                    apiKey: self.settings.apiKey
+                )
                 Task.detached(priority: .userInitiated) { [weak self] in
-                    let raw = service.scanCandidates(tracker: tracker)
+                    let raw = service.scanCandidates(tracker: tracker, knownServerPhotos: cachedServerPhotos)
                     let sorted = PhotoBackupPipeline.sortCandidates(raw, by: mode)
                     await MainActor.run {
                         guard let self else { return }
@@ -362,7 +370,7 @@ final class CompressorViewModel: ObservableObject {
         }
 
         do {
-            let outcome = try await PhotoBackupPipeline.backupAndProxyAsset(
+            let result = try await PhotoBackupPipeline.backupAndProxyAsset(
                 candidate: candidate,
                 photoService: photoService,
                 apiClient: apiClient,
@@ -383,11 +391,24 @@ final class CompressorViewModel: ObservableObject {
             }
 
             await MainActor.run {
-                self.stageOriginalForDeletion(
-                    id: currentId,
-                    asset: candidate.asset,
-                    savedBytes: outcome.savedBytes
-                )
+                switch result {
+                case .backedUp(let outcome):
+                    self.stageOriginalForDeletion(
+                        id: currentId,
+                        asset: candidate.asset,
+                        savedBytes: outcome.savedBytes
+                    )
+                case .skippedExistingProxy:
+                    if let idx = self.candidates.firstIndex(where: { $0.id == currentId }) {
+                        self.candidates[idx].state = .alreadyProxy
+                        self.candidates[idx].isSelected = false
+                    }
+                case .skippedProtectedOriginal:
+                    if let idx = self.candidates.firstIndex(where: { $0.id == currentId }) {
+                        self.candidates[idx].state = .skipped("Restored Original Protected")
+                        self.candidates[idx].isSelected = false
+                    }
+                }
                 self.completedCount += 1
             }
             return true
