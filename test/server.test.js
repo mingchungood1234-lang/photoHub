@@ -799,6 +799,13 @@ test('Storage Quota Reporting & Upload Enforcement', async (t) => {
     const dupBody = await dupRes.json();
     assert.equal(dupBody.isDuplicate, true);
   });
+
+  await t.test('3. DEFAULT_QUOTA_GB=5000 resolves to exact 5 TB (5e12 bytes) matching iOS .file display', async () => {
+    const { getConfig } = require('../src/config');
+    const cfg = getConfig({ defaultQuotaGb: 5000, userQuotas: 'tester:50' });
+    assert.equal(cfg.defaultQuotaBytes, 5_000_000_000_000);
+    assert.equal(cfg.userQuotaMap.get('tester'), 50_000_000_000);
+  });
 });
 
 test('Google OAuth PKCE Login, Gateway Node Routing, and Cross-Node Session Verification', async (t) => {

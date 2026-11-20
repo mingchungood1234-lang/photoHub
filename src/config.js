@@ -140,7 +140,8 @@ function parsePairMap(raw, valueTransform = (v) => v) {
 function gbToBytes(rawGb) {
   const num = Number(rawGb);
   if (!Number.isFinite(num) || num <= 0) return 0;
-  return Math.round(num * 1024 * 1024 * 1024);
+  // Use SI base-10 GB (1000^3) to match iOS ByteCountFormatter (.file), so 5000 GB displays as 5 TB
+  return Math.round(num * 1000 * 1000 * 1000);
 }
 
 function getConfig(overrides = {}) {
