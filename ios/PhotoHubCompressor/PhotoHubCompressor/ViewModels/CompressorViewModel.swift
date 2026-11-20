@@ -3,6 +3,7 @@ import Photos
 import SwiftUI
 import UIKit
 
+@MainActor
 final class CompressorViewModel: ObservableObject {
     @Published var candidates: [PhotoCandidate] = []
     @Published var pendingDeleteAssets: [PHAsset] = []
@@ -15,14 +16,19 @@ final class CompressorViewModel: ObservableObject {
     @Published var totalSavedBytes: Int64 = 0
     @Published var completedCount: Int = 0
     @Published var totalToProcess: Int = 0
+    @Published var sortMode: CandidateSortMode
+    @Published var recentlyDeletedNoticeCount: Int = 0
+    @Published var recentlyDeletedNoticeBytes: Int64 = 0
 
     let settings: AppSettings
     private let photoService = PhotoLibraryService()
     private let tracker = LocalProxyTracker.shared
     private var pendingAutoDeleteWhenActive: Bool = false
+    private var activeBgTaskId: UIBackgroundTaskIdentifier = .invalid
 
     init(settings: AppSettings) {
         self.settings = settings
+        self.sortMode = settings.candidateSortMode
         self.permissionStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
     }
 
@@ -30,32 +36,58 @@ final class CompressorViewModel: ObservableObject {
         candidates.filter { $0.isSelected && !$0.state.isFinished }.count
     }
 
+    var pendingVideoCandidates: [PhotoCandidate] {
+        candidates.filter { $0.isVideo && !$0.state.isFinished }
+    }
+
+    var pendingVideoEstimatedBytes: Int64 {
+        pendingVideoCandidates.reduce(0) { $0 + max(0, $1.estimatedBytes) }
+    }
+
+    var totalEligibleEstimatedBytes: Int64 {
+        candidates
+            .filter { !$0.state.isFinished }
+            .reduce(0) { $0 + max(0, $1.estimatedBytes) }
+    }
+
+    func setSortMode(_ newMode: CandidateSortMode) {
+        sortMode = newMode
+        settings.candidateSortMode = newMode
+        candidates = PhotoBackupPipeline.sortCandidates(candidates, by: newMode)
+    }
+
     func scanLibrary() {
         guard !isScanning else { return }
         isScanning = true
         statusBanner = nil
+        BackgroundBackupManager.shared.pruneMissingAssetsFromStaged()
 
         photoService.requestAuthorization { [weak self] status in
-            guard let self = self else { return }
-            self.permissionStatus = status
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.permissionStatus = status
 
-            guard status == .authorized || status == .limited else {
-                self.isScanning = false
-                self.statusBanner = "Please allow Photos access in iOS Settings to scan your library."
-                return
-            }
-
-            let service = self.photoService
-            let tracker = self.tracker
-            DispatchQueue.global(qos: .userInitiated).async {
-                let scanned = service.scanCandidates(tracker: tracker)
-                DispatchQueue.main.async {
-                    self.candidates = scanned
-                    self.pendingDeleteAssets.removeAll()
-                    self.pendingAutoDeleteWhenActive = false
+                guard status == .authorized || status == .limited else {
                     self.isScanning = false
-                    if scanned.isEmpty {
-                        self.statusBanner = "No uncompressed photos or videos found."
+                    self.statusBanner = "Please allow Photos access in iOS Settings to scan your library."
+                    return
+                }
+
+                let service = self.photoService
+                let tracker = self.tracker
+                let mode = self.sortMode
+                Task.detached(priority: .userInitiated) { [weak self] in
+                    let raw = service.scanCandidates(tracker: tracker)
+                    let sorted = PhotoBackupPipeline.sortCandidates(raw, by: mode)
+                    await MainActor.run {
+                        guard let self else { return }
+                        self.applyScannedCandidates(sorted)
+                        self.pendingDeleteAssets.removeAll()
+                        self.pendingAutoDeleteWhenActive = false
+                        self.isScanning = false
+                        if sorted.isEmpty {
+                            self.statusBanner = "No uncompressed photos or videos found."
+                        }
                     }
                 }
             }
@@ -66,28 +98,48 @@ final class CompressorViewModel: ObservableObject {
         guard !isScanning && !isProcessing else { return }
         isScanning = true
         statusBanner = nil
+        BackgroundBackupManager.shared.pruneMissingAssetsFromStaged()
 
         photoService.requestAuthorization { [weak self] status in
-            guard let self = self else { return }
-            self.permissionStatus = status
-            guard status == .authorized || status == .limited else {
-                self.isScanning = false
-                return
-            }
-
-            let service = self.photoService
-            let tracker = self.tracker
-            DispatchQueue.global(qos: .userInitiated).async {
-                let scanned = service.scanCandidates(tracker: tracker)
-                DispatchQueue.main.async {
-                    self.candidates = scanned
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.permissionStatus = status
+                guard status == .authorized || status == .limited else {
                     self.isScanning = false
-                    if !scanned.isEmpty && self.settings.autoCompressOnOpen {
-                        self.selectAllEligible(true)
-                        self.startProcessingSelectedPhotos()
+                    return
+                }
+
+                let service = self.photoService
+                let tracker = self.tracker
+                let mode = self.sortMode
+                Task.detached(priority: .userInitiated) { [weak self] in
+                    let raw = service.scanCandidates(tracker: tracker)
+                    let sorted = PhotoBackupPipeline.sortCandidates(raw, by: mode)
+                    await MainActor.run {
+                        guard let self else { return }
+                        self.applyScannedCandidates(sorted)
+                        self.isScanning = false
+                        if !sorted.isEmpty && self.settings.autoCompressOnOpen {
+                            self.selectAllEligible(true)
+                            self.startProcessingSelectedPhotos()
+                        }
                     }
                 }
             }
+        }
+    }
+
+    private func applyScannedCandidates(_ scanned: [PhotoCandidate]) {
+        let stagedById = Dictionary(
+            uniqueKeysWithValues: BackgroundBackupManager.shared.stagedItems.map { ($0.id, $0) }
+        )
+        candidates = scanned.map { item in
+            var copy = item
+            if let staged = stagedById[item.id] {
+                copy.state = .readyToDelete(savedBytes: staged.savedBytes)
+                copy.isSelected = false
+            }
+            return copy
         }
     }
 
@@ -98,13 +150,15 @@ final class CompressorViewModel: ObservableObject {
         }
         let asset = candidates[index].asset
         photoService.loadThumbnail(for: asset) { [weak self] thumb in
-            guard let self = self,
-                  let thumb = thumb,
-                  let currentIndex = self.candidates.firstIndex(where: { $0.id == id }) else {
-                return
-            }
-            if self.candidates[currentIndex].thumbnail == nil {
-                self.candidates[currentIndex].thumbnail = thumb
+            Task { @MainActor [weak self] in
+                guard let self,
+                      let thumb,
+                      let currentIndex = self.candidates.firstIndex(where: { $0.id == id }) else {
+                    return
+                }
+                if self.candidates[currentIndex].thumbnail == nil {
+                    self.candidates[currentIndex].thumbnail = thumb
+                }
             }
         }
     }
@@ -121,6 +175,42 @@ final class CompressorViewModel: ObservableObject {
         }
     }
 
+    /// Selects the largest eligible videos first for immediate multi-GB space savings.
+    func selectTopVideos(maxCount: Int = 25) {
+        selectAllEligible(false)
+        let sortedVideos = PhotoBackupPipeline.sortCandidates(
+            candidates.filter { $0.isVideo && !$0.state.isFinished },
+            by: .largestFirst
+        ).prefix(maxCount)
+        let targetIds = Set(sortedVideos.map { $0.id })
+        for idx in candidates.indices where targetIds.contains(candidates[idx].id) {
+            candidates[idx].isSelected = true
+        }
+    }
+
+    func dismissRecentlyDeletedNotice() {
+        recentlyDeletedNoticeCount = 0
+        recentlyDeletedNoticeBytes = 0
+    }
+
+    func triggerStagedOvernightCleanupPrompt() {
+        let staged = BackgroundBackupManager.shared.stagedItems
+        guard !staged.isEmpty else { return }
+        let ids = staged.map { $0.id }
+        let liveAssets = PhotoLibraryService.fetchLiveAssets(forLocalIdentifiers: ids)
+        guard !liveAssets.isEmpty else {
+            BackgroundBackupManager.shared.clearAllStagedItems()
+            return
+        }
+        pendingDeleteAssets = liveAssets
+        if totalSavedBytes == 0 {
+            totalSavedBytes = BackgroundBackupManager.shared.stagedSavedBytes
+        }
+        isAwaitingDeleteConfirmation = false
+        pendingAutoDeleteWhenActive = false
+        scheduleAutomaticDeletePrompt()
+    }
+
     func startProcessingSelectedPhotos() {
         guard !isProcessing else { return }
         let targetIds = candidates
@@ -132,6 +222,8 @@ final class CompressorViewModel: ObservableObject {
         completedCount = 0
         totalToProcess = targetIds.count
         statusBanner = nil
+
+        beginAppBackgroundTask()
 
         let apiClient = PhotoHubAPIClient(settings: settings)
         let format = settings.proxyFormat
@@ -153,6 +245,7 @@ final class CompressorViewModel: ObservableObject {
             } catch APIClientError.httpError(401, _) {
                 await MainActor.run {
                     self.isProcessing = false
+                    self.endAppBackgroundTask()
                     self.statusBanner = "Session expired. Please sign in again."
                     LocalProxySyncManager.shared.cancel()
                     self.settings.signOut()
@@ -161,6 +254,7 @@ final class CompressorViewModel: ObservableObject {
             } catch {
                 await MainActor.run {
                     self.isProcessing = false
+                    self.endAppBackgroundTask()
                     let hostLabel = normalizedBaseURL?.host ?? "server"
                     self.statusBanner = "Server check failed (\(hostLabel)): \(error.localizedDescription)"
                 }
@@ -213,6 +307,7 @@ final class CompressorViewModel: ObservableObject {
 
             await MainActor.run {
                 self.isProcessing = false
+                self.endAppBackgroundTask()
                 let savedStr = ByteCountFormatter.string(fromByteCount: self.totalSavedBytes, countStyle: .file)
                 if !self.pendingDeleteAssets.isEmpty {
                     self.scheduleAutomaticDeletePrompt()
@@ -223,6 +318,21 @@ final class CompressorViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    private func beginAppBackgroundTask() {
+        endAppBackgroundTask()
+        activeBgTaskId = UIApplication.shared.beginBackgroundTask(withName: "PhotoHubCompression") { [weak self] in
+            Task { @MainActor in
+                self?.endAppBackgroundTask()
+            }
+        }
+    }
+
+    private func endAppBackgroundTask() {
+        guard activeBgTaskId != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(activeBgTaskId)
+        activeBgTaskId = .invalid
     }
 
     private func processSingleCandidate(
@@ -252,168 +362,31 @@ final class CompressorViewModel: ObservableObject {
         }
 
         do {
-            // Step 1: Export full-resolution original & compute SHA-256
-            let master = try await photoService.exportOriginalMasterAsync(for: candidate.asset)
-            defer { try? FileManager.default.removeItem(at: master.fileURL) }
-
-            // Step 2: Check server & upload if not already backed up
-            let checkResult = try await apiClient.checkHash(master.sha256)
-            let needsUpload = !(checkResult.exists && checkResult.isMaster == true && checkResult.canReplaceWithProxy == true)
-
-            if needsUpload {
-                self.updateStateOnMain(id: currentId, state: .uploading(0))
-                let progressHandler: (Double) -> Void = { [weak self] progress in
-                    self?.updateStateOnMain(id: currentId, state: .uploading(progress))
+            let outcome = try await PhotoBackupPipeline.backupAndProxyAsset(
+                candidate: candidate,
+                photoService: photoService,
+                apiClient: apiClient,
+                tracker: tracker,
+                format: format,
+                maxPixelSize: maxPx,
+                quality: quality,
+                uploadMode: uploadMode,
+                keepLocalProxy: keepLocal,
+                normalizedBaseURL: normalizedBaseURL,
+                cacheScopeKey: apiKey,
+                videoSemaphore: videoSemaphore,
+                photosSaveSemaphore: photosSaveSemaphore
+            ) { [weak self] newState in
+                Task { @MainActor in
+                    self?.updateState(id: currentId, state: newState)
                 }
-
-                switch uploadMode {
-                case .directVPS:
-                    _ = try await apiClient.uploadMasterDirect(
-                        fileURL: master.fileURL,
-                        filename: master.filename,
-                        mimeType: master.mimeType,
-                        createdAt: candidate.creationDate,
-                        expectedSha256: master.sha256,
-                        onProgress: progressHandler
-                    )
-                case .s3Presigned:
-                    _ = try await apiClient.uploadMasterPresigned(
-                        fileURL: master.fileURL,
-                        filename: master.filename,
-                        mimeType: master.mimeType,
-                        createdAt: candidate.creationDate,
-                        expectedSha256: master.sha256,
-                        onProgress: progressHandler
-                    )
-                }
-            }
-
-            // Step 3: Create lightweight proxy (limit heavy video transcoding to 1 at a time)
-            self.updateStateOnMain(id: currentId, state: .creatingProxy)
-            let proxy: GeneratedProxy
-            let previewFileForServer: URL?
-            let previewFormatForServer: String
-            let videoProxyFileForServer: URL?
-
-            if candidate.mediaType == .video {
-                await videoSemaphore.acquire()
-                do {
-                    proxy = try await ProxyGenerator.createVideoProxy(from: master.fileURL)
-                    await videoSemaphore.release()
-                } catch {
-                    await videoSemaphore.release()
-                    throw error
-                }
-                previewFileForServer = proxy.posterFileURL
-                previewFormatForServer = "jpeg"
-                videoProxyFileForServer = proxy.fileURL
-            } else {
-                proxy = try ProxyGenerator.createProxy(
-                    from: master.fileURL,
-                    format: format,
-                    maxPixelSize: maxPx,
-                    quality: quality
-                )
-                previewFileForServer = proxy.fileURL
-                previewFormatForServer = format.rawValue
-                videoProxyFileForServer = nil
-            }
-
-            try? FileManager.default.removeItem(at: master.fileURL)
-            defer {
-                try? FileManager.default.removeItem(at: proxy.fileURL)
-                if let posterURL = proxy.posterFileURL {
-                    try? FileManager.default.removeItem(at: posterURL)
-                }
-            }
-
-            // Step 4: Register proxy on server (streams video proxy binary) & persist in LocalProxyStore
-            try? await apiClient.registerProxy(
-                masterHash: master.sha256,
-                proxyHash: proxy.sha256,
-                assetId: candidate.id,
-                proxyFileURL: previewFileForServer,
-                proxyFormat: previewFormatForServer,
-                videoProxyURL: videoProxyFileForServer
-            )
-
-            if let previewURL = previewFileForServer {
-                LocalProxyStore.shared.copyPreviewFile(from: previewURL, forHash: master.sha256)
-            }
-            if candidate.mediaType == .video {
-                LocalProxyStore.shared.copyVideoProxy(from: proxy.fileURL, forHash: master.sha256)
-            }
-
-            let iso = ISO8601DateFormatter()
-            let nowISO = iso.string(from: Date())
-            let photoISO = candidate.creationDate.map { iso.string(from: $0) } ?? nowISO
-            let posterSize: Int64? = {
-                guard let previewURL = previewFileForServer,
-                      let values = try? previewURL.resourceValues(forKeys: [.fileSizeKey]),
-                      let size = values.fileSize else {
-                    return nil
-                }
-                return Int64(size)
-            }()
-            LocalProxyStore.shared.upsertPhoto(
-                ServerPhoto(
-                    hash: master.sha256,
-                    originalName: master.filename,
-                    size: master.sizeBytes,
-                    photoDate: photoISO,
-                    takenAt: photoISO,
-                    uploadedAt: nowISO,
-                    savedPath: checkResult.savedPath ?? master.filename,
-                    hasProxy: true,
-                    hasPreview: previewFileForServer != nil,
-                    proxyHash: proxy.sha256,
-                    proxySize: candidate.mediaType == .video ? posterSize : proxy.sizeBytes,
-                    hasVideoProxy: candidate.mediaType == .video,
-                    videoProxySize: candidate.mediaType == .video ? proxy.sizeBytes : nil
-                ),
-                baseURL: normalizedBaseURL,
-                apiKey: apiKey
-            )
-
-            // Step 5: Save compressed proxy to Photos (serialized for photolibraryd stability)
-            let savedBytes = keepLocal
-                ? max(0, master.sizeBytes - proxy.sizeBytes)
-                : master.sizeBytes
-
-            if keepLocal {
-                self.updateStateOnMain(id: currentId, state: .replacingInPhotos)
-                await photosSaveSemaphore.acquire()
-                let newAssetId: String
-                do {
-                    newAssetId = try await photoService.saveCompressedProxyToPhotosAsync(
-                        originalAsset: candidate.asset,
-                        mediaType: candidate.mediaType,
-                        proxyFileURL: proxy.fileURL
-                    )
-                    await photosSaveSemaphore.release()
-                } catch {
-                    await photosSaveSemaphore.release()
-                    throw error
-                }
-
-                if newAssetId != candidate.id {
-                    self.tracker.markAsProxy(
-                        assetId: newAssetId,
-                        proxySha256: proxy.sha256,
-                        masterHash: master.sha256,
-                        originalName: master.filename
-                    )
-                }
-            } else {
-                // Respect user's choice when "Keep Compressed Proxy in iPhone Photos" is OFF
-                self.tracker.markMasterHandledForPhotos(master.sha256)
             }
 
             await MainActor.run {
                 self.stageOriginalForDeletion(
                     id: currentId,
                     asset: candidate.asset,
-                    savedBytes: savedBytes
+                    savedBytes: outcome.savedBytes
                 )
                 self.completedCount += 1
             }
@@ -444,12 +417,11 @@ final class CompressorViewModel: ObservableObject {
         guard !pendingDeleteAssets.isEmpty, !isAwaitingDeleteConfirmation else { return }
 
         isAwaitingDeleteConfirmation = true
-        statusBanner = "Backed up & compressed \(pendingDeleteAssets.count) item(s). Opening iOS delete alert…"
+        statusBanner = "SHA-256 verified! Opening iOS delete confirmation for \(pendingDeleteAssets.count) original(s)…"
 
-        // Wait briefly on the main runloop so SwiftUI finishes closing the progress bar
-        // and photolibraryd finishes indexing newly saved proxies.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            guard let self = self,
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            guard let self,
                   self.isAwaitingDeleteConfirmation,
                   !self.pendingDeleteAssets.isEmpty else {
                 return
@@ -458,7 +430,7 @@ final class CompressorViewModel: ObservableObject {
             guard UIApplication.shared.applicationState == .active else {
                 self.isAwaitingDeleteConfirmation = false
                 self.pendingAutoDeleteWhenActive = true
-                self.statusBanner = "Backed up & compressed! Return to photoHub to confirm the iOS delete alert for \(self.pendingDeleteAssets.count) original(s)."
+                self.statusBanner = "Backed up & verified! Return to photoHub to confirm deleting \(self.pendingDeleteAssets.count) original(s)."
                 return
             }
 
@@ -467,6 +439,7 @@ final class CompressorViewModel: ObservableObject {
     }
 
     func onAppBecameActive() {
+        BackgroundBackupManager.shared.pruneMissingAssetsFromStaged()
         guard pendingAutoDeleteWhenActive,
               !pendingDeleteAssets.isEmpty,
               !isAwaitingDeleteConfirmation,
@@ -487,7 +460,7 @@ final class CompressorViewModel: ObservableObject {
     func dismissPendingDeleteAfterError() {
         let pendingIds = Set(pendingDeleteAssets.map { $0.localIdentifier })
         for idx in candidates.indices where pendingIds.contains(candidates[idx].id) {
-            candidates[idx].state = .skipped("Backed up • Original kept")
+            candidates[idx].state = .skipped("Backed up (SHA-256) • Original kept")
             candidates[idx].isSelected = false
         }
         pendingDeleteAssets.removeAll()
@@ -498,33 +471,45 @@ final class CompressorViewModel: ObservableObject {
     private func performDelete(assets: [PHAsset]) {
         let targetIds = Set(assets.map { $0.localIdentifier })
         photoService.deleteOriginalAssets(assets) { [weak self] result in
-            guard let self = self else { return }
-            self.isAwaitingDeleteConfirmation = false
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.isAwaitingDeleteConfirmation = false
 
-            switch result {
-            case .success(.deleted(let deletedIds)):
-                let deletedSet = Set(deletedIds)
-                self.candidates.removeAll { deletedSet.contains($0.id) }
-                self.pendingDeleteAssets.removeAll { deletedSet.contains($0.localIdentifier) }
+                switch result {
+                case .success(.deleted(let deletedIds)):
+                    let deletedSet = Set(deletedIds)
+                    let stagedSaved = BackgroundBackupManager.shared.stagedItems
+                        .filter { deletedSet.contains($0.id) }
+                        .reduce(Int64(0)) { $0 + max(0, $1.savedBytes) }
+                    let freedBytes = self.totalSavedBytes > 0 ? self.totalSavedBytes : stagedSaved
 
-                let savedStr = ByteCountFormatter.string(fromByteCount: self.totalSavedBytes, countStyle: .file)
-                if self.pendingDeleteAssets.isEmpty {
-                    self.statusBanner = "Deleted \(deletedSet.count) original(s) from iPhone! Space saved: \(savedStr). Empty 'Recently Deleted' in Photos to reclaim storage immediately."
-                } else {
-                    self.statusBanner = "Deleted \(deletedSet.count) original(s). \(self.pendingDeleteAssets.count) item(s) still remain."
+                    self.candidates.removeAll { deletedSet.contains($0.id) }
+                    self.pendingDeleteAssets.removeAll { deletedSet.contains($0.localIdentifier) }
+                    BackgroundBackupManager.shared.removeStagedItems(ids: deletedSet)
+
+                    self.recentlyDeletedNoticeCount += deletedSet.count
+                    self.recentlyDeletedNoticeBytes += max(0, freedBytes)
+
+                    let savedStr = ByteCountFormatter.string(fromByteCount: max(0, freedBytes), countStyle: .file)
+                    if self.pendingDeleteAssets.isEmpty {
+                        self.statusBanner = "Verified & moved \(deletedSet.count) original(s) (\(savedStr)) to Apple Photos → Recently Deleted."
+                    } else {
+                        self.statusBanner = "Deleted \(deletedSet.count) original(s). \(self.pendingDeleteAssets.count) item(s) still remain."
+                    }
+
+                case .success(.cancelledByUser):
+                    for idx in self.candidates.indices where targetIds.contains(self.candidates[idx].id) {
+                        self.candidates[idx].state = .skipped("Backed up (SHA-256) • Kept on iPhone")
+                        self.candidates[idx].isSelected = false
+                    }
+                    self.pendingDeleteAssets.removeAll { targetIds.contains($0.localIdentifier) }
+                    BackgroundBackupManager.shared.removeStagedItems(ids: targetIds)
+                    self.statusBanner = "Originals kept on iPhone (safely backed up on server)."
+
+                case .failure(let error):
+                    self.statusBanner = error.localizedDescription
+                    self.deleteErrorAlertMessage = error.localizedDescription
                 }
-
-            case .success(.cancelledByUser):
-                for idx in self.candidates.indices where targetIds.contains(self.candidates[idx].id) {
-                    self.candidates[idx].state = .skipped("Backed up • Kept on iPhone")
-                    self.candidates[idx].isSelected = false
-                }
-                self.pendingDeleteAssets.removeAll { targetIds.contains($0.localIdentifier) }
-                self.statusBanner = "Kept original photo(s) on iPhone."
-
-            case .failure(let error):
-                self.statusBanner = error.localizedDescription
-                self.deleteErrorAlertMessage = error.localizedDescription
             }
         }
     }
@@ -532,12 +517,6 @@ final class CompressorViewModel: ObservableObject {
     private func updateState(id: String, state: PhotoCompressionState) {
         if let idx = candidates.firstIndex(where: { $0.id == id }) {
             candidates[idx].state = state
-        }
-    }
-
-    private func updateStateOnMain(id: String, state: PhotoCompressionState) {
-        DispatchQueue.main.async { [weak self] in
-            self?.updateState(id: id, state: state)
         }
     }
 }

@@ -91,6 +91,10 @@ final class AppSettings: ObservableObject {
     @AppStorage("autoDownloadLocalProxies") var autoDownloadLocalProxies: Bool = true
     @AppStorage("autoDownloadLocalVideos") var autoDownloadLocalVideos: Bool = true
     @AppStorage("autoSaveProxiesToPhotosApp") var autoSaveProxiesToPhotosApp: Bool = true
+    @AppStorage("nightlyAutoBackupEnabled") var nightlyAutoBackupEnabled: Bool = false
+    @AppStorage("nightlyRequiresCharging") var nightlyRequiresCharging: Bool = true
+    @AppStorage("morningReminderHour") var morningReminderHour: Int = 8
+    @AppStorage("candidateSortMode") var candidateSortModeRaw: String = CandidateSortMode.largestVideosFirst.rawValue
 
     @Published private(set) var authToken: String
     @Published private(set) var assignedServerURLString: String
@@ -125,6 +129,11 @@ final class AppSettings: ObservableObject {
     var proxyFormat: ProxyFormat {
         get { ProxyFormat(rawValue: proxyFormatRaw) ?? .heic }
         set { proxyFormatRaw = newValue.rawValue }
+    }
+
+    var candidateSortMode: CandidateSortMode {
+        get { CandidateSortMode(rawValue: candidateSortModeRaw) ?? .largestVideosFirst }
+        set { candidateSortModeRaw = newValue.rawValue }
     }
 
     var gatewayURL: URL? {

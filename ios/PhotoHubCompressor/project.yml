@@ -21,6 +21,11 @@ targets:
         LSRequiresIPhoneOS: true
         UIRequiresFullScreen: true
         UILaunchStoryboardName: LaunchScreen
+        UIBackgroundModes:
+          - processing
+          - fetch
+        BGTaskSchedulerPermittedIdentifiers:
+          - com.photohub.compressor.nightlyBackup
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
           UISceneConfigurations: {}

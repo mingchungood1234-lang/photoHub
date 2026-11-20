@@ -5,11 +5,13 @@ struct SettingsView: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject private var syncManager: LocalProxySyncManager
     @ObservedObject private var authService: GoogleAuthService
+    @ObservedObject private var bgManager: BackgroundBackupManager
 
     init(settings: AppSettings) {
         self.settings = settings
         self._syncManager = ObservedObject(wrappedValue: LocalProxySyncManager.shared)
         self._authService = ObservedObject(wrappedValue: GoogleAuthService.shared)
+        self._bgManager = ObservedObject(wrappedValue: BackgroundBackupManager.shared)
     }
 
     @State private var connectionStatus: String?
@@ -26,6 +28,7 @@ struct SettingsView: View {
             Form {
                 accountSection
                 storageLimitSection
+                overnightBackupSection
                 proxySettingsSection
                 safetySection
                 diagnosticsSection
@@ -34,9 +37,20 @@ struct SettingsView: View {
             .onAppear {
                 photosAuthText = PhotoLibraryService.currentReadWriteAuthLabel()
                 localProxyCacheBytes = LocalProxyStore.shared.totalStorageBytes()
+                bgManager.refreshNotificationPermissionLabel()
                 if settings.isSignedIn {
                     Task { await refreshAccountAndStorage() }
                 }
+            }
+            .onChange(of: settings.nightlyAutoBackupEnabled) { enabled in
+                if enabled {
+                    bgManager.requestNotificationPermissionAndSchedule(settings: settings)
+                } else {
+                    bgManager.scheduleNightlyBackupIfEnabled(settings: settings)
+                }
+            }
+            .onChange(of: settings.nightlyRequiresCharging) { _ in
+                bgManager.scheduleNightlyBackupIfEnabled(settings: settings)
             }
             .onReceive(NotificationCenter.default.publisher(for: .localProxyStoreDidChange)) { _ in
                 localProxyCacheBytes = LocalProxyStore.shared.totalStorageBytes()
@@ -192,6 +206,51 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
+    private var overnightBackupSection: some View {
+        Section {
+            Toggle("Nightly Auto-Backup (Wi-Fi)", isOn: $settings.nightlyAutoBackupEnabled)
+
+            Toggle("Require Charger Overnight", isOn: $settings.nightlyRequiresCharging)
+                .disabled(!settings.nightlyAutoBackupEnabled)
+
+            Picker("Morning Delete Reminder", selection: $settings.morningReminderHour) {
+                ForEach(6...11, id: \.self) { hr in
+                    Text("\(hr):00 AM").tag(hr)
+                }
+            }
+            .disabled(!settings.nightlyAutoBackupEnabled)
+
+            HStack {
+                Text("Notification Permission")
+                Spacer()
+                Text(bgManager.notificationPermissionLabel)
+                    .foregroundStyle(bgManager.notificationPermissionLabel == "Allowed" ? .green : .secondary)
+            }
+
+            if !bgManager.stagedItems.isEmpty {
+                let bytesStr = formatBytes(bgManager.stagedSavedBytes)
+                Text("Staged Ready to Free: \(bgManager.stagedItems.count) item(s) (~\(bytesStr))")
+                    .font(.caption.weight(.medium))
+                    .foregroundColor(.indigo)
+            }
+
+            if !bgManager.lastRunSummary.isEmpty {
+                Text(bgManager.lastRunSummary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Button("Send Test Morning Alert (5s)") {
+                bgManager.sendTestMorningAlert(settings: settings)
+            }
+        } header: {
+            Text("Overnight Backup & Morning Alert")
+        } footer: {
+            Text("Uses iOS Background Processing overnight on Wi-Fi (works without a paid Apple Developer account) to upload originals, generate proxies, and remind you in the morning to free space in 1 tap.")
+        }
+    }
+
+    @ViewBuilder
     private var proxySettingsSection: some View {
         Section {
             Toggle("Auto Scan & Compress on App Open", isOn: $settings.autoCompressOnOpen)
@@ -233,7 +292,7 @@ struct SettingsView: View {
     @ViewBuilder
     private var safetySection: some View {
         Section("How Safety Works") {
-            Text("1. Your iPhone computes the SHA-256 checksum of the full-resolution original.\n2. The original is uploaded to your server (or S3/MinIO).\n3. Only after the backend confirms the exact SHA-256 checksum on disk does the app request deletion via iOS Photos.")
+            Text("1. Your iPhone computes the SHA-256 checksum of the full-resolution original.\n2. The original is uploaded to your server (or S3/R2).\n3. Only after the backend confirms the exact SHA-256 checksum on disk does photoHub save a proxy and ask iOS to delete the original.\n4. Deleted originals stay recoverable in Apple Photos → Recently Deleted for 30 days (empty it anytime to reclaim storage immediately), and full-resolution originals remain restorable from your server.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }

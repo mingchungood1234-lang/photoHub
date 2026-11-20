@@ -82,7 +82,8 @@ final class PhotoLibraryService {
                     filename: "\(prefixLabel)_\(shortId)",
                     pixelWidth: asset.pixelWidth,
                     pixelHeight: asset.pixelHeight,
-                    creationDate: asset.creationDate
+                    creationDate: asset.creationDate,
+                    estimatedBytes: Self.estimateBytes(for: asset)
                 )
 
                 candidates.append(candidate)
@@ -90,6 +91,35 @@ final class PhotoLibraryService {
         }
 
         return candidates
+    }
+
+    static func estimateBytes(for asset: PHAsset) -> Int64 {
+        let pixels = Int64(max(0, asset.pixelWidth)) * Int64(max(0, asset.pixelHeight))
+        if asset.mediaType == .video {
+            let durationSec = max(1.0, asset.duration)
+            let maxDim = max(asset.pixelWidth, asset.pixelHeight)
+            let bytesPerSecond: Double
+            if maxDim >= 3800 {
+                bytesPerSecond = 5_500_000 // ~44 Mbps 4K HEVC/H.264
+            } else if maxDim >= 1900 {
+                bytesPerSecond = 2_200_000 // ~17 Mbps 1080p
+            } else {
+                bytesPerSecond = 1_200_000
+            }
+            return max(8_000_000, Int64(durationSec * bytesPerSecond))
+        }
+        return max(1_500_000, pixels / 4)
+    }
+
+    static func fetchLiveAssets(forLocalIdentifiers ids: [String]) -> [PHAsset] {
+        guard !ids.isEmpty else { return [] }
+        let fetched = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
+        var out: [PHAsset] = []
+        out.reserveCapacity(fetched.count)
+        for idx in 0..<fetched.count {
+            out.append(fetched.object(at: idx))
+        }
+        return out
     }
 
     func loadThumbnail(

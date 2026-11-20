@@ -2,7 +2,23 @@ import Foundation
 import Photos
 import UIKit
 
-enum PhotoCompressionState: Equatable {
+enum CandidateSortMode: String, CaseIterable, Identifiable, Sendable {
+    case largestVideosFirst = "largest_videos_first"
+    case largestFirst = "largest_first"
+    case newestFirst = "newest_first"
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .largestVideosFirst: return "Largest Videos First"
+        case .largestFirst: return "Largest Files First"
+        case .newestFirst: return "Newest First"
+        }
+    }
+}
+
+enum PhotoCompressionState: Equatable, Sendable {
     case pending
     case hashing
     case alreadyProxy
@@ -20,23 +36,23 @@ enum PhotoCompressionState: Equatable {
         case .pending:
             return "Tap to Select"
         case .hashing:
-            return "Hashing…"
+            return "Hashing SHA-256…"
         case .alreadyProxy:
             return "Already Proxy"
         case .uploading(let progress):
             return "Uploading \(Int(progress * 100))%"
         case .verifyingChecksum:
-            return "Verifying Checksum…"
+            return "Verifying SHA-256…"
         case .creatingProxy:
             return "Compressing Proxy…"
         case .replacingInPhotos:
-            return "Replacing in Photos…"
+            return "Saving Proxy to Photos…"
         case .readyToDelete(let savedBytes):
             let formatted = ByteCountFormatter.string(fromByteCount: max(0, savedBytes), countStyle: .file)
-            return "Backed Up • Confirming with iOS (\(formatted))"
+            return "SHA-256 Verified · Ready to Free \(formatted)"
         case .completed(let savedBytes):
             let formatted = ByteCountFormatter.string(fromByteCount: max(0, savedBytes), countStyle: .file)
-            return "Saved \(formatted)"
+            return "Verified & Saved \(formatted)"
         case .skipped(let reason):
             return reason
         case .failed(let message):
@@ -52,6 +68,17 @@ enum PhotoCompressionState: Equatable {
             return false
         }
     }
+
+    var isIntegrityVerified: Bool {
+        switch self {
+        case .readyToDelete, .completed:
+            return true
+        case .skipped(let reason):
+            return reason.localizedCaseInsensitiveContains("Backed up")
+        default:
+            return false
+        }
+    }
 }
 
 struct PhotoCandidate: Identifiable {
@@ -63,12 +90,17 @@ struct PhotoCandidate: Identifiable {
     let pixelWidth: Int
     let pixelHeight: Int
     let creationDate: Date?
+    let estimatedBytes: Int64
     var thumbnail: UIImage?
     var state: PhotoCompressionState = .pending
     var isSelected: Bool = false
 
     var isVideo: Bool {
         mediaType == .video
+    }
+
+    var estimatedSizeLabel: String {
+        "~\(ByteCountFormatter.string(fromByteCount: max(0, estimatedBytes), countStyle: .file))"
     }
 
     var resolutionLabel: String {

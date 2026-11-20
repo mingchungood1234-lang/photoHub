@@ -1252,6 +1252,15 @@ private struct ServerPhotoDetailView: View {
                             Text("\(smallStr) proxy · \(masterStr) original")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+
+                            HStack(spacing: 4) {
+                                Image(systemName: "checkmark.shield.fill")
+                                    .font(.caption2)
+                                    .foregroundColor(.green)
+                                Text("SHA-256 verified (\(String(currentPhoto.hash.prefix(10)))…)")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
 
                         Spacer()

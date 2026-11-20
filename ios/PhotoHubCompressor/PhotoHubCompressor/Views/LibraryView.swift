@@ -1,8 +1,15 @@
 import SwiftUI
+import UIKit
 
 struct LibraryView: View {
     @ObservedObject var viewModel: CompressorViewModel
+    @ObservedObject private var bgManager: BackgroundBackupManager
     @AppStorage("keepLocalProxyInPhotos") private var keepLocalProxyInPhotos: Bool = true
+
+    init(viewModel: CompressorViewModel) {
+        self.viewModel = viewModel
+        self._bgManager = ObservedObject(wrappedValue: BackgroundBackupManager.shared)
+    }
 
     var body: some View {
         AdaptiveNavigationStack {
@@ -27,6 +34,14 @@ struct LibraryView: View {
                     .background(Color.orange.opacity(0.15))
                 }
 
+                if !bgManager.stagedItems.isEmpty && !viewModel.isProcessing && !viewModel.isAwaitingDeleteConfirmation {
+                    overnightReadyBanner
+                }
+
+                if viewModel.recentlyDeletedNoticeCount > 0 {
+                    recentlyDeletedWarningBanner
+                }
+
                 if let banner = viewModel.statusBanner {
                     HStack(spacing: 8) {
                         Image(systemName: "info.circle.fill")
@@ -45,7 +60,7 @@ struct LibraryView: View {
                             value: Double(viewModel.completedCount),
                             total: Double(max(1, viewModel.totalToProcess))
                         )
-                        Text("Processing \(viewModel.completedCount) of \(viewModel.totalToProcess) photos…")
+                        Text("Processing \(viewModel.completedCount) of \(viewModel.totalToProcess) item(s)…")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -59,7 +74,7 @@ struct LibraryView: View {
                         systemImage: "photo.on.rectangle.angled",
                         description: (viewModel.permissionStatus == .denied || viewModel.permissionStatus == .restricted)
                             ? "Photos permission is required. Open iOS Settings to allow access."
-                            : "Tap Scan Library to find full-resolution photos that can be backed up and replaced with lightweight proxies."
+                            : "Tap Scan Library to prioritize your largest videos & photos, verify SHA-256 backups on your server, and reclaim space safely."
                     ) {
                         if viewModel.permissionStatus == .denied || viewModel.permissionStatus == .restricted {
                             Button("Open iOS Settings") {
@@ -96,7 +111,7 @@ struct LibraryView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .navigationTitle("photoHub")
+            .navigationTitle("Compress")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
@@ -115,10 +130,27 @@ struct LibraryView: View {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     if !viewModel.candidates.isEmpty {
                         Menu {
+                            Picker("Sort Order", selection: Binding(
+                                get: { viewModel.sortMode },
+                                set: { viewModel.setSortMode($0) }
+                            )) {
+                                ForEach(CandidateSortMode.allCases) { mode in
+                                    Text(mode.displayName).tag(mode)
+                                }
+                            }
+
+                            if !viewModel.pendingVideoCandidates.isEmpty {
+                                Button {
+                                    viewModel.selectTopVideos()
+                                } label: {
+                                    Label("Select Largest Videos", systemImage: "video.fill")
+                                }
+                            }
+
                             Button("Select All") { viewModel.selectAllEligible(true) }
                             Button("Deselect All") { viewModel.selectAllEligible(false) }
                         } label: {
-                            Image(systemName: "checklist")
+                            Image(systemName: "line.3.horizontal.decrease.circle")
                         }
                         .disabled(viewModel.isProcessing)
                     }
@@ -160,6 +192,7 @@ struct LibraryView: View {
                 viewModel.onAppBecameActive()
             }
             .onAppear {
+                bgManager.pruneMissingAssetsFromStaged()
                 if viewModel.candidates.isEmpty && viewModel.settings.autoCompressOnOpen {
                     viewModel.scanAndAutoCompressIfEnabled()
                 }
@@ -167,25 +200,114 @@ struct LibraryView: View {
         }
     }
 
+    private var overnightReadyBanner: some View {
+        let sizeStr = ByteCountFormatter.string(fromByteCount: bgManager.stagedSavedBytes, countStyle: .file)
+        return HStack(spacing: 10) {
+            Image(systemName: "moon.stars.fill")
+                .foregroundColor(.indigo)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(bgManager.stagedItems.count) item(s) verified overnight")
+                    .font(.subheadline.weight(.semibold))
+                Text("~\(sizeStr) backed up safely on server. Tap to delete originals from iPhone.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Free Space") {
+                viewModel.triggerStagedOvernightCleanupPrompt()
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.indigo)
+            .controlSize(.small)
+
+            Button {
+                bgManager.clearAllStagedItems()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(12)
+        .background(Color.indigo.opacity(0.1))
+    }
+
+    private var recentlyDeletedWarningBanner: some View {
+        let sizeStr = ByteCountFormatter.string(fromByteCount: viewModel.recentlyDeletedNoticeBytes, countStyle: .file)
+        return HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.circle.fill")
+                .foregroundColor(.orange)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Free space immediately in Apple Photos")
+                    .font(.caption.weight(.semibold))
+                Text("iOS holds the \(viewModel.recentlyDeletedNoticeCount) deleted original(s) (\(sizeStr)) in Photos → Recently Deleted for 30 days. Open Photos → Utilities → Recently Deleted → Delete All.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 12) {
+                    Button("Open Photos") {
+                        if let url = URL(string: "photos-redirect://") {
+                            UIApplication.shared.open(url)
+                        }
+                    }
+                    .font(.caption.weight(.semibold))
+
+                    Button("Dismiss") {
+                        viewModel.dismissRecentlyDeletedNotice()
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                .padding(.top, 2)
+            }
+            Spacer()
+        }
+        .padding(12)
+        .background(Color.orange.opacity(0.12))
+    }
+
     private var summaryHeader: some View {
         VStack(spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark.shield.fill")
+                    .font(.caption)
+                    .foregroundColor(.green)
+                Text("SHA-256 verified before delete · Originals stay restorable")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if viewModel.totalSavedBytes > 0 {
+                    Text("Saved \(ByteCountFormatter.string(fromByteCount: viewModel.totalSavedBytes, countStyle: .file))")
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Color.green.opacity(0.15), in: Capsule())
+                        .foregroundStyle(.green)
+                }
+            }
+
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("\(viewModel.candidates.count) Photos & Videos")
-                        .font(.headline)
-                    Text("Selected: \(viewModel.selectedCount) item(s)")
+                    Text("\(viewModel.candidates.count) Items · Selected \(viewModel.selectedCount)")
+                        .font(.subheadline.weight(.semibold))
+                    let estStr = ByteCountFormatter.string(fromByteCount: viewModel.totalEligibleEstimatedBytes, countStyle: .file)
+                    Text("Estimated iPhone space: ~\(estStr)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                if viewModel.totalSavedBytes > 0 {
-                    Text("Saved \(ByteCountFormatter.string(fromByteCount: viewModel.totalSavedBytes, countStyle: .file))")
-                        .font(.caption.bold())
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(Color.green.opacity(0.15))
-                        .foregroundStyle(.green)
-                        .clipShape(Capsule())
+
+                if !viewModel.pendingVideoCandidates.isEmpty && !viewModel.isProcessing {
+                    let vidStr = ByteCountFormatter.string(fromByteCount: viewModel.pendingVideoEstimatedBytes, countStyle: .file)
+                    Button {
+                        viewModel.selectTopVideos()
+                    } label: {
+                        Label("Videos (~\(vidStr))", systemImage: "video.fill")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                 }
             }
 
@@ -205,8 +327,8 @@ struct LibraryView: View {
             viewModel.startProcessingSelectedPhotos()
         } label: {
             HStack {
-                Image(systemName: "arrow.up.circle.fill")
-                Text("Upload & Compress \(viewModel.selectedCount) Item(s)")
+                Image(systemName: "checkmark.shield.fill")
+                Text("Verify, Back Up & Free \(viewModel.selectedCount) Item(s)")
                     .fontWeight(.semibold)
             }
             .frame(maxWidth: .infinity)
@@ -255,9 +377,15 @@ private struct PhotoCandidateRow: View {
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                Text(item.filename)
-                    .font(.subheadline.weight(.medium))
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(item.filename)
+                        .font(.subheadline.weight(.medium))
+                        .lineLimit(1)
+                    Spacer()
+                    Text(item.estimatedSizeLabel)
+                        .font(.caption.monospacedDigit().weight(.medium))
+                        .foregroundStyle(item.isVideo ? .orange : .secondary)
+                }
 
                 HStack(spacing: 8) {
                     Text(item.resolutionLabel)
@@ -271,12 +399,17 @@ private struct PhotoCandidateRow: View {
                     }
                 }
 
-                Text(item.state.label)
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(badgeColor(for: item.state))
+                HStack(spacing: 4) {
+                    if item.state.isIntegrityVerified {
+                        Image(systemName: "checkmark.shield.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.green)
+                    }
+                    Text(item.state.label)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(badgeColor(for: item.state))
+                }
             }
-
-            Spacer()
         }
         .contentShape(Rectangle())
         .onTapGesture {

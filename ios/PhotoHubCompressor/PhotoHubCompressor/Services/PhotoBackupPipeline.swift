@@ -1,0 +1,235 @@
+import Foundation
+import Photos
+
+struct BackupPipelineOutcome: Sendable {
+    let masterSha256: String
+    let masterBytes: Int64
+    let proxyBytes: Int64
+    let savedBytes: Int64
+    let filename: String
+}
+
+enum PhotoBackupPipeline {
+    static func sortCandidates(_ items: [PhotoCandidate], by mode: CandidateSortMode) -> [PhotoCandidate] {
+        items.sorted { lhs, rhs in
+            switch mode {
+            case .largestVideosFirst:
+                if lhs.isVideo != rhs.isVideo {
+                    return lhs.isVideo && !rhs.isVideo
+                }
+                if lhs.estimatedBytes != rhs.estimatedBytes {
+                    return lhs.estimatedBytes > rhs.estimatedBytes
+                }
+                return compareDatesDesc(lhs.creationDate, rhs.creationDate, lhsId: lhs.id, rhsId: rhs.id)
+
+            case .largestFirst:
+                if lhs.estimatedBytes != rhs.estimatedBytes {
+                    return lhs.estimatedBytes > rhs.estimatedBytes
+                }
+                return compareDatesDesc(lhs.creationDate, rhs.creationDate, lhsId: lhs.id, rhsId: rhs.id)
+
+            case .newestFirst:
+                return compareDatesDesc(lhs.creationDate, rhs.creationDate, lhsId: lhs.id, rhsId: rhs.id)
+            }
+        }
+    }
+
+    private static func compareDatesDesc(
+        _ lhs: Date?,
+        _ rhs: Date?,
+        lhsId: String,
+        rhsId: String
+    ) -> Bool {
+        switch (lhs, rhs) {
+        case let (ld?, rd?) where ld != rd:
+            return ld > rd
+        case (.some, .none):
+            return true
+        case (.none, .some):
+            return false
+        default:
+            return lhsId > rhsId
+        }
+    }
+
+    static func backupAndProxyAsset(
+        candidate: PhotoCandidate,
+        photoService: PhotoLibraryService,
+        apiClient: PhotoHubAPIClient,
+        tracker: LocalProxyTracker,
+        format: ProxyFormat,
+        maxPixelSize: Int,
+        quality: Double,
+        uploadMode: UploadMode,
+        keepLocalProxy: Bool,
+        normalizedBaseURL: URL?,
+        cacheScopeKey: String,
+        videoSemaphore: AsyncSemaphore,
+        photosSaveSemaphore: AsyncSemaphore,
+        onStageChange: @Sendable @escaping (PhotoCompressionState) -> Void
+    ) async throws -> BackupPipelineOutcome {
+        // Step 1: Export full-resolution original & compute SHA-256
+        let master = try await photoService.exportOriginalMasterAsync(for: candidate.asset)
+        defer { try? FileManager.default.removeItem(at: master.fileURL) }
+
+        // Step 2: Check server & upload original if not already verified on server
+        let checkResult = try await apiClient.checkHash(master.sha256)
+        let needsUpload = !(checkResult.exists && checkResult.isMaster == true && checkResult.canReplaceWithProxy == true)
+
+        if needsUpload {
+            onStageChange(.uploading(0))
+            let progressHandler: @Sendable (Double) -> Void = { progress in
+                onStageChange(.uploading(progress))
+            }
+
+            switch uploadMode {
+            case .directVPS:
+                _ = try await apiClient.uploadMasterDirect(
+                    fileURL: master.fileURL,
+                    filename: master.filename,
+                    mimeType: master.mimeType,
+                    createdAt: candidate.creationDate,
+                    expectedSha256: master.sha256,
+                    onProgress: progressHandler
+                )
+            case .s3Presigned:
+                _ = try await apiClient.uploadMasterPresigned(
+                    fileURL: master.fileURL,
+                    filename: master.filename,
+                    mimeType: master.mimeType,
+                    createdAt: candidate.creationDate,
+                    expectedSha256: master.sha256,
+                    onProgress: progressHandler
+                )
+            }
+        }
+
+        // Step 3: Create lightweight proxy (limit heavy video transcoding to 1 at a time)
+        onStageChange(.creatingProxy)
+        let proxy: GeneratedProxy
+        let previewFileForServer: URL?
+        let previewFormatForServer: String
+        let videoProxyFileForServer: URL?
+
+        if candidate.mediaType == .video {
+            await videoSemaphore.acquire()
+            do {
+                proxy = try await ProxyGenerator.createVideoProxy(from: master.fileURL)
+                await videoSemaphore.release()
+            } catch {
+                await videoSemaphore.release()
+                throw error
+            }
+            previewFileForServer = proxy.posterFileURL
+            previewFormatForServer = "jpeg"
+            videoProxyFileForServer = proxy.fileURL
+        } else {
+            proxy = try ProxyGenerator.createProxy(
+                from: master.fileURL,
+                format: format,
+                maxPixelSize: maxPixelSize,
+                quality: quality
+            )
+            previewFileForServer = proxy.fileURL
+            previewFormatForServer = format.rawValue
+            videoProxyFileForServer = nil
+        }
+
+        try? FileManager.default.removeItem(at: master.fileURL)
+        defer {
+            try? FileManager.default.removeItem(at: proxy.fileURL)
+            if let posterURL = proxy.posterFileURL {
+                try? FileManager.default.removeItem(at: posterURL)
+            }
+        }
+
+        // Step 4: Register proxy on server & cache locally
+        try? await apiClient.registerProxy(
+            masterHash: master.sha256,
+            proxyHash: proxy.sha256,
+            assetId: candidate.id,
+            proxyFileURL: previewFileForServer,
+            proxyFormat: previewFormatForServer,
+            videoProxyURL: videoProxyFileForServer
+        )
+
+        if let previewURL = previewFileForServer {
+            LocalProxyStore.shared.copyPreviewFile(from: previewURL, forHash: master.sha256)
+        }
+        if candidate.mediaType == .video {
+            LocalProxyStore.shared.copyVideoProxy(from: proxy.fileURL, forHash: master.sha256)
+        }
+
+        let iso = ISO8601DateFormatter()
+        let nowISO = iso.string(from: Date())
+        let photoISO = candidate.creationDate.map { iso.string(from: $0) } ?? nowISO
+        let posterSize: Int64? = {
+            guard let previewURL = previewFileForServer,
+                  let values = try? previewURL.resourceValues(forKeys: [.fileSizeKey]),
+                  let size = values.fileSize else {
+                return nil
+            }
+            return Int64(size)
+        }()
+        LocalProxyStore.shared.upsertPhoto(
+            ServerPhoto(
+                hash: master.sha256,
+                originalName: master.filename,
+                size: master.sizeBytes,
+                photoDate: photoISO,
+                takenAt: photoISO,
+                uploadedAt: nowISO,
+                savedPath: checkResult.savedPath ?? master.filename,
+                hasProxy: true,
+                hasPreview: previewFileForServer != nil,
+                proxyHash: proxy.sha256,
+                proxySize: candidate.mediaType == .video ? posterSize : proxy.sizeBytes,
+                hasVideoProxy: candidate.mediaType == .video,
+                videoProxySize: candidate.mediaType == .video ? proxy.sizeBytes : nil
+            ),
+            baseURL: normalizedBaseURL,
+            apiKey: cacheScopeKey
+        )
+
+        // Step 5: Save compressed proxy to iPhone Photos (serialized for photolibraryd stability)
+        let savedBytes = keepLocalProxy
+            ? max(0, master.sizeBytes - proxy.sizeBytes)
+            : master.sizeBytes
+
+        if keepLocalProxy {
+            onStageChange(.replacingInPhotos)
+            await photosSaveSemaphore.acquire()
+            let newAssetId: String
+            do {
+                newAssetId = try await photoService.saveCompressedProxyToPhotosAsync(
+                    originalAsset: candidate.asset,
+                    mediaType: candidate.mediaType,
+                    proxyFileURL: proxy.fileURL
+                )
+                await photosSaveSemaphore.release()
+            } catch {
+                await photosSaveSemaphore.release()
+                throw error
+            }
+
+            if newAssetId != candidate.id {
+                tracker.markAsProxy(
+                    assetId: newAssetId,
+                    proxySha256: proxy.sha256,
+                    masterHash: master.sha256,
+                    originalName: master.filename
+                )
+            }
+        } else {
+            tracker.markMasterHandledForPhotos(master.sha256)
+        }
+
+        return BackupPipelineOutcome(
+            masterSha256: master.sha256,
+            masterBytes: master.sizeBytes,
+            proxyBytes: proxy.sizeBytes,
+            savedBytes: savedBytes,
+            filename: master.filename
+        )
+    }
+}
