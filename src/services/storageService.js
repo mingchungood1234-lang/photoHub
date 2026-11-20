@@ -1,7 +1,7 @@
 const fsp = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
-const { computeBufferSha256, computeFileSha256 } = require('./hashIndex');
+const { computeBufferSha256, computeFileSha256 } = require('../models/hashIndexModel');
 
 const MIME_EXT_MAP = {
   'image/jpeg': '.jpg',
