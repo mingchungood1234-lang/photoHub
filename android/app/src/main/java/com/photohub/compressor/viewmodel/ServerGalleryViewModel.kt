@@ -290,6 +290,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
     private val inFlightPreviews = Collections.synchronizedSet(mutableSetOf<String>())
     private var batchJob: Job? = null
+    private var speculativePrefetchJob: Job? = null
 
     init {
         viewModelScope.launch {
@@ -302,6 +303,9 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
     fun onEnterScreen() {
         loadFromLocalStore()
         loadPhotos()
+        viewModelScope.launch {
+            PhotoHubApiClient(context, settings).warmConnectionIfNeeded()
+        }
     }
 
     fun loadFromLocalStore() {
@@ -621,6 +625,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
     fun openPhotoDetail(photo: ServerPhoto) {
         val initialBmp = _uiState.value.imageCache[photo.hash]
         _detailState.value = PhotoDetailUiState(photo = photo, previewBitmap = initialBmp)
+        speculativePrefetchJob?.cancel()
 
         viewModelScope.launch(Dispatchers.IO) {
             if (initialBmp == null && !(photo.isVideo && photo.needsProxy)) {
@@ -640,9 +645,27 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                 prepareDetailVideoProxy(photo)
             }
         }
+
+        // Speculatively pre-fetch full-resolution originals for opened photos (<= 40 MB)
+        // so tapping Share Original or Restore completes immediately, just like iCloud Photos.
+        if (!photo.isVideo && photo.size in 1L..SPECULATIVE_PREFETCH_MAX_BYTES) {
+            speculativePrefetchJob = viewModelScope.launch(Dispatchers.IO) {
+                runCatching {
+                    OriginalDownloadCache.getOrFetchOriginal(
+                        context = context,
+                        apiClient = PhotoHubApiClient(context, settings),
+                        masterHash = photo.hash,
+                        preferredFilename = photo.originalName,
+                        expectedSizeBytes = photo.size
+                    )
+                }
+            }
+        }
     }
 
     fun closePhotoDetail() {
+        speculativePrefetchJob?.cancel()
+        speculativePrefetchJob = null
         _detailState.value = null
     }
 
@@ -726,7 +749,11 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                     apiClient = PhotoHubApiClient(context, settings),
                     masterHash = photo.hash,
                     preferredFilename = photo.originalName,
-                    expectedSizeBytes = photo.size
+                    expectedSizeBytes = photo.size,
+                    onProgress = { down, total ->
+                        val label = formatDetailProgressLabel("Fetching original…", down, total)
+                        _detailState.update { it?.copy(busyLabel = label) }
+                    }
                 )
                 _detailState.update {
                     it?.copy(isBusy = false, busyLabel = "", shareFileReady = file)
@@ -827,12 +854,21 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                 return@launch
             }
             val client = PhotoHubApiClient(context, settings)
-            var tempFile: File? = null
             try {
-                tempFile = client.downloadMasterToTempFile(photo.hash, photo.originalName)
-                val fileSize = tempFile.length()
+                val (originalFile, _) = OriginalDownloadCache.getOrFetchOriginal(
+                    context = context,
+                    apiClient = client,
+                    masterHash = photo.hash,
+                    preferredFilename = photo.originalName,
+                    expectedSizeBytes = photo.size,
+                    onProgress = { down, total ->
+                        val label = formatDetailProgressLabel("Downloading original…", down, total)
+                        _detailState.update { it?.copy(busyLabel = label) }
+                    }
+                )
+                val fileSize = originalFile.length()
                 val savedId = mediaService.saveRestoredOriginalToGallery(
-                    file = tempFile,
+                    file = originalFile,
                     isVideo = photo.isVideo,
                     originalFilename = photo.originalName,
                     creationDateMs = photo.parsedCreationDateMs
@@ -855,10 +891,23 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                 _detailState.update {
                     it?.copy(isBusy = false, busyLabel = "", saveMessage = "Restore failed: ${err.localizedMessage}")
                 }
-            } finally {
-                tempFile?.delete()
             }
         }
+    }
+
+    private fun formatDetailProgressLabel(prefix: String, downloaded: Long, total: Long?): String {
+        if (downloaded <= 0L && total == null) return prefix
+        val downStr = android.text.format.Formatter.formatFileSize(context, downloaded)
+        return if (total != null && total > 0L) {
+            val totalStr = android.text.format.Formatter.formatFileSize(context, total)
+            "$prefix ($downStr / $totalStr)"
+        } else {
+            "$prefix ($downStr)"
+        }
+    }
+
+    companion object {
+        private const val SPECULATIVE_PREFETCH_MAX_BYTES = 40L * 1024L * 1024L
     }
 
     fun updateOriginalProtection(protected: Boolean) {

@@ -39,7 +39,16 @@ import com.photohub.compressor.ui.theme.PhotoHubOrange
 import com.photohub.compressor.ui.theme.PhotoHubRed
 import com.photohub.compressor.ui.theme.PhotoHubTheme
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 private sealed interface ShareOriginalUiState {
     data object NeedsSignIn : ShareOriginalUiState
@@ -150,11 +159,12 @@ private fun ShareOriginalScreen(
         arrayOf(ComponentName(context, ShareOriginalActivity::class.java))
     }
 
-    var uiState by remember {
-        mutableStateOf<ShareOriginalUiState>(
+    val uiStateFlow = remember {
+        MutableStateFlow<ShareOriginalUiState>(
             ShareOriginalUiState.Fetching(1, incomingUris.size.coerceAtLeast(1), "Starting…", null, 0L, null)
         )
     }
+    val uiState by uiStateFlow.collectAsState()
     var retryCounter by remember { mutableIntStateOf(0) }
     var autoLaunchedChooserForNonce by remember { mutableIntStateOf(-1) }
 
@@ -167,77 +177,134 @@ private fun ShareOriginalScreen(
     LaunchedEffect(nonce, retryCounter, incomingUris) {
         val currentSettings = settings.current
         if (!currentSettings.isSignedIn || currentSettings.normalizedBaseUrl == null) {
-            uiState = ShareOriginalUiState.NeedsSignIn
+            uiStateFlow.value = ShareOriginalUiState.NeedsSignIn
             return@LaunchedEffect
         }
         if (incomingUris.isEmpty()) {
-            uiState = ShareOriginalUiState.Failed(
+            uiStateFlow.value = ShareOriginalUiState.Failed(
                 message = "No shared photo or video was provided.",
                 canRetry = false
             )
             return@LaunchedEffect
         }
+        uiStateFlow.value = ShareOriginalUiState.Fetching(
+            currentIndex = 1,
+            totalCount = incomingUris.size,
+            stageText = if (incomingUris.size > 1) "Preparing ${incomingUris.size} items in parallel…" else "Matching compressed item…",
+            currentFilename = null,
+            downloadedBytes = 0L,
+            totalBytes = null
+        )
 
         val resolver = OriginalMediaResolver(context, settings)
-        val fetched = ArrayList<FetchedOriginalResult>(incomingUris.size)
-        var unresolved = 0
-        var lastErrorMessage: String? = null
+        val warmClient = PhotoHubApiClient(context, settings)
+        val completedCount = AtomicInteger(0)
+        val unresolvedCount = AtomicInteger(0)
+        val totalDownBytes = AtomicLong(0L)
+        val perUriDownloaded = java.util.concurrent.ConcurrentHashMap<Int, Long>()
+        val authExpired = java.util.concurrent.atomic.AtomicBoolean(false)
+        val firstErrorMessage = java.util.concurrent.atomic.AtomicReference<String?>(null)
 
-        for ((index, uri) in incomingUris.withIndex()) {
-            val hintName = resolver.queryDisplayName(uri)
-            uiState = ShareOriginalUiState.Fetching(
-                currentIndex = index + 1,
-                totalCount = incomingUris.size,
-                stageText = "Matching compressed item…",
-                currentFilename = hintName,
-                downloadedBytes = 0L,
-                totalBytes = null
-            )
-
-            try {
-                val res = resolver.resolveAndFetchOriginal(
-                    uri = uri,
-                    onStage = { stage ->
-                        val prev = uiState as? ShareOriginalUiState.Fetching
-                        uiState = ShareOriginalUiState.Fetching(
-                            currentIndex = index + 1,
-                            totalCount = incomingUris.size,
-                            stageText = stage,
-                            currentFilename = hintName ?: prev?.currentFilename,
-                            downloadedBytes = prev?.downloadedBytes ?: 0L,
-                            totalBytes = prev?.totalBytes
-                        )
-                    },
-                    onDownloadProgress = { down, total ->
-                        uiState = ShareOriginalUiState.Fetching(
-                            currentIndex = index + 1,
-                            totalCount = incomingUris.size,
-                            stageText = "Auto-fetching original from server…",
-                            currentFilename = hintName,
-                            downloadedBytes = down,
-                            totalBytes = total
-                        )
+        val semaphore = Semaphore(3)
+        val orderedResults = coroutineScope {
+            val warmJob = launch { warmClient.warmConnectionIfNeeded() }
+            val tasks = incomingUris.mapIndexed { index, uri ->
+                async {
+                    semaphore.withPermit {
+                        if (authExpired.get()) return@withPermit null
+                        val hintName = resolver.queryDisplayName(uri)
+                        try {
+                            val res = resolver.resolveAndFetchOriginal(
+                                uri = uri,
+                                onStage = { stage ->
+                                    if (incomingUris.size == 1) {
+                                        uiStateFlow.update { cur ->
+                                            val prev = cur as? ShareOriginalUiState.Fetching
+                                            ShareOriginalUiState.Fetching(
+                                                currentIndex = 1,
+                                                totalCount = 1,
+                                                stageText = stage,
+                                                currentFilename = hintName ?: prev?.currentFilename,
+                                                downloadedBytes = prev?.downloadedBytes ?: 0L,
+                                                totalBytes = prev?.totalBytes
+                                            )
+                                        }
+                                    }
+                                },
+                                onDownloadProgress = { down, total ->
+                                    if (incomingUris.size == 1) {
+                                        uiStateFlow.value = ShareOriginalUiState.Fetching(
+                                            currentIndex = 1,
+                                            totalCount = 1,
+                                            stageText = "Auto-fetching original from server…",
+                                            currentFilename = hintName,
+                                            downloadedBytes = down,
+                                            totalBytes = total
+                                        )
+                                    } else {
+                                        val prevDown = perUriDownloaded.put(index, down) ?: 0L
+                                        val agg = totalDownBytes.addAndGet(down - prevDown).coerceAtLeast(0L)
+                                        val doneNow = completedCount.get()
+                                        uiStateFlow.value = ShareOriginalUiState.Fetching(
+                                            currentIndex = (doneNow + 1).coerceAtMost(incomingUris.size),
+                                            totalCount = incomingUris.size,
+                                            stageText = "Auto-fetching ${incomingUris.size} originals in parallel…",
+                                            currentFilename = hintName,
+                                            downloadedBytes = agg,
+                                            totalBytes = null
+                                        )
+                                    }
+                                }
+                            )
+                            val done = completedCount.incrementAndGet()
+                            if (incomingUris.size > 1) {
+                                uiStateFlow.value = ShareOriginalUiState.Fetching(
+                                    currentIndex = done,
+                                    totalCount = incomingUris.size,
+                                    stageText = "Fetched $done of ${incomingUris.size} originals…",
+                                    currentFilename = res.originalName,
+                                    downloadedBytes = totalDownBytes.get(),
+                                    totalBytes = null
+                                )
+                            }
+                            res
+                        } catch (cancel: CancellationException) {
+                            throw cancel
+                        } catch (http: ApiHttpException) {
+                            if (http.statusCode == 401) {
+                                authExpired.set(true)
+                            }
+                            unresolvedCount.incrementAndGet()
+                            firstErrorMessage.compareAndSet(null, http.message)
+                            null
+                        } catch (err: Exception) {
+                            unresolvedCount.incrementAndGet()
+                            firstErrorMessage.compareAndSet(
+                                null,
+                                err.localizedMessage ?: "Failed to fetch original from server."
+                            )
+                            null
+                        }
                     }
-                )
-                fetched.add(res)
-            } catch (cancel: CancellationException) {
-                throw cancel
-            } catch (http: ApiHttpException) {
-                if (http.statusCode == 401) {
-                    settings.signOut()
-                    uiState = ShareOriginalUiState.NeedsSignIn
-                    return@LaunchedEffect
                 }
-                unresolved++
-                lastErrorMessage = http.message
-            } catch (err: Exception) {
-                unresolved++
-                lastErrorMessage = err.localizedMessage ?: "Failed to fetch original from server."
             }
+            val list = tasks.awaitAll()
+            warmJob.cancel()
+            list
         }
 
+        if (authExpired.get()) {
+            settings.signOut()
+            uiStateFlow.value = ShareOriginalUiState.NeedsSignIn
+            return@LaunchedEffect
+        }
+
+        val fetched = orderedResults.filterNotNull()
+        val unresolved = unresolvedCount.get()
+        val lastErrorMessage = firstErrorMessage.get()
+
         if (fetched.isEmpty()) {
-            uiState = ShareOriginalUiState.Failed(
+            uiStateFlow.value = ShareOriginalUiState.Failed(
                 message = lastErrorMessage
                     ?: "None of the selected gallery items are linked to a backed-up PhotoHub original.",
                 canRetry = true
@@ -245,7 +312,7 @@ private fun ShareOriginalScreen(
             return@LaunchedEffect
         }
 
-        uiState = ShareOriginalUiState.Ready(
+        uiStateFlow.value = ShareOriginalUiState.Ready(
             items = fetched,
             unresolvedCount = unresolved
         )
@@ -472,11 +539,11 @@ private fun ShareOriginalScreen(
                             OutlinedButton(
                                 onClick = {
                                     if (state.isSavingToGallery) return@OutlinedButton
-                                    uiState = state.copy(isSavingToGallery = true, savedMessage = null)
+                                    uiStateFlow.value = state.copy(isSavingToGallery = true, savedMessage = null)
                                     scope.launch {
                                         val mediaService = MediaLibraryService(context)
                                         if (!mediaService.canWriteGallery()) {
-                                            uiState = state.copy(
+                                            uiStateFlow.value = state.copy(
                                                 isSavingToGallery = false,
                                                 savedMessage = "Photos & Videos permission needed in photoHub."
                                             )
@@ -502,7 +569,7 @@ private fun ShareOriginalScreen(
                                                 if (firstError == null) firstError = err.localizedMessage
                                             }
                                         }
-                                        uiState = state.copy(
+                                        uiStateFlow.value = state.copy(
                                             isSavingToGallery = false,
                                             savedMessage = if (savedCount > 0) {
                                                 "Saved $savedCount original(s) to Gallery & protected from re-proxying."

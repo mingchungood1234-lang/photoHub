@@ -5,6 +5,7 @@ const fsp = require('fs/promises');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const zlib = require('zlib');
 const { createApp } = require('../src/server');
 
 async function startTestServer(extraOverrides = {}) {
@@ -368,6 +369,19 @@ test('iOS Proxy-Replacement Workflow: strict checksum, proxy registration, batch
     assert.equal(vpRes.status, 200);
     assert.equal(vpRes.headers['x-photo-variant'], 'video-proxy');
     assert.equal(vpRes.buffer.toString('utf8'), 'FAKE_MP4_PROXY_STREAM');
+
+    // Original download supports Accept-Ranges, Content-Length, immutable cache headers, and 206 Partial Content
+    const fullMasterRes = await ctx.request(`/api/photo/${masterHash}`);
+    assert.equal(fullMasterRes.status, 200);
+    assert.equal(fullMasterRes.headers['accept-ranges'], 'bytes');
+    assert.equal(Number(fullMasterRes.headers['content-length']), masterBytes.length);
+    assert.match(String(fullMasterRes.headers['cache-control'] || ''), /immutable/);
+
+    const rangeMasterRes = await ctx.request(`/api/photo/${masterHash}`, {
+      headers: { Range: 'bytes=5-10' },
+    });
+    assert.equal(rangeMasterRes.status, 206);
+    assert.deepEqual(rangeMasterRes.buffer, masterBytes.subarray(5, 11));
 
     const missingVp = await ctx.request(`/api/photo/${'a'.repeat(64)}/video-proxy`);
     assert.equal(missingVp.status, 404);
@@ -741,6 +755,15 @@ test('iOS Proxy-Replacement Workflow: strict checksum, proxy registration, batch
       ).json();
       assert.equal(prefixMatches.photos.length, 1);
       assert.equal(prefixMatches.photos[0].hash, firstHash);
+
+      // Gzip compression for /api/photos JSON when client advertises Accept-Encoding: gzip
+      const gzRes = await timelineCtx.request('/api/photos', {
+        headers: { 'Accept-Encoding': 'gzip' },
+      });
+      assert.equal(gzRes.status, 200);
+      assert.equal(gzRes.headers['content-encoding'], 'gzip');
+      const unzipped = JSON.parse(zlib.gunzipSync(gzRes.buffer).toString('utf8'));
+      assert.equal(unzipped.total, 6);
     } finally {
       await timelineCtx.cleanup();
     }

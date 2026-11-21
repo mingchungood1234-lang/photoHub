@@ -14,14 +14,24 @@ import com.photohub.compressor.data.ServerPhoto
 import com.photohub.compressor.network.PhotoHubApiClient
 import com.photohub.compressor.sync.LocalProxyStore
 import com.photohub.compressor.sync.LocalProxyTracker
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 data class ResolvedMasterMedia(
     val masterHash: String,
@@ -40,14 +50,27 @@ data class FetchedOriginalResult(
 )
 
 /**
- * Bounded LRU cache for auto-fetched full-resolution originals stored under `cacheDir`,
- * preserving original filenames so FileProvider shares keep expected names and extensions.
+ * Bounded LRU cache with Single-Flight request coalescing for auto-fetched originals.
+ * Speculative prefetches and explicit Share/Restore taps coalesce onto the same in-flight transfer.
  */
 object OriginalDownloadCache {
     private const val DIR_NAME = "photohub_originals_cache"
     private const val SHARE_DIR_PREFIX = "photohub_share_"
     private const val MAX_CACHE_BYTES = 400L * 1024L * 1024L
     private const val MAX_TEMP_AGE_MS = 24L * 60L * 60L * 1000L
+
+    private class ActiveFetch(
+        val key: String,
+        val deferred: CompletableDeferred<File>,
+        val listeners: CopyOnWriteArrayList<(Long, Long?) -> Unit> = CopyOnWriteArrayList(),
+        val lastDownloaded: AtomicLong = AtomicLong(0L),
+        val lastTotal: AtomicReference<Long?> = AtomicReference(null),
+        val waiters: AtomicInteger = AtomicInteger(0),
+        @Volatile var job: Job? = null
+    )
+
+    private val cacheScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val inFlight = ConcurrentHashMap<String, ActiveFetch>()
 
     private fun rootDir(context: Context): File =
         File(context.cacheDir, DIR_NAME).apply { mkdirs() }
@@ -95,16 +118,61 @@ object OriginalDownloadCache {
             return cached to true
         }
 
-        val destDir = hashDir(context, masterHash)
-        val result = apiClient.downloadMasterToDirectory(
-            hash = masterHash,
-            destDir = destDir,
-            preferredFilename = preferredFilename,
-            onProgress = onProgress
-        )
-        runCatching { result.file.setLastModified(System.currentTimeMillis()) }
-        enforceSizeBudget(context, protectedFile = result.file)
-        return result.file to false
+        val key = masterHash.trim().lowercase(Locale.ROOT)
+        var created = false
+        val entry = inFlight.computeIfAbsent(key) {
+            created = true
+            ActiveFetch(key = key, deferred = CompletableDeferred())
+        }
+
+        if (created) {
+            val destDir = hashDir(context, key)
+            entry.job = cacheScope.launch {
+                try {
+                    val result = apiClient.downloadMasterToDirectory(
+                        hash = masterHash,
+                        destDir = destDir,
+                        preferredFilename = preferredFilename,
+                        expectedSizeBytes = expectedSizeBytes,
+                        onProgress = { down, total ->
+                            entry.lastDownloaded.set(down)
+                            if (total != null) entry.lastTotal.set(total)
+                            for (listener in entry.listeners) {
+                                listener(down, total)
+                            }
+                        }
+                    )
+                    runCatching { result.file.setLastModified(System.currentTimeMillis()) }
+                    enforceSizeBudget(context, protectedFile = result.file)
+                    entry.deferred.complete(result.file)
+                } catch (t: Throwable) {
+                    entry.deferred.completeExceptionally(t)
+                } finally {
+                    inFlight.remove(key, entry)
+                }
+            }
+        }
+
+        entry.waiters.incrementAndGet()
+        if (onProgress != null) {
+            entry.listeners.add(onProgress)
+            val prevDown = entry.lastDownloaded.get()
+            val prevTotal = entry.lastTotal.get()
+            if (prevDown > 0L || prevTotal != null) {
+                onProgress(prevDown, prevTotal)
+            }
+        }
+
+        return try {
+            val file = entry.deferred.await()
+            file to false
+        } finally {
+            if (onProgress != null) entry.listeners.remove(onProgress)
+            if (entry.waiters.decrementAndGet() == 0 && !entry.deferred.isCompleted) {
+                inFlight.remove(key, entry)
+                entry.job?.cancel()
+            }
+        }
     }
 
     fun pruneStaleCache(context: Context, nowMs: Long = System.currentTimeMillis()) {
@@ -196,7 +264,7 @@ class OriginalMediaResolver(
             )
         }
 
-        // 2. EXIF PhotoHubProxy:<masterHash> marker (survives reinstall & cross-device JPEG proxy copy).
+        // 2. EXIF PhotoHubProxy:<masterHash> marker (0 extra RTTs when full 64-char SHA-256 is embedded).
         var shortPrefix = displayName?.let { ProxyGenerator.extractMasterHashPrefix(it) }
         val isLikelyVideo = mimeHint.startsWith("video/") ||
             (displayName?.substringAfterLast('.', "")?.lowercase(Locale.ROOT)
@@ -213,24 +281,12 @@ class OriginalMediaResolver(
                 if (ProxyGenerator.isFullSha256Hex(exifMarker)) {
                     val norm = exifMarker.lowercase(Locale.ROOT)
                     val cached = cachedPhotos.firstOrNull { it.hash.equals(norm, ignoreCase = true) }
-                    if (cached != null) {
-                        return@withContext ResolvedMasterMedia(
-                            masterHash = cached.hash,
-                            originalName = cached.originalName,
-                            expectedSizeBytes = cached.size,
-                            sourceDisplayName = displayName
-                        )
-                    }
-                    val check = client.checkHash(norm)
-                    if (check.exists) {
-                        val master = check.masterHash ?: norm
-                        return@withContext ResolvedMasterMedia(
-                            masterHash = master,
-                            originalName = null,
-                            expectedSizeBytes = null,
-                            sourceDisplayName = displayName
-                        )
-                    }
+                    return@withContext ResolvedMasterMedia(
+                        masterHash = cached?.hash ?: norm,
+                        originalName = cached?.originalName,
+                        expectedSizeBytes = cached?.size,
+                        sourceDisplayName = displayName
+                    )
                 } else if (shortPrefix == null) {
                     shortPrefix = exifMarker
                 }

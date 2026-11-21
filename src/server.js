@@ -33,9 +33,14 @@ if (require.main === module) {
           },
           app
         );
+        server.keepAliveTimeout = 65_000;
+        server.headersTimeout = 66_000;
         server.listen(port, '0.0.0.0', onListening);
       } else {
-        http.createServer(app).listen(port, '0.0.0.0', onListening);
+        const server = http.createServer(app);
+        server.keepAliveTimeout = 65_000;
+        server.headersTimeout = 66_000;
+        server.listen(port, '0.0.0.0', onListening);
       }
     })
     .catch((err) => {

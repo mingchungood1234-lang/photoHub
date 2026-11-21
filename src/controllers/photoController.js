@@ -1,7 +1,72 @@
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
+const { promisify } = require('util');
 const { isS3Configured, createPresignedUrl } = require('../services/s3Service');
 const { isVideoFilename } = require('../services/proxyService');
+
+const gzipAsync = promisify(zlib.gzip);
+
+function acceptsGzip(req) {
+  return /\bgzip\b/i.test(String((req.headers && req.headers['accept-encoding']) || ''));
+}
+
+async function sendJsonOptimized(req, res, payload) {
+  const jsonStr = JSON.stringify(payload);
+  if (jsonStr.length >= 1024 && acceptsGzip(req)) {
+    const gz = await gzipAsync(Buffer.from(jsonStr, 'utf8'));
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Content-Encoding', 'gzip');
+    res.setHeader('Vary', 'Accept-Encoding');
+    res.setHeader('Content-Length', String(gz.length));
+    return res.end(gz);
+  }
+  return res.type('application/json').send(jsonStr);
+}
+
+function sendImmutableMediaFile(
+  res,
+  filePath,
+  { variant = null, masterHash, contentType = null, contentDisposition = null }
+) {
+  if (variant) res.setHeader('X-Photo-Variant', variant);
+  if (masterHash) res.setHeader('X-Master-Sha256', masterHash);
+  if (contentDisposition) res.setHeader('Content-Disposition', contentDisposition);
+
+  const headers = {
+    'Cache-Control': 'private, max-age=31536000, immutable',
+    ...(contentType ? { 'Content-Type': contentType } : {}),
+  };
+
+  return res.sendFile(
+    path.resolve(filePath),
+    {
+      dotfiles: 'allow',
+      acceptRanges: true,
+      cacheControl: false,
+      etag: true,
+      lastModified: true,
+      headers,
+    },
+    (err) => {
+      if (!err) return;
+      if (
+        err.code === 'ECONNABORTED' ||
+        err.code === 'ECONNRESET' ||
+        err.message === 'Request aborted'
+      ) {
+        return;
+      }
+      if (!res.headersSent) {
+        const isNotFound = err.statusCode === 404 || err.code === 'ENOENT';
+        res.status(isNotFound ? 404 : err.statusCode || 500).json({
+          success: false,
+          error: isNotFound ? 'Photo file not found on disk' : err.message,
+        });
+      }
+    }
+  );
+}
 
 function createPhotoController({ config }) {
   async function lookupPhotoOr404(req, res) {
@@ -72,7 +137,7 @@ function createPhotoController({ config }) {
         }
 
         const photos = all.slice(offset, offset + limit);
-        return res.json({
+        return sendJsonOptimized(req, res, {
           success: true,
           userFolder: folderName,
           total: all.length,
@@ -98,9 +163,10 @@ function createPhotoController({ config }) {
         if (record.proxyRelativePath) {
           const proxyPath = path.join(storageDir, record.proxyRelativePath);
           if (fs.existsSync(proxyPath)) {
-            res.setHeader('X-Photo-Variant', 'proxy');
-            res.setHeader('X-Master-Sha256', lookupResult.masterHash);
-            return fs.createReadStream(proxyPath).pipe(res);
+            return sendImmutableMediaFile(res, proxyPath, {
+              variant: 'proxy',
+              masterHash: lookupResult.masterHash,
+            });
           }
         }
 
@@ -121,9 +187,10 @@ function createPhotoController({ config }) {
             error: 'Photo file not found on disk',
           });
         }
-        res.setHeader('X-Photo-Variant', 'master');
-        res.setHeader('X-Master-Sha256', lookupResult.masterHash);
-        return fs.createReadStream(fullPath).pipe(res);
+        return sendImmutableMediaFile(res, fullPath, {
+          variant: 'master',
+          masterHash: lookupResult.masterHash,
+        });
       } catch (err) {
         return res.status(500).json({
           success: false,
@@ -142,10 +209,11 @@ function createPhotoController({ config }) {
         if (record.videoProxyRelativePath) {
           const videoProxyPath = path.join(storageDir, record.videoProxyRelativePath);
           if (fs.existsSync(videoProxyPath)) {
-            res.setHeader('X-Photo-Variant', 'video-proxy');
-            res.setHeader('X-Master-Sha256', lookupResult.masterHash);
-            res.setHeader('Content-Type', 'video/mp4');
-            return res.sendFile(path.resolve(videoProxyPath));
+            return sendImmutableMediaFile(res, videoProxyPath, {
+              variant: 'video-proxy',
+              masterHash: lookupResult.masterHash,
+              contentType: 'video/mp4',
+            });
           }
         }
 
@@ -203,12 +271,11 @@ function createPhotoController({ config }) {
         if (redirectIfS3(res, record)) return undefined;
 
         const fullPath = path.join(storageDir, record.relativePath);
-        res.setHeader(
-          'Content-Disposition',
-          `inline; filename="${encodeURIComponent(record.originalName || path.basename(fullPath))}"`
-        );
-        res.setHeader('X-Master-Sha256', lookupResult.masterHash);
-        return fs.createReadStream(fullPath).pipe(res);
+        const safeName = encodeURIComponent(record.originalName || path.basename(fullPath));
+        return sendImmutableMediaFile(res, fullPath, {
+          masterHash: lookupResult.masterHash,
+          contentDisposition: `inline; filename="${safeName}"`,
+        });
       } catch (err) {
         return res.status(500).json({
           success: false,

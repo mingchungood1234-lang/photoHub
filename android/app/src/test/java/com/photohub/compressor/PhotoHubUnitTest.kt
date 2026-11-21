@@ -6,6 +6,8 @@ import com.photohub.compressor.data.*
 import com.photohub.compressor.media.PhotoBackupPipeline
 import com.photohub.compressor.media.ProxyGenerator
 import com.photohub.compressor.media.ShareUtils
+import com.photohub.compressor.network.ContentRangeInfo
+import com.photohub.compressor.network.DownloadRangePlanner
 import com.photohub.compressor.provider.PhotoHubDocumentIdParser
 import com.photohub.compressor.viewmodel.ServerGalleryFilter
 import com.photohub.compressor.viewmodel.ServerMediaTypeFilter
@@ -102,5 +104,28 @@ class PhotoHubUnitTest {
         val docId = PhotoHubDocumentIdParser.photoDocId("ABCD1234EFGH5678")
         assertEquals("abcd1234efgh5678", PhotoHubDocumentIdParser.parsePhotoHash(docId))
         assertNull(PhotoHubDocumentIdParser.parsePhotoHash("dir:year:2026"))
+    }
+
+    @Test
+    fun `content range planner parses headers and shards remaining bytes cleanly`() {
+        assertEquals(
+            ContentRangeInfo(0L, 2097151L, 10485760L),
+            DownloadRangePlanner.parseContentRangeInfo("bytes 0-2097151/10485760")
+        )
+        assertNull(DownloadRangePlanner.parseContentRangeInfo("bytes */10485760"))
+        assertNull(DownloadRangePlanner.parseContentRangeInfo(null))
+
+        val ranges = DownloadRangePlanner.buildRemainingByteRanges(
+            startOffset = 2_000_000L,
+            totalSize = 11_000_000L,
+            maxSegments = 3
+        )
+        assertEquals(3, ranges.size)
+        assertEquals(2_000_000L, ranges.first().first)
+        assertEquals(10_999_999L, ranges.last().last)
+        for (i in 0 until ranges.lastIndex) {
+            assertEquals(ranges[i].last + 1L, ranges[i + 1].first)
+        }
+        assertEquals(11_000_000L - 2_000_000L, ranges.sumOf { (it.last - it.first) + 1L })
     }
 }

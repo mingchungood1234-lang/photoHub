@@ -6,29 +6,42 @@ import com.photohub.compressor.data.*
 import com.photohub.compressor.media.ProxyGenerator
 import com.photohub.compressor.sync.LocalProxyStore
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import okhttp3.CertificatePinner
+import okhttp3.ConnectionPool
+import okhttp3.Dispatcher
+import okhttp3.HttpUrl
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.ResponseBody
 import okio.BufferedSink
 import okio.source
 import org.json.JSONObject
 import java.io.File
 import java.io.IOException
+import java.io.RandomAccessFile
 import java.net.URI
 import java.net.URLDecoder
 import java.net.URLEncoder
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
 import java.nio.charset.StandardCharsets
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 class ApiHttpException(val statusCode: Int, override val message: String) : Exception(message)
 
@@ -61,21 +74,34 @@ private class StreamingFileRequestBody(
     }
 }
 
-class PhotoHubApiClient(
-    private val context: Context,
-    private val settings: AppSettings
-) {
-    private val client: OkHttpClient by lazy {
-        val builder = OkHttpClient.Builder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(180, TimeUnit.SECONDS)
-            .writeTimeout(600, TimeUnit.SECONDS)
+/**
+ * Process-wide OkHttp connection & HTTP/2 socket pool shared across all PhotoHub API clients,
+ * matching iOS URLSession pooling so TLS handshakes and connections stay warm.
+ */
+private object SharedHttpClientPool {
+    private val sharedConnectionPool = ConnectionPool(12, 5, TimeUnit.MINUTES)
+    private val sharedDispatcher = Dispatcher().apply {
+        maxRequests = 32
+        maxRequestsPerHost = 8
+    }
 
-        val pins = settings.pinnedCertHashes
-        val baseHost = settings.current.normalizedBaseUrl?.let { safeHost(it) }
-        val gatewayHost = settings.current.gatewayUrl?.let { safeHost(it) }
-        val hosts = listOfNotNull(baseHost, gatewayHost).distinct()
-        if (pins.isNotEmpty() && hosts.isNotEmpty()) {
+    private val baseClient: OkHttpClient = OkHttpClient.Builder()
+        .connectionPool(sharedConnectionPool)
+        .dispatcher(sharedDispatcher)
+        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+        .retryOnConnectionFailure(true)
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(180, TimeUnit.SECONDS)
+        .writeTimeout(600, TimeUnit.SECONDS)
+        .build()
+
+    private val pinnedClients = ConcurrentHashMap<String, OkHttpClient>()
+    private val lastWarmAtMs = ConcurrentHashMap<String, Long>()
+
+    fun clientFor(hosts: List<String>, pins: List<String>): OkHttpClient {
+        if (pins.isEmpty() || hosts.isEmpty()) return baseClient
+        val key = "${hosts.sorted().joinToString(",")}|${pins.sorted().joinToString(",")}"
+        return pinnedClients.getOrPut(key) {
             val pinner = CertificatePinner.Builder()
             for (h in hosts) {
                 for (pin in pins) {
@@ -83,9 +109,90 @@ class PhotoHubApiClient(
                     pinner.add(h, formatted)
                 }
             }
-            builder.certificatePinner(pinner.build())
+            baseClient.newBuilder()
+                .certificatePinner(pinner.build())
+                .build()
         }
-        builder.build()
+    }
+
+    fun shouldWarm(baseUrl: String, nowMs: Long = System.currentTimeMillis()): Boolean {
+        val prev = lastWarmAtMs[baseUrl] ?: 0L
+        if (nowMs - prev < 30_000L) return false
+        lastWarmAtMs[baseUrl] = nowMs
+        return true
+    }
+}
+
+data class ContentRangeInfo(
+    val start: Long,
+    val end: Long,
+    val total: Long
+)
+
+object DownloadRangePlanner {
+    private val CONTENT_RANGE_REGEX = Regex("""bytes\s+(\d+)-(\d+)/(\d+)""", RegexOption.IGNORE_CASE)
+    private const val MIN_SEGMENT_BYTES = 1024L * 1024L
+
+    fun parseContentRangeInfo(header: String?): ContentRangeInfo? {
+        header ?: return null
+        val match = CONTENT_RANGE_REGEX.find(header.trim()) ?: return null
+        val start = match.groupValues[1].toLongOrNull() ?: return null
+        val end = match.groupValues[2].toLongOrNull() ?: return null
+        val total = match.groupValues[3].toLongOrNull() ?: return null
+        if (start < 0L || end < start || total <= end) return null
+        return ContentRangeInfo(start, end, total)
+    }
+
+    fun buildRemainingByteRanges(
+        startOffset: Long,
+        totalSize: Long,
+        maxSegments: Int = 3
+    ): List<LongRange> {
+        val remaining = totalSize - startOffset
+        if (remaining <= 0L || maxSegments <= 0) return emptyList()
+        val count = minOf(
+            maxSegments,
+            maxOf(1, (remaining / MIN_SEGMENT_BYTES).toInt())
+        )
+        if (count <= 1) {
+            return listOf(startOffset until totalSize)
+        }
+        val step = (remaining + count - 1L) / count
+        val ranges = ArrayList<LongRange>(count)
+        var cursor = startOffset
+        while (cursor < totalSize) {
+            val end = minOf(totalSize - 1L, cursor + step - 1L)
+            ranges.add(cursor..end)
+            cursor = end + 1L
+        }
+        return ranges
+    }
+}
+
+class PhotoHubApiClient(
+    private val context: Context,
+    private val settings: AppSettings
+) {
+    private val client: OkHttpClient
+        get() {
+            val pins = settings.pinnedCertHashes
+            val baseHost = settings.current.normalizedBaseUrl?.let { safeHost(it) }
+            val gatewayHost = settings.current.gatewayUrl?.let { safeHost(it) }
+            val hosts = listOfNotNull(baseHost, gatewayHost).distinct()
+            return SharedHttpClientPool.clientFor(hosts, pins)
+        }
+
+    /** Pre-establishes TLS / HTTP/2 socket cleanly before the user triggers an original download. */
+    suspend fun warmConnectionIfNeeded() = withContext(Dispatchers.IO) {
+        val base = settings.current.normalizedBaseUrl ?: return@withContext
+        if (!SharedHttpClientPool.shouldWarm(base)) return@withContext
+        runCatching {
+            val req = Request.Builder()
+                .url("${base.trimEnd('/')}/api/health")
+                .get()
+                .build()
+            client.newCall(req).execute().use { it.body?.close() }
+        }
     }
 
     private fun safeHost(url: String): String? = try {
@@ -625,27 +732,38 @@ class PhotoHubApiClient(
         fetchAllServerPhotos(sync = true).firstOrNull { it.hash.startsWith(cleanPrefix, ignoreCase = true) }
     }
 
+    private class SegmentedFallbackException : Exception()
+
     suspend fun downloadMasterToTempFile(
         hash: String,
         preferredFilename: String? = null,
+        expectedSizeBytes: Long? = null,
         onProgress: ((downloadedBytes: Long, totalBytes: Long?) -> Unit)? = null
     ): File {
         val shareDir = File(context.cacheDir, "photohub_share_${UUID.randomUUID().toString().take(8)}")
-        return downloadMasterToDirectory(hash, shareDir, preferredFilename, onProgress).file
+        return downloadMasterToDirectory(hash, shareDir, preferredFilename, expectedSizeBytes, onProgress).file
     }
 
     suspend fun downloadMasterToDirectory(
         hash: String,
         destDir: File,
         preferredFilename: String? = null,
+        expectedSizeBytes: Long? = null,
         onProgress: ((downloadedBytes: Long, totalBytes: Long?) -> Unit)? = null
-    ): DownloadedFileResult = streamDownloadToDirectory(
-        path = "/api/photo/$hash",
-        destDir = destDir,
-        preferredFilename = preferredFilename,
-        fallbackFilename = "photo_${hash.take(8)}.jpg",
-        onProgress = onProgress
-    )
+    ): DownloadedFileResult {
+        val path = "/api/photo/$hash"
+        val fallback = "photo_${hash.take(8)}.jpg"
+        // Small files finish faster in a single keep-alive HTTP request; larger or unknown files
+        // try 2 MB ranged fetch + up to 3 parallel segments immediately (zero extra HEAD RTT).
+        if (expectedSizeBytes != null && expectedSizeBytes in 1L until SMALL_SINGLE_STREAM_THRESHOLD_BYTES) {
+            return streamDownloadToDirectory(path, destDir, preferredFilename, fallback, onProgress)
+        }
+        return try {
+            downloadWithParallelRanges(path, destDir, preferredFilename, fallback, onProgress)
+        } catch (_: SegmentedFallbackException) {
+            streamDownloadToDirectory(path, destDir, preferredFilename, fallback, onProgress)
+        }
+    }
 
     suspend fun downloadVideoProxyToTempFile(hash: String): File {
         val shareDir = File(context.cacheDir, "photohub_share_${UUID.randomUUID().toString().take(8)}")
@@ -656,6 +774,180 @@ class PhotoHubApiClient(
             fallbackFilename = "${hash.take(16)}.mp4",
             onProgress = null
         ).file
+    }
+
+    private suspend fun downloadWithParallelRanges(
+        path: String,
+        destDir: File,
+        preferredFilename: String?,
+        fallbackFilename: String,
+        onProgress: ((downloadedBytes: Long, totalBytes: Long?) -> Unit)?
+    ): DownloadedFileResult = withContext(Dispatchers.IO) {
+        val origUrl = makeUrl(path)
+        val req = Request.Builder()
+            .url(origUrl)
+            .get()
+            .applyAuth()
+            .header("Range", "bytes=0-${INITIAL_RANGE_BYTES - 1L}")
+            .build()
+
+        destDir.mkdirs()
+        val partFile = File(destDir, ".part_${UUID.randomUUID().toString().take(8)}")
+        val origHost = safeHost(origUrl)
+
+        try {
+            var suggestedName = fallbackFilename
+            var finalBytes = 0L
+
+            client.newCall(req).execute().use { resp ->
+                if (resp.code == 416) {
+                    throw SegmentedFallbackException()
+                }
+                if (!resp.isSuccessful) {
+                    val errText = resp.body?.string().orEmpty()
+                    throw ApiHttpException(resp.code, parseErrorMessage(resp.code, errText))
+                }
+
+                suggestedName = resolveDownloadFilename(
+                    preferredFilename = preferredFilename,
+                    contentDisposition = resp.header("Content-Disposition"),
+                    fallbackFilename = fallbackFilename
+                )
+
+                val body = resp.body ?: throw IOException("Empty download response")
+                val rangeInfo = if (resp.code == 206) {
+                    DownloadRangePlanner.parseContentRangeInfo(resp.header("Content-Range"))
+                } else {
+                    null
+                }
+
+                // If server sent full 200 OK or full file fit inside the initial 2 MB window, stream linearly.
+                if (rangeInfo == null || rangeInfo.start != 0L || rangeInfo.end + 1L >= rangeInfo.total) {
+                    val totalLen = rangeInfo?.total ?: body.contentLength().takeIf { it > 0L }
+                    finalBytes = streamBodyToPartFile(body, partFile, totalLen, onProgress)
+                } else {
+                    val totalSize = rangeInfo.total
+                    val remainingRanges = DownloadRangePlanner.buildRemainingByteRanges(
+                        startOffset = rangeInfo.end + 1L,
+                        totalSize = totalSize,
+                        maxSegments = MAX_EXTRA_PARALLEL_SEGMENTS
+                    )
+                    val resolvedUrl = resp.request.url
+                    val sameHost = origHost != null && resolvedUrl.host.equals(origHost, ignoreCase = true)
+
+                    onProgress?.invoke(0L, totalSize)
+                    val downloaded = AtomicLong(0L)
+                    val lastNotify = AtomicLong(0L)
+                    fun reportChunkBytes(added: Long) {
+                        val curTotal = downloaded.addAndGet(added)
+                        if (onProgress != null) {
+                            val prev = lastNotify.get()
+                            if (curTotal - prev >= PROGRESS_STEP_BYTES || curTotal >= totalSize) {
+                                if (lastNotify.compareAndSet(prev, curTotal)) {
+                                    onProgress.invoke(curTotal, totalSize)
+                                }
+                            }
+                        }
+                    }
+
+                    RandomAccessFile(partFile, "rw").use { raf ->
+                        raf.setLength(totalSize)
+                        val channel = raf.channel
+                        coroutineScope {
+                            val firstJob = async {
+                                streamBodyToChannel(body, channel, 0L, ::reportChunkBytes)
+                            }
+                            val extraJobs = remainingRanges.map { range ->
+                                async {
+                                    downloadRangeSegment(
+                                        targetUrl = resolvedUrl,
+                                        applyAuthHeader = sameHost,
+                                        range = range,
+                                        channel = channel,
+                                        onBytes = ::reportChunkBytes
+                                    )
+                                }
+                            }
+                            firstJob.await()
+                            extraJobs.awaitAll()
+                        }
+                    }
+
+                    if (partFile.length() != totalSize) {
+                        throw SegmentedFallbackException()
+                    }
+                    finalBytes = totalSize
+                    onProgress?.invoke(finalBytes, totalSize)
+                }
+            }
+
+            promotePartFile(partFile, destDir, suggestedName, finalBytes)
+        } catch (err: Exception) {
+            partFile.delete()
+            throw err
+        }
+    }
+
+    private suspend fun downloadRangeSegment(
+        targetUrl: HttpUrl,
+        applyAuthHeader: Boolean,
+        range: LongRange,
+        channel: FileChannel,
+        onBytes: (Long) -> Unit
+    ) {
+        val builder = Request.Builder()
+            .url(targetUrl)
+            .get()
+            .header("Range", "bytes=${range.first}-${range.last}")
+        if (applyAuthHeader) builder.applyAuth()
+
+        client.newCall(builder.build()).execute().use { resp ->
+            if (!resp.isSuccessful) {
+                val errText = resp.body?.string().orEmpty()
+                throw ApiHttpException(resp.code, parseErrorMessage(resp.code, errText))
+            }
+            if (resp.code != 206) {
+                throw SegmentedFallbackException()
+            }
+            val body = resp.body ?: throw SegmentedFallbackException()
+            val expectedLen = (range.last - range.first) + 1L
+            val written = streamBodyToChannel(body, channel, range.first, onBytes)
+            if (written != expectedLen) {
+                throw SegmentedFallbackException()
+            }
+        }
+    }
+
+    private suspend fun streamBodyToChannel(
+        body: ResponseBody,
+        channel: FileChannel,
+        startPos: Long,
+        onBytes: (Long) -> Unit
+    ): Long {
+        val coroutineCtx = currentCoroutineContext()
+        val buffer = ByteArray(64 * 1024)
+        var pos = startPos
+        var total = 0L
+        body.byteStream().use { input ->
+            while (true) {
+                coroutineCtx.ensureActive()
+                val read = input.read(buffer)
+                if (read <= 0) break
+                pos = writeFullyAtPosition(channel, buffer, read, pos)
+                total += read
+                onBytes(read.toLong())
+            }
+        }
+        return total
+    }
+
+    private fun writeFullyAtPosition(channel: FileChannel, bytes: ByteArray, length: Int, startPos: Long): Long {
+        val buf = ByteBuffer.wrap(bytes, 0, length)
+        var pos = startPos
+        while (buf.hasRemaining()) {
+            pos += channel.write(buf, pos)
+        }
+        return pos
     }
 
     private suspend fun streamDownloadToDirectory(
@@ -683,52 +975,88 @@ class PhotoHubApiClient(
                     val errText = resp.body?.string().orEmpty()
                     throw ApiHttpException(resp.code, parseErrorMessage(resp.code, errText))
                 }
-                val dispositionName = extractDispositionFilename(resp.header("Content-Disposition"))
-                val rawName = preferredFilename?.trim()?.takeIf { it.isNotEmpty() }
-                    ?: dispositionName
-                    ?: fallbackFilename
-                suggestedName = File(rawName).name.ifBlank { fallbackFilename }
-
+                suggestedName = resolveDownloadFilename(
+                    preferredFilename = preferredFilename,
+                    contentDisposition = resp.header("Content-Disposition"),
+                    fallbackFilename = fallbackFilename
+                )
                 val body = resp.body ?: throw IOException("Empty download response")
                 val totalLen = body.contentLength().takeIf { it > 0L }
-                onProgress?.invoke(0L, totalLen)
-
-                val coroutineCtx = currentCoroutineContext()
-                body.byteStream().use { input ->
-                    partFile.outputStream().use { output ->
-                        val buffer = ByteArray(64 * 1024)
-                        var lastNotifyBytes = 0L
-                        while (true) {
-                            coroutineCtx.ensureActive()
-                            val read = input.read(buffer)
-                            if (read <= 0) break
-                            output.write(buffer, 0, read)
-                            downloaded += read
-                            if (onProgress != null && (downloaded - lastNotifyBytes >= 64 * 1024L || (totalLen != null && downloaded >= totalLen))) {
-                                lastNotifyBytes = downloaded
-                                onProgress.invoke(downloaded, totalLen)
-                            }
-                        }
-                    }
-                }
-                onProgress?.invoke(downloaded, totalLen)
+                downloaded = streamBodyToPartFile(body, partFile, totalLen, onProgress)
             }
 
-            if (!partFile.exists() || partFile.length() <= 0L) {
-                throw IOException("Downloaded file was empty.")
-            }
-
-            val finalFile = File(destDir, suggestedName)
-            if (finalFile.exists()) finalFile.delete()
-            if (!partFile.renameTo(finalFile)) {
-                partFile.copyTo(finalFile, overwrite = true)
-                partFile.delete()
-            }
-            DownloadedFileResult(file = finalFile, suggestedFilename = suggestedName, bytesWritten = downloaded)
+            promotePartFile(partFile, destDir, suggestedName, downloaded)
         } catch (err: Exception) {
             partFile.delete()
             throw err
         }
+    }
+
+    private suspend fun streamBodyToPartFile(
+        body: ResponseBody,
+        partFile: File,
+        totalLen: Long?,
+        onProgress: ((downloadedBytes: Long, totalBytes: Long?) -> Unit)?
+    ): Long {
+        onProgress?.invoke(0L, totalLen)
+        var downloaded = 0L
+        var lastNotifyBytes = 0L
+        val coroutineCtx = currentCoroutineContext()
+        body.byteStream().use { input ->
+            partFile.outputStream().use { output ->
+                val buffer = ByteArray(64 * 1024)
+                while (true) {
+                    coroutineCtx.ensureActive()
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    output.write(buffer, 0, read)
+                    downloaded += read
+                    if (onProgress != null && (downloaded - lastNotifyBytes >= PROGRESS_STEP_BYTES || (totalLen != null && downloaded >= totalLen))) {
+                        lastNotifyBytes = downloaded
+                        onProgress.invoke(downloaded, totalLen)
+                    }
+                }
+            }
+        }
+        onProgress?.invoke(downloaded, totalLen)
+        return downloaded
+    }
+
+    private fun resolveDownloadFilename(
+        preferredFilename: String?,
+        contentDisposition: String?,
+        fallbackFilename: String
+    ): String {
+        val dispositionName = extractDispositionFilename(contentDisposition)
+        val rawName = preferredFilename?.trim()?.takeIf { it.isNotEmpty() }
+            ?: dispositionName
+            ?: fallbackFilename
+        return File(rawName).name.ifBlank { fallbackFilename }
+    }
+
+    private fun promotePartFile(
+        partFile: File,
+        destDir: File,
+        suggestedName: String,
+        bytesWritten: Long
+    ): DownloadedFileResult {
+        if (!partFile.exists() || partFile.length() <= 0L) {
+            throw IOException("Downloaded file was empty.")
+        }
+        val finalFile = File(destDir, suggestedName)
+        if (finalFile.exists()) finalFile.delete()
+        if (!partFile.renameTo(finalFile)) {
+            partFile.copyTo(finalFile, overwrite = true)
+            partFile.delete()
+        }
+        return DownloadedFileResult(file = finalFile, suggestedFilename = suggestedName, bytesWritten = bytesWritten)
+    }
+
+    companion object {
+        private const val SMALL_SINGLE_STREAM_THRESHOLD_BYTES = 1_500_000L
+        private const val INITIAL_RANGE_BYTES = 2L * 1024L * 1024L
+        private const val MAX_EXTRA_PARALLEL_SEGMENTS = 3
+        private const val PROGRESS_STEP_BYTES = 64L * 1024L
     }
 
     suspend fun setOriginalProtected(masterHash: String, protected: Boolean): ServerPhoto = withContext(Dispatchers.IO) {
