@@ -14,7 +14,7 @@ on:
 jobs:
   build-ios:
     name: Compile PhotoHubCompressor (iOS)
-    runs-on: macos-26
+    runs-on: macos-15
 
     steps:
       - name: Checkout repository
@@ -22,13 +22,16 @@ jobs:
 
       - name: Select Xcode
         run: |
-          XCODE_APP=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1 || true)
-          if [ -n "$XCODE_APP" ] && [ -d "$XCODE_APP/Contents/Developer" ]; then
-            sudo xcode-select -s "$XCODE_APP/Contents/Developer"
-          elif [ -d /Applications/Xcode.app/Contents/Developer ]; then
+          if [ -d /Applications/Xcode.app/Contents/Developer ]; then
             sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          else
+            XCODE_APP=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1 || true)
+            if [ -n "$XCODE_APP" ] && [ -d "$XCODE_APP/Contents/Developer" ]; then
+              sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+            fi
           fi
           xcodebuild -version
+          xcodebuild -showsdks
 
       - name: Generate Xcode project with XcodeGen
         working-directory: ios/PhotoHubCompressor
@@ -50,29 +53,32 @@ jobs:
       - name: Build unsigned iOS device app (.app)
         run: |
           set -o pipefail
-          if ! xcodebuild \
+          xcodebuild \
             -project ios/PhotoHubCompressor/PhotoHubCompressor.xcodeproj \
             -scheme PhotoHubCompressor \
             -configuration Release \
             -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
             -derivedDataPath build/DerivedData \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
-            clean build 2>&1 | tee build.log; then
-            echo "=== XCODEBUILD ERRORS ==="
-            ERRORS=$(grep -nE -A 2 "error:|fatal error:" build.log | head -n 80 || true)
+            clean build 2>&1 | tee build.log
+          BUILD_RC=${PIPESTATUS[0]}
+          if [ "$BUILD_RC" -ne 0 ]; then
+            echo "=== XCODEBUILD ERRORS (exit $BUILD_RC) ==="
+            ERRORS=$(grep -nE -C 2 "error:|fatal error:|xcodebuild: error:" build.log | head -n 120 || true)
             if [ -z "$ERRORS" ]; then
-              ERRORS=$(tail -n 80 build.log)
+              ERRORS=$(tail -n 100 build.log)
             fi
             echo "$ERRORS"
             {
-              echo "### xcodebuild Failed (exit code 65)"
+              echo "### xcodebuild Failed (exit code $BUILD_RC)"
               echo '```'
               echo "$ERRORS"
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
-            exit 65
+            exit "$BUILD_RC"
           fi
 
       - name: Verify Info.plist privacy keys are in the built app

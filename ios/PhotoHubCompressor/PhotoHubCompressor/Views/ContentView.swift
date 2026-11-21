@@ -63,7 +63,8 @@ struct ContentView: View {
 
     private func openDeletePromptFromNotification() {
         selectedTab = 0
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 350_000_000)
             viewModel.handleNotificationOpenCleanup()
         }
     }

@@ -21,10 +21,39 @@ struct PendingBackgroundUploadJob: Codable, Sendable {
     let morningHour: Int
 }
 
+struct BackgroundUploadConfig: Sendable {
+    let authToken: String
+    let baseURL: URL
+    let proxyFormatRaw: String
+    let proxyMaxPixelSize: Int
+    let proxyQuality: Double
+    let keepLocalProxyInPhotos: Bool
+    let cacheScopeKey: String
+    let notifyOnComplete: Bool
+    let morningHour: Int
+
+    @MainActor
+    init?(settings: AppSettings) {
+        let token = settings.authToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty, let url = settings.normalizedBaseURL else {
+            return nil
+        }
+        self.authToken = token
+        self.baseURL = url
+        self.proxyFormatRaw = settings.proxyFormat.rawValue
+        self.proxyMaxPixelSize = settings.proxyMaxPixelSize
+        self.proxyQuality = settings.proxyQuality
+        self.keepLocalProxyInPhotos = settings.keepLocalProxyInPhotos
+        self.cacheScopeKey = settings.apiKey
+        self.notifyOnComplete = settings.notifyWhenBackgroundUploadFinishes
+        self.morningHour = settings.morningReminderHour
+    }
+}
+
 /// Manages true silent OS-managed background uploads (`URLSession.background`) so large photos
 /// and videos continue uploading in the background with zero Home Screen/Lock Screen notice,
 /// waking the app on completion to verify SHA-256, create the proxy, and notify the user to delete originals.
-final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, URLSessionTaskDelegate, URLSessionDelegate, @unchecked Sendable {
+final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     static let shared = BackgroundUploadTransport()
     static let sessionIdentifier = "com.photohub.compressor.silentBgUpload"
 
@@ -83,16 +112,13 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, URLSess
     func enqueueSilentUpload(
         candidate: PhotoCandidate,
         photoService: PhotoLibraryService,
-        settings: AppSettings
+        apiClient: PhotoHubAPIClient,
+        config: BackgroundUploadConfig
     ) async -> Bool {
         let assetId = candidate.id
         if activeAssetIds().contains(assetId) {
             return true
         }
-
-        let authToken = await MainActor.run { settings.authToken.trimmingCharacters(in: .whitespacesAndNewlines) }
-        guard !authToken.isEmpty else { return false }
-        guard let baseURL = await MainActor.run { settings.normalizedBaseURL } else { return false }
 
         do {
             let master = try await photoService.exportOriginalMasterAsync(for: candidate.asset)
@@ -112,7 +138,6 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, URLSess
                 return true
             }
 
-            let apiClient = PhotoHubAPIClient(settings: settings)
             let check = try await apiClient.checkHash(master.sha256)
             if check.isProxy == true {
                 try? FileManager.default.removeItem(at: master.fileURL)
@@ -139,10 +164,10 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, URLSess
             // Move master file into persistent Caches folder so iOS doesn't purge /tmp mid-upload
             let stagedURL = try moveMasterToPersistentStaging(from: master.fileURL, sha256: master.sha256, filename: master.filename)
 
-            let uploadURL = baseURL.appendingPathComponent("api/upload")
+            let uploadURL = config.baseURL.appendingPathComponent("api/upload")
             var request = URLRequest(url: uploadURL)
             request.httpMethod = "POST"
-            request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
+            request.setValue("Bearer \(config.authToken)", forHTTPHeaderField: "Authorization")
             request.setValue(master.mimeType, forHTTPHeaderField: "Content-Type")
             request.setValue(
                 master.filename.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? master.filename,
@@ -154,27 +179,25 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, URLSess
                 request.setValue(isoFormatter.string(from: creationDate), forHTTPHeaderField: "X-Photo-Date")
             }
 
-            let job = await MainActor.run {
-                PendingBackgroundUploadJob(
-                    jobId: UUID().uuidString,
-                    assetId: assetId,
-                    masterSha256: master.sha256,
-                    masterBytes: master.sizeBytes,
-                    filename: master.filename,
-                    mimeType: master.mimeType,
-                    creationDate: candidate.creationDate,
-                    stagedFilePath: stagedURL.path,
-                    isVideo: candidate.mediaType == .video,
-                    proxyFormatRaw: settings.proxyFormat.rawValue,
-                    proxyMaxPixelSize: settings.proxyMaxPixelSize,
-                    proxyQuality: settings.proxyQuality,
-                    keepLocalProxyInPhotos: settings.keepLocalProxyInPhotos,
-                    serverBaseURLString: baseURL.absoluteString,
-                    cacheScopeKey: settings.apiKey,
-                    notifyOnComplete: settings.notifyWhenBackgroundUploadFinishes,
-                    morningHour: settings.morningReminderHour
-                )
-            }
+            let job = PendingBackgroundUploadJob(
+                jobId: UUID().uuidString,
+                assetId: assetId,
+                masterSha256: master.sha256,
+                masterBytes: master.sizeBytes,
+                filename: master.filename,
+                mimeType: master.mimeType,
+                creationDate: candidate.creationDate,
+                stagedFilePath: stagedURL.path,
+                isVideo: candidate.mediaType == .video,
+                proxyFormatRaw: config.proxyFormatRaw,
+                proxyMaxPixelSize: config.proxyMaxPixelSize,
+                proxyQuality: config.proxyQuality,
+                keepLocalProxyInPhotos: config.keepLocalProxyInPhotos,
+                serverBaseURLString: config.baseURL.absoluteString,
+                cacheScopeKey: config.cacheScopeKey,
+                notifyOnComplete: config.notifyOnComplete,
+                morningHour: config.morningHour
+            )
 
             let task = backgroundSession.uploadTask(with: request, fromFile: stagedURL)
             task.taskDescription = job.jobId

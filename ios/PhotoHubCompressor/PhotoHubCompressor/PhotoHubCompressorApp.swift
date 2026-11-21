@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 
+@MainActor
 final class PhotoHubAppDelegate: NSObject, UIApplicationDelegate {
     func application(
         _ application: UIApplication,

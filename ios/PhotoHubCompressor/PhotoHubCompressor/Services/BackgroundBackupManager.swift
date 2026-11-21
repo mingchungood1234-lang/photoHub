@@ -343,7 +343,8 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
         guard settings.nightlyAutoBackupEnabled,
               settings.isSignedIn,
               !isSilentUploadRunning,
-              let baseURL = settings.normalizedBaseURL else {
+              let baseURL = settings.normalizedBaseURL,
+              let uploadConfig = BackgroundUploadConfig(settings: settings) else {
             return
         }
 
@@ -414,7 +415,8 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                     _ = await BackgroundUploadTransport.shared.enqueueSilentUpload(
                         candidate: candidate,
                         photoService: photoService,
-                        settings: settings
+                        apiClient: apiClient,
+                        config: uploadConfig
                     )
                     continue
                 }
@@ -522,6 +524,7 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
         let notifyImmediate = settings.notifyWhenBackgroundUploadFinishes
         let existingStagedIds = Set(stagedItems.map { $0.id })
         let activeBgIds = BackgroundUploadTransport.shared.activeAssetIds()
+        let uploadConfig = BackgroundUploadConfig(settings: settings)
 
         let work = Task.detached(priority: .utility) { [weak self] in
             var processedNew = 0
@@ -553,11 +556,12 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
 
             for candidate in prioritized {
                 if Task.isCancelled { break }
-                if candidate.isVideo || candidate.estimatedBytes > 15_000_000 {
+                if (candidate.isVideo || candidate.estimatedBytes > 15_000_000), let uploadConfig {
                     _ = await BackgroundUploadTransport.shared.enqueueSilentUpload(
                         candidate: candidate,
                         photoService: photoService,
-                        settings: settings
+                        apiClient: apiClient,
+                        config: uploadConfig
                     )
                     continue
                 }
