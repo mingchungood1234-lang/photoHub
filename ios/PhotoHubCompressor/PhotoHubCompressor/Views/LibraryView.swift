@@ -58,7 +58,7 @@ struct LibraryView: View {
                     VStack(alignment: .leading, spacing: 6) {
                         ProgressView(value: viewModel.overallProgressFraction, total: 1.0)
                         let pct = Int((viewModel.overallProgressFraction * 100).rounded())
-                        Text("Uploading & Compressing \(pct)% (\(viewModel.completedCount)/\(viewModel.totalToProcess)) — You can switch to Home Screen on iOS 26+")
+                        Text("Uploading & Compressing \(pct)% (\(viewModel.completedCount)/\(viewModel.totalToProcess))…")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -72,7 +72,7 @@ struct LibraryView: View {
                         systemImage: "photo.on.rectangle.angled",
                         description: (viewModel.permissionStatus == .denied || viewModel.permissionStatus == .restricted)
                             ? "Photos permission is required. Open iOS Settings to allow access."
-                            : "Tap Auto-Upload New Photos to scan and upload immediately (continues on Home Screen on iOS 26+), or scan to pick individual photos first."
+                            : "New photos & videos upload silently in the background, and photoHub notifies you when originals are ready to delete — or tap below to scan and free space now."
                     ) {
                         if viewModel.permissionStatus == .denied || viewModel.permissionStatus == .restricted {
                             Button("Open iOS Settings") {

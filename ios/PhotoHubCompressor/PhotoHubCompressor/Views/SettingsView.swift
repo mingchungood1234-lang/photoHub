@@ -1,5 +1,6 @@
 import Photos
 import SwiftUI
+import UIKit
 
 struct SettingsView: View {
     @ObservedObject var settings: AppSettings
@@ -44,8 +45,8 @@ struct SettingsView: View {
             }
             .onChange(of: settings.nightlyAutoBackupEnabled) { enabled in
                 if enabled {
-                    settings.autoCompressOnOpen = true
                     bgManager.requestNotificationPermissionAndSchedule(settings: settings)
+                    bgManager.triggerSilentAutoUpload(settings: settings, isMovingToBackground: false)
                 } else {
                     bgManager.scheduleNightlyBackupIfEnabled(settings: settings)
                 }
@@ -214,11 +215,11 @@ struct SettingsView: View {
     @ViewBuilder
     private var overnightBackupSection: some View {
         Section {
-            Toggle("Auto Background Upload (iOS 26+ & Wi-Fi)", isOn: $settings.nightlyAutoBackupEnabled)
+            Toggle("Silent Auto Background Upload", isOn: $settings.nightlyAutoBackupEnabled)
 
             Toggle("Notify When Ready to Delete Originals", isOn: $settings.notifyWhenBackgroundUploadFinishes)
 
-            Toggle("Require Charger for Overnight Schedule", isOn: $settings.nightlyRequiresCharging)
+            Toggle("Require Charger for Large Batches", isOn: $settings.nightlyRequiresCharging)
                 .disabled(!settings.nightlyAutoBackupEnabled)
 
             Picker("Overnight Reminder Time", selection: $settings.morningReminderHour) {
@@ -252,9 +253,9 @@ struct SettingsView: View {
                 bgManager.sendTestMorningAlert(settings: settings)
             }
         } header: {
-            Text("Auto Background Upload & Delete Alerts")
+            Text("Silent Background Upload & Delete Alerts")
         } footer: {
-            Text("On iOS 26+, active uploads continue in the background with Live Activity progress when you leave the app. Scheduled Wi-Fi background uploads also run automatically and push a notification as soon as originals are backed up and ready to delete from your iPhone.")
+            Text("Just like Google Photos, new photos & videos upload quietly in the background without progress banners or interruptions. Once backups are SHA-256 verified and ready to remove, photoHub sends a notification so you can tap once to delete original photos from your iPhone.")
         }
     }
 

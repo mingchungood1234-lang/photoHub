@@ -1,6 +1,7 @@
 import BackgroundTasks
 import Foundation
 import Photos
+import UIKit
 import UserNotifications
 
 extension Notification.Name {
@@ -15,144 +16,13 @@ struct StagedCleanupItem: Codable, Identifiable, Equatable, Sendable {
     let verifiedAt: Date
 }
 
-/// Bridges an active foreground/background upload batch to iOS 26+ `BGContinuedProcessingTask`
-/// so uploads & proxy compression continue seamlessly when switching to the Home Screen, displaying
-/// a native Live Activity progress bar on Dynamic Island and the Lock Screen.
-final class ContinuedUploadSession: @unchecked Sendable {
-    let identifier: String
-    let totalCount: Int
-
-    private let lock = NSLock()
-    private var rawTask: AnyObject?
-    private var isEnded = false
-    private var finalSuccess = true
-    private var onCancel: (@Sendable () -> Void)?
-    private var lastTitlePercent: Int = -1
-    private var lastTitleCompleted: Int = -1
-    private var lastTitleUpdateTime: Date = .distantPast
-
-    init(identifier: String, totalCount: Int, onCancel: @escaping @Sendable () -> Void) {
-        self.identifier = identifier
-        self.totalCount = max(1, totalCount)
-        self.onCancel = onCancel
-    }
-
-    #if compiler(>=6.2)
-    @available(iOS 26.0, *)
-    func attach(task: BGContinuedProcessingTask) {
-        task.progress.totalUnitCount = 1000
-        task.progress.completedUnitCount = 0
-
-        task.expirationHandler = { [weak self] in
-            self?.cancelFromSystem()
-        }
-
-        lock.lock()
-        let alreadyEnded = isEnded
-        let endedSuccess = finalSuccess
-        if !alreadyEnded {
-            rawTask = task
-        }
-        lock.unlock()
-
-        if alreadyEnded {
-            task.setTaskCompleted(success: endedSuccess)
-        }
-    }
-    #endif
-
-    func update(fraction: Double, completed: Int, total: Int, statusText: String) {
-        #if compiler(>=6.2)
-        if #available(iOS 26.0, *) {
-            let clampedFraction = min(1.0, max(0.0, fraction))
-            let percent = Int((clampedFraction * 100.0).rounded())
-            let now = Date()
-
-            lock.lock()
-            let task = rawTask as? BGContinuedProcessingTask
-            let ended = isEnded
-            let shouldRefreshTitle =
-                !ended &&
-                (percent >= lastTitlePercent + 2 ||
-                 completed != lastTitleCompleted ||
-                 now.timeIntervalSince(lastTitleUpdateTime) >= 0.8)
-            if shouldRefreshTitle {
-                lastTitlePercent = percent
-                lastTitleCompleted = completed
-                lastTitleUpdateTime = now
-            }
-            lock.unlock()
-
-            guard !ended, let task else { return }
-            task.progress.totalUnitCount = 1000
-            task.progress.completedUnitCount = Int64((clampedFraction * 1000.0).rounded())
-            if shouldRefreshTitle {
-                task.updateTitle(
-                    "photoHub Auto Backup (\(percent)%)",
-                    subtitle: "\(completed)/\(max(1, total)) done · \(statusText)"
-                )
-            }
-        }
-        #endif
-    }
-
-    func finish(success: Bool, completionNote: String = "Finished") {
-        lock.lock()
-        guard !isEnded else {
-            lock.unlock()
-            return
-        }
-        isEnded = true
-        finalSuccess = success
-        onCancel = nil
-        let taskObj = rawTask
-        rawTask = nil
-        lock.unlock()
-
-        #if compiler(>=6.2)
-        if #available(iOS 26.0, *), let task = taskObj as? BGContinuedProcessingTask {
-            if success {
-                task.progress.totalUnitCount = 1000
-                task.progress.completedUnitCount = 1000
-                task.updateTitle("photoHub Backup Complete", subtitle: completionNote)
-            }
-            task.setTaskCompleted(success: success)
-        }
-        #endif
-    }
-
-    private func cancelFromSystem() {
-        lock.lock()
-        guard !isEnded else {
-            lock.unlock()
-            return
-        }
-        isEnded = true
-        finalSuccess = false
-        let cancelCallback = onCancel
-        onCancel = nil
-        let taskObj = rawTask
-        rawTask = nil
-        lock.unlock()
-
-        cancelCallback?()
-
-        #if compiler(>=6.2)
-        if #available(iOS 26.0, *) {
-            (taskObj as? BGContinuedProcessingTask)?.setTaskCompleted(success: false)
-        }
-        #endif
-    }
-}
-
 @MainActor
-final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
+final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificationCenterDelegate, PHPhotoLibraryChangeObserver {
     static let shared = BackgroundBackupManager()
     static let taskIdentifier = "com.photohub.compressor.nightlyBackup"
     static let refreshTaskIdentifier = "com.photohub.compressor.autoUploadRefresh"
-    static let continuedTaskPrefix = "com.photohub.compressor.continued."
     static let morningNotificationIdentifier = "com.photohub.compressor.morningFreeUp"
-    static let immediateNotificationIdentifier = "com.photohub.compressor.uploadFinishedDeleteOriginals"
+    static let deleteReadyNotificationIdentifier = "com.photohub.compressor.uploadFinishedDeleteOriginals"
 
     private let stagedStorageKey = "photohub.stagedOvernightCleanup.v1"
     private let lastRunSummaryKey = "photohub.lastOvernightSummary.v1"
@@ -163,6 +33,9 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
     @Published var pendingOpenCleanupFromNotification: Bool = false
 
     private var hasRegistered = false
+    private var hasRegisteredPhotoObserver = false
+    private var isSilentUploadRunning = false
+    private var debouncedSilentTask: Task<Void, Never>?
     private weak var settingsRef: AppSettings?
 
     private override init() {
@@ -177,6 +50,9 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
     func register(settings: AppSettings) {
         self.settingsRef = settings
         UNUserNotificationCenter.current().delegate = self
+        _ = BackgroundUploadTransport.shared
+        ensurePhotoObserverIfAuthorized()
+
         guard !hasRegistered else { return }
         hasRegistered = true
 
@@ -207,51 +83,26 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
         }
     }
 
-    // MARK: - iOS 26+ Continued Background Upload Session
+    func ensurePhotoObserverIfAuthorized() {
+        guard !hasRegisteredPhotoObserver else { return }
+        let auth = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard auth == .authorized || auth == .limited else { return }
+        hasRegisteredPhotoObserver = true
+        PHPhotoLibrary.shared().register(self)
+    }
 
-    /// Starts an iOS 26 `BGContinuedProcessingTask` for a user-initiated/auto-started upload batch so iOS keeps
-    /// compressing & uploading in the background with Live Activity progress when switching apps or locking the screen.
-    func beginContinuedUploadSession(
-        totalCount: Int,
-        onCancel: @escaping @Sendable () -> Void
-    ) -> ContinuedUploadSession? {
-        #if compiler(>=6.2)
-        if #available(iOS 26.0, *) {
-            let jobId = "\(Self.continuedTaskPrefix)\(UUID().uuidString)"
-            let session = ContinuedUploadSession(
-                identifier: jobId,
-                totalCount: totalCount,
-                onCancel: onCancel
-            )
+    // MARK: - PHPhotoLibraryChangeObserver (Google Photos-style silent detection of new photos)
 
-            _ = BGTaskScheduler.shared.register(
-                forTaskWithIdentifier: jobId,
-                using: nil
-            ) { task in
-                guard let continuedTask = task as? BGContinuedProcessingTask else {
-                    task.setTaskCompleted(success: false)
-                    return
-                }
-                session.attach(task: continuedTask)
-            }
-
-            let request = BGContinuedProcessingTaskRequest(
-                identifier: jobId,
-                title: "photoHub Auto Backup",
-                subtitle: "Uploading & compressing \(totalCount) photo(s)…"
-            )
-            request.strategy = .queue
-
-            do {
-                try BGTaskScheduler.shared.submit(request)
-                return session
-            } catch {
-                session.finish(success: false)
-                return nil
+    nonisolated func photoLibraryDidChange(_ changeInstance: PHChange) {
+        Task { @MainActor [weak self] in
+            guard let self, let settings = self.settingsRef else { return }
+            self.debouncedSilentTask?.cancel()
+            self.debouncedSilentTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                guard !Task.isCancelled else { return }
+                self?.triggerSilentAutoUpload(settings: settings, isMovingToBackground: false)
             }
         }
-        #endif
-        return nil
     }
 
     // MARK: - Notifications
@@ -303,6 +154,7 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
     }
 
     func scheduleNightlyBackupIfEnabled(settings: AppSettings) {
+        ensurePhotoObserverIfAuthorized()
         guard settings.nightlyAutoBackupEnabled, settings.isSignedIn else {
             BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Self.taskIdentifier)
             BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Self.refreshTaskIdentifier)
@@ -312,16 +164,16 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
         let processingReq = BGProcessingTaskRequest(identifier: Self.taskIdentifier)
         processingReq.requiresNetworkConnectivity = true
         processingReq.requiresExternalPower = settings.nightlyRequiresCharging
-        processingReq.earliestBeginDate = Self.nextNightlyBeginDate()
+        processingReq.earliestBeginDate = Date(timeIntervalSinceNow: 30 * 60)
 
         let refreshReq = BGAppRefreshTaskRequest(identifier: Self.refreshTaskIdentifier)
-        refreshReq.earliestBeginDate = Date(timeIntervalSinceNow: 20 * 60)
+        refreshReq.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
 
         do {
             try BGTaskScheduler.shared.submit(processingReq)
             try? BGTaskScheduler.shared.submit(refreshReq)
             if lastRunSummary.isEmpty {
-                updateSummary("Auto background upload active (iOS 26+ continued + Wi-Fi scheduler).")
+                updateSummary("Silent auto-upload active in background.")
             }
         } catch {
             updateSummary("Background schedule note: \(error.localizedDescription)")
@@ -338,17 +190,17 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                 let count = self?.stagedItems.count ?? 0
                 if count > 0, let bytes = self?.stagedSavedBytes {
                     let sizeStr = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
-                    content.title = "Upload & Compression Done — Delete \(count) Original\(count == 1 ? "" : "s")"
-                    content.body = "\(count) original\(count == 1 ? " is" : "s are") backed up & SHA-256 verified on your server. Tap to delete the original photos from your iPhone (free ~\(sizeStr))."
+                    content.title = "Delete \(count) Backed-Up Original Photo\(count == 1 ? "" : "s")?"
+                    content.body = "photoHub uploaded & verified \(count) item\(count == 1 ? "" : "s") silently in the background. Tap to delete the original photos from your iPhone (free ~\(sizeStr))."
                 } else {
-                    content.title = "Upload & Compression Done — Delete Original Photos"
+                    content.title = "Delete Backed-Up Original Photos?"
                     content.body = "Your originals are backed up & SHA-256 verified on your server. Tap to confirm deleting the original photos from your iPhone."
                 }
                 content.sound = .default
 
                 let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 5, repeats: false)
                 let req = UNNotificationRequest(
-                    identifier: Self.morningNotificationIdentifier + ".test",
+                    identifier: Self.deleteReadyNotificationIdentifier + ".test",
                     content: content,
                     trigger: trigger
                 )
@@ -372,13 +224,8 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
 
             let sizeStr = ByteCountFormatter.string(fromByteCount: max(0, savedBytes), countStyle: .file)
             let content = UNMutableNotificationContent()
-            if immediate {
-                content.title = "Upload & Compression Done — Delete \(count) Original\(count == 1 ? "" : "s")"
-                content.body = "\(count) original photo\(count == 1 ? " is" : "s are") backed up & SHA-256 verified on your server. Tap here to delete the original photos from your iPhone and free ~\(sizeStr)."
-            } else {
-                content.title = "Backed Up Overnight — Delete \(count) Original\(count == 1 ? "" : "s") (Free \(sizeStr))"
-                content.body = "\(count) original\(count == 1 ? " is" : "s are") safely stored & SHA-256 verified on your server. Tap to delete the original photos from your iPhone."
-            }
+            content.title = "Delete \(count) Original Photo\(count == 1 ? "" : "s") to Free ~\(sizeStr)"
+            content.body = "\(count) original\(count == 1 ? " is" : "s are") uploaded & SHA-256 verified on your server. Tap to delete the original files from your iPhone."
             content.sound = .default
 
             let now = Date()
@@ -388,9 +235,9 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
 
             let trigger: UNNotificationTrigger
             let requestId: String
-            if immediate || (currentHour >= targetHour && currentHour < 22) {
+            if immediate || (currentHour >= targetHour && currentHour < 23) {
                 trigger = UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
-                requestId = Self.immediateNotificationIdentifier
+                requestId = Self.deleteReadyNotificationIdentifier
             } else {
                 var target = cal.nextDate(
                     after: now,
@@ -471,7 +318,7 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
         if stagedItems.isEmpty {
             UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [
                 Self.morningNotificationIdentifier,
-                Self.immediateNotificationIdentifier,
+                Self.deleteReadyNotificationIdentifier,
             ])
         }
     }
@@ -481,46 +328,35 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
         saveStagedItems()
         UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [
             Self.morningNotificationIdentifier,
-            Self.immediateNotificationIdentifier,
+            Self.deleteReadyNotificationIdentifier,
         ])
         UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [
             Self.morningNotificationIdentifier,
-            Self.immediateNotificationIdentifier,
+            Self.deleteReadyNotificationIdentifier,
         ])
     }
 
-    // MARK: - Scheduled Background Tasks (BGProcessingTask + BGAppRefreshTask)
+    // MARK: - Silent Auto Background Upload (Google Photos-style, Zero Screen Notices Until Ready to Delete)
 
-    private func handleBackgroundProcessingTask(_ task: BGProcessingTask) {
-        runScheduledTask(task: task, maxItems: 40, isOvernight: true)
-    }
-
-    private func handleBackgroundRefreshTask(_ task: BGAppRefreshTask) {
-        runScheduledTask(task: task, maxItems: 6, isOvernight: false)
-    }
-
-    private func runScheduledTask(task: BGTask, maxItems: Int, isOvernight: Bool) {
-        guard let settings = settingsRef else {
-            task.setTaskCompleted(success: false)
-            return
-        }
-
-        // Re-enqueue the next automatic run per Apple best practices
-        scheduleNightlyBackupIfEnabled(settings: settings)
-
+    func triggerSilentAutoUpload(settings: AppSettings, isMovingToBackground: Bool) {
+        ensurePhotoObserverIfAuthorized()
         guard settings.nightlyAutoBackupEnabled,
               settings.isSignedIn,
+              !isSilentUploadRunning,
               let baseURL = settings.normalizedBaseURL else {
-            task.setTaskCompleted(success: true)
             return
         }
 
         let authStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         guard authStatus == .authorized || authStatus == .limited else {
-            updateSummary("Skipped background upload: Full Photos permission needed.")
-            task.setTaskCompleted(success: false)
             return
         }
+
+        if settings.notifyWhenBackgroundUploadFinishes {
+            requestNotificationPermissionIfNeeded()
+        }
+
+        isSilentUploadRunning = true
 
         let apiClient = PhotoHubAPIClient(settings: settings)
         let format = settings.proxyFormat
@@ -530,42 +366,59 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
         let keepLocal = settings.keepLocalProxyInPhotos
         let cacheScope = settings.apiKey
         let morningHour = settings.morningReminderHour
-        let notifyImmediate = settings.notifyWhenBackgroundUploadFinishes
+        let notifyOnFinish = settings.notifyWhenBackgroundUploadFinishes
         let existingStagedIds = Set(stagedItems.map { $0.id })
+        let activeBgIds = BackgroundUploadTransport.shared.activeAssetIds()
+
+        let taskHolder = SilentTaskBox()
+        let bgId = UIApplication.shared.beginBackgroundTask(withName: "PhotoHubSilentAutoBackup") {
+            taskHolder.cancelAndEndBackgroundTask()
+        }
+        taskHolder.setBackgroundTaskId(bgId)
 
         let work = Task.detached(priority: .utility) { [weak self] in
-            var processedNew = 0
-            do {
-                _ = try await apiClient.whoami()
-            } catch {
-                await MainActor.run {
-                    self?.updateSummary("Background backup skipped: server unreachable.")
+            defer {
+                taskHolder.endBackgroundTask()
+                Task { @MainActor in
+                    self?.isSilentUploadRunning = false
                 }
-                task.setTaskCompleted(success: false)
-                return
             }
+
+            guard (try? await apiClient.whoami()) != nil else { return }
 
             let photoService = PhotoLibraryService()
             let tracker = LocalProxyTracker.shared
             let cachedServerPhotos = LocalProxyStore.shared.cachedPhotos(baseURL: baseURL, apiKey: cacheScope)
-            let scanCap = isOvernight ? 250 : 40
-            let inspectCap = isOvernight ? 2500 : 300
             let rawCandidates = photoService.scanCandidates(
                 tracker: tracker,
                 knownServerPhotos: cachedServerPhotos,
-                maxResults: scanCap,
-                maxInspect: inspectCap
+                maxResults: 20,
+                maxInspect: 400
             )
             let prioritized = PhotoBackupPipeline
                 .sortCandidates(rawCandidates, by: .largestVideosFirst)
-                .filter { !existingStagedIds.contains($0.id) }
-                .prefix(maxItems)
+                .filter { !existingStagedIds.contains($0.id) && !activeBgIds.contains($0.id) }
+                .prefix(isMovingToBackground ? 6 : 12)
 
             let videoSemaphore = AsyncSemaphore(value: 1)
             let photosSaveSemaphore = AsyncSemaphore(value: 1)
+            var uploadedNewCount = 0
 
             for candidate in prioritized {
                 if Task.isCancelled { break }
+
+                // Hand off large uploads (or when app just backgrounded) straight to URLSession.background
+                // so the OS daemon uploads silently with zero app time limit & zero screen banners.
+                let useOSBackgroundSession = isMovingToBackground || candidate.isVideo || candidate.estimatedBytes > 15_000_000
+                if useOSBackgroundSession {
+                    _ = await BackgroundUploadTransport.shared.enqueueSilentUpload(
+                        candidate: candidate,
+                        photoService: photoService,
+                        settings: settings
+                    )
+                    continue
+                }
+
                 do {
                     let result = try await PhotoBackupPipeline.backupAndProxyAsset(
                         candidate: candidate,
@@ -584,8 +437,150 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                         onStageChange: { _ in }
                     )
 
-                    switch result {
-                    case .backedUp(let outcome):
+                    if case .backedUp(let outcome) = result {
+                        let entry = StagedCleanupItem(
+                            id: candidate.id,
+                            filename: outcome.filename,
+                            masterSha256: outcome.masterSha256,
+                            savedBytes: outcome.savedBytes,
+                            verifiedAt: Date()
+                        )
+                        await MainActor.run {
+                            self?.appendStagedItem(entry)
+                        }
+                        uploadedNewCount += 1
+                    }
+                } catch APIClientError.httpError(507, _) {
+                    break
+                } catch {
+                    continue
+                }
+            }
+
+            if uploadedNewCount > 0 {
+                await MainActor.run {
+                    guard let self else { return }
+                    self.pruneMissingAssetsFromStaged()
+                    let totalCount = self.stagedItems.count
+                    let totalBytes = self.stagedSavedBytes
+                    let totalStr = ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
+                    self.updateSummary("Silently backed up \(uploadedNewCount) item(s); \(totalCount) original(s) ready to delete (~\(totalStr)).")
+                    if notifyOnFinish && totalCount > 0 {
+                        self.sendDeleteOriginalsNotification(
+                            count: totalCount,
+                            savedBytes: totalBytes,
+                            immediate: true,
+                            morningHour: morningHour
+                        )
+                    }
+                }
+            }
+        }
+
+        taskHolder.set(work)
+    }
+
+    // MARK: - Scheduled Background Tasks (BGProcessingTask + BGAppRefreshTask)
+
+    private func handleBackgroundProcessingTask(_ task: BGProcessingTask) {
+        runScheduledTask(task: task, maxItems: 40, isOvernight: true)
+    }
+
+    private func handleBackgroundRefreshTask(_ task: BGAppRefreshTask) {
+        runScheduledTask(task: task, maxItems: 6, isOvernight: false)
+    }
+
+    private func runScheduledTask(task: BGTask, maxItems: Int, isOvernight: Bool) {
+        guard let settings = settingsRef else {
+            task.setTaskCompleted(success: false)
+            return
+        }
+
+        scheduleNightlyBackupIfEnabled(settings: settings)
+
+        guard settings.nightlyAutoBackupEnabled,
+              settings.isSignedIn,
+              let baseURL = settings.normalizedBaseURL else {
+            task.setTaskCompleted(success: true)
+            return
+        }
+
+        let authStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard authStatus == .authorized || authStatus == .limited else {
+            task.setTaskCompleted(success: false)
+            return
+        }
+
+        let apiClient = PhotoHubAPIClient(settings: settings)
+        let format = settings.proxyFormat
+        let maxPx = settings.proxyMaxPixelSize
+        let quality = settings.proxyQuality
+        let uploadMode = settings.uploadMode
+        let keepLocal = settings.keepLocalProxyInPhotos
+        let cacheScope = settings.apiKey
+        let morningHour = settings.morningReminderHour
+        let notifyImmediate = settings.notifyWhenBackgroundUploadFinishes
+        let existingStagedIds = Set(stagedItems.map { $0.id })
+        let activeBgIds = BackgroundUploadTransport.shared.activeAssetIds()
+
+        let work = Task.detached(priority: .utility) { [weak self] in
+            var processedNew = 0
+            do {
+                _ = try await apiClient.whoami()
+            } catch {
+                task.setTaskCompleted(success: false)
+                return
+            }
+
+            let photoService = PhotoLibraryService()
+            let tracker = LocalProxyTracker.shared
+            let cachedServerPhotos = LocalProxyStore.shared.cachedPhotos(baseURL: baseURL, apiKey: cacheScope)
+            let scanCap = isOvernight ? 250 : 40
+            let inspectCap = isOvernight ? 2500 : 300
+            let rawCandidates = photoService.scanCandidates(
+                tracker: tracker,
+                knownServerPhotos: cachedServerPhotos,
+                maxResults: scanCap,
+                maxInspect: inspectCap
+            )
+            let prioritized = PhotoBackupPipeline
+                .sortCandidates(rawCandidates, by: .largestVideosFirst)
+                .filter { !existingStagedIds.contains($0.id) && !activeBgIds.contains($0.id) }
+                .prefix(maxItems)
+
+            let videoSemaphore = AsyncSemaphore(value: 1)
+            let photosSaveSemaphore = AsyncSemaphore(value: 1)
+
+            for candidate in prioritized {
+                if Task.isCancelled { break }
+                if candidate.isVideo || candidate.estimatedBytes > 15_000_000 {
+                    _ = await BackgroundUploadTransport.shared.enqueueSilentUpload(
+                        candidate: candidate,
+                        photoService: photoService,
+                        settings: settings
+                    )
+                    continue
+                }
+
+                do {
+                    let result = try await PhotoBackupPipeline.backupAndProxyAsset(
+                        candidate: candidate,
+                        photoService: photoService,
+                        apiClient: apiClient,
+                        tracker: tracker,
+                        format: format,
+                        maxPixelSize: maxPx,
+                        quality: quality,
+                        uploadMode: uploadMode,
+                        keepLocalProxy: keepLocal,
+                        normalizedBaseURL: baseURL,
+                        cacheScopeKey: cacheScope,
+                        videoSemaphore: videoSemaphore,
+                        photosSaveSemaphore: photosSaveSemaphore,
+                        onStageChange: { _ in }
+                    )
+
+                    if case .backedUp(let outcome) = result {
                         let entry = StagedCleanupItem(
                             id: candidate.id,
                             filename: outcome.filename,
@@ -597,8 +592,6 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                             self?.appendStagedItem(entry)
                         }
                         processedNew += 1
-                    case .skippedExistingProxy, .skippedProtectedOriginal:
-                        break
                     }
                 } catch APIClientError.httpError(507, _) {
                     await MainActor.run {
@@ -622,12 +615,12 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                 let totalStr = ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
 
                 if totalCount > 0 {
-                    self.updateSummary("Uploaded & verified \(processedNew) new item(s); \(totalCount) original(s) ready to delete (free ~\(totalStr)).")
-                    if processedNew > 0 || isOvernight {
+                    self.updateSummary("Silently verified \(processedNew) new item(s); \(totalCount) original(s) ready to delete (free ~\(totalStr)).")
+                    if (processedNew > 0 || isOvernight) && notifyImmediate {
                         self.sendDeleteOriginalsNotification(
                             count: totalCount,
                             savedBytes: totalBytes,
-                            immediate: notifyImmediate && !isOvernight,
+                            immediate: !isOvernight,
                             morningHour: morningHour
                         )
                     }
@@ -669,18 +662,58 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
             UserDefaults.standard.set(data, forKey: stagedStorageKey)
         }
     }
+}
 
-    private static func nextNightlyBeginDate() -> Date {
-        let now = Date()
-        let cal = Calendar.current
-        // Aim for 01:00 AM local time so large overnight uploads trigger while charging
-        if let nextNight = cal.nextDate(
-            after: now,
-            matching: DateComponents(hour: 1, minute: 0, second: 0),
-            matchingPolicy: .nextTime
-        ) {
-            return nextNight
+private final class SilentTaskBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: Task<Void, Never>?
+    private var bgTaskId: UIBackgroundTaskIdentifier = .invalid
+    private var cancelled = false
+
+    func set(_ t: Task<Void, Never>) {
+        lock.lock()
+        let alreadyCancelled = cancelled
+        task = t
+        lock.unlock()
+        if alreadyCancelled {
+            t.cancel()
         }
-        return now.addingTimeInterval(4 * 3600)
+    }
+
+    func setBackgroundTaskId(_ id: UIBackgroundTaskIdentifier) {
+        lock.lock()
+        let alreadyCancelled = cancelled
+        bgTaskId = id
+        lock.unlock()
+        if alreadyCancelled {
+            endBackgroundTask()
+        }
+    }
+
+    func endBackgroundTask() {
+        lock.lock()
+        let id = bgTaskId
+        bgTaskId = .invalid
+        lock.unlock()
+        if id != .invalid {
+            Task { @MainActor in
+                UIApplication.shared.endBackgroundTask(id)
+            }
+        }
+    }
+
+    func cancelAndEndBackgroundTask() {
+        lock.lock()
+        cancelled = true
+        let current = task
+        let id = bgTaskId
+        bgTaskId = .invalid
+        lock.unlock()
+        current?.cancel()
+        if id != .invalid {
+            Task { @MainActor in
+                UIApplication.shared.endBackgroundTask(id)
+            }
+        }
     }
 }

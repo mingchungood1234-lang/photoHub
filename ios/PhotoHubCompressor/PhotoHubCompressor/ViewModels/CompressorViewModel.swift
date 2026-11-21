@@ -27,7 +27,6 @@ final class CompressorViewModel: ObservableObject {
     private var pendingAutoDeleteWhenActive: Bool = false
     private var activeBgTaskId: UIBackgroundTaskIdentifier = .invalid
     private var activeUploadTask: Task<Void, Never>?
-    private var activeContinuedSession: ContinuedUploadSession?
     private var activeItemProgress: [String: Double] = [:]
     private var hasAutoStartedThisSession: Bool = false
 
@@ -105,8 +104,7 @@ final class CompressorViewModel: ObservableObject {
 
     func scanAndAutoCompressIfEnabled(forceNow: Bool = false) {
         if !forceNow {
-            guard !hasAutoStartedThisSession,
-                  (settings.autoCompressOnOpen || settings.nightlyAutoBackupEnabled) else {
+            guard !hasAutoStartedThisSession, settings.autoCompressOnOpen else {
                 return
             }
             hasAutoStartedThisSession = true
@@ -134,7 +132,6 @@ final class CompressorViewModel: ObservableObject {
                     apiKey: self.settings.apiKey
                 )
                 Task.detached(priority: .userInitiated) { [weak self] in
-                    // Bounded fast scan so auto-upload & iOS 26 Home Screen progress start in under a second
                     let raw = service.scanCandidates(
                         tracker: tracker,
                         knownServerPhotos: cachedServerPhotos,
@@ -146,7 +143,7 @@ final class CompressorViewModel: ObservableObject {
                         guard let self else { return }
                         self.applyScannedCandidates(sorted)
                         self.isScanning = false
-                        if !sorted.isEmpty && (forceNow || self.settings.autoCompressOnOpen || self.settings.nightlyAutoBackupEnabled) {
+                        if !sorted.isEmpty && (forceNow || self.settings.autoCompressOnOpen) {
                             self.selectAllEligible(true)
                             self.startProcessingSelectedPhotos()
                         } else if sorted.isEmpty {
@@ -263,15 +260,6 @@ final class CompressorViewModel: ObservableObject {
         let notifyOnFinish = settings.notifyWhenBackgroundUploadFinishes
         let morningHour = settings.morningReminderHour
 
-        let continuedSession = BackgroundBackupManager.shared.beginContinuedUploadSession(
-            totalCount: targetIds.count
-        ) { [weak self] in
-            Task { @MainActor [weak self] in
-                self?.activeUploadTask?.cancel()
-            }
-        }
-        activeContinuedSession = continuedSession
-
         let apiClient = PhotoHubAPIClient(settings: settings)
         let format = settings.proxyFormat
         let maxPx = settings.proxyMaxPixelSize
@@ -282,10 +270,7 @@ final class CompressorViewModel: ObservableObject {
         let apiKey = settings.apiKey
 
         activeUploadTask = Task.detached(priority: .userInitiated) { [weak self] in
-            guard let self = self else {
-                continuedSession?.finish(success: false)
-                return
-            }
+            guard let self = self else { return }
 
             do {
                 let info = try await apiClient.whoami()
@@ -293,9 +278,7 @@ final class CompressorViewModel: ObservableObject {
                     self.settings.serverStorage = info.storage
                 }
             } catch APIClientError.httpError(401, _) {
-                continuedSession?.finish(success: false)
                 await MainActor.run {
-                    self.activeContinuedSession = nil
                     self.activeUploadTask = nil
                     self.isProcessing = false
                     self.endAppBackgroundTask()
@@ -305,9 +288,7 @@ final class CompressorViewModel: ObservableObject {
                 }
                 return
             } catch {
-                continuedSession?.finish(success: false)
                 await MainActor.run {
-                    self.activeContinuedSession = nil
                     self.activeUploadTask = nil
                     self.isProcessing = false
                     self.endAppBackgroundTask()
@@ -339,7 +320,6 @@ final class CompressorViewModel: ObservableObject {
                                 apiKey: apiKey,
                                 videoSemaphore: videoSemaphore,
                                 photosSaveSemaphore: photosSaveSemaphore,
-                                continuedSession: continuedSession,
                                 totalCount: targetIds.count
                             )
                             if !ok {
@@ -366,7 +346,6 @@ final class CompressorViewModel: ObservableObject {
             let finishedCleanly = !Task.isCancelled && failedCount == 0
 
             await MainActor.run {
-                self.activeContinuedSession = nil
                 self.activeUploadTask = nil
                 self.isProcessing = false
                 self.overallProgressFraction = finishedCleanly ? 1.0 : self.overallProgressFraction
@@ -374,10 +353,6 @@ final class CompressorViewModel: ObservableObject {
                 let savedStr = ByteCountFormatter.string(fromByteCount: self.totalSavedBytes, countStyle: .file)
                 if !self.pendingDeleteAssets.isEmpty {
                     let readyCount = self.pendingDeleteAssets.count
-                    continuedSession?.finish(
-                        success: finishedCleanly,
-                        completionNote: "Done · Tap notification to delete \(readyCount) original(s)"
-                    )
                     if notifyOnFinish && UIApplication.shared.applicationState != .active {
                         BackgroundBackupManager.shared.sendDeleteOriginalsNotification(
                             count: readyCount,
@@ -387,13 +362,10 @@ final class CompressorViewModel: ObservableObject {
                         )
                     }
                     self.scheduleAutomaticDeletePrompt()
-                } else {
-                    continuedSession?.finish(success: finishedCleanly, completionNote: "All originals backed up")
-                    if failedCount > 0 && self.statusBanner == nil {
-                        self.statusBanner = "Finished with \(failedCount) error(s). Space saved: \(savedStr)."
-                    } else if failedCount == 0 {
-                        self.statusBanner = "Finished! All originals backed up & verified."
-                    }
+                } else if failedCount > 0 && self.statusBanner == nil {
+                    self.statusBanner = "Finished with \(failedCount) error(s). Space saved: \(savedStr)."
+                } else if failedCount == 0 {
+                    self.statusBanner = "Finished! All originals backed up & verified."
                 }
             }
         }
@@ -426,7 +398,6 @@ final class CompressorViewModel: ObservableObject {
         apiKey: String,
         videoSemaphore: AsyncSemaphore,
         photosSaveSemaphore: AsyncSemaphore,
-        continuedSession: ContinuedUploadSession?,
         totalCount: Int
     ) async -> Bool {
         let candidate: PhotoCandidate? = await MainActor.run {
@@ -440,13 +411,7 @@ final class CompressorViewModel: ObservableObject {
         guard let candidate else {
             await MainActor.run {
                 self.completedCount += 1
-                self.recordItemProgress(
-                    id: currentId,
-                    fraction: 1.0,
-                    totalCount: totalCount,
-                    statusText: "",
-                    continuedSession: continuedSession
-                )
+                self.recordItemProgress(id: currentId, fraction: 1.0, totalCount: totalCount)
             }
             return true
         }
@@ -473,9 +438,7 @@ final class CompressorViewModel: ObservableObject {
                     self.recordItemProgress(
                         id: currentId,
                         fraction: Self.stageFraction(for: newState),
-                        totalCount: totalCount,
-                        statusText: candidate.filename,
-                        continuedSession: continuedSession
+                        totalCount: totalCount
                     )
                 }
             }
@@ -509,13 +472,7 @@ final class CompressorViewModel: ObservableObject {
                     }
                 }
                 self.completedCount += 1
-                self.recordItemProgress(
-                    id: currentId,
-                    fraction: 1.0,
-                    totalCount: totalCount,
-                    statusText: candidate.filename,
-                    continuedSession: continuedSession
-                )
+                self.recordItemProgress(id: currentId, fraction: 1.0, totalCount: totalCount)
             }
             return true
         } catch {
@@ -523,13 +480,7 @@ final class CompressorViewModel: ObservableObject {
                 self.updateState(id: currentId, state: .failed(error.localizedDescription))
                 self.statusBanner = error.localizedDescription
                 self.completedCount += 1
-                self.recordItemProgress(
-                    id: currentId,
-                    fraction: 1.0,
-                    totalCount: totalCount,
-                    statusText: candidate.filename,
-                    continuedSession: continuedSession
-                )
+                self.recordItemProgress(id: currentId, fraction: 1.0, totalCount: totalCount)
             }
             return false
         }
@@ -538,21 +489,12 @@ final class CompressorViewModel: ObservableObject {
     private func recordItemProgress(
         id: String,
         fraction: Double,
-        totalCount: Int,
-        statusText: String,
-        continuedSession: ContinuedUploadSession?
+        totalCount: Int
     ) {
         let existing = activeItemProgress[id] ?? 0.0
         activeItemProgress[id] = max(existing, min(1.0, max(0.0, fraction)))
         let totalSum = activeItemProgress.values.reduce(0.0, +)
-        let overall = min(1.0, max(0.0, totalSum / Double(max(1, totalCount))))
-        overallProgressFraction = overall
-        continuedSession?.update(
-            fraction: overall,
-            completed: completedCount,
-            total: totalCount,
-            statusText: statusText
-        )
+        overallProgressFraction = min(1.0, max(0.0, totalSum / Double(max(1, totalCount))))
     }
 
     private static func stageFraction(for state: PhotoCompressionState) -> Double {
