@@ -20,8 +20,10 @@ import androidx.work.*
 import com.photohub.compressor.MainActivity
 import com.photohub.compressor.R
 import com.photohub.compressor.data.AppSettings
+import com.photohub.compressor.data.AppSettingsState
 import com.photohub.compressor.data.CandidateSortMode
 import com.photohub.compressor.data.StagedCleanupItem
+import com.photohub.compressor.media.BackupPipelineOutcome
 import com.photohub.compressor.media.BackupPipelineResult
 import com.photohub.compressor.media.MediaAccessLevel
 import com.photohub.compressor.media.MediaLibraryService
@@ -165,6 +167,7 @@ class BackgroundBackupManager private constructor(context: Context) {
         val workManager = WorkManager.getInstance(appContext)
         if (!cur.nightlyAutoBackupEnabled || !cur.isSignedIn) {
             workManager.cancelUniqueWork(UNIQUE_PERIODIC_WORK)
+            workManager.cancelUniqueWork(UNIQUE_CONTENT_TRIGGER_WORK)
             return
         }
 
@@ -183,9 +186,44 @@ class BackgroundBackupManager private constructor(context: Context) {
             ExistingPeriodicWorkPolicy.UPDATE,
             periodic
         )
+        scheduleMediaContentTriggerIfEnabled(replaceExisting = false)
         if (_state.value.lastRunSummary.isEmpty()) {
             updateSummary("Silent auto-upload active in background.")
         }
+    }
+
+    /**
+     * Registers a persistent WorkManager MediaStore content trigger so Android wakes PhotoUploadWorker
+     * in the background whenever new camera photos/videos appear—even if the app is closed.
+     */
+    fun scheduleMediaContentTriggerIfEnabled(replaceExisting: Boolean = false) {
+        val cur = settings.current
+        val workManager = WorkManager.getInstance(appContext)
+        if (!cur.nightlyAutoBackupEnabled || !cur.isSignedIn) {
+            workManager.cancelUniqueWork(UNIQUE_CONTENT_TRIGGER_WORK)
+            return
+        }
+        val mediaService = MediaLibraryService(appContext)
+        if (mediaService.currentAccessLevel() == MediaAccessLevel.DENIED) return
+
+        val triggerConstraints = Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .addContentUriTrigger(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, true)
+            .addContentUriTrigger(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, true)
+            .setTriggerContentUpdateDelay(3, TimeUnit.SECONDS)
+            .setTriggerContentMaxDelay(20, TimeUnit.SECONDS)
+            .build()
+
+        val triggerWork = OneTimeWorkRequestBuilder<PhotoUploadWorker>()
+            .setConstraints(triggerConstraints)
+            .setInputData(workDataOf(PhotoUploadWorker.KEY_IS_OVERNIGHT to false))
+            .build()
+
+        workManager.enqueueUniqueWork(
+            UNIQUE_CONTENT_TRIGGER_WORK,
+            if (replaceExisting) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP,
+            triggerWork
+        )
     }
 
     fun scheduleDebouncedSilentCheck(delayMs: Long = 2500L) {
@@ -263,6 +301,8 @@ class BackgroundBackupManager private constructor(context: Context) {
                 val videoSem = Semaphore(1)
                 val gallerySem = Semaphore(1)
                 val newStaged = mutableListOf<StagedCleanupItem>()
+                var silentDeletedCount = 0
+                var silentDeletedBytes = 0L
 
                 for (candidate in batch) {
                     if (!isActive) break
@@ -288,15 +328,27 @@ class BackgroundBackupManager private constructor(context: Context) {
                             onStageChange = {}
                         )
                         if (res is BackupPipelineResult.BackedUp) {
-                            newStaged.add(
-                                StagedCleanupItem(
-                                    id = candidate.id,
-                                    filename = res.outcome.filename,
-                                    masterSha256 = res.outcome.masterSha256,
-                                    savedBytes = res.outcome.savedBytes,
-                                    verifiedAtMs = System.currentTimeMillis()
-                                )
+                            val deletedSilently = tryHandleBackedUpSilentDelete(
+                                candidateId = candidate.id,
+                                outcome = res.outcome,
+                                settingsState = cur,
+                                mediaService = mediaService,
+                                tracker = tracker
                             )
+                            if (deletedSilently) {
+                                silentDeletedCount++
+                                silentDeletedBytes += res.outcome.savedBytes.coerceAtLeast(0L)
+                            } else {
+                                newStaged.add(
+                                    StagedCleanupItem(
+                                        id = candidate.id,
+                                        filename = res.outcome.filename,
+                                        masterSha256 = res.outcome.masterSha256,
+                                        savedBytes = res.outcome.savedBytes,
+                                        verifiedAtMs = System.currentTimeMillis()
+                                    )
+                                )
+                            }
                         }
                     } catch (err: ApiHttpException) {
                         if (err.statusCode == 507) break
@@ -310,12 +362,16 @@ class BackgroundBackupManager private constructor(context: Context) {
 
                 if (newStaged.isNotEmpty()) {
                     appendStagedItems(newStaged)
-                    pruneMissingAssetsFromStaged()
-                    val stagedCount = _state.value.stagedItems.size
-                    val stagedBytes = _state.value.stagedSavedBytes
-                    val totalStr = Formatter.formatFileSize(appContext, stagedBytes)
+                }
+                pruneMissingAssetsFromStaged()
+                silentlyCleanStagedItemsIfAllowed()
+
+                val stagedCount = _state.value.stagedItems.size
+                val stagedBytes = _state.value.stagedSavedBytes
+                val totalStr = Formatter.formatFileSize(appContext, stagedBytes)
+                if (stagedCount > 0 && newStaged.isNotEmpty()) {
                     updateSummary("Silently backed up ${newStaged.size} item(s); $stagedCount original(s) ready to delete (~$totalStr).")
-                    if (cur.notifyWhenBackgroundUploadFinishes && stagedCount > 0) {
+                    if (cur.notifyWhenBackgroundUploadFinishes) {
                         sendDeleteOriginalsNotification(
                             count = stagedCount,
                             savedBytes = stagedBytes,
@@ -323,6 +379,9 @@ class BackgroundBackupManager private constructor(context: Context) {
                             morningHour = cur.morningReminderHour
                         )
                     }
+                } else if (silentDeletedCount > 0) {
+                    val freedStr = Formatter.formatFileSize(appContext, silentDeletedBytes)
+                    updateSummary("Silently uploaded, verified & deleted $silentDeletedCount original(s) (freed ~$freedStr).")
                 }
             } finally {
                 val retryAt = System.currentTimeMillis() + 180_000L
@@ -386,6 +445,73 @@ class BackgroundBackupManager private constructor(context: Context) {
         saveStaged(emptyList())
         _state.value = _state.value.copy(stagedItems = emptyList())
         NotificationManagerCompat.from(appContext).cancel(NOTIFICATION_ID_DELETE_READY)
+    }
+
+    /**
+     * Silently deletes a verified original right after backup+proxy creation if user opted in
+     * and granted All Files Access (`MANAGE_EXTERNAL_STORAGE`). Never runs on restored-protected items.
+     */
+    suspend fun tryHandleBackedUpSilentDelete(
+        candidateId: String,
+        outcome: BackupPipelineOutcome,
+        settingsState: AppSettingsState = settings.current,
+        mediaService: MediaLibraryService = MediaLibraryService(appContext),
+        tracker: LocalProxyTracker = LocalProxyTracker.getInstance(appContext)
+    ): Boolean {
+        if (!settingsState.silentAutoDeleteOriginals || !mediaService.canSilentlyDeleteOriginals()) {
+            return false
+        }
+        if (tracker.isRestoredMasterHash(outcome.masterSha256) || tracker.isRestoredOriginal(candidateId)) {
+            return false
+        }
+        if (settingsState.keepLocalProxyInPhotos && tracker.liveProxyAssetId(outcome.masterSha256) == null) {
+            return false
+        }
+        return mediaService.trySilentDeleteOriginal(candidateId)
+    }
+
+    suspend fun silentlyCleanStagedItemsIfAllowed(): Int {
+        val cur = settings.current
+        val mediaService = MediaLibraryService(appContext)
+        if (!cur.silentAutoDeleteOriginals || !mediaService.canSilentlyDeleteOriginals()) {
+            return 0
+        }
+        val current = _state.value.stagedItems
+        if (current.isEmpty()) return 0
+
+        val tracker = LocalProxyTracker.getInstance(appContext)
+        val deletedIds = mutableSetOf<String>()
+        var freedBytes = 0L
+
+        for (item in current) {
+            if (tracker.isRestoredMasterHash(item.masterSha256) || tracker.isRestoredOriginal(item.id)) {
+                continue
+            }
+            if (cur.keepLocalProxyInPhotos && tracker.liveProxyAssetId(item.masterSha256) == null) {
+                continue
+            }
+            if (mediaService.trySilentDeleteOriginal(item.id)) {
+                deletedIds.add(item.id)
+                freedBytes += item.savedBytes.coerceAtLeast(0L)
+            }
+        }
+
+        if (deletedIds.isNotEmpty()) {
+            removeStagedItems(deletedIds)
+            val freedStr = Formatter.formatFileSize(appContext, freedBytes)
+            updateSummary("Silently deleted ${deletedIds.size} backed-up original(s) (freed ~$freedStr).")
+        }
+        return deletedIds.size
+    }
+
+    fun silentlyCleanStagedItemsIfAllowedAsync() {
+        val cur = settings.current
+        if (!cur.silentAutoDeleteOriginals || !MediaLibraryService(appContext).canSilentlyDeleteOriginals()) {
+            return
+        }
+        scope.launch {
+            silentlyCleanStagedItemsIfAllowed()
+        }
     }
 
     fun sendTestMorningAlert() {
@@ -467,6 +593,7 @@ class BackgroundBackupManager private constructor(context: Context) {
         private const val NOTIFICATION_ID_DELETE_READY = 4101
         private const val NOTIFICATION_ID_TEST = 4102
         private const val UNIQUE_PERIODIC_WORK = "photohub_periodic_backup"
+        private const val UNIQUE_CONTENT_TRIGGER_WORK = "photohub_content_trigger_backup"
         private const val UNIQUE_IMMEDIATE_BG_WORK = "photohub_immediate_bg_backup"
         private const val KEY_STAGED_ITEMS = "staged_cleanup_items_v1"
         private const val KEY_LAST_SUMMARY = "last_run_summary_v1"

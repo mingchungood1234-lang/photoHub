@@ -399,7 +399,26 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
             }
 
             if (pendingIds.isNotEmpty()) {
-                triggerTrashConfirmation(pendingIds)
+                val latestSettings = settings.current
+                if (latestSettings.silentAutoDeleteOriginals && mediaService.canSilentlyDeleteOriginals()) {
+                    val silentlyDeleted = mutableListOf<String>()
+                    val remaining = mutableListOf<String>()
+                    for (id in pendingIds) {
+                        if (mediaService.trySilentDeleteOriginal(id)) {
+                            silentlyDeleted.add(id)
+                        } else {
+                            remaining.add(id)
+                        }
+                    }
+                    if (silentlyDeleted.isNotEmpty()) {
+                        onTrashConfirmed(silentlyDeleted, silent = true)
+                    }
+                    if (remaining.isNotEmpty()) {
+                        triggerTrashConfirmation(remaining)
+                    }
+                } else {
+                    triggerTrashConfirmation(pendingIds)
+                }
             } else if (failures > 0 && _uiState.value.statusBanner == null) {
                 _uiState.update { it.copy(statusBanner = "Finished with $failures error(s). Space saved: $savedStr.") }
             } else if (failures == 0) {
@@ -621,7 +640,7 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
         _uiState.update { it.copy(trashPromptRequest = null) }
     }
 
-    fun onTrashConfirmed(targetIds: List<String>) {
+    fun onTrashConfirmed(targetIds: List<String>, silent: Boolean = false) {
         val deletedSet = targetIds.toSet()
         val stagedSaved = bgManager.state.value.stagedItems
             .filter { it.id in deletedSet }
@@ -638,12 +657,17 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
                 trashPromptRequest = null,
                 candidates = prev.candidates.filterNot { it.id in deletedSet },
                 pendingDeleteIds = remainingPending,
-                recentlyDeletedNoticeCount = prev.recentlyDeletedNoticeCount + deletedSet.size,
-                recentlyDeletedNoticeBytes = prev.recentlyDeletedNoticeBytes + freed.coerceAtLeast(0L),
-                statusBanner = if (remainingPending.isEmpty()) {
-                    "Verified & moved ${deletedSet.size} original(s) ($freedStr) to Trash (30 days)."
-                } else {
-                    "Moved ${deletedSet.size} original(s) to Trash. ${remainingPending.size} remain."
+                recentlyDeletedNoticeCount = if (silent) prev.recentlyDeletedNoticeCount else prev.recentlyDeletedNoticeCount + deletedSet.size,
+                recentlyDeletedNoticeBytes = if (silent) prev.recentlyDeletedNoticeBytes else prev.recentlyDeletedNoticeBytes + freed.coerceAtLeast(0L),
+                statusBanner = when {
+                    silent && remainingPending.isEmpty() ->
+                        "Verified & silently freed $freedStr across ${deletedSet.size} original(s)."
+                    silent ->
+                        "Silently deleted ${deletedSet.size} original(s). ${remainingPending.size} remain."
+                    remainingPending.isEmpty() ->
+                        "Verified & moved ${deletedSet.size} original(s) ($freedStr) to Trash (30 days)."
+                    else ->
+                        "Moved ${deletedSet.size} original(s) to Trash. ${remainingPending.size} remain."
                 }
             )
         }

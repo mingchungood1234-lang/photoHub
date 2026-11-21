@@ -3,6 +3,7 @@ package com.photohub.compressor.ui.screens
 import android.app.Activity
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.provider.Settings
 import android.text.format.Formatter
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -20,6 +21,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.photohub.compressor.data.*
 import com.photohub.compressor.ui.theme.*
@@ -51,6 +55,17 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
         val sender = uiState.pendingTestTrashIntentSender ?: return@LaunchedEffect
         viewModel.clearPendingTestTrash()
         testTrashLauncher.launch(IntentSenderRequest.Builder(sender).build())
+    }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                viewModel.onAppear()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     LaunchedEffect(Unit) {
@@ -241,12 +256,47 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
             item {
                 SectionCard(
                     title = "Silent Background Upload & Delete Alerts",
-                    footer = "Just like Google Photos, new photos & videos upload quietly in the background without progress banners or interruptions. Once backups are SHA-256 verified and ready to remove, photoHub sends a notification so you can tap once to trash original photos."
+                    footer = "New photos & videos trigger WorkManager silently in the background (even when the app is closed). Enable 'Silent Auto-Delete Originals' + grant All Files Access to permanently delete verified originals without notifications or Trash popups; otherwise photoHub notifies you to confirm Trash."
                 ) {
                     SwitchRow("Silent Auto Background Upload", settingsState.nightlyAutoBackupEnabled) { enabled ->
                         viewModel.settings.setNightlyAutoBackupEnabled(enabled)
                         viewModel.bgManager.scheduleBackgroundWorkersIfEnabled()
                         if (enabled) viewModel.bgManager.triggerSilentAutoUpload(isMovingToBackground = false)
+                    }
+                    SwitchRow(
+                        label = "Silent Auto-Delete Originals (No Popup)",
+                        checked = settingsState.silentAutoDeleteOriginals,
+                        enabled = true
+                    ) { enabled ->
+                        viewModel.setSilentAutoDeleteOriginals(enabled)
+                        if (enabled && !uiState.hasAllFilesAccess) {
+                            openAllFilesAccessSettings(context)
+                        }
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("All Files Access (Silent Delete)", style = MaterialTheme.typography.bodyMedium)
+                                Text(
+                                    text = if (uiState.hasAllFilesAccess) {
+                                        "Allowed — verified originals can delete silently"
+                                    } else {
+                                        "Required on Android 11+ to skip Trash popups"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (uiState.hasAllFilesAccess) PhotoHubGreen else PhotoHubOrange
+                                )
+                            }
+                            TextButton(
+                                onClick = { openAllFilesAccessSettings(context) },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                            ) {
+                                Text(if (uiState.hasAllFilesAccess) "Manage" else "Grant")
+                            }
+                        }
                     }
                     SwitchRow("Notify When Ready to Delete Originals", settingsState.notifyWhenBackgroundUploadFinishes) {
                         viewModel.settings.setNotifyWhenBackgroundUploadFinishes(it)
@@ -586,4 +636,26 @@ private fun SwitchRow(
         )
         Switch(checked = checked, onCheckedChange = onCheckedChange, enabled = enabled)
     }
+}
+
+private fun openAllFilesAccessSettings(context: android.content.Context) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        val pkgIntent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+            data = Uri.fromParts("package", context.packageName, null)
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        val openedPkg = runCatching { context.startActivity(pkgIntent) }.isSuccess
+        if (openedPkg) return
+
+        val allIntent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        val openedAll = runCatching { context.startActivity(allIntent) }.isSuccess
+        if (openedAll) return
+    }
+    val detailsIntent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+        data = Uri.fromParts("package", context.packageName, null)
+        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+    }
+    runCatching { context.startActivity(detailsIntent) }
 }

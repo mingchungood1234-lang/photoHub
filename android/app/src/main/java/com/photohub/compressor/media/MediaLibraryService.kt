@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.IntentSender
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -68,6 +69,24 @@ class MediaLibraryService(private val context: Context) {
         val read = ContextCompat.checkSelfPermission(context, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
         return if (read) MediaAccessLevel.FULL_ACCESS else MediaAccessLevel.DENIED
     }
+
+    fun hasMediaLocationPermission(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return true
+        return ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_MEDIA_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    fun hasAllFilesAccess(): Boolean = when {
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> Environment.isExternalStorageManager()
+        Build.VERSION.SDK_INT <= Build.VERSION_CODES.P ->
+            ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        else -> false
+    }
+
+    fun canSilentlyDeleteOriginals(): Boolean =
+        hasAllFilesAccess() && currentAccessLevel() != MediaAccessLevel.DENIED
 
     fun canWriteGallery(): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -288,13 +307,7 @@ class MediaLibraryService(private val context: Context) {
         var total = 0L
 
         try {
-            val sourceUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                runCatching { MediaStore.setRequireOriginal(candidate.contentUri) }.getOrDefault(candidate.contentUri)
-            } else {
-                candidate.contentUri
-            }
-            val input = resolver.openInputStream(sourceUri)
-                ?: resolver.openInputStream(candidate.contentUri)
+            val input = openOriginalStreamWithFallback(resolver, candidate.contentUri)
                 ?: throw IOException("Could not open original media stream.")
 
             input.use { stream ->
@@ -322,6 +335,27 @@ class MediaLibraryService(private val context: Context) {
             tempFile.delete()
             throw err
         }
+    }
+
+    private fun openOriginalStreamWithFallback(
+        resolver: android.content.ContentResolver,
+        uri: Uri
+    ) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && hasMediaLocationPermission()) {
+        val originalUri = runCatching { MediaStore.setRequireOriginal(uri) }.getOrNull()
+        val openedOriginal = if (originalUri != null) {
+            try {
+                resolver.openInputStream(originalUri)
+            } catch (_: SecurityException) {
+                null
+            } catch (_: UnsupportedOperationException) {
+                null
+            }
+        } else {
+            null
+        }
+        openedOriginal ?: resolver.openInputStream(uri)
+    } else {
+        resolver.openInputStream(uri)
     }
 
     suspend fun saveCompressedProxyToGallery(
@@ -484,7 +518,73 @@ class MediaLibraryService(private val context: Context) {
         return TrashOrDeleteRequestResult.DeletedImmediately(deletedIds)
     }
 
+    /**
+     * Silently deletes a verified original without a system confirmation dialog when
+     * All Files Access (`MANAGE_EXTERNAL_STORAGE` on Android 11+, or legacy storage write on <= 9) is active.
+     * Refuses to delete any PhotoHub compressed proxy filename or restored-protected asset.
+     */
+    suspend fun trySilentDeleteOriginal(assetId: String): Boolean = withContext(Dispatchers.IO) {
+        if (!canSilentlyDeleteOriginals()) return@withContext false
+        val tracker = LocalProxyTracker.getInstance(context)
+        if (tracker.isKnownProxy(assetId) || tracker.isRestoredOriginal(assetId)) {
+            return@withContext false
+        }
+
+        val uri = Uri.parse(assetId)
+        val (displayName, diskPath) = queryMediaFileInfo(uri)
+        val candidateName = displayName ?: diskPath?.let { File(it).name }
+        if (candidateName != null && !isSafeSilentDeleteFilename(candidateName)) {
+            return@withContext false
+        }
+
+        val resolverDeleted = runCatching {
+            context.contentResolver.delete(uri, null, null) > 0
+        }.getOrDefault(false)
+
+        if (diskPath != null && hasAllFilesAccess()) {
+            val file = File(diskPath)
+            if (file.exists()) {
+                val fileDeleted = runCatching { file.delete() }.getOrDefault(false)
+                if (fileDeleted || !file.exists()) {
+                    runCatching { context.contentResolver.delete(uri, null, null) }
+                    MediaScannerConnection.scanFile(context, arrayOf(diskPath), null, null)
+                }
+            }
+            return@withContext !File(diskPath).exists()
+        }
+
+        resolverDeleted || fetchLiveAssetIds(listOf(assetId)).isEmpty()
+    }
+
+    private fun queryMediaFileInfo(uri: Uri): Pair<String?, String?> {
+        val projection = arrayOf(
+            MediaStore.MediaColumns.DISPLAY_NAME,
+            MediaStore.MediaColumns.DATA
+        )
+        return runCatching {
+            context.contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val nameIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME)
+                    val dataIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
+                    val name = if (nameIdx >= 0) cursor.getString(nameIdx) else null
+                    val path = if (dataIdx >= 0) cursor.getString(dataIdx) else null
+                    name to path
+                } else {
+                    null to null
+                }
+            } ?: (null to null)
+        }.getOrDefault(null to null)
+    }
+
     suspend fun findLatestImageCandidate(tracker: LocalProxyTracker): PhotoCandidate? = withContext(Dispatchers.IO) {
         scanCandidates(tracker = tracker, maxResults = 1, maxInspect = 30).firstOrNull()
+    }
+
+    companion object {
+        fun isSafeSilentDeleteFilename(filenameOrPath: String): Boolean {
+            val trimmed = filenameOrPath.trim()
+            if (trimmed.isEmpty()) return false
+            return ProxyGenerator.extractMasterHashPrefix(File(trimmed).name) == null
+        }
     }
 }

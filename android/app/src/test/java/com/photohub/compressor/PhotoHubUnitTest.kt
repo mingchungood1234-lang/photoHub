@@ -3,6 +3,7 @@ package com.photohub.compressor
 import com.photohub.compressor.background.AssetUploadCoordinator
 import com.photohub.compressor.background.UploadOwner
 import com.photohub.compressor.data.*
+import com.photohub.compressor.media.MediaLibraryService
 import com.photohub.compressor.media.PhotoBackupPipeline
 import com.photohub.compressor.media.ProxyGenerator
 import com.photohub.compressor.media.ShareUtils
@@ -127,5 +128,14 @@ class PhotoHubUnitTest {
             assertEquals(ranges[i].last + 1L, ranges[i + 1].first)
         }
         assertEquals(11_000_000L - 2_000_000L, ranges.sumOf { (it.last - it.first) + 1L })
+    }
+
+    @Test
+    fun `silent delete filename guard protects compressed proxies and blank names`() {
+        assertTrue(MediaLibraryService.isSafeSilentDeleteFilename("IMG_20261121_120000.HEIC"))
+        assertTrue(MediaLibraryService.isSafeSilentDeleteFilename("/storage/emulated/0/DCIM/Camera/VID_0001.mp4"))
+        assertFalse(MediaLibraryService.isSafeSilentDeleteFilename("PHOTOHUB_PROXY_0123456789abcdef.jpg"))
+        assertFalse(MediaLibraryService.isSafeSilentDeleteFilename("/storage/emulated/0/Movies/PhotoHub/PHOTOHUB_PROXY_fedcba9876543210 (1).mp4"))
+        assertFalse(MediaLibraryService.isSafeSilentDeleteFilename(""))
     }
 }

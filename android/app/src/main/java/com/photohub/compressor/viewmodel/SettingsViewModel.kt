@@ -23,7 +23,9 @@ data class SettingsUiState(
     val deleteDiagResult: String? = null,
     val pendingTestTrashIntentSender: IntentSender? = null,
     val localProxyCacheBytes: Long = 0L,
-    val mediaPermissionLabel: String = "Denied"
+    val mediaPermissionLabel: String = "Denied",
+    val hasAllFilesAccess: Boolean = false,
+    val canSilentlyDeleteOriginals: Boolean = false
 )
 
 class SettingsViewModel(application: Application) : AndroidViewModel(application) {
@@ -38,7 +40,9 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     private val _uiState = MutableStateFlow(
         SettingsUiState(
             localProxyCacheBytes = store.totalStorageBytes(),
-            mediaPermissionLabel = mediaService.permissionLabel()
+            mediaPermissionLabel = mediaService.permissionLabel(),
+            hasAllFilesAccess = mediaService.hasAllFilesAccess(),
+            canSilentlyDeleteOriginals = mediaService.canSilentlyDeleteOriginals()
         )
     )
     val uiState: StateFlow<SettingsUiState> = _uiState.asStateFlow()
@@ -53,11 +57,33 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     fun onAppear() {
         bgManager.refreshNotificationPermissionLabel()
+        val hasAllFiles = mediaService.hasAllFilesAccess()
+        val canSilentDelete = mediaService.canSilentlyDeleteOriginals()
         _uiState.update {
             it.copy(
                 localProxyCacheBytes = store.totalStorageBytes(),
-                mediaPermissionLabel = mediaService.permissionLabel()
+                mediaPermissionLabel = mediaService.permissionLabel(),
+                hasAllFilesAccess = hasAllFiles,
+                canSilentlyDeleteOriginals = canSilentDelete
             )
+        }
+        if (canSilentDelete && settings.current.silentAutoDeleteOriginals) {
+            bgManager.silentlyCleanStagedItemsIfAllowedAsync()
+        }
+        bgManager.ensureMediaObserverAndSchedule()
+    }
+
+    fun setSilentAutoDeleteOriginals(enabled: Boolean) {
+        settings.setSilentAutoDeleteOriginals(enabled)
+        _uiState.update {
+            it.copy(
+                hasAllFilesAccess = mediaService.hasAllFilesAccess(),
+                canSilentlyDeleteOriginals = mediaService.canSilentlyDeleteOriginals()
+            )
+        }
+        bgManager.scheduleBackgroundWorkersIfEnabled()
+        if (enabled && mediaService.canSilentlyDeleteOriginals()) {
+            bgManager.silentlyCleanStagedItemsIfAllowedAsync()
         }
     }
 

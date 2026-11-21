@@ -47,7 +47,9 @@ class MainActivity : ComponentActivity() {
         GoogleAuthManager.getInstance(applicationContext).cancelPendingUiStateIfReturnedWithoutCallback()
         BackgroundBackupManager.getInstance(applicationContext).apply {
             pruneMissingAssetsFromStaged()
+            silentlyCleanStagedItemsIfAllowedAsync()
             refreshNotificationPermissionLabel()
+            ensureMediaObserverAndSchedule()
             triggerSilentAutoUpload(isMovingToBackground = false)
         }
     }
@@ -74,12 +76,16 @@ class MainActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             needed += Manifest.permission.READ_MEDIA_IMAGES
             needed += Manifest.permission.READ_MEDIA_VIDEO
+            needed += Manifest.permission.ACCESS_MEDIA_LOCATION
             needed += Manifest.permission.POST_NOTIFICATIONS
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 needed += Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED
             }
         } else {
             needed += Manifest.permission.READ_EXTERNAL_STORAGE
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                needed += Manifest.permission.ACCESS_MEDIA_LOCATION
+            }
             if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
                 needed += Manifest.permission.WRITE_EXTERNAL_STORAGE
             }
