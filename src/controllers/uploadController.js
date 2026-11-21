@@ -107,6 +107,7 @@ function createUploadController({ config, contextService }) {
               storageDir,
               hashIndex,
               quotaBytes,
+              minFreeDiskBytes: config.minFreeDiskBytes,
             });
             itemResult.userFolder = folderName;
             results.push(itemResult);
@@ -137,6 +138,7 @@ function createUploadController({ config, contextService }) {
           storageDir,
           hashIndex,
           quotaBytes,
+          minFreeDiskBytes: config.minFreeDiskBytes,
         });
 
         result.userFolder = folderName;
@@ -205,6 +207,7 @@ function createUploadController({ config, contextService }) {
 
         const quotaBytes = contextService.getQuotaBytesForContext(req.userContext);
         assertWithinQuota(hashIndex, quotaBytes, Number(fileSize) || 0);
+        await contextService.assertDiskFreeForUpload(Number(fileSize) || 0);
 
         const { year, dateFolder } = parseDateFolder(createdAt);
         const safeName = sanitizeFilename(fileName, mimeType, cleanHash);

@@ -255,6 +255,38 @@ class UserDirectory {
     return this.usersBySub.get(String(sub || '')) || null;
   }
 
+  getByEmail(email) {
+    const clean = String(email || '').trim().toLowerCase();
+    if (!clean) return null;
+    for (const rec of this.usersBySub.values()) {
+      if (rec && String(rec.email || '').trim().toLowerCase() === clean) {
+        return rec;
+      }
+    }
+    return null;
+  }
+
+  listAll() {
+    return Array.from(this.usersBySub.values());
+  }
+
+  async setQuotaOverride(subOrEmail, quotaBytes) {
+    const key = String(subOrEmail || '').trim();
+    const record = this.getBySub(key) || this.getByEmail(key);
+    if (!record) return null;
+    if (quotaBytes === null || quotaBytes === undefined) {
+      delete record.quotaBytesOverride;
+      record.quotaBytes = null;
+    } else {
+      const cleanBytes = Math.max(0, Number(quotaBytes) || 0);
+      record.quotaBytesOverride = cleanBytes;
+      record.quotaBytes = cleanBytes;
+    }
+    this.usersBySub.set(record.sub, record);
+    await this.persist();
+    return record;
+  }
+
   async upsertGoogleUser({ sub, email, name, picture, publicBaseUrl, config }) {
     const cleanSub = String(sub || '').trim();
     const cleanEmail = String(email || '').trim().toLowerCase();
@@ -273,10 +305,10 @@ class UserDirectory {
       config,
       existingNodeId: existing ? existing.nodeId : null,
     });
-    const quotaBytes = resolveQuotaBytes(
-      { email: cleanEmail, folderName },
-      config
-    );
+    const quotaBytes =
+      existing && existing.quotaBytesOverride !== undefined
+        ? Math.max(0, Number(existing.quotaBytesOverride) || 0)
+        : resolveQuotaBytes({ email: cleanEmail, folderName }, config);
 
     const record = {
       sub: cleanSub,
@@ -287,6 +319,9 @@ class UserDirectory {
       nodeId,
       assignedUrl: serverUrl,
       quotaBytes,
+      ...(existing && existing.quotaBytesOverride !== undefined
+        ? { quotaBytesOverride: existing.quotaBytesOverride }
+        : {}),
       createdAt: (existing && existing.createdAt) || new Date().toISOString(),
       lastLoginAt: new Date().toISOString(),
     };

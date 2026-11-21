@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>photoHub Admin — Server &amp; User Storage</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --surface: #1e293b;
+      --surface-soft: #263348;
+      --border: #334155;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --blue: #38bdf8;
+      --green: #34d399;
+      --orange: #fbbf24;
+      --red: #f87171;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    .container { max-width: 1120px; margin: 0 auto; padding: 24px 16px 48px; }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 24px;
+    }
+    .brand h1 { margin: 0; font-size: 1.5rem; font-weight: 700; }
+    .brand p { margin: 2px 0 0; color: var(--muted); font-size: 0.9rem; }
+    .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    button {
+      background: var(--surface-soft);
+      color: var(--text);
+      border: 1px solid var(--border);
+      padding: 8px 14px;
+      border-radius: 8px;
+      font-size: 0.875rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover { border-color: var(--blue); }
+    button.primary { background: #0284c7; border-color: #0284c7; }
+    button.primary:hover { background: #0369a1; }
+    button.small { padding: 5px 10px; font-size: 0.78rem; }
+    input[type="password"], input[type="search"], select {
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 0.9rem;
+    }
+    .login-box {
+      max-width: 440px;
+      margin: 64px auto;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 28px;
+    }
+    .login-box h2 { margin: 0 0 8px; font-size: 1.25rem; }
+    .login-box p { margin: 0 0 18px; color: var(--muted); font-size: 0.9rem; }
+    .login-box input { width: 100%; margin-bottom: 12px; }
+    .login-box button { width: 100%; padding: 10px; }
+    .error-msg {
+      background: rgba(248, 113, 113, 0.14);
+      border: 1px solid rgba(248, 113, 113, 0.4);
+      color: var(--red);
+      border-radius: 10px;
+      padding: 10px 14px;
+      margin-bottom: 16px;
+      font-size: 0.9rem;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 14px;
+      margin-bottom: 22px;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px 18px;
+    }
+    .card-label { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+    .card-val { font-size: 1.45rem; font-weight: 700; margin: 4px 0; }
+    .card-sub { font-size: 0.82rem; color: var(--muted); }
+    .badge {
+      display: inline-block;
+      padding: 2px 9px;
+      border-radius: 999px;
+      font-size: 0.74rem;
+      font-weight: 600;
+    }
+    .badge.green { background: rgba(52, 211, 153, 0.16); color: var(--green); }
+    .badge.red { background: rgba(248, 113, 113, 0.16); color: var(--red); }
+    .badge.blue { background: rgba(56, 189, 248, 0.16); color: var(--blue); }
+    .badge.orange { background: rgba(251, 191, 36, 0.16); color: var(--orange); }
+    .progress-track {
+      width: 100%;
+      height: 7px;
+      background: var(--bg);
+      border-radius: 999px;
+      overflow: hidden;
+      margin-top: 6px;
+    }
+    .progress-fill { height: 100%; background: var(--green); transition: width 0.2s; }
+    .progress-fill.warn { background: var(--orange); }
+    .progress-fill.danger { background: var(--red); }
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      overflow: hidden;
+    }
+    .panel-head {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--border);
+    }
+    .panel-head h2 { margin: 0; font-size: 1.05rem; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 720px; }
+    th, td {
+      text-align: left;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.88rem;
+      vertical-align: middle;
+    }
+    th { font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+    tr:last-child td { border-bottom: none; }
+    code {
+      background: var(--bg);
+      padding: 2px 6px;
+      border-radius: 5px;
+      font-size: 0.82rem;
+    }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div id="loginBox" class="login-box hidden">
+      <h2>photoHub Admin Console</h2>
+      <p id="loginHint">Enter your server <code>ADMIN_KEY</code> from <code>.env</code> to inspect user quotas and disk storage.</p>
+      <div id="loginError" class="error-msg hidden"></div>
+      <form id="loginForm">
+        <input id="adminKeyInput" type="password" placeholder="ADMIN_KEY" autocomplete="current-password" required />
+        <button class="primary" type="submit">Unlock Dashboard</button>
+      </form>
+    </div>
+
+    <div id="dashboard" class="hidden">
+      <header>
+        <div class="brand">
+          <h1>photoHub Admin Console</h1>
+          <p id="serverMeta">Loading server status...</p>
+        </div>
+        <div class="toolbar">
+          <button id="rescanAllBtn">Rescan Storage Disks</button>
+          <button id="refreshBtn" class="primary">Refresh</button>
+          <button id="logoutBtn" class="hidden">Lock</button>
+        </div>
+      </header>
+
+      <div id="bannerAlert" class="error-msg hidden"></div>
+
+      <section class="grid">
+        <div class="card">
+          <div class="card-label">Server Photo Storage Used</div>
+          <div id="cardUsedVal" class="card-val">—</div>
+          <div id="cardUsedSub" class="card-sub">—</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Assigned Quota Pool</div>
+          <div id="cardAllocVal" class="card-val">—</div>
+          <div id="cardAllocSub" class="card-sub">—</div>
+          <div class="progress-track"><div id="cardAllocBar" class="progress-fill" style="width:0%"></div></div>
+        </div>
+        <div class="card">
+          <div class="card-label">Physical Disk Free</div>
+          <div id="cardDiskVal" class="card-val">—</div>
+          <div id="cardDiskSub" class="card-sub">—</div>
+        </div>
+        <div class="card">
+          <div class="card-label">New User Sign-Ins</div>
+          <div id="cardSignupVal" class="card-val">—</div>
+          <div id="cardSignupSub" class="card-sub">—</div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Users &amp; Storage Folders (<span id="userCount">0</span>)</h2>
+          <div class="toolbar">
+            <input id="searchInput" type="search" placeholder="Search email or folder..." />
+            <select id="sortSelect">
+              <option value="used">Sort: Space Used ↓</option>
+              <option value="pct">Sort: Quota % ↓</option>
+              <option value="items">Sort: Photo Count ↓</option>
+              <option value="name">Sort: Name A–Z</option>
+            </select>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>User / Account</th>
+                <th>Server Folder</th>
+                <th>Media</th>
+                <th>Originals · Proxies</th>
+                <th>Quota Usage</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="usersBody"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    const STORAGE_KEY = 'photohub_admin_key';
+    let lastData = null;
+
+    function fmtBytes(bytes) {
+      if (bytes === null || bytes === undefined) return 'Unlimited';
+      const num = Number(bytes) || 0;
+      if (num >= 1e12) return (num / 1e12).toFixed(2) + ' TB';
+      if (num >= 1e9) return (num / 1e9).toFixed(2) + ' GB';
+      if (num >= 1e6) return (num / 1e6).toFixed(1) + ' MB';
+      if (num >= 1e3) return (num / 1e3).toFixed(1) + ' KB';
+      return num + ' B';
+    }
+
+    function esc(str) {
+      return String(str || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function getHeaders(extra = {}) {
+      const key = sessionStorage.getItem(STORAGE_KEY) || '';
+      const h = { ...extra };
+      if (key) h['X-Admin-Key'] = key;
+      return h;
+    }
+
+    function showLogin(msg, isSetupError = false) {
+      document.getElementById('dashboard').classList.add('hidden');
+      document.getElementById('loginBox').classList.remove('hidden');
+      const errEl = document.getElementById('loginError');
+      if (msg) {
+        errEl.textContent = msg;
+        errEl.classList.remove('hidden');
+      } else {
+        errEl.classList.add('hidden');
+      }
+      document.getElementById('loginForm').classList.toggle('hidden', isSetupError);
+    }
+
+    async function loadOverview() {
+      const res = await fetch('/api/admin/overview', { headers: getHeaders() });
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 401) {
+        sessionStorage.removeItem(STORAGE_KEY);
+        showLogin(sessionStorage.getItem(STORAGE_KEY) ? 'Invalid ADMIN_KEY.' : '');
+        return;
+      }
+      if (res.status === 503 && data.needsSetup) {
+        showLogin(data.error, true);
+        return;
+      }
+      if (!res.ok || !data.success) {
+        document.getElementById('bannerAlert').textContent = data.error || 'Failed to load server stats.';
+        document.getElementById('bannerAlert').classList.remove('hidden');
+        return;
+      }
+      document.getElementById('loginBox').classList.add('hidden');
+      document.getElementById('dashboard').classList.remove('hidden');
+      document.getElementById('logoutBtn').classList.toggle('hidden', !sessionStorage.getItem(STORAGE_KEY));
+      lastData = data;
+      renderOverview(data);
+    }
+
+    function renderOverview(data) {
+      const cap = data.capacity;
+      const srv = data.server;
+      document.getElementById('serverMeta').textContent =
+        `Storage: ${srv.storageDir} · S3: ${srv.s3Enabled ? 'Enabled' : 'Local Disk'} · Nodes: ${srv.nodeCount} · Updated ${new Date().toLocaleTimeString()}`;
+
+      document.getElementById('cardUsedVal').textContent = fmtBytes(cap.totalUsedBytes);
+      document.getElementById('cardUsedSub').textContent =
+        `${cap.totalItems.toLocaleString()} files (${fmtBytes(cap.totalMastersBytes)} originals · ${fmtBytes(cap.totalProxiesBytes)} proxies)`;
+
+      const capLimit = cap.serverCapacityBytes;
+      document.getElementById('cardAllocVal').textContent =
+        capLimit ? `${fmtBytes(cap.totalAllocatedQuotaBytes)} / ${fmtBytes(capLimit)}` : fmtBytes(cap.totalAllocatedQuotaBytes);
+      document.getElementById('cardAllocSub').textContent = capLimit
+        ? `Per-user default: ${cap.defaultQuotaBytes ? fmtBytes(cap.defaultQuotaBytes) : 'Unlimited'}`
+        : 'SERVER_CAPACITY_GB not set (unlimited pool)';
+
+      const allocRatio = capLimit ? Math.min(100, Math.round((Math.max(cap.totalAllocatedQuotaBytes, cap.totalUsedBytes) / capLimit) * 100)) : 0;
+      const bar = document.getElementById('cardAllocBar');
+      bar.style.width = `${allocRatio}%`;
+      bar.className = 'progress-fill' + (allocRatio >= 90 ? ' danger' : allocRatio >= 75 ? ' warn' : '');
+
+      document.getElementById('cardDiskVal').textContent =
+        cap.diskFreeBytes !== null ? fmtBytes(cap.diskFreeBytes) : 'Unavailable';
+      document.getElementById('cardDiskSub').textContent =
+        cap.diskTotalBytes !== null ? `of ${fmtBytes(cap.diskTotalBytes)} disk capacity` : 'Host filesystem stats unavailable';
+
+      const signupEl = document.getElementById('cardSignupVal');
+      const signupSub = document.getElementById('cardSignupSub');
+      if (cap.isFullForNewUsers) {
+        signupEl.innerHTML = '<span class="badge red">Blocked (Full)</span>';
+        signupSub.textContent = cap.newSignupBlockReason || 'Server full';
+      } else {
+        signupEl.innerHTML = '<span class="badge green">Open</span>';
+        signupSub.textContent = cap.maxUsers
+          ? `${cap.registeredUserCount} / ${cap.maxUsers} max accounts`
+          : `${cap.registeredUserCount} account(s) active`;
+      }
+
+      const banner = document.getElementById('bannerAlert');
+      if (cap.isFullForNewUsers) {
+        banner.textContent = 'New Sign-Ins Blocked: ' + cap.newSignupBlockReason;
+        banner.classList.remove('hidden');
+      } else {
+        banner.classList.add('hidden');
+      }
+
+      renderUsersTable(cap.users || []);
+    }
+
+    function renderUsersTable(users) {
+      const q = document.getElementById('searchInput').value.trim().toLowerCase();
+      const sortMode = document.getElementById('sortSelect').value;
+
+      let filtered = users.filter((u) => {
+        if (!q) return true;
+        return (
+          String(u.displayName || '').toLowerCase().includes(q) ||
+          String(u.email || '').toLowerCase().includes(q) ||
+          String(u.folderName || '').toLowerCase().includes(q)
+        );
+      });
+
+      filtered.sort((a, b) => {
+        if (sortMode === 'pct') return (b.usagePercent || 0) - (a.usagePercent || 0);
+        if (sortMode === 'items') return b.itemCount - a.itemCount;
+        if (sortMode === 'name') return String(a.displayName).localeCompare(String(b.displayName));
+        return b.usedBytes - a.usedBytes;
+      });
+
+      document.getElementById('userCount').textContent = String(filtered.length);
+      const tbody = document.getElementById('usersBody');
+      if (filtered.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:28px;">No matching users or folders.</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = filtered.map((u) => {
+        const badgeCls = u.authType === 'google' ? 'blue' : u.authType === 'api_key' ? 'orange' : 'green';
+        const badgeLabel = u.authType === 'google' ? 'Google' : u.authType === 'api_key' ? 'USER_KEYS' : 'Root';
+        const pct = u.usagePercent !== null ? u.usagePercent : 0;
+        const fillCls = pct >= 90 ? 'danger' : pct >= 75 ? 'warn' : '';
+        const quotaText = u.quotaBytes ? `${fmtBytes(u.usedBytes)} / ${fmtBytes(u.quotaBytes)} (${pct}%)` : `${fmtBytes(u.usedBytes)} / Unlimited`;
+        const editBtn = u.authType === 'google'
+          ? `<button class="small" onclick="editUserQuota('${esc(u.id)}', '${esc(u.email || u.displayName)}', ${u.quotaBytes || 0})">Quota</button>`
+          : '';
+        return `<tr>
+          <td>
+            <div style="font-weight:600;">${esc(u.displayName)} <span class="badge ${badgeCls}">${badgeLabel}</span></div>
+            <div style="font-size:0.8rem;color:var(--muted);">${esc(u.email || 'Node: ' + u.nodeId)}</div>
+          </td>
+          <td><code>${esc(u.folderName)}</code></td>
+          <td>${u.itemCount.toLocaleString()}</td>
+          <td>${fmtBytes(u.mastersBytes)} <span style="color:var(--muted);">· ${fmtBytes(u.proxiesBytes)}</span></td>
+          <td style="min-width:170px;">
+            <div>${quotaText}</div>
+            ${u.quotaBytes ? `<div class="progress-track"><div class="progress-fill ${fillCls}" style="width:${pct}%"></div></div>` : ''}
+          </td>
+          <td>
+            <div style="display:flex;gap:6px;">
+              ${editBtn}
+              <button class="small" onclick="rescanFolder('${esc(u.folderKey)}')">Rescan</button>
+            </div>
+          </td>
+        </tr>`;
+      }).join('');
+    }
+
+    async function editUserQuota(sub, label, currentBytes) {
+      const currentGb = currentBytes ? (currentBytes / 1e9).toFixed(1) : '0';
+      const input = window.prompt(`Set storage quota (in GB) for ${label}.\nEnter 0 for default / unlimited:`, currentGb);
+      if (input === null) return;
+      const gb = Number(input);
+      if (!Number.isFinite(gb) || gb < 0) {
+        alert('Please enter a non-negative number of GB.');
+        return;
+      }
+      const res = await fetch('/api/admin/user-quota', {
+        method: 'POST',
+        headers: getHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ sub, quotaGb: gb }),
+      });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        alert(out.error || 'Failed to update quota');
+        return;
+      }
+      await loadOverview();
+    }
+
+    async function rescanFolder(folderKey) {
+      const res = await fetch('/api/admin/rescan', {
+        method: 'POST',
+        headers: getHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify(folderKey ? { folderKey } : {}),
+      });
+      if (!res.ok) {
+        const out = await res.json().catch(() => ({}));
+        alert(out.error || 'Rescan failed');
+        return;
+      }
+      await loadOverview();
+    }
+
+    document.getElementById('loginForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const val = document.getElementById('adminKeyInput').value.trim();
+      if (!val) return;
+      sessionStorage.setItem(STORAGE_KEY, val);
+      await loadOverview();
+      if (!sessionStorage.getItem(STORAGE_KEY)) {
+        document.getElementById('loginError').textContent = 'Invalid ADMIN_KEY.';
+        document.getElementById('loginError').classList.remove('hidden');
+      }
+    });
+
+    document.getElementById('refreshBtn').addEventListener('click', loadOverview);
+    document.getElementById('rescanAllBtn').addEventListener('click', () => rescanFolder(null));
+    document.getElementById('logoutBtn').addEventListener('click', () => {
+      sessionStorage.removeItem(STORAGE_KEY);
+      showLogin('');
+    });
+    document.getElementById('searchInput').addEventListener('input', () => {
+      if (lastData) renderUsersTable(lastData.capacity.users || []);
+    });
+    document.getElementById('sortSelect').addEventListener('change', () => {
+      if (lastData) renderUsersTable(lastData.capacity.users || []);
+    });
+
+    loadOverview();
+  </script>
+</body>
+</html>

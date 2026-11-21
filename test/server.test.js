@@ -1167,3 +1167,133 @@ test('Multi-device proxy dedupe (proxyHashes) & Restored Original protection', a
   assert.equal(checkUnlocked.canReplaceWithProxy, true);
   assert.equal(checkUnlocked.canDelete, true);
 });
+
+test('Server Capacity Gate blocks new sign-ins when full while existing users & Admin Dashboard work', async (t) => {
+  let activeProfile = {
+    sub: 'sub-alice-cap-001',
+    email: 'alice@gmail.com',
+    name: 'Alice Existing',
+  };
+
+  const ctx = await startTestServer({
+    publicUrl: 'https://cap.photohub.test',
+    googleClientId: 'cap-client-id',
+    googleClientSecret: 'cap-client-secret',
+    authSessionSecret: 'cap-session-secret-0123456789abcdef',
+    defaultQuotaGb: 0.00006, // 60,000 bytes per user
+    serverCapacityGb: 0.0001, // 100,000 bytes server pool (room for 1 user @ 60 KB, not 2 @ 120 KB)
+    adminKey: 'super_admin_secret_key',
+    exchangeGoogleCodeForProfile: async () => activeProfile,
+  });
+  t.after(() => ctx.cleanup());
+
+  async function runOAuthLogin() {
+    const codeVerifier = 'cap_pkce_verifier_secret_string_at_least_32_chars';
+    const codeChallenge = crypto
+      .createHash('sha256')
+      .update(codeVerifier, 'utf8')
+      .digest('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/g, '');
+
+    const startRes = await ctx.request(
+      `/api/auth/google/start?code_challenge=${encodeURIComponent(codeChallenge)}&redirect_uri=${encodeURIComponent('photohub://auth/callback')}`
+    );
+    const state = new URL(startRes.headers.location).searchParams.get('state');
+    const cbRes = await ctx.request(
+      `/api/auth/google/callback?code=mock_code&state=${encodeURIComponent(state)}`
+    );
+    const redirectUrl = new URL(cbRes.headers.location);
+    return { redirectUrl, codeVerifier };
+  }
+
+  // 1. User 1 (alice@gmail.com) fits inside the 100 KB assigned pool -> login succeeds
+  const login1 = await runOAuthLogin();
+  const code1 = login1.redirectUrl.searchParams.get('code');
+  assert.ok(code1);
+  const ex1 = await (
+    await ctx.request('/api/auth/exchange', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: code1, codeVerifier: login1.codeVerifier }),
+    })
+  ).json();
+  assert.equal(ex1.success, true);
+
+  // Alice uploads a 40-byte photo -> initializes her folder cleanly
+  const sampleBuf = Buffer.alloc(40, 0x55);
+  const upForm = new FormData();
+  upForm.append('photo', new Blob([sampleBuf], { type: 'image/jpeg' }), 'ALICE_CAP.JPG');
+  const upRes = await ctx.request('/api/upload', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${ex1.token}` },
+    body: upForm,
+  });
+  assert.equal(upRes.status, 200);
+
+  // 2. Brand-new user people1@gmail.com exceeds 100 KB pool -> sign-in is rejected & NO folder is created
+  activeProfile = {
+    sub: 'sub-people1-cap-002',
+    email: 'people1@gmail.com',
+    name: 'People One',
+  };
+  const login2 = await runOAuthLogin();
+  assert.equal(login2.redirectUrl.searchParams.get('code'), null);
+  assert.match(String(login2.redirectUrl.searchParams.get('error') || ''), /full/i);
+
+  const diskDirs = await fsp.readdir(ctx.storageDir);
+  assert.equal(diskDirs.some((d) => d.startsWith('google_people1_')), false);
+
+  // 3. Existing user alice@gmail.com can STILL sign in anytime even though server pool cannot admit new users
+  activeProfile = {
+    sub: 'sub-alice-cap-001',
+    email: 'alice@gmail.com',
+    name: 'Alice Existing',
+  };
+  const loginAliceAgain = await runOAuthLogin();
+  assert.ok(loginAliceAgain.redirectUrl.searchParams.get('code'));
+  assert.equal(loginAliceAgain.redirectUrl.searchParams.get('error'), null);
+
+  // 4. Admin Dashboard HTML + Admin Overview API (requires ADMIN_KEY)
+  const adminPageRes = await ctx.request('/admin');
+  assert.equal(adminPageRes.status, 200);
+  assert.match(adminPageRes.buffer.toString('utf8'), /photoHub Admin Console/);
+
+  const unauthAdmin = await ctx.request('/api/admin/overview');
+  assert.equal(unauthAdmin.status, 401);
+
+  const overviewRes = await ctx.request('/api/admin/overview', {
+    headers: { 'X-Admin-Key': 'super_admin_secret_key' },
+  });
+  assert.equal(overviewRes.status, 200);
+  const overview = await overviewRes.json();
+  assert.equal(overview.success, true);
+  assert.equal(overview.capacity.isFullForNewUsers, true);
+  assert.equal(overview.capacity.totalItems, 1);
+  assert.equal(overview.capacity.totalUsedBytes, 40);
+
+  const aliceRow = overview.capacity.users.find((u) => u.email === 'alice@gmail.com');
+  assert.ok(aliceRow);
+  assert.equal(aliceRow.itemCount, 1);
+  assert.equal(aliceRow.usedBytes, 40);
+  assert.equal(aliceRow.quotaBytes, 60_000);
+
+  // 5. Admin live quota override updates Alice's quota immediately in /api/whoami
+  const quotaRes = await ctx.request('/api/admin/user-quota', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Admin-Key': 'super_admin_secret_key',
+    },
+    body: JSON.stringify({ email: 'alice@gmail.com', quotaGb: 0.00008 }),
+  });
+  assert.equal(quotaRes.status, 200);
+
+  const whoUpdated = await (
+    await ctx.request('/api/whoami', {
+      headers: { Authorization: `Bearer ${ex1.token}` },
+    })
+  ).json();
+  assert.equal(whoUpdated.storage.quotaBytes, 80_000);
+});

@@ -118,6 +118,18 @@ function createAuthController({
           config,
         });
 
+        const capacityCheck = await contextService.checkNewUserSignupCapacity({
+          sub: profile.sub,
+          email: profile.email,
+        });
+        if (!capacityCheck.allowed) {
+          appRedirect.searchParams.set(
+            'error',
+            capacityCheck.reason || 'Server assigned storage is full. New sign-ins are closed.'
+          );
+          return res.redirect(appRedirect.toString());
+        }
+
         const user = await userDirectory.upsertGoogleUser({
           ...profile,
           publicBaseUrl: statePayload.baseUrl,

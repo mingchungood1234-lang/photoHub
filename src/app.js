@@ -26,6 +26,7 @@ const {
 const { exchangeGoogleCodeForProfile } = require('./services/googleOAuthService');
 const { createContextService } = require('./services/contextService');
 const { createAuthMiddleware } = require('./middleware/authMiddleware');
+const { createAdminAuthMiddleware } = require('./middleware/adminAuthMiddleware');
 const { createUploadMiddleware } = require('./middleware/uploadMiddleware');
 const { errorMiddleware } = require('./middleware/errorMiddleware');
 const { createHealthController } = require('./controllers/healthController');
@@ -35,6 +36,7 @@ const { createCheckController } = require('./controllers/checkController');
 const { createUploadController } = require('./controllers/uploadController');
 const { createProxyController } = require('./controllers/proxyController');
 const { createPhotoController } = require('./controllers/photoController');
+const { createAdminController } = require('./controllers/adminController');
 const { mountRoutes } = require('./routes');
 
 async function createApp(configOverrides = {}) {
@@ -51,7 +53,7 @@ async function createApp(configOverrides = {}) {
   const googleExchangeFn =
     configOverrides.exchangeGoogleCodeForProfile || exchangeGoogleCodeForProfile;
 
-  const contextService = createContextService(config);
+  const contextService = createContextService(config, { userDirectory });
   await contextService.init();
 
   // Build Express application and parse JSON/binary bodies before route handlers run
@@ -68,6 +70,10 @@ async function createApp(configOverrides = {}) {
     config,
     sessionSecret,
     contextService,
+  });
+  const adminAuthMiddleware = createAdminAuthMiddleware({
+    config,
+    sessionSecret,
   });
 
   app.use(express.json({ limit: '50mb' })); // Parses `application/json` payloads into `req.body`
@@ -89,10 +95,12 @@ async function createApp(configOverrides = {}) {
     uploadController: createUploadController({ config, contextService }),
     proxyController: createProxyController({ config }),
     photoController: createPhotoController({ config }),
+    adminController: createAdminController({ config, contextService, userDirectory }),
   };
 
-  // Mount all `/api/*` routes, then register errorMiddleware LAST (Express error-handler rule)
-  mountRoutes(app, { authMiddleware, uploadMiddleware, controllers });
+  // Mount all `/api/*` routes, `/admin` web page, and register errorMiddleware LAST (Express error-handler rule)
+  app.get('/admin', controllers.adminController.getDashboardPage);
+  mountRoutes(app, { authMiddleware, adminAuthMiddleware, uploadMiddleware, controllers });
   app.use(errorMiddleware);
 
   return app;

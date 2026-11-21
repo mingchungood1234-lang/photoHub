@@ -121,6 +121,24 @@ function assertWithinQuota(hashIndex, quotaBytes, incomingBytes = 0) {
   return usage;
 }
 
+async function assertMinimumFreeDisk(storageDir, minFreeDiskBytes, incomingBytes = 0) {
+  const minFree = Number(minFreeDiskBytes) || 0;
+  if (minFree <= 0 || typeof fsp.statfs !== 'function') return;
+  try {
+    await fsp.mkdir(storageDir, { recursive: true });
+    const fsStats = await fsp.statfs(storageDir);
+    const blockSize = Number(fsStats.bsize) || 4096;
+    const diskFreeBytes = (Number(fsStats.bavail) || 0) * blockSize;
+    if (diskFreeBytes - (Number(incomingBytes) || 0) < minFree) {
+      const err = new Error('Server disk free space is below the safety reserve.');
+      err.statusCode = 507;
+      throw err;
+    }
+  } catch (err) {
+    if (err.statusCode === 507) throw err;
+  }
+}
+
 /**
  * Stores a photo buffer into STORAGE_DIR/YYYY/YYYY-MM-DD/<filename>,
  * verifies its SHA-256 on disk, and updates the HashIndex.
@@ -136,6 +154,7 @@ async function storeAndVerifyPhoto({
   storageDir,
   hashIndex,
   quotaBytes = 0,
+  minFreeDiskBytes = 0,
 }) {
   if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
     const err = new Error('Uploaded photo buffer is empty');
@@ -214,6 +233,7 @@ async function storeAndVerifyPhoto({
   }
 
   assertWithinQuota(hashIndex, quotaBytes, buffer.length);
+  await assertMinimumFreeDisk(storageDir, minFreeDiskBytes, buffer.length);
 
   // 2. Determine date folder (YYYY/YYYY-MM-DD) and target filename
   const { year, dateFolder, dateObj, takenAt } = parseDateFolder(createdAt);

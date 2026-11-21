@@ -262,6 +262,21 @@ function getConfig(overrides = {}) {
     ),
     defaultQuotaBytes,
     userQuotaMap, // Map<lowercaseIdentifier, quotaBytes>
+    serverCapacityBytes: gbToBytes(
+      overrides.serverCapacityGb ?? process.env.SERVER_CAPACITY_GB ?? 0
+    ),
+    minFreeDiskBytes: gbToBytes(
+      overrides.minFreeDiskGb ?? process.env.MIN_FREE_DISK_GB ?? 0
+    ),
+    maxUsers: Math.max(
+      0,
+      Math.floor(Number(overrides.maxUsers ?? process.env.MAX_USERS ?? 0) || 0)
+    ),
+    adminKey: String(overrides.adminKey ?? process.env.ADMIN_KEY ?? '').trim(),
+    adminEmails:
+      overrides.adminEmails instanceof Set
+        ? overrides.adminEmails
+        : parseListCsv(overrides.adminEmails ?? process.env.ADMIN_EMAILS ?? ''),
     maxFileSizeBytes: effectiveMaxMb * 1024 * 1024,
     // Set SCAN_STORAGE_ON_STARTUP=false if using a large remote rclone/gdrive mount to avoid slow startup scans
     scanStorageOnStartup:
@@ -287,4 +302,4 @@ function getConfig(overrides = {}) {
   };
 }
 
-module.exports = { getConfig, resolvePath, parseUserKeys, sanitizeUserFolder };
+module.exports = { getConfig, resolvePath, parseUserKeys, sanitizeUserFolder, gbToBytes };

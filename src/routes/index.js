@@ -10,14 +10,18 @@
  */
 
 const { createPublicRoutes } = require('./publicRoutes');
+const { createAdminRoutes } = require('./adminRoutes');
 const { createAccountRoutes } = require('./accountRoutes');
 const { createUploadRoutes } = require('./uploadRoutes');
 const { createProxyRoutes } = require('./proxyRoutes');
 const { createPhotoRoutes } = require('./photoRoutes');
 
-function mountRoutes(app, { authMiddleware, uploadMiddleware, controllers }) {
+function mountRoutes(app, { authMiddleware, adminAuthMiddleware, uploadMiddleware, controllers }) {
   // Public endpoints (Docker healthcheck & OAuth discovery/PKCE handshake)
   app.use('/api', createPublicRoutes(controllers));
+
+  // Admin dashboard APIs (protected by ADMIN_KEY or ADMIN_EMAILS)
+  app.use('/api/admin', adminAuthMiddleware, createAdminRoutes(controllers));
 
   // Protect all remaining `/api/*` endpoints
   app.use('/api', authMiddleware);
