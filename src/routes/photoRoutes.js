@@ -1,3 +1,16 @@
+/**
+ * SERVER PHOTO GALLERY & DOWNLOAD ROUTES (Authenticated via `authMiddleware`)
+ *
+ * Where this belongs: `src/routes/photoRoutes.js`, mounted in `src/routes/index.js`.
+ * Where requests go (`controllers/photoController.js`):
+ *   - `GET /api/photos`                        -> `listPhotos` (supports pagination, year, mediaType, prefix, gzip)
+ *   - `GET /api/photo/:hash/preview`           -> `streamPreview` (lightweight compressed thumbnail/preview)
+ *   - `GET /api/photo/:hash/video-proxy`       -> `streamVideoProxy` (lightweight H.264 MP4 proxy)
+ *   - `POST /api/photo/:hash/protect-original` -> `setProtectOriginal` (prevents auto re-compression)
+ *   - `GET /api/photo/:hash`                   -> `downloadMaster` (full-res original w/ HTTP Range support)
+ *     (Note: `/preview` and `/video-proxy` are defined BEFORE `/photo/:hash` so Express matches specific suffixes first.)
+ */
+
 const express = require('express');
 
 function createPhotoRoutes({ photoController }) {

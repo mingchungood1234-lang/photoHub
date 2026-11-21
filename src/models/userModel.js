@@ -1,3 +1,17 @@
+/**
+ * USERS, SESSION TOKENS (JWT), PKCE & NODE ROUTING MODEL
+ *
+ * Where this belongs: `src/models/userModel.js` (Data / Model Layer).
+ * Used by:
+ *   - `src/app.js` (`resolveSessionSecret`, `UserDirectory`, `OneTimeExchangeStore`)
+ *   - `src/middleware/authMiddleware.js` (`verifyToken`, `resolveConfiguredUserFolder`)
+ *   - `src/controllers/authController.js` (`signToken`, `verifyToken`, `isAllowedAppRedirectUri`, `selectNodeForUser`)
+ *   - `src/services/contextService.js` (`resolveQuotaBytes`)
+ * Where data goes on disk:
+ *   - `DATA_DIR/auth-secret.key` (auto-generated HMAC secret for signing session tokens)
+ *   - `DATA_DIR/users.json` (persistent JSON map of Google user `sub` -> folder, assigned node, quota)
+ */
+
 const fsp = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');

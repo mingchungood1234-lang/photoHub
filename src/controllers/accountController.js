@@ -1,3 +1,12 @@
+/**
+ * ACCOUNT & QUOTA INFO CONTROLLER
+ *
+ * Where this belongs: `src/controllers/accountController.js`.
+ * Called by: `src/routes/accountRoutes.js` (`GET /api/storage` & `GET /api/whoami`, both after `authMiddleware`).
+ * Calls: `contextService.buildStorageSummary(req.userContext)` and `s3Service.isS3Configured(...)`.
+ * Returns: The logged-in user's assigned folder, storage usage vs. quota, and indexed photo count.
+ */
+
 const { isS3Configured } = require('../services/s3Service');
 
 function createAccountController({ config, contextService }) {

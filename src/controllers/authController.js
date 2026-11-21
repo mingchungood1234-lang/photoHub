@@ -1,3 +1,22 @@
+/**
+ * GOOGLE OAUTH PKCE & NODE ROUTING CONTROLLER
+ *
+ * Where this belongs: `src/controllers/authController.js`.
+ * Called by:
+ *   - `src/routes/publicRoutes.js`: `getConfig`, `startGoogleAuth`, `handleGoogleCallback`, `exchangeCode`
+ *   - `src/routes/accountRoutes.js`: `resolveNode` (authenticated)
+ * Calls: `models/userModel.js` (JWT tokens, PKCE check, consistent node selection),
+ *        `services/googleOAuthService.js` (exchanges Google's auth code for user email/sub),
+ *        and `services/contextService.js` (resolves public base URL).
+ *
+ * Step-by-step Google PKCE login flow:
+ *   1. Mobile app creates a random `codeVerifier`, hashes it into `codeChallenge`, and opens `/api/auth/google/start`.
+ *   2. Server redirects browser to Google -> Google redirects back to `/api/auth/google/callback`.
+ *   3. Server creates/updates the user in `UserDirectory`, mints a signed JWT session token, stores it behind
+ *      a 1-time code, and redirects to `photohub://auth/callback?code=...`.
+ *   4. App POSTs `{ code, codeVerifier }` to `/api/auth/exchange` -> gets `{ token, serverUrl, user }`.
+ */
+
 const crypto = require('crypto');
 const {
   signToken,

@@ -1,3 +1,14 @@
+/**
+ * SERVER-SIDE PROXY TRANSCODING SERVICE (`sharp` + `ffmpeg`)
+ *
+ * Where this belongs: `src/services/proxyService.js` (Service Layer).
+ * Called by:
+ *   - `src/controllers/proxyController.js` (`generateProxy` -> compresses images/videos on server under `.proxies/`)
+ *   - `src/controllers/photoController.js` (`isVideoFilename` -> checks whether a filename is a video)
+ * How fallback works: If neither `sharp` nor `ffmpeg` is installed, throws HTTP `501` with
+ * `fallbackToClient: true` so the Android/iOS app automatically compresses locally instead.
+ */
+
 const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');

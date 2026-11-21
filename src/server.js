@@ -1,8 +1,19 @@
+/**
+ * ENTRY POINT — HTTP / HTTPS Server Bootstrap
+ *
+ * Where this belongs: Top-level entry script (`npm start` / `node src/server.js`).
+ * Where it connects: Imports `createApp()` from `./app`, wraps the Express app in
+ * Node's built-in `http` or `https` server, and starts listening on `PORT`.
+ * Also exports `{ createApp }` so `test/server.test.js` can spin up isolated test servers.
+ */
+
 const fs = require('fs');
 const http = require('http');
 const https = require('https');
 const { createApp } = require('./app');
 
+// `require.main === module` is true ONLY when you run `node src/server.js` directly
+// (and false when another file like a test imports `./server` via `require`).
 if (require.main === module) {
   createApp()
     .then((app) => {
@@ -33,11 +44,14 @@ if (require.main === module) {
           },
           app
         );
+        // Keep TCP/TLS sockets warm longer (65s vs Node's 5s default) so phones
+        // can reuse connections across rapid bursts of photo fetches.
         server.keepAliveTimeout = 65_000;
         server.headersTimeout = 66_000;
         server.listen(port, '0.0.0.0', onListening);
       } else {
         const server = http.createServer(app);
+        // Match reverse proxy (Nginx/Caddy) keep-alive windows for faster photo browsing.
         server.keepAliveTimeout = 65_000;
         server.headersTimeout = 66_000;
         server.listen(port, '0.0.0.0', onListening);

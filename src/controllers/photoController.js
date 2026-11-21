@@ -1,3 +1,16 @@
+/**
+ * SERVER GALLERY BROWSING & ORIGINAL DOWNLOAD CONTROLLER
+ *
+ * Where this belongs: `src/controllers/photoController.js`.
+ * Called by: `src/routes/photoRoutes.js` (all protected by `authMiddleware`):
+ *   - `listPhotos`         (`GET /api/photos` — returns sorted timeline list w/ year, mediaType, prefix filters & gzip)
+ *   - `streamPreview`      (`GET /api/photo/:hash/preview` — fast compressed JPEG preview for grid browsing)
+ *   - `streamVideoProxy`   (`GET /api/photo/:hash/video-proxy` — lightweight MP4 video playback w/ Range seek)
+ *   - `setProtectOriginal` (`POST /api/photo/:hash/protect-original` — marks restored originals safe from auto re-compression)
+ *   - `downloadMaster`     (`GET /api/photo/:hash` — full-resolution original via S3 302 redirect or Express `sendFile` HTTP 206 Ranges)
+ * Calls: `req.userContext.hashIndex` (`models/hashIndexModel.js`) and `services/s3Service.js`.
+ */
+
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');

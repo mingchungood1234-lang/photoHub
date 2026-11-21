@@ -1,3 +1,12 @@
+/**
+ * GOOGLE OAUTH TOKEN EXCHANGE SERVICE
+ *
+ * Where this belongs: `src/services/googleOAuthService.js` (Service Layer).
+ * Called by: `src/controllers/authController.js` (`handleGoogleCallback`), wired in `src/app.js`.
+ * What it does: Swaps Google's one-time callback `code` for the user's verified Google profile
+ * (`sub`, `email`, `name`, `picture`) and enforces `ALLOWED_GOOGLE_EMAILS` / `ALLOWED_GOOGLE_DOMAINS`.
+ */
+
 function isGoogleUserAllowed(email, config) {
   const lower = String(email || '').trim().toLowerCase();
   if (!lower || !lower.includes('@')) return false;

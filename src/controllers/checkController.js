@@ -1,3 +1,14 @@
+/**
+ * PRE-UPLOAD DEDUPLICATION & PROXY STATUS CONTROLLER
+ *
+ * Where this belongs: `src/controllers/checkController.js`.
+ * Called by: `src/routes/uploadRoutes.js` (`GET /api/check/:hash`, `POST /api/check`, `POST /api/check/batch`).
+ * Reads from: `req.userContext.hashIndex` (`models/hashIndexModel.js`).
+ * Why it exists: Before uploading a giant photo or video, the phone sends its SHA-256 hash here.
+ * If the server already has the master (or recognizes it as a compressed proxy), the phone skips
+ * uploading and immediately learns `canReplaceWithProxy`, `hasProxy`, or `isProtectedOriginal`.
+ */
+
 function formatCheckPayload(lookupResult, reqHash, folderName) {
   const record = lookupResult.record;
   const exists = lookupResult.status !== 'missing';

@@ -1,3 +1,14 @@
+/**
+ * PHOTO & VIDEO UPLOAD CONTROLLER (Direct VPS & S3 Presigned Flows)
+ *
+ * Where this belongs: `src/controllers/uploadController.js`.
+ * Called by: `src/routes/uploadRoutes.js`:
+ *   - `uploadDirect`  (`POST /api/upload` after `uploadMiddleware` parses `req.files` or raw `req.body` Buffer)
+ *   - `presignUpload` (`POST /api/upload/presign` — checks duplicates/quota & returns temporary S3 PUT URL)
+ *   - `confirmUpload` (`POST /api/upload/confirm` — verifies S3 object SHA-256 & records it in `hashIndex`)
+ * Calls: `services/storageService.js` (saves & SHA-256 verifies on disk) and `services/s3Service.js`.
+ */
+
 const path = require('path');
 const {
   storeAndVerifyPhoto,

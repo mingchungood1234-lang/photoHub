@@ -1,3 +1,18 @@
+/**
+ * PHOTO HASH INDEX & METADATA MODEL (`data/hash-index*.json`)
+ *
+ * Where this belongs: `src/models/hashIndexModel.js` (Data / Model Layer — the "database" of backed-up media).
+ * Created by: `src/services/contextService.js` (one `HashIndex` instance per user folder).
+ * Attached to every authenticated request as `req.userContext.hashIndex` by `authMiddleware.js`,
+ * and read/updated by `checkController`, `proxyController`, `photoController`, and `storageService`.
+ *
+ * What it manages:
+ *   - `this.records`: Map<masterSha256, metadata> saved atomically to `DATA_DIR/hash-index*.json`
+ *   - `this.proxyToMaster`: reverse Map<proxySha256, masterSha256> so compressed proxies aren't re-uploaded as new originals
+ *   - `syncStorageDir()`: scans disk folders on startup/`?sync=1` to index manually added photos (using JPEG EXIF & filename dates)
+ *   - `verifyExisting()` / `lookup()`: verifies a hash still physically exists on disk (or S3) before confirming delete/proxy actions
+ */
+
 const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');

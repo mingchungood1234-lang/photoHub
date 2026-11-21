@@ -1,3 +1,15 @@
+/**
+ * CONFIGURATION LAYER — Reads `.env` & Builds Normalized Settings
+ *
+ * Where this belongs: `src/config/env.js`.
+ * Where it goes: Imported by `src/app.js` at startup (via `getConfig(overrides)`)
+ * and `src/models/userModel.js` (uses `sanitizeUserFolder`).
+ *
+ * In Node.js, `process.env` holds all environment variables (populated from `.env`
+ * by `dotenv.config()`). `getConfig(overrides)` lets tests override settings in memory
+ * without touching your real `.env` file.
+ */
+
 const os = require('os');
 const path = require('path');
 require('dotenv').config();

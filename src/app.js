@@ -1,3 +1,21 @@
+/**
+ * EXPRESS APPLICATION FACTORY — Connects Every Layer Together
+ *
+ * Where this belongs: Application wiring module (imported by `src/server.js`).
+ *
+ * How a request travels through PhotoHub (top to bottom):
+ *   Client HTTP request
+ *     -> src/server.js (HTTP/HTTPS listener)
+ *     -> src/app.js (Express body parsers)
+ *     -> src/routes/index.js (`/api/*` routing table)
+ *        ├── Public endpoints (`publicRoutes.js`: `/api/health`, `/api/auth/*`)
+ *        ├── src/middleware/authMiddleware.js (verifies JWT/API key & sets `req.userContext`)
+ *        └── Protected endpoints (`accountRoutes`, `uploadRoutes`, `proxyRoutes`, `photoRoutes`)
+ *     -> src/controllers/* (handles HTTP input/output for each feature)
+ *     -> src/services/* & src/models/* (business logic, disk/S3 storage, JSON indexes)
+ *     -> src/middleware/errorMiddleware.js (catches thrown/next(err) errors last)
+ */
+
 const express = require('express');
 const { getConfig } = require('./config/env');
 const {
@@ -36,15 +54,15 @@ async function createApp(configOverrides = {}) {
   const contextService = createContextService(config);
   await contextService.init();
 
-  // Build Express application
+  // Build Express application and parse JSON/binary bodies before route handlers run
   const app = express();
-  app.set('trust proxy', 1);
+  app.set('trust proxy', 1); // Respect X-Forwarded-* headers when running behind Nginx/Cloudflare/Caddy
   app.locals.config = config;
   app.locals.hashIndex = contextService.defaultHashIndex;
   app.locals.folderContexts = contextService.folderContexts;
   app.locals.sessionSecret = sessionSecret;
 
-  // Middleware
+  // Middleware: parsers transform incoming bytes into `req.body` or `req.files`
   const uploadMiddleware = createUploadMiddleware(config);
   const authMiddleware = createAuthMiddleware({
     config,
@@ -52,10 +70,10 @@ async function createApp(configOverrides = {}) {
     contextService,
   });
 
-  app.use(express.json({ limit: '50mb' }));
-  app.use('/api/upload', uploadMiddleware.rawUploadParser);
+  app.use(express.json({ limit: '50mb' })); // Parses `application/json` payloads into `req.body`
+  app.use('/api/upload', uploadMiddleware.rawUploadParser); // Parses raw binary photo uploads on `/api/upload`
 
-  // Controllers
+  // Controllers: thin HTTP handlers injected with config/services (Dependency Injection)
   const controllers = {
     healthController: createHealthController({ config, contextService }),
     authController: createAuthController({
@@ -73,7 +91,7 @@ async function createApp(configOverrides = {}) {
     photoController: createPhotoController({ config }),
   };
 
-  // Routes & global error handler
+  // Mount all `/api/*` routes, then register errorMiddleware LAST (Express error-handler rule)
   mountRoutes(app, { authMiddleware, uploadMiddleware, controllers });
   app.use(errorMiddleware);
 

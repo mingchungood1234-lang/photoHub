@@ -1,3 +1,14 @@
+/**
+ * S3 / MINIO / R2 OBJECT STORAGE SERVICE (AWS SigV4 Pre-Signed URLs)
+ *
+ * Where this belongs: `src/services/s3Service.js` (Service Layer).
+ * Called by:
+ *   - `controllers/uploadController.js` (`presignUpload` creates direct-PUT URL, `confirmUpload` verifies S3 object SHA-256)
+ *   - `controllers/photoController.js` (`redirectIfS3` issues a temporary 302 pre-signed GET redirect for fast direct downloads)
+ *   - `controllers/healthController.js` & `controllers/accountController.js` (`isS3Configured`)
+ * Pure crypto implementation using Node's built-in `crypto` module — zero AWS SDK dependencies needed.
+ */
+
 const crypto = require('crypto');
 
 function sha256Hex(data) {

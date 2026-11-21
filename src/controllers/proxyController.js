@@ -1,3 +1,14 @@
+/**
+ * COMPRESSED PROXY REGISTRATION & GENERATION CONTROLLER
+ *
+ * Where this belongs: `src/controllers/proxyController.js`.
+ * Called by: `src/routes/proxyRoutes.js`:
+ *   - `registerProxy`          (`POST /api/proxy/register` — stores phone-generated small JPEG/poster previews under `.proxies/`)
+ *   - `uploadVideoProxyStream` (`POST /api/proxy/:masterHash/video` — streams a phone-compressed MP4 proxy directly to disk)
+ *   - `generateProxy`          (`POST /api/proxy/generate` — transcodes proxies on the server using `sharp`/`ffmpeg` when possible)
+ * Calls: `services/proxyService.js` and `req.userContext.hashIndex`.
+ */
+
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');

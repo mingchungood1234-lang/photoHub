@@ -1,3 +1,13 @@
+/**
+ * DUPLICATE-CHECK & UPLOAD ROUTES (Authenticated via `authMiddleware`)
+ *
+ * Where this belongs: `src/routes/uploadRoutes.js`, mounted in `src/routes/index.js`.
+ * Where requests go:
+ *   - `GET /api/check/:hash`, `POST /api/check`, `POST /api/check/batch` -> `controllers/checkController.js`
+ *   - `POST /api/upload` -> runs `uploadMiddleware.conditionalMultipart` first -> `controllers/uploadController.js` (`uploadDirect`)
+ *   - `POST /api/upload/presign`, `POST /api/upload/confirm` -> S3/MinIO 2-step flow -> `controllers/uploadController.js`
+ */
+
 const express = require('express');
 
 function createUploadRoutes({ checkController, uploadController, uploadMiddleware }) {

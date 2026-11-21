@@ -1,3 +1,14 @@
+/**
+ * PHOTO STORAGE & SHA-256 VERIFICATION SERVICE
+ *
+ * Where this belongs: `src/services/storageService.js` (Service Layer).
+ * Called by: `src/controllers/uploadController.js` (`uploadDirect`, `presignUpload`, `confirmUpload`).
+ * Uses: `models/hashIndexModel.js` (`computeBufferSha256`, `computeFileSha256`, `hashIndex.lookup`/`set`).
+ * Where files go on disk:
+ *   Writes uploaded originals into `<storageDir>/<YYYY>/<YYYY-MM-DD>/<filename>`, reads the saved
+ *   file back from disk to double-check its SHA-256 hash, and only then returns `canDelete: true`.
+ */
+
 const fsp = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');

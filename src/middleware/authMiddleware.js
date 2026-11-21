@@ -1,3 +1,14 @@
+/**
+ * AUTHENTICATION MIDDLEWARE (Gatekeeper for Protected `/api/*` Endpoints)
+ *
+ * Where this belongs: `src/middleware/authMiddleware.js`.
+ * Where it runs: Mounted in `src/routes/index.js` right AFTER `publicRoutes` and BEFORE
+ * `accountRoutes`, `uploadRoutes`, `proxyRoutes`, and `photoRoutes`.
+ * Where it goes next: Calls `contextService.getOrCreateFolderContext(...)` & `models/userModel.js`
+ * to verify credentials, attaches `req.userContext = { folderName, storageDir, hashIndex, ... }`,
+ * and calls `next()` so the target controller knows which user folder to read/write.
+ */
+
 const { verifyToken, resolveConfiguredUserFolder } = require('../models/userModel');
 
 /**

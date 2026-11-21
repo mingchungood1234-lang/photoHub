@@ -1,3 +1,15 @@
+/**
+ * UPLOAD BODY PARSER MIDDLEWARE
+ *
+ * Where this belongs: `src/middleware/uploadMiddleware.js`.
+ * Where it is used:
+ *   - `rawUploadParser` is mounted globally on `/api/upload` in `src/app.js` to capture raw
+ *     binary file bodies (`Buffer` in `req.body`) sent by mobile clients or Apple Shortcuts.
+ *   - `conditionalMultipart` runs per-route in `src/routes/uploadRoutes.js` to parse HTML/form
+ *     `multipart/form-data` uploads (`multer` puts uploaded file(s) into `req.files`).
+ * Where it goes next: Calls `next()` into `uploadController.uploadDirect`.
+ */
+
 const express = require('express');
 const multer = require('multer');
 

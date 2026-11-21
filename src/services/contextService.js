@@ -1,3 +1,14 @@
+/**
+ * USER CONTEXT & PER-FOLDER ISOLATION SERVICE
+ *
+ * Where this belongs: `src/services/contextService.js` (Business-logic Service Layer).
+ * Created once in `src/app.js` at startup and passed into `authMiddleware`, `healthController`,
+ * `authController`, `accountController`, and `uploadController`.
+ * Uses: `models/hashIndexModel.js` (one `HashIndex` instance per user folder) & `models/userModel.js` (`resolveQuotaBytes`).
+ * Why it exists: Keeps each user's photos (`STORAGE_DIR/<folderName>`) and hash index JSON file
+ * (`DATA_DIR/hash-index-<folder>.json`) completely separated even when multiple people share one server.
+ */
+
 const fsp = require('fs/promises');
 const path = require('path');
 const { HashIndex } = require('../models/hashIndexModel');
