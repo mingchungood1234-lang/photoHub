@@ -1297,3 +1297,201 @@ test('Server Capacity Gate blocks new sign-ins when full while existing users & 
   ).json();
   assert.equal(whoUpdated.storage.quotaBytes, 80_000);
 });
+
+test('Admin refresh and rescan do not create phantom root user slot in multi-user or Google mode', async (t) => {
+  const ctx = await startTestServer({
+    publicUrl: 'https://noroot.photohub.test',
+    googleClientId: 'noroot-client-id',
+    googleClientSecret: 'noroot-client-secret',
+    authSessionSecret: 'noroot-session-secret-0123456789abcdef',
+    userKeys: 'mingchun:mingchun,leeping:leeping',
+    defaultQuotaGb: 0.00005, // 50,000 bytes per user
+    serverCapacityGb: 0.00012, // 120,000 bytes pool: room for mingchun + leeping (100 KB), NOT +1 phantom root (150 KB)
+    adminKey: 'noroot_admin_secret',
+    scanStorageOnStartup: true,
+    exchangeGoogleCodeForProfile: async () => ({
+      sub: 'sub-bob-noroot',
+      email: 'bob@gmail.com',
+      name: 'Bob',
+    }),
+  });
+  t.after(() => ctx.cleanup());
+
+  // Upload one photo to mingchun and put an untracked photo inside leeping & an orphaned google_* folder
+  const mingBuf = Buffer.alloc(120, 0x33);
+  const mingForm = new FormData();
+  mingForm.append('photo', new Blob([mingBuf], { type: 'image/jpeg' }), 'MING_01.JPG');
+  const upMing = await ctx.request('/api/upload', {
+    method: 'POST',
+    headers: { 'X-Api-Key': 'mingchun' },
+    body: mingForm,
+  });
+  assert.equal(upMing.status, 200);
+
+  const orphanGoogleDir = path.join(ctx.storageDir, 'google_orphan_deadbeef', '2026', '01');
+  await fsp.mkdir(orphanGoogleDir, { recursive: true });
+  await fsp.writeFile(path.join(orphanGoogleDir, 'ORPHAN.JPG'), Buffer.alloc(200, 0x44));
+
+  // Trigger a full Rescan Storage Disks then load Overview twice (simulating Admin "Rescan" + "Refresh")
+  const rescanRes = await ctx.request('/api/admin/rescan', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Admin-Key': 'noroot_admin_secret',
+    },
+    body: JSON.stringify({}),
+  });
+  assert.equal(rescanRes.status, 200);
+  const rescanBody = await rescanRes.json();
+  assert.equal(rescanBody.rescanned.includes('/'), false);
+
+  const ov1 = await (
+    await ctx.request('/api/admin/overview', {
+      headers: { 'X-Admin-Key': 'noroot_admin_secret' },
+    })
+  ).json();
+  const ov2 = await (
+    await ctx.request('/api/admin/overview', {
+      headers: { 'X-Admin-Key': 'noroot_admin_secret' },
+    })
+  ).json();
+
+  for (const ov of [ov1, ov2]) {
+    assert.equal(ov.success, true);
+    assert.equal(ov.capacity.users.some((u) => u.id === 'root' || u.folderKey === '__ROOT__'), false);
+    assert.equal(ov.capacity.registeredUserCount, 2);
+    assert.equal(ov.capacity.totalItems, 1);
+    assert.equal(ov.capacity.totalUsedBytes, 120);
+    assert.equal(ov.capacity.totalAllocatedQuotaBytes, 100_000);
+    assert.equal(ov.capacity.isFullForNewUsers, true); // 100 KB + 50 KB > 120 KB
+  }
+
+  // Also test Google-only mode (`userKeyMap` empty, `API_KEY` empty) with background startup scan enabled:
+  // even after rescan & refresh, root must never appear or occupy a quota slot.
+  const ctxGoogleOnly = await startTestServer({
+    publicUrl: 'https://gonly.photohub.test',
+    googleClientId: 'gonly-client-id',
+    googleClientSecret: 'gonly-client-secret',
+    authSessionSecret: 'gonly-session-secret-0123456789abcdef',
+    defaultQuotaGb: 0.00005,
+    serverCapacityGb: 0.00008, // room for 1 user (Alice 50 KB), blocked if phantom root added (100 KB > 80 KB)
+    adminKey: 'gonly_admin_secret',
+    scanStorageOnStartup: true,
+    exchangeGoogleCodeForProfile: async () => ({
+      sub: 'sub-alice-gonly',
+      email: 'alice@gmail.com',
+      name: 'Alice Only',
+    }),
+  });
+  t.after(() => ctxGoogleOnly.cleanup());
+
+  const verifier = 'gonly_pkce_verifier_secret_string_at_least_32_chars';
+  const challenge = crypto
+    .createHash('sha256')
+    .update(verifier, 'utf8')
+    .digest('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+  const startR = await ctxGoogleOnly.request(
+    `/api/auth/google/start?code_challenge=${encodeURIComponent(challenge)}&redirect_uri=${encodeURIComponent('photohub://auth/callback')}`
+  );
+  const st = new URL(startR.headers.location).searchParams.get('state');
+  const cbR = await ctxGoogleOnly.request(
+    `/api/auth/google/callback?code=mock&state=${encodeURIComponent(st)}`
+  );
+  const authCode = new URL(cbR.headers.location).searchParams.get('code');
+  const exR = await (
+    await ctxGoogleOnly.request('/api/auth/exchange', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: authCode, codeVerifier: verifier }),
+    })
+  ).json();
+
+  const aliceForm = new FormData();
+  aliceForm.append('photo', new Blob([Buffer.alloc(75, 0x22)], { type: 'image/jpeg' }), 'ALICE_GO.JPG');
+  const upAlice = await ctxGoogleOnly.request('/api/upload', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${exR.token}` },
+    body: aliceForm,
+  });
+  assert.equal(upAlice.status, 200);
+
+  // Even if an old polluted data/hash-index.json existed referencing Alice's folder, overview + rescan stay clean
+  await ctxGoogleOnly.request('/api/admin/rescan', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Admin-Key': 'gonly_admin_secret' },
+    body: JSON.stringify({}),
+  });
+
+  const gOverview = await (
+    await ctxGoogleOnly.request('/api/admin/overview', {
+      headers: { 'X-Admin-Key': 'gonly_admin_secret' },
+    })
+  ).json();
+  assert.equal(gOverview.capacity.users.length, 1);
+  assert.equal(gOverview.capacity.users[0].email, 'alice@gmail.com');
+  assert.equal(gOverview.capacity.registeredUserCount, 1);
+  assert.equal(gOverview.capacity.totalItems, 1);
+  assert.equal(gOverview.capacity.totalUsedBytes, 75);
+  assert.equal(gOverview.capacity.totalAllocatedQuotaBytes, 50_000);
+
+  // Also test self-healing when an older server run already left polluted user-folder entries
+  // inside data/hash-index.json and API_KEY is enabled alongside USER_KEYS.
+  const preRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'photohub-prepolluted-'));
+  t.after(() => fsp.rm(preRoot, { recursive: true, force: true }));
+  const preStorage = path.join(preRoot, 'uploads');
+  const preData = path.join(preRoot, 'data');
+  await fsp.mkdir(path.join(preStorage, 'mingchun', '2026', '01'), { recursive: true });
+  await fsp.mkdir(preData, { recursive: true });
+  const fakePhotoBuf = Buffer.alloc(90, 0x77);
+  const fakePhotoHash = crypto.createHash('sha256').update(fakePhotoBuf).digest('hex');
+  await fsp.writeFile(
+    path.join(preStorage, 'mingchun', '2026', '01', 'POLLUTED.JPG'),
+    fakePhotoBuf
+  );
+  await fsp.writeFile(
+    path.join(preData, 'hash-index.json'),
+    JSON.stringify({
+      [fakePhotoHash]: {
+        hash: fakePhotoHash,
+        relativePath: 'mingchun/2026/01/POLLUTED.JPG',
+        originalName: 'POLLUTED.JPG',
+        size: 90,
+      },
+    })
+  );
+
+  const ctxPolluted = await startTestServer({
+    storageDir: preStorage,
+    dataDir: preData,
+    apiKey: 'shared_root_secret',
+    userKeys: 'mingchun:mingchun',
+    adminKey: 'heal_admin_secret',
+    scanStorageOnStartup: true,
+  });
+  t.after(() => ctxPolluted.cleanup());
+
+  await ctxPolluted.request('/api/admin/rescan', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Admin-Key': 'heal_admin_secret' },
+    body: JSON.stringify({}),
+  });
+  const healedOv = await (
+    await ctxPolluted.request('/api/admin/overview', {
+      headers: { 'X-Admin-Key': 'heal_admin_secret' },
+    })
+  ).json();
+
+  const rootRow = healedOv.capacity.users.find((u) => u.id === 'root');
+  const mingRow = healedOv.capacity.users.find((u) => u.folderName === 'mingchun');
+  assert.ok(rootRow);
+  assert.equal(rootRow.itemCount, 0);
+  assert.equal(rootRow.usedBytes, 0);
+  assert.ok(mingRow);
+  assert.equal(mingRow.itemCount, 1);
+  assert.equal(mingRow.usedBytes, 90);
+  assert.equal(healedOv.capacity.totalItems, 1);
+  assert.equal(healedOv.capacity.totalUsedBytes, 90);
+});

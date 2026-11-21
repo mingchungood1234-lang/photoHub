@@ -31,11 +31,79 @@ function formatBytesShort(bytes) {
  * capacity limits for new user signups, and per-user storage reporting.
  */
 function createContextService(config, { userDirectory = null } = {}) {
+  const folderContexts = new Map(); // folderName -> { folderName, storageDir, hashIndex }
+  const pendingFolderInits = new Map();
+
+  function isOpenLocalRootMode() {
+    return (
+      config.userKeyMap.size === 0 &&
+      !config.googleClientId &&
+      !config.requireAuth
+    );
+  }
+
+  function isRootFolderEnabled() {
+    if (config.apiKey) return true;
+    if (isOpenLocalRootMode()) return true;
+    if (Array.from(config.userFolderMap.values()).includes('__ROOT__')) {
+      return true;
+    }
+    if (
+      userDirectory &&
+      userDirectory.listAll().some((u) => !u.folderName || u.folderName === '__ROOT__')
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  // Root (`defaultHashIndex`) points at `config.storageDir`, which is also the parent directory
+  // holding per-user folders (`USER_KEYS`, `USER_FOLDERS`, `google_*`). Exclude every per-user
+  // folder from root scans/index loads so multi-user folders never get counted as root photos.
+  function shouldExcludeFromDefaultRoot(relPath) {
+    const normalized = String(relPath || '')
+      .replace(/\\/g, '/')
+      .replace(/^\/+/, '');
+    if (!normalized) return false;
+    const topSegment = normalized.split('/')[0];
+    if (!topSegment) return false;
+
+    if (!isOpenLocalRootMode() && topSegment.startsWith('google_')) {
+      return true;
+    }
+    for (const folderName of config.userKeyMap.values()) {
+      if (folderName && folderName !== '__ROOT__' && folderName === topSegment) {
+        return true;
+      }
+    }
+    for (const folderName of config.userFolderMap.values()) {
+      if (folderName && folderName !== '__ROOT__' && folderName === topSegment) {
+        return true;
+      }
+    }
+    if (folderContexts.has(topSegment)) return true;
+    if (userDirectory) {
+      for (const user of userDirectory.listAll()) {
+        if (
+          user &&
+          user.folderName &&
+          user.folderName !== '__ROOT__' &&
+          user.folderName === topSegment
+        ) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   const defaultHashIndex = new HashIndex({
     storageDir: config.storageDir,
     hashIndexFile: config.hashIndexFile,
-    scanStorageOnStartup:
-      config.userKeyMap.size === 0 ? config.scanStorageOnStartup : false,
+    scanStorageOnStartup: Boolean(
+      config.scanStorageOnStartup && isRootFolderEnabled()
+    ),
+    shouldExcludePath: (relPath) => shouldExcludeFromDefaultRoot(relPath),
   });
 
   let defaultIndexPromise = null;
@@ -45,9 +113,6 @@ function createContextService(config, { userDirectory = null } = {}) {
     }
     return defaultIndexPromise;
   }
-
-  const folderContexts = new Map(); // folderName -> { folderName, storageDir, hashIndex }
-  const pendingFolderInits = new Map();
 
   async function getOrCreateFolderContext(folderName) {
     if (folderContexts.has(folderName)) {
@@ -83,11 +148,7 @@ function createContextService(config, { userDirectory = null } = {}) {
   }
 
   async function init() {
-    if (
-      config.userKeyMap.size === 0 ||
-      config.apiKey ||
-      Array.from(config.userFolderMap.values()).includes('__ROOT__')
-    ) {
+    if (isRootFolderEnabled()) {
       await ensureDefaultHashIndexReady();
     }
     for (const folderName of new Set(config.userKeyMap.values())) {
@@ -96,7 +157,9 @@ function createContextService(config, { userDirectory = null } = {}) {
   }
 
   async function ensureKnownUserContextsReady() {
-    await ensureDefaultHashIndexReady();
+    if (isRootFolderEnabled()) {
+      await ensureDefaultHashIndexReady();
+    }
     if (!userDirectory) return;
     for (const user of userDirectory.listAll()) {
       if (user && user.folderName && user.folderName !== '__ROOT__') {
@@ -284,11 +347,9 @@ function createContextService(config, { userDirectory = null } = {}) {
       });
     }
 
-    if (!seenFolderKeys.has('__ROOT__')) {
+    if (!seenFolderKeys.has('__ROOT__') && isRootFolderEnabled()) {
       const rootUsage = getUsageForFolder(null);
-      const isOpenLocalRoot =
-        config.userKeyMap.size === 0 && !config.googleClientId && !config.requireAuth;
-      if (rootUsage.itemCount > 0 || config.apiKey || isOpenLocalRoot) {
+      if (rootUsage.itemCount > 0 || config.apiKey || isOpenLocalRootMode()) {
         const quotaBytes = getQuotaBytesForContext({ apiKey: config.apiKey || undefined });
         userRows.push({
           id: 'root',
@@ -410,7 +471,12 @@ function createContextService(config, { userDirectory = null } = {}) {
   async function rescanFolders(targetFolderKey = null) {
     await ensureKnownUserContextsReady();
     const rescanned = [];
-    if (!targetFolderKey || targetFolderKey === '__ROOT__' || targetFolderKey === '/') {
+    const shouldScanRoot =
+      targetFolderKey === '__ROOT__' ||
+      targetFolderKey === '/' ||
+      (!targetFolderKey && isRootFolderEnabled());
+    if (shouldScanRoot) {
+      await ensureDefaultHashIndexReady();
       await defaultHashIndex.syncStorageDir();
       rescanned.push('/');
     }

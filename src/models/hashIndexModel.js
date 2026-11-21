@@ -286,14 +286,41 @@ async function inferDiskMediaDates(relPath, fileName, stat, fullPath) {
 }
 
 class HashIndex {
-  constructor({ storageDir, hashIndexFile, scanStorageOnStartup = true }) {
+  constructor({
+    storageDir,
+    hashIndexFile,
+    scanStorageOnStartup = true,
+    shouldExcludePath = null,
+  }) {
     this.storageDir = storageDir;
     this.hashIndexFile = hashIndexFile;
     this.scanStorageOnStartup = scanStorageOnStartup;
+    this.shouldExcludePath =
+      typeof shouldExcludePath === 'function' ? shouldExcludePath : null;
     this.records = new Map(); // sha256 -> { hash, relativePath, originalName, size, photoDate, uploadedAt, proxyHash? }
     this.proxyToMaster = new Map(); // proxySha256 -> masterSha256
     this.writePromise = Promise.resolve();
     this.syncPromise = null;
+  }
+
+  _deleteIndexedRecord(hash, entry) {
+    this.records.delete(hash);
+    if (entry && entry.proxyHash && typeof entry.proxyHash === 'string') {
+      const p = entry.proxyHash.trim().toLowerCase();
+      if (this.proxyToMaster.get(p) === hash) {
+        this.proxyToMaster.delete(p);
+      }
+    }
+    if (entry && Array.isArray(entry.proxyHashes)) {
+      for (const rawP of entry.proxyHashes) {
+        if (typeof rawP === 'string' && rawP.trim()) {
+          const p = rawP.trim().toLowerCase();
+          if (this.proxyToMaster.get(p) === hash) {
+            this.proxyToMaster.delete(p);
+          }
+        }
+      }
+    }
   }
 
   async init() {
@@ -309,12 +336,18 @@ class HashIndex {
       console.warn(`Warning: could not mkdir dataDir (${path.dirname(this.hashIndexFile)}):`, err.message);
     }
 
+    let prunedExcluded = false;
     try {
       const raw = await fsp.readFile(this.hashIndexFile, 'utf8');
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed === 'object') {
         for (const [hash, entry] of Object.entries(parsed)) {
           if (entry && entry.relativePath) {
+            const relSlash = String(entry.relativePath).replace(/\\/g, '/');
+            if (this.shouldExcludePath && this.shouldExcludePath(relSlash, false)) {
+              prunedExcluded = true;
+              continue;
+            }
             const normalizedHash = hash.toLowerCase();
             this.records.set(normalizedHash, entry);
             if (entry.proxyHash && typeof entry.proxyHash === 'string') {
@@ -334,6 +367,12 @@ class HashIndex {
       if (err.code !== 'ENOENT') {
         console.warn('Warning: could not read hash index file, starting fresh:', err.message);
       }
+    }
+
+    if (prunedExcluded) {
+      await this.persist().catch((err) => {
+        console.warn('Warning: could not persist pruned hash index:', err.message);
+      });
     }
 
     if (this.scanStorageOnStartup) {
@@ -358,6 +397,12 @@ class HashIndex {
       const indexedPaths = new Set();
 
       for (const [hash, entry] of this.records.entries()) {
+        const relSlash = String((entry && entry.relativePath) || '').replace(/\\/g, '/');
+        if (this.shouldExcludePath && relSlash && this.shouldExcludePath(relSlash, false)) {
+          this._deleteIndexedRecord(hash, entry);
+          changed = true;
+          continue;
+        }
         if (entry && entry.storageType === 's3') {
           if (entry.relativePath) {
             indexedPaths.add(path.normalize(entry.relativePath));
@@ -368,7 +413,7 @@ class HashIndex {
         try {
           const stat = await fsp.stat(fullPath);
           if (!stat.isFile() || (entry.size && stat.size !== entry.size)) {
-            this.records.delete(hash);
+            this._deleteIndexedRecord(hash, entry);
             changed = true;
           } else {
             indexedPaths.add(path.normalize(entry.relativePath));
@@ -390,7 +435,7 @@ class HashIndex {
             }
           }
         } catch {
-          this.records.delete(hash);
+          this._deleteIndexedRecord(hash, entry);
           changed = true;
         }
       }
@@ -414,15 +459,19 @@ class HashIndex {
         for (const d of entries) {
           if (d.name.startsWith('.') || ignoredDirs.has(d.name)) continue;
           const fullPath = path.join(dir, d.name);
-          if (d.isDirectory()) {
+          const relPath = path.normalize(path.relative(this.storageDir, fullPath));
+          const relSlash = relPath.split(path.sep).join('/');
+          const isDir = d.isDirectory();
+          if (this.shouldExcludePath && this.shouldExcludePath(relSlash, isDir)) {
+            continue;
+          }
+          if (isDir) {
             await walk(fullPath);
           } else if (d.isFile() && !d.name.endsWith('.tmp')) {
-            const relPath = path.normalize(path.relative(this.storageDir, fullPath));
             if (!indexedPaths.has(relPath)) {
               try {
                 const stat = await fsp.stat(fullPath);
                 const hash = await computeFileSha256(fullPath);
-                const relSlash = relPath.split(path.sep).join('/');
                 const inferred = await inferDiskMediaDates(relSlash, d.name, stat, fullPath);
                 this.records.set(hash, {
                   hash,
