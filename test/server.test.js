@@ -733,6 +733,14 @@ test('iOS Proxy-Replacement Workflow: strict checksum, proxy registration, batch
         y2025.photos.map((p) => p.originalName),
         ['MORNING.JPG', 'AFTERNOON.MP4']
       );
+
+      // Optional hash prefix filter (cross-device proxy -> master lookup)
+      const firstHash = videosOnly.photos[0].hash;
+      const prefixMatches = await (
+        await timelineCtx.request(`/api/photos?prefix=${firstHash.slice(0, 16)}`)
+      ).json();
+      assert.equal(prefixMatches.photos.length, 1);
+      assert.equal(prefixMatches.photos[0].hash, firstHash);
     } finally {
       await timelineCtx.cleanup();
     }

@@ -1,0 +1,50 @@
+name: Build Android App
+
+on:
+  push:
+    paths:
+      - 'android/**'
+      - '.github/workflows/android-build.yml'
+  pull_request:
+    paths:
+      - 'android/**'
+      - '.github/workflows/android-build.yml'
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    name: Build PhotoHubCompressor (Android)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run unit tests and build Debug APK
+        working-directory: android
+        env:
+          PHOTOHUB_GATEWAY_URL: ${{ vars.PHOTOHUB_GATEWAY_URL }}
+          PHOTOHUB_PINNED_CERT_SHA256: ${{ vars.PHOTOHUB_PINNED_CERT_SHA256 }}
+        run: |
+          chmod +x gradlew || true
+          if [ -x ./gradlew ]; then
+            ./gradlew testDebugUnitTest assembleDebug
+          else
+            gradle testDebugUnitTest assembleDebug
+          fi
+
+      - name: Upload Debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhotoHubCompressor-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          retention-days: 30

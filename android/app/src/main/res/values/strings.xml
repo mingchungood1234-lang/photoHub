@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">photoHub</string>
+    <string name="share_original_label">Fetch &amp; Share Original</string>
+    <string name="documents_provider_label">photoHub</string>
+</resources>

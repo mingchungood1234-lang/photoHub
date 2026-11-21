@@ -63,6 +63,10 @@ function createPhotoController({ config }) {
             return wantVideo ? isVid : !isVid;
           });
         }
+        if (req.query.prefix && /^[0-9a-f]{8,64}$/i.test(String(req.query.prefix).trim())) {
+          const targetPrefix = String(req.query.prefix).trim().toLowerCase();
+          all = all.filter((item) => String(item.hash || '').toLowerCase().startsWith(targetPrefix));
+        }
         if (req.query.order === 'asc') {
           all = all.slice().reverse();
         }
