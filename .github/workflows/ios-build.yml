@@ -14,7 +14,7 @@ on:
 jobs:
   build-ios:
     name: Compile PhotoHubCompressor (iOS)
-    runs-on: macos-15
+    runs-on: macos-26
 
     steps:
       - name: Checkout repository
@@ -22,11 +22,11 @@ jobs:
 
       - name: Select Xcode
         run: |
-          if [ -d /Applications/Xcode.app/Contents/Developer ]; then
-            sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-          else
-            XCODE_APP=$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)
+          XCODE_APP=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1 || true)
+          if [ -n "$XCODE_APP" ] && [ -d "$XCODE_APP/Contents/Developer" ]; then
             sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          elif [ -d /Applications/Xcode.app/Contents/Developer ]; then
+            sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
           fi
           xcodebuild -version
 

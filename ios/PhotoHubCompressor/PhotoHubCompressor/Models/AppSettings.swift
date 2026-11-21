@@ -93,6 +93,7 @@ final class AppSettings: ObservableObject {
     @AppStorage("autoSaveProxiesToPhotosApp") var autoSaveProxiesToPhotosApp: Bool = true
     @AppStorage("nightlyAutoBackupEnabled") var nightlyAutoBackupEnabled: Bool = false
     @AppStorage("nightlyRequiresCharging") var nightlyRequiresCharging: Bool = true
+    @AppStorage("notifyWhenBackgroundUploadFinishes") var notifyWhenBackgroundUploadFinishes: Bool = true
     @AppStorage("morningReminderHour") var morningReminderHour: Int = 8
     @AppStorage("candidateSortMode") var candidateSortModeRaw: String = CandidateSortMode.largestVideosFirst.rawValue
 

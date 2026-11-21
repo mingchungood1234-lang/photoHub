@@ -67,6 +67,8 @@
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
 		<string>com.photohub.compressor.nightlyBackup</string>
+		<string>com.photohub.compressor.autoUploadRefresh</string>
+		<string>com.photohub.compressor.continued.*</string>
 	</array>
 	<key>UILaunchScreen</key>
 	<dict/>

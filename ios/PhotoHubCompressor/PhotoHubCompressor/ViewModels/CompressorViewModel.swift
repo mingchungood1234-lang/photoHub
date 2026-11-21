@@ -25,6 +25,8 @@ final class CompressorViewModel: ObservableObject {
     private let tracker = LocalProxyTracker.shared
     private var pendingAutoDeleteWhenActive: Bool = false
     private var activeBgTaskId: UIBackgroundTaskIdentifier = .invalid
+    private var activeUploadTask: Task<Void, Never>?
+    private var activeContinuedSession: ContinuedUploadSession?
 
     init(settings: AppSettings) {
         self.settings = settings
@@ -231,7 +233,23 @@ final class CompressorViewModel: ObservableObject {
         totalToProcess = targetIds.count
         statusBanner = nil
 
+        if settings.notifyWhenBackgroundUploadFinishes {
+            BackgroundBackupManager.shared.requestNotificationPermissionIfNeeded()
+        }
+
         beginAppBackgroundTask()
+        activeUploadTask?.cancel()
+        let notifyOnFinish = settings.notifyWhenBackgroundUploadFinishes
+        let morningHour = settings.morningReminderHour
+
+        let continuedSession = BackgroundBackupManager.shared.beginContinuedUploadSession(
+            totalCount: targetIds.count
+        ) { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.activeUploadTask?.cancel()
+            }
+        }
+        activeContinuedSession = continuedSession
 
         let apiClient = PhotoHubAPIClient(settings: settings)
         let format = settings.proxyFormat
@@ -242,8 +260,11 @@ final class CompressorViewModel: ObservableObject {
         let normalizedBaseURL = settings.normalizedBaseURL
         let apiKey = settings.apiKey
 
-        Task.detached(priority: .userInitiated) { [weak self] in
-            guard let self = self else { return }
+        activeUploadTask = Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self = self else {
+                continuedSession?.finish(success: false)
+                return
+            }
 
             do {
                 let info = try await apiClient.whoami()
@@ -251,7 +272,10 @@ final class CompressorViewModel: ObservableObject {
                     self.settings.serverStorage = info.storage
                 }
             } catch APIClientError.httpError(401, _) {
+                continuedSession?.finish(success: false)
                 await MainActor.run {
+                    self.activeContinuedSession = nil
+                    self.activeUploadTask = nil
                     self.isProcessing = false
                     self.endAppBackgroundTask()
                     self.statusBanner = "Session expired. Please sign in again."
@@ -260,7 +284,10 @@ final class CompressorViewModel: ObservableObject {
                 }
                 return
             } catch {
+                continuedSession?.finish(success: false)
                 await MainActor.run {
+                    self.activeContinuedSession = nil
+                    self.activeUploadTask = nil
                     self.isProcessing = false
                     self.endAppBackgroundTask()
                     let hostLabel = normalizedBaseURL?.host ?? "server"
@@ -278,7 +305,7 @@ final class CompressorViewModel: ObservableObject {
                 for _ in 0..<workerCount {
                     group.addTask {
                         var workerFailures = 0
-                        while let nextId = await queue.next() {
+                        while !Task.isCancelled, let nextId = await queue.next() {
                             let ok = await self.processSingleCandidate(
                                 id: nextId,
                                 apiClient: apiClient,
@@ -290,7 +317,9 @@ final class CompressorViewModel: ObservableObject {
                                 normalizedBaseURL: normalizedBaseURL,
                                 apiKey: apiKey,
                                 videoSemaphore: videoSemaphore,
-                                photosSaveSemaphore: photosSaveSemaphore
+                                photosSaveSemaphore: photosSaveSemaphore,
+                                continuedSession: continuedSession,
+                                totalCount: targetIds.count
                             )
                             if !ok {
                                 workerFailures += 1
@@ -313,16 +342,30 @@ final class CompressorViewModel: ObservableObject {
                 }
             }
 
+            let finishedCleanly = !Task.isCancelled && failedCount == 0
+            continuedSession?.finish(success: finishedCleanly)
+
             await MainActor.run {
+                self.activeContinuedSession = nil
+                self.activeUploadTask = nil
                 self.isProcessing = false
                 self.endAppBackgroundTask()
                 let savedStr = ByteCountFormatter.string(fromByteCount: self.totalSavedBytes, countStyle: .file)
                 if !self.pendingDeleteAssets.isEmpty {
+                    let readyCount = self.pendingDeleteAssets.count
+                    if notifyOnFinish && UIApplication.shared.applicationState != .active {
+                        BackgroundBackupManager.shared.sendDeleteOriginalsNotification(
+                            count: readyCount,
+                            savedBytes: self.totalSavedBytes,
+                            immediate: true,
+                            morningHour: morningHour
+                        )
+                    }
                     self.scheduleAutomaticDeletePrompt()
                 } else if failedCount > 0 && self.statusBanner == nil {
                     self.statusBanner = "Finished with \(failedCount) error(s). Space saved: \(savedStr)."
                 } else if failedCount == 0 {
-                    self.statusBanner = "Finished! Space saved: \(savedStr)."
+                    self.statusBanner = "Finished! All originals backed up & verified."
                 }
             }
         }
@@ -354,7 +397,9 @@ final class CompressorViewModel: ObservableObject {
         normalizedBaseURL: URL?,
         apiKey: String,
         videoSemaphore: AsyncSemaphore,
-        photosSaveSemaphore: AsyncSemaphore
+        photosSaveSemaphore: AsyncSemaphore,
+        continuedSession: ContinuedUploadSession?,
+        totalCount: Int
     ) async -> Bool {
         let candidate: PhotoCandidate? = await MainActor.run {
             guard let index = self.candidates.firstIndex(where: { $0.id == currentId }) else {
@@ -365,7 +410,10 @@ final class CompressorViewModel: ObservableObject {
         }
 
         guard let candidate else {
-            await MainActor.run { self.completedCount += 1 }
+            await MainActor.run {
+                self.completedCount += 1
+                continuedSession?.update(completed: self.completedCount, total: totalCount, currentFilename: "")
+            }
             return true
         }
 
@@ -398,6 +446,15 @@ final class CompressorViewModel: ObservableObject {
                         asset: candidate.asset,
                         savedBytes: outcome.savedBytes
                     )
+                    BackgroundBackupManager.shared.appendStagedItems([
+                        StagedCleanupItem(
+                            id: currentId,
+                            filename: outcome.filename,
+                            masterSha256: outcome.masterSha256,
+                            savedBytes: outcome.savedBytes,
+                            verifiedAt: Date()
+                        ),
+                    ])
                 case .skippedExistingProxy:
                     if let idx = self.candidates.firstIndex(where: { $0.id == currentId }) {
                         self.candidates[idx].state = .alreadyProxy
@@ -410,6 +467,11 @@ final class CompressorViewModel: ObservableObject {
                     }
                 }
                 self.completedCount += 1
+                continuedSession?.update(
+                    completed: self.completedCount,
+                    total: totalCount,
+                    currentFilename: candidate.filename
+                )
             }
             return true
         } catch {
@@ -417,6 +479,11 @@ final class CompressorViewModel: ObservableObject {
                 self.updateState(id: currentId, state: .failed(error.localizedDescription))
                 self.statusBanner = error.localizedDescription
                 self.completedCount += 1
+                continuedSession?.update(
+                    completed: self.completedCount,
+                    total: totalCount,
+                    currentFilename: candidate.filename
+                )
             }
             return false
         }
@@ -438,7 +505,9 @@ final class CompressorViewModel: ObservableObject {
         guard !pendingDeleteAssets.isEmpty, !isAwaitingDeleteConfirmation else { return }
 
         isAwaitingDeleteConfirmation = true
-        statusBanner = "SHA-256 verified! Opening iOS delete confirmation for \(pendingDeleteAssets.count) original(s)…"
+        let readyCount = pendingDeleteAssets.count
+        let savedStr = ByteCountFormatter.string(fromByteCount: max(0, totalSavedBytes), countStyle: .file)
+        statusBanner = "Backed up & SHA-256 verified! Tap 'Delete' on Apple's popup to remove \(readyCount) original photo\(readyCount == 1 ? "" : "s") from iPhone (saves ~\(savedStr))."
 
         Task { [weak self] in
             try? await Task.sleep(nanoseconds: 800_000_000)
@@ -451,7 +520,7 @@ final class CompressorViewModel: ObservableObject {
             guard UIApplication.shared.applicationState == .active else {
                 self.isAwaitingDeleteConfirmation = false
                 self.pendingAutoDeleteWhenActive = true
-                self.statusBanner = "Backed up & verified! Return to photoHub to confirm deleting \(self.pendingDeleteAssets.count) original(s)."
+                self.statusBanner = "Upload & compression finished! Tap here to delete \(self.pendingDeleteAssets.count) original photo(s) from your iPhone (free ~\(savedStr))."
                 return
             }
 
@@ -471,6 +540,17 @@ final class CompressorViewModel: ObservableObject {
         scheduleAutomaticDeletePrompt()
     }
 
+    func handleNotificationOpenCleanup() {
+        BackgroundBackupManager.shared.pendingOpenCleanupFromNotification = false
+        guard !isProcessing else { return }
+        if !pendingDeleteAssets.isEmpty {
+            pendingAutoDeleteWhenActive = false
+            retryPendingDeleteAlert()
+        } else if !BackgroundBackupManager.shared.stagedItems.isEmpty {
+            triggerStagedOvernightCleanupPrompt()
+        }
+    }
+
     func retryPendingDeleteAlert() {
         guard !pendingDeleteAssets.isEmpty, !isAwaitingDeleteConfirmation else { return }
         pendingAutoDeleteWhenActive = false
@@ -484,6 +564,7 @@ final class CompressorViewModel: ObservableObject {
             candidates[idx].state = .skipped("Backed up (SHA-256) • Original kept")
             candidates[idx].isSelected = false
         }
+        BackgroundBackupManager.shared.removeStagedItems(ids: pendingIds)
         pendingDeleteAssets.removeAll()
         pendingAutoDeleteWhenActive = false
         deleteErrorAlertMessage = nil

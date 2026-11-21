@@ -203,17 +203,17 @@ struct LibraryView: View {
     private var overnightReadyBanner: some View {
         let sizeStr = ByteCountFormatter.string(fromByteCount: bgManager.stagedSavedBytes, countStyle: .file)
         return HStack(spacing: 10) {
-            Image(systemName: "moon.stars.fill")
+            Image(systemName: "checkmark.seal.fill")
                 .foregroundColor(.indigo)
             VStack(alignment: .leading, spacing: 2) {
-                Text("\(bgManager.stagedItems.count) item(s) verified overnight")
+                Text("\(bgManager.stagedItems.count) Original\(bgManager.stagedItems.count == 1 ? "" : "s") Backed Up & Ready to Delete")
                     .font(.subheadline.weight(.semibold))
-                Text("~\(sizeStr) backed up safely on server. Tap to delete originals from iPhone.")
+                Text("Safely uploaded & SHA-256 verified on your server. Delete the original file\(bgManager.stagedItems.count == 1 ? "" : "s") from iPhone to free ~\(sizeStr).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Button("Free Space") {
+            Button("Delete Originals") {
                 viewModel.triggerStagedOvernightCleanupPrompt()
             }
             .buttonStyle(.borderedProminent)
@@ -240,9 +240,9 @@ struct LibraryView: View {
                 .foregroundColor(.orange)
                 .padding(.top, 2)
             VStack(alignment: .leading, spacing: 4) {
-                Text("Free space immediately in Apple Photos")
+                Text("One More Step to Free ~\(sizeStr) Right Now")
                     .font(.caption.weight(.semibold))
-                Text("iOS holds the \(viewModel.recentlyDeletedNoticeCount) deleted original(s) (\(sizeStr)) in Photos → Recently Deleted for 30 days. Open Photos → Utilities → Recently Deleted → Delete All.")
+                Text("iPhone Photos moved the \(viewModel.recentlyDeletedNoticeCount) deleted original photo(s) to Recently Deleted for 30 days. Open Photos -> Utilities -> Recently Deleted -> Delete All to reclaim that space immediately.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                 HStack(spacing: 12) {
@@ -311,11 +311,20 @@ struct LibraryView: View {
                 }
             }
 
-            Picker("After Upload Action", selection: $keepLocalProxyInPhotos) {
-                Text("Replace with Proxy").tag(true)
-                Text("Delete from iPhone").tag(false)
+            Picker("After Backup Action", selection: $keepLocalProxyInPhotos) {
+                Text("Replace Original w/ Proxy").tag(true)
+                Text("Delete Original Only").tag(false)
             }
             .pickerStyle(.segmented)
+
+            Text(
+                keepLocalProxyInPhotos
+                ? "After upload & SHA-256 verification: keeps a lightweight proxy in Apple Photos and prompts you to delete the large original."
+                : "After upload & SHA-256 verification: prompts you to delete the original from Apple Photos completely (stays backed up on Server)."
+            )
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.horizontal)
         .padding(.vertical, 10)
@@ -328,8 +337,12 @@ struct LibraryView: View {
         } label: {
             HStack {
                 Image(systemName: "checkmark.shield.fill")
-                Text("Verify, Back Up & Free \(viewModel.selectedCount) Item(s)")
-                    .fontWeight(.semibold)
+                Text(
+                    keepLocalProxyInPhotos
+                    ? "Upload, Compress & Delete \(viewModel.selectedCount) Original\(viewModel.selectedCount == 1 ? "" : "s")"
+                    : "Back Up & Delete \(viewModel.selectedCount) Original\(viewModel.selectedCount == 1 ? "" : "s")"
+                )
+                .fontWeight(.semibold)
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 14)

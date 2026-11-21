@@ -3,32 +3,38 @@ import SwiftUI
 struct ContentView: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject private var authService: GoogleAuthService
+    @ObservedObject private var bgManager: BackgroundBackupManager
     @StateObject private var viewModel: CompressorViewModel
+    @State private var selectedTab: Int = 0
 
     init(settings: AppSettings) {
         self.settings = settings
         self._authService = ObservedObject(wrappedValue: GoogleAuthService.shared)
+        self._bgManager = ObservedObject(wrappedValue: BackgroundBackupManager.shared)
         _viewModel = StateObject(wrappedValue: CompressorViewModel(settings: settings))
     }
 
     var body: some View {
         Group {
             if settings.isSignedIn {
-                TabView {
+                TabView(selection: $selectedTab) {
                     LibraryView(viewModel: viewModel)
                         .tabItem {
                             Label("Compress", systemImage: "photo.stack")
                         }
+                        .tag(0)
 
                     ServerGalleryView(settings: settings)
                         .tabItem {
                             Label("Server", systemImage: "cloud")
                         }
+                        .tag(1)
 
                     SettingsView(settings: settings)
                         .tabItem {
                             Label("Settings", systemImage: "gearshape")
                         }
+                        .tag(2)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .ignoresSafeArea(.keyboard, edges: .bottom)
@@ -37,10 +43,28 @@ struct ContentView: View {
                         await authService.refreshGatewayRouteAndStorage(settings: settings)
                     }
                     LocalProxySyncManager.shared.syncFromServerOnLaunch(settings: settings)
+                    if bgManager.pendingOpenCleanupFromNotification {
+                        openDeletePromptFromNotification()
+                    }
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .photoHubOpenCleanupPrompt)) { _ in
+                    openDeletePromptFromNotification()
+                }
+                .onChange(of: bgManager.pendingOpenCleanupFromNotification) { pending in
+                    if pending {
+                        openDeletePromptFromNotification()
+                    }
                 }
             } else {
                 GoogleSignInGateView(settings: settings, authService: authService)
             }
+        }
+    }
+
+    private func openDeletePromptFromNotification() {
+        selectedTab = 0
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            viewModel.handleNotificationOpenCleanup()
         }
     }
 }

@@ -38,7 +38,7 @@ enum PhotoCompressionState: Equatable, Sendable {
         case .hashing:
             return "Hashing SHA-256…"
         case .alreadyProxy:
-            return "Already Proxy"
+            return "Already Compressed Proxy"
         case .uploading(let progress):
             return "Uploading \(Int(progress * 100))%"
         case .verifyingChecksum:
@@ -49,7 +49,7 @@ enum PhotoCompressionState: Equatable, Sendable {
             return "Saving Proxy to Photos…"
         case .readyToDelete(let savedBytes):
             let formatted = ByteCountFormatter.string(fromByteCount: max(0, savedBytes), countStyle: .file)
-            return "SHA-256 Verified · Ready to Free \(formatted)"
+            return "Backed Up · Ready to Delete Original (Free \(formatted))"
         case .completed(let savedBytes):
             let formatted = ByteCountFormatter.string(fromByteCount: max(0, savedBytes), countStyle: .file)
             return "Verified & Saved \(formatted)"

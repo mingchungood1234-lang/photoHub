@@ -26,6 +26,8 @@ targets:
           - fetch
         BGTaskSchedulerPermittedIdentifiers:
           - com.photohub.compressor.nightlyBackup
+          - com.photohub.compressor.autoUploadRefresh
+          - com.photohub.compressor.continued.*
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
           UISceneConfigurations: {}

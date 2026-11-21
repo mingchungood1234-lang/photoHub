@@ -52,6 +52,11 @@ struct SettingsView: View {
             .onChange(of: settings.nightlyRequiresCharging) { _ in
                 bgManager.scheduleNightlyBackupIfEnabled(settings: settings)
             }
+            .onChange(of: settings.notifyWhenBackgroundUploadFinishes) { enabled in
+                if enabled {
+                    bgManager.requestNotificationPermissionIfNeeded()
+                }
+            }
             .onReceive(NotificationCenter.default.publisher(for: .localProxyStoreDidChange)) { _ in
                 localProxyCacheBytes = LocalProxyStore.shared.totalStorageBytes()
             }
@@ -208,12 +213,14 @@ struct SettingsView: View {
     @ViewBuilder
     private var overnightBackupSection: some View {
         Section {
-            Toggle("Nightly Auto-Backup (Wi-Fi)", isOn: $settings.nightlyAutoBackupEnabled)
+            Toggle("Auto Background Upload (iOS 26+ & Wi-Fi)", isOn: $settings.nightlyAutoBackupEnabled)
 
-            Toggle("Require Charger Overnight", isOn: $settings.nightlyRequiresCharging)
+            Toggle("Notify When Ready to Delete Originals", isOn: $settings.notifyWhenBackgroundUploadFinishes)
+
+            Toggle("Require Charger for Overnight Schedule", isOn: $settings.nightlyRequiresCharging)
                 .disabled(!settings.nightlyAutoBackupEnabled)
 
-            Picker("Morning Delete Reminder", selection: $settings.morningReminderHour) {
+            Picker("Overnight Reminder Time", selection: $settings.morningReminderHour) {
                 ForEach(6...11, id: \.self) { hr in
                     Text("\(hr):00 AM").tag(hr)
                 }
@@ -229,7 +236,7 @@ struct SettingsView: View {
 
             if !bgManager.stagedItems.isEmpty {
                 let bytesStr = formatBytes(bgManager.stagedSavedBytes)
-                Text("Staged Ready to Free: \(bgManager.stagedItems.count) item(s) (~\(bytesStr))")
+                Text("Ready to Delete on iPhone: \(bgManager.stagedItems.count) original\(bgManager.stagedItems.count == 1 ? "" : "s") (free ~\(bytesStr))")
                     .font(.caption.weight(.medium))
                     .foregroundColor(.indigo)
             }
@@ -240,20 +247,20 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Button("Send Test Morning Alert (5s)") {
+            Button("Send Test 'Delete Originals' Alert (5s)") {
                 bgManager.sendTestMorningAlert(settings: settings)
             }
         } header: {
-            Text("Overnight Backup & Morning Alert")
+            Text("Auto Background Upload & Delete Alerts")
         } footer: {
-            Text("Uses iOS Background Processing overnight on Wi-Fi (works without a paid Apple Developer account) to upload originals, generate proxies, and remind you in the morning to free space in 1 tap.")
+            Text("On iOS 26+, active uploads continue in the background with Live Activity progress when you leave the app. Scheduled Wi-Fi background uploads also run automatically and push a notification as soon as originals are backed up and ready to delete from your iPhone.")
         }
     }
 
     @ViewBuilder
     private var proxySettingsSection: some View {
         Section {
-            Toggle("Auto Scan & Compress on App Open", isOn: $settings.autoCompressOnOpen)
+            Toggle("Auto Scan & Upload on App Open", isOn: $settings.autoCompressOnOpen)
             Toggle("Keep Compressed Proxy in iPhone Photos", isOn: $settings.keepLocalProxyInPhotos)
 
             Picker("Upload Mode", selection: $settings.uploadModeRaw) {
@@ -285,14 +292,14 @@ struct SettingsView: View {
         } header: {
             Text("Lightweight Proxy Settings")
         } footer: {
-            Text("When 'Keep Compressed Proxy in iPhone Photos' is ON, the original photo is replaced with a small proxy in Photos. Turn it OFF to delete the photo from your iPhone completely after uploading to the Server tab.")
+            Text("When 'Keep Compressed Proxy in iPhone Photos' is ON, photoHub saves a small compressed proxy and prompts you to delete the huge original photo. Turn it OFF to delete the original photo from your iPhone completely while keeping it in the Server tab.")
         }
     }
 
     @ViewBuilder
     private var safetySection: some View {
-        Section("How Safety Works") {
-            Text("1. Your iPhone computes the SHA-256 checksum of the full-resolution original.\n2. The original is uploaded to your server (or S3/R2).\n3. Only after the backend confirms the exact SHA-256 checksum on disk does photoHub save a proxy and ask iOS to delete the original.\n4. Deleted originals stay recoverable in Apple Photos → Recently Deleted for 30 days (empty it anytime to reclaim storage immediately), and full-resolution originals remain restorable from your server.")
+        Section("How Safety & Original Deletion Works") {
+            Text("1. Your iPhone computes the SHA-256 checksum of the full-resolution original.\n2. The original uploads to your server in the foreground or background (iOS 26+ continued tasks & scheduled Wi-Fi runs).\n3. Only after your server verifies the exact SHA-256 checksum on disk does photoHub save the proxy and ask you to delete the original photo from your iPhone.\n4. Apple moves deleted originals to Photos → Recently Deleted for 30 days (tap Delete All there to free space right away), while full-resolution originals remain restorable anytime.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
