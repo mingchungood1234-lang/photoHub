@@ -20,6 +20,7 @@ final class CompressorViewModel: ObservableObject {
     @Published var sortMode: CandidateSortMode
     @Published var recentlyDeletedNoticeCount: Int = 0
     @Published var recentlyDeletedNoticeBytes: Int64 = 0
+    @Published private(set) var backgroundActiveCount: Int = 0
 
     let settings: AppSettings
     private let photoService = PhotoLibraryService()
@@ -34,6 +35,7 @@ final class CompressorViewModel: ObservableObject {
         self.settings = settings
         self.sortMode = settings.candidateSortMode
         self.permissionStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        self.backgroundActiveCount = AssetUploadCoordinator.shared.backgroundActiveAssetIds().count
     }
 
     var selectedCount: Int {
@@ -76,6 +78,7 @@ final class CompressorViewModel: ObservableObject {
                     self.statusBanner = "Please allow Photos access in iOS Settings to scan your library."
                     return
                 }
+                BackgroundBackupManager.shared.ensurePhotoObserverIfAuthorized()
 
                 let service = self.photoService
                 let tracker = self.tracker
@@ -123,6 +126,7 @@ final class CompressorViewModel: ObservableObject {
                     self.statusBanner = "Allow Full Photos Access in iOS Settings to auto-upload and delete originals."
                     return
                 }
+                BackgroundBackupManager.shared.ensurePhotoObserverIfAuthorized()
 
                 let service = self.photoService
                 let tracker = self.tracker
@@ -159,13 +163,38 @@ final class CompressorViewModel: ObservableObject {
         let stagedById = Dictionary(
             uniqueKeysWithValues: BackgroundBackupManager.shared.stagedItems.map { ($0.id, $0) }
         )
+        let bgActiveIds = AssetUploadCoordinator.shared.backgroundActiveAssetIds()
+        backgroundActiveCount = bgActiveIds.count
         candidates = scanned.map { item in
             var copy = item
             if let staged = stagedById[item.id] {
                 copy.state = .readyToDelete(savedBytes: staged.savedBytes)
                 copy.isSelected = false
+            } else if bgActiveIds.contains(item.id) {
+                copy.state = .uploadingInBackground
+                copy.isSelected = false
             }
             return copy
+        }
+    }
+
+    func syncBackgroundStateToCandidates() {
+        let bgActiveIds = AssetUploadCoordinator.shared.backgroundActiveAssetIds()
+        backgroundActiveCount = bgActiveIds.count
+        let stagedById = Dictionary(
+            uniqueKeysWithValues: BackgroundBackupManager.shared.stagedItems.map { ($0.id, $0) }
+        )
+        for idx in candidates.indices {
+            let id = candidates[idx].id
+            if let staged = stagedById[id] {
+                candidates[idx].state = .readyToDelete(savedBytes: staged.savedBytes)
+                candidates[idx].isSelected = false
+            } else if bgActiveIds.contains(id) {
+                candidates[idx].state = .uploadingInBackground
+                candidates[idx].isSelected = false
+            } else if candidates[idx].state == .uploadingInBackground {
+                candidates[idx].state = .pending
+            }
         }
     }
 
@@ -404,7 +433,6 @@ final class CompressorViewModel: ObservableObject {
             guard let index = self.candidates.firstIndex(where: { $0.id == currentId }) else {
                 return nil
             }
-            self.candidates[index].state = .hashing
             return self.candidates[index]
         }
 
@@ -415,6 +443,32 @@ final class CompressorViewModel: ObservableObject {
             }
             return true
         }
+
+        let canProcess: Bool = await MainActor.run {
+            if let staged = BackgroundBackupManager.shared.stagedItems.first(where: { $0.id == currentId }) {
+                self.stageOriginalForDeletion(id: currentId, asset: candidate.asset, savedBytes: staged.savedBytes)
+                self.completedCount += 1
+                self.recordItemProgress(id: currentId, fraction: 1.0, totalCount: totalCount)
+                return false
+            }
+            if AssetUploadCoordinator.shared.isClaimedByBackground(currentId) ||
+                !AssetUploadCoordinator.shared.tryClaimAsset(currentId, owner: .manual) {
+                self.updateState(id: currentId, state: .uploadingInBackground)
+                if let idx = self.candidates.firstIndex(where: { $0.id == currentId }) {
+                    self.candidates[idx].isSelected = false
+                }
+                self.completedCount += 1
+                self.recordItemProgress(id: currentId, fraction: 1.0, totalCount: totalCount)
+                return false
+            }
+            self.updateState(id: currentId, state: .hashing)
+            return true
+        }
+
+        guard canProcess else {
+            return true
+        }
+        defer { AssetUploadCoordinator.shared.releaseAsset(currentId, owner: .manual) }
 
         do {
             let result = try await PhotoBackupPipeline.backupAndProxyAsset(
@@ -470,6 +524,15 @@ final class CompressorViewModel: ObservableObject {
                         self.candidates[idx].state = .skipped("Restored Original Protected")
                         self.candidates[idx].isSelected = false
                     }
+                case .skippedInFlight:
+                    if let staged = BackgroundBackupManager.shared.stagedItems.first(where: { $0.id == currentId }) {
+                        self.stageOriginalForDeletion(id: currentId, asset: candidate.asset, savedBytes: staged.savedBytes)
+                    } else if let idx = self.candidates.firstIndex(where: { $0.id == currentId }) {
+                        self.candidates[idx].state = AssetUploadCoordinator.shared.isClaimedByBackground(currentId)
+                            ? .uploadingInBackground
+                            : .skipped("Already Uploading")
+                        self.candidates[idx].isSelected = false
+                    }
                 }
                 self.completedCount += 1
                 self.recordItemProgress(id: currentId, fraction: 1.0, totalCount: totalCount)
@@ -505,7 +568,7 @@ final class CompressorViewModel: ObservableObject {
         case .verifyingChecksum: return 0.78
         case .creatingProxy: return 0.86
         case .replacingInPhotos: return 0.94
-        case .alreadyProxy, .readyToDelete, .completed, .skipped, .failed: return 1.0
+        case .alreadyProxy, .uploadingInBackground, .readyToDelete, .completed, .skipped, .failed: return 1.0
         }
     }
 

@@ -22,6 +22,7 @@ enum PhotoCompressionState: Equatable, Sendable {
     case pending
     case hashing
     case alreadyProxy
+    case uploadingInBackground
     case uploading(Double)
     case verifyingChecksum
     case creatingProxy
@@ -39,6 +40,8 @@ enum PhotoCompressionState: Equatable, Sendable {
             return "Hashing SHA-256…"
         case .alreadyProxy:
             return "Already Compressed Proxy"
+        case .uploadingInBackground:
+            return "Uploading in Background…"
         case .uploading(let progress):
             return "Uploading \(Int(progress * 100))%"
         case .verifyingChecksum:
@@ -62,7 +65,7 @@ enum PhotoCompressionState: Equatable, Sendable {
 
     var isFinished: Bool {
         switch self {
-        case .completed, .readyToDelete, .alreadyProxy, .skipped:
+        case .completed, .readyToDelete, .alreadyProxy, .uploadingInBackground, .skipped:
             return true
         default:
             return false

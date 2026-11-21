@@ -4,10 +4,14 @@ function formatCheckPayload(lookupResult, reqHash, folderName) {
   const isMaster = lookupResult.status === 'master';
   const isProxy = lookupResult.status === 'proxy';
   const keepOriginalOnDevice = Boolean(record && record.keepOriginalOnDevice);
+  const hasProxy = Boolean(record && record.proxyHash);
+  const proxySize = (record && (record.proxySize || record.videoProxySize)) || null;
   return {
     exists,
     isMaster,
     isProxy,
+    hasProxy,
+    proxySize,
     isProtectedOriginal: keepOriginalOnDevice,
     keepOriginalOnDevice,
     canDelete: isMaster && !keepOriginalOnDevice,

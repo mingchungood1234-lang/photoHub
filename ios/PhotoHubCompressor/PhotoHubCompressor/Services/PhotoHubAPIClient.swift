@@ -168,6 +168,8 @@ struct CheckResponse: Decodable {
     let exists: Bool
     let isMaster: Bool?
     let isProxy: Bool?
+    let hasProxy: Bool?
+    let proxySize: Int64?
     let isProtectedOriginal: Bool?
     let keepOriginalOnDevice: Bool?
     let canReplaceWithProxy: Bool?

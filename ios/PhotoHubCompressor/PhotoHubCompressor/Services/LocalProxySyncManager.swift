@@ -63,6 +63,7 @@ final class LocalProxySyncManager: ObservableObject {
                 LocalProxyStore.shared.savePhotos(fetched, baseURL: baseURL, apiKey: apiKey)
                 DispatchQueue.main.async {
                     NotificationCenter.default.post(name: .localProxyStoreDidChange, object: nil)
+                    NotificationCenter.default.post(name: .photoHubServerSyncCompleted, object: nil)
                 }
                 await self.prefetchMissingProxies(
                     photos: fetched,

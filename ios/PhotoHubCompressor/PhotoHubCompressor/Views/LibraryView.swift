@@ -38,6 +38,20 @@ struct LibraryView: View {
                     overnightReadyBanner
                 }
 
+                if viewModel.backgroundActiveCount > 0 {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Background upload running for \(viewModel.backgroundActiveCount) item\(viewModel.backgroundActiveCount == 1 ? "" : "s") — automatically skipped from manual upload to prevent duplicates.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Color.blue.opacity(0.08))
+                }
+
                 if viewModel.recentlyDeletedNoticeCount > 0 {
                     recentlyDeletedWarningBanner
                 }
@@ -196,6 +210,10 @@ struct LibraryView: View {
             }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
                 viewModel.onAppBecameActive()
+                viewModel.syncBackgroundStateToCandidates()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .photoHubUploadCoordinatorDidChange)) { _ in
+                viewModel.syncBackgroundStateToCandidates()
             }
             .onAppear {
                 bgManager.pruneMissingAssetsFromStaged()
@@ -443,7 +461,7 @@ private struct PhotoCandidateRow: View {
         case .readyToDelete: return .orange
         case .alreadyProxy, .skipped: return .secondary
         case .failed: return .red
-        case .uploading, .hashing, .verifyingChecksum, .creatingProxy, .replacingInPhotos: return .blue
+        case .uploading, .uploadingInBackground, .hashing, .verifyingChecksum, .creatingProxy, .replacingInPhotos: return .blue
         case .pending: return .secondary
         }
     }

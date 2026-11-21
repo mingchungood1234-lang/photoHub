@@ -1,6 +1,17 @@
 import Foundation
 import Photos
 
+extension Notification.Name {
+    static let photoHubCheckRemainingSilentUploads = Notification.Name("photoHub.checkRemainingSilentUploads")
+}
+
+enum BackgroundEnqueueOutcome: Sendable {
+    case queuedBackgroundUpload
+    case finalizedLocally
+    case skippedAlreadyHandled
+    case failed
+}
+
 struct PendingBackgroundUploadJob: Codable, Sendable {
     let jobId: String
     let assetId: String
@@ -84,6 +95,8 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
     private override init() {
         super.init()
         loadJobs()
+        let restoredIds = Set(jobsByTaskId.values.map { $0.assetId })
+        AssetUploadCoordinator.shared.syncPersistedBackgroundAssetIds(restoredIds)
         _ = backgroundSession
     }
 
@@ -108,16 +121,17 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
     }
 
     /// Exports/stages `candidate` to Caches and starts an OS-managed background upload task.
-    /// Returns `true` if queued cleanly for silent background upload (or already handled/skipped).
+    /// Caller must hold a `.background` claim on `candidate.id` (which transfers to this transport
+    /// only when `.queuedBackgroundUpload` is returned).
     func enqueueSilentUpload(
         candidate: PhotoCandidate,
         photoService: PhotoLibraryService,
         apiClient: PhotoHubAPIClient,
         config: BackgroundUploadConfig
-    ) async -> Bool {
+    ) async -> BackgroundEnqueueOutcome {
         let assetId = candidate.id
         if activeAssetIds().contains(assetId) {
-            return true
+            return .queuedBackgroundUpload
         }
 
         do {
@@ -135,7 +149,7 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
                     masterHash: embeddedMasterHash,
                     originalName: master.filename
                 )
-                return true
+                return .skippedAlreadyHandled
             }
 
             let check = try await apiClient.checkHash(master.sha256)
@@ -147,18 +161,81 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
                     masterHash: check.masterHash,
                     originalName: master.filename
                 )
-                return true
+                return .skippedAlreadyHandled
             }
 
             let resolvedMasterHash = check.masterHash ?? master.sha256
+            guard AssetUploadCoordinator.shared.tryClaimMasterHash(resolvedMasterHash) else {
+                try? FileManager.default.removeItem(at: master.fileURL)
+                return .skippedAlreadyHandled
+            }
+            defer { AssetUploadCoordinator.shared.releaseMasterHash(resolvedMasterHash) }
+
+            let tracker = LocalProxyTracker.shared
             let isProtected = (check.keepOriginalOnDevice == true)
                 || (check.isProtectedOriginal == true)
-                || LocalProxyTracker.shared.isRestoredMasterHash(master.sha256)
-                || LocalProxyTracker.shared.isRestoredMasterHash(resolvedMasterHash)
+                || tracker.isRestoredMasterHash(master.sha256)
+                || tracker.isRestoredMasterHash(resolvedMasterHash)
             if isProtected {
                 try? FileManager.default.removeItem(at: master.fileURL)
-                LocalProxyTracker.shared.markRestoredOriginal(assetId: assetId, masterHash: resolvedMasterHash)
-                return true
+                tracker.markRestoredOriginal(assetId: assetId, masterHash: resolvedMasterHash)
+                return .skippedAlreadyHandled
+            }
+
+            let job = PendingBackgroundUploadJob(
+                jobId: UUID().uuidString,
+                assetId: assetId,
+                masterSha256: master.sha256,
+                masterBytes: master.sizeBytes,
+                filename: master.filename,
+                mimeType: master.mimeType,
+                creationDate: candidate.creationDate,
+                stagedFilePath: master.fileURL.path,
+                isVideo: candidate.mediaType == .video,
+                proxyFormatRaw: config.proxyFormatRaw,
+                proxyMaxPixelSize: config.proxyMaxPixelSize,
+                proxyQuality: config.proxyQuality,
+                keepLocalProxyInPhotos: config.keepLocalProxyInPhotos,
+                serverBaseURLString: config.baseURL.absoluteString,
+                cacheScopeKey: config.cacheScopeKey,
+                notifyOnComplete: config.notifyOnComplete,
+                morningHour: config.morningHour
+            )
+
+            // If this master is already verified on server (e.g. another upload completed),
+            // never re-upload the full original — finalize local proxy/staging right here.
+            if check.exists && check.isMaster == true && check.canReplaceWithProxy == true {
+                let serverHasProxy = (check.hasProxy == true)
+                let localProxyPresent = tracker.liveProxyAssetId(forMasterHash: resolvedMasterHash) != nil
+                    || tracker.isMasterHandledForPhotos(resolvedMasterHash)
+                if serverHasProxy && (!config.keepLocalProxyInPhotos || localProxyPresent) {
+                    try? FileManager.default.removeItem(at: master.fileURL)
+                    let knownProxyBytes = check.proxySize ?? 0
+                    let savedBytes = config.keepLocalProxyInPhotos
+                        ? max(0, master.sizeBytes - knownProxyBytes)
+                        : master.sizeBytes
+                    let item = StagedCleanupItem(
+                        id: assetId,
+                        filename: master.filename,
+                        masterSha256: master.sha256,
+                        savedBytes: savedBytes,
+                        verifiedAt: Date()
+                    )
+                    await MainActor.run {
+                        let mgr = BackgroundBackupManager.shared
+                        mgr.appendStagedItems([item])
+                        mgr.pruneMissingAssetsFromStaged()
+                    }
+                    return .finalizedLocally
+                }
+
+                await finalizeCompletedBackgroundUpload(
+                    job: job,
+                    stagedURL: master.fileURL,
+                    notifyNow: false,
+                    releaseCoordinatorAsset: false
+                )
+                return .finalizedLocally
             }
 
             // Move master file into persistent Caches folder so iOS doesn't purge /tmp mid-upload
@@ -179,38 +256,38 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
                 request.setValue(isoFormatter.string(from: creationDate), forHTTPHeaderField: "X-Photo-Date")
             }
 
-            let job = PendingBackgroundUploadJob(
-                jobId: UUID().uuidString,
-                assetId: assetId,
-                masterSha256: master.sha256,
-                masterBytes: master.sizeBytes,
-                filename: master.filename,
-                mimeType: master.mimeType,
-                creationDate: candidate.creationDate,
+            let persistedJob = PendingBackgroundUploadJob(
+                jobId: job.jobId,
+                assetId: job.assetId,
+                masterSha256: job.masterSha256,
+                masterBytes: job.masterBytes,
+                filename: job.filename,
+                mimeType: job.mimeType,
+                creationDate: job.creationDate,
                 stagedFilePath: stagedURL.path,
-                isVideo: candidate.mediaType == .video,
-                proxyFormatRaw: config.proxyFormatRaw,
-                proxyMaxPixelSize: config.proxyMaxPixelSize,
-                proxyQuality: config.proxyQuality,
-                keepLocalProxyInPhotos: config.keepLocalProxyInPhotos,
-                serverBaseURLString: config.baseURL.absoluteString,
-                cacheScopeKey: config.cacheScopeKey,
-                notifyOnComplete: config.notifyOnComplete,
-                morningHour: config.morningHour
+                isVideo: job.isVideo,
+                proxyFormatRaw: job.proxyFormatRaw,
+                proxyMaxPixelSize: job.proxyMaxPixelSize,
+                proxyQuality: job.proxyQuality,
+                keepLocalProxyInPhotos: job.keepLocalProxyInPhotos,
+                serverBaseURLString: job.serverBaseURLString,
+                cacheScopeKey: job.cacheScopeKey,
+                notifyOnComplete: job.notifyOnComplete,
+                morningHour: job.morningHour
             )
 
             let task = backgroundSession.uploadTask(with: request, fromFile: stagedURL)
-            task.taskDescription = job.jobId
+            task.taskDescription = persistedJob.jobId
 
             lock.lock()
-            jobsByTaskId[task.taskIdentifier] = job
+            jobsByTaskId[task.taskIdentifier] = persistedJob
             saveJobsLocked()
             lock.unlock()
 
             task.resume()
-            return true
+            return .queuedBackgroundUpload
         } catch {
-            return false
+            return .failed
         }
     }
 
@@ -255,6 +332,7 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
               let responseData,
               let confirm = try? JSONDecoder().decode(UploadConfirmResponse.self, from: responseData) else {
             try? FileManager.default.removeItem(at: stagedURL)
+            AssetUploadCoordinator.shared.releaseAsset(job.assetId, owner: .background)
             return
         }
 
@@ -262,11 +340,17 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
         let verifiedFlag = (confirm.checksumVerified == true) || (confirm.canDelete == true)
         guard confirm.success, verifiedFlag, confirmedHash == job.masterSha256.lowercased() else {
             try? FileManager.default.removeItem(at: stagedURL)
+            AssetUploadCoordinator.shared.releaseAsset(job.assetId, owner: .background)
             return
         }
 
         Task {
-            await finalizeCompletedBackgroundUpload(job: job, stagedURL: stagedURL)
+            await finalizeCompletedBackgroundUpload(
+                job: job,
+                stagedURL: stagedURL,
+                notifyNow: true,
+                releaseCoordinatorAsset: true
+            )
         }
     }
 
@@ -285,8 +369,23 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
 
     // MARK: - Finalize Proxy & Notify for Deletion
 
-    private func finalizeCompletedBackgroundUpload(job: PendingBackgroundUploadJob, stagedURL: URL) async {
-        defer { try? FileManager.default.removeItem(at: stagedURL) }
+    private func finalizeCompletedBackgroundUpload(
+        job: PendingBackgroundUploadJob,
+        stagedURL: URL,
+        notifyNow: Bool,
+        releaseCoordinatorAsset: Bool
+    ) async {
+        defer {
+            try? FileManager.default.removeItem(at: stagedURL)
+            if releaseCoordinatorAsset {
+                AssetUploadCoordinator.shared.releaseAsset(job.assetId, owner: .background)
+                if activeAssetIds().isEmpty {
+                    DispatchQueue.main.async {
+                        NotificationCenter.default.post(name: .photoHubCheckRemainingSilentUploads, object: nil)
+                    }
+                }
+            }
+        }
 
         let settings = await MainActor.run { AppSettings() }
         let apiClient = PhotoHubAPIClient(settings: settings)
@@ -372,7 +471,7 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
             let mgr = BackgroundBackupManager.shared
             mgr.appendStagedItems([item])
             mgr.pruneMissingAssetsFromStaged()
-            if job.notifyOnComplete && !mgr.stagedItems.isEmpty {
+            if notifyNow && job.notifyOnComplete && !mgr.stagedItems.isEmpty {
                 mgr.sendDeleteOriginalsNotification(
                     count: mgr.stagedItems.count,
                     savedBytes: mgr.stagedSavedBytes,

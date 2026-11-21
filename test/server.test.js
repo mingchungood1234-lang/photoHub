@@ -337,6 +337,8 @@ test('iOS Proxy-Replacement Workflow: strict checksum, proxy registration, batch
     assert.equal(batchBody.results[masterHash].exists, true);
     assert.equal(batchBody.results[masterHash].isMaster, true);
     assert.equal(batchBody.results[masterHash].isProxy, false);
+    assert.equal(batchBody.results[masterHash].hasProxy, true);
+    assert.equal(batchBody.results[masterHash].proxySize, sampleVideoProxy.length);
     assert.equal(batchBody.results[masterHash].canReplaceWithProxy, true);
 
     assert.equal(batchBody.results[proxyHash].exists, true);

@@ -13,6 +13,7 @@ enum BackupPipelineResult: Sendable {
     case backedUp(BackupPipelineOutcome)
     case skippedExistingProxy(masterHash: String?)
     case skippedProtectedOriginal(masterHash: String?)
+    case skippedInFlight
 }
 
 enum PhotoBackupPipeline {
@@ -119,6 +120,11 @@ enum PhotoBackupPipeline {
         }
 
         let resolvedMasterHash = checkResult.masterHash ?? master.sha256
+        guard AssetUploadCoordinator.shared.tryClaimMasterHash(resolvedMasterHash) else {
+            return .skippedInFlight
+        }
+        defer { AssetUploadCoordinator.shared.releaseMasterHash(resolvedMasterHash) }
+
         let isProtectedOriginal = (checkResult.keepOriginalOnDevice == true)
             || (checkResult.isProtectedOriginal == true)
             || tracker.isRestoredMasterHash(master.sha256)
@@ -129,6 +135,25 @@ enum PhotoBackupPipeline {
         }
 
         let needsUpload = !(checkResult.exists && checkResult.isMaster == true && checkResult.canReplaceWithProxy == true)
+        let serverHasProxy = (checkResult.hasProxy == true)
+        let localProxyAlreadyExists = tracker.liveProxyAssetId(forMasterHash: resolvedMasterHash) != nil
+            || tracker.isMasterHandledForPhotos(resolvedMasterHash)
+
+        // If original + server proxy (and local proxy if needed) are already completed,
+        // skip both uploading and re-compressing/saving duplicate proxies to Apple Photos.
+        if !needsUpload && serverHasProxy && (!keepLocalProxy || localProxyAlreadyExists) {
+            let knownProxyBytes = checkResult.proxySize ?? 0
+            let savedBytes = keepLocalProxy ? max(0, master.sizeBytes - knownProxyBytes) : master.sizeBytes
+            return .backedUp(
+                BackupPipelineOutcome(
+                    masterSha256: master.sha256,
+                    masterBytes: master.sizeBytes,
+                    proxyBytes: knownProxyBytes,
+                    savedBytes: savedBytes,
+                    filename: master.filename
+                )
+            )
+        }
 
         if needsUpload {
             onStageChange(.uploading(0))
