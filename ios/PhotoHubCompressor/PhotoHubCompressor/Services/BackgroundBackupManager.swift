@@ -16,7 +16,8 @@ struct StagedCleanupItem: Codable, Identifiable, Equatable, Sendable {
 }
 
 /// Bridges an active foreground/background upload batch to iOS 26+ `BGContinuedProcessingTask`
-/// so uploads & proxy compression continue seamlessly when the user switches apps or locks screen.
+/// so uploads & proxy compression continue seamlessly when switching to the Home Screen, displaying
+/// a native Live Activity progress bar on Dynamic Island and the Lock Screen.
 final class ContinuedUploadSession: @unchecked Sendable {
     let identifier: String
     let totalCount: Int
@@ -26,6 +27,9 @@ final class ContinuedUploadSession: @unchecked Sendable {
     private var isEnded = false
     private var finalSuccess = true
     private var onCancel: (@Sendable () -> Void)?
+    private var lastTitlePercent: Int = -1
+    private var lastTitleCompleted: Int = -1
+    private var lastTitleUpdateTime: Date = .distantPast
 
     init(identifier: String, totalCount: Int, onCancel: @escaping @Sendable () -> Void) {
         self.identifier = identifier
@@ -36,7 +40,7 @@ final class ContinuedUploadSession: @unchecked Sendable {
     #if compiler(>=6.2)
     @available(iOS 26.0, *)
     func attach(task: BGContinuedProcessingTask) {
-        task.progress.totalUnitCount = Int64(totalCount)
+        task.progress.totalUnitCount = 1000
         task.progress.completedUnitCount = 0
 
         task.expirationHandler = { [weak self] in
@@ -57,28 +61,42 @@ final class ContinuedUploadSession: @unchecked Sendable {
     }
     #endif
 
-    func update(completed: Int, total: Int, currentFilename: String) {
+    func update(fraction: Double, completed: Int, total: Int, statusText: String) {
         #if compiler(>=6.2)
         if #available(iOS 26.0, *) {
+            let clampedFraction = min(1.0, max(0.0, fraction))
+            let percent = Int((clampedFraction * 100.0).rounded())
+            let now = Date()
+
             lock.lock()
             let task = rawTask as? BGContinuedProcessingTask
             let ended = isEnded
+            let shouldRefreshTitle =
+                !ended &&
+                (percent >= lastTitlePercent + 2 ||
+                 completed != lastTitleCompleted ||
+                 now.timeIntervalSince(lastTitleUpdateTime) >= 0.8)
+            if shouldRefreshTitle {
+                lastTitlePercent = percent
+                lastTitleCompleted = completed
+                lastTitleUpdateTime = now
+            }
             lock.unlock()
 
             guard !ended, let task else { return }
-            let safeTotal = max(1, total)
-            let safeCompleted = max(0, min(safeTotal, completed))
-            task.progress.totalUnitCount = Int64(safeTotal)
-            task.progress.completedUnitCount = Int64(safeCompleted)
-            task.updateTitle(
-                "photoHub Auto Backup",
-                subtitle: "Backed up \(safeCompleted) of \(safeTotal) · \(currentFilename)"
-            )
+            task.progress.totalUnitCount = 1000
+            task.progress.completedUnitCount = Int64((clampedFraction * 1000.0).rounded())
+            if shouldRefreshTitle {
+                task.updateTitle(
+                    "photoHub Auto Backup (\(percent)%)",
+                    subtitle: "\(completed)/\(max(1, total)) done · \(statusText)"
+                )
+            }
         }
         #endif
     }
 
-    func finish(success: Bool) {
+    func finish(success: Bool, completionNote: String = "Finished") {
         lock.lock()
         guard !isEnded else {
             lock.unlock()
@@ -92,8 +110,13 @@ final class ContinuedUploadSession: @unchecked Sendable {
         lock.unlock()
 
         #if compiler(>=6.2)
-        if #available(iOS 26.0, *) {
-            (taskObj as? BGContinuedProcessingTask)?.setTaskCompleted(success: success)
+        if #available(iOS 26.0, *), let task = taskObj as? BGContinuedProcessingTask {
+            if success {
+                task.progress.totalUnitCount = 1000
+                task.progress.completedUnitCount = 1000
+                task.updateTitle("photoHub Backup Complete", subtitle: completionNote)
+            }
+            task.setTaskCompleted(success: success)
         }
         #endif
     }
@@ -525,7 +548,14 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
             let photoService = PhotoLibraryService()
             let tracker = LocalProxyTracker.shared
             let cachedServerPhotos = LocalProxyStore.shared.cachedPhotos(baseURL: baseURL, apiKey: cacheScope)
-            let rawCandidates = photoService.scanCandidates(tracker: tracker, knownServerPhotos: cachedServerPhotos)
+            let scanCap = isOvernight ? 250 : 40
+            let inspectCap = isOvernight ? 2500 : 300
+            let rawCandidates = photoService.scanCandidates(
+                tracker: tracker,
+                knownServerPhotos: cachedServerPhotos,
+                maxResults: scanCap,
+                maxInspect: inspectCap
+            )
             let prioritized = PhotoBackupPipeline
                 .sortCandidates(rawCandidates, by: .largestVideosFirst)
                 .filter { !existingStagedIds.contains($0.id) }

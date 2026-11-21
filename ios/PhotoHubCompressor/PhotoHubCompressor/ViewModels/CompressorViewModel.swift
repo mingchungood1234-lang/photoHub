@@ -16,6 +16,7 @@ final class CompressorViewModel: ObservableObject {
     @Published var totalSavedBytes: Int64 = 0
     @Published var completedCount: Int = 0
     @Published var totalToProcess: Int = 0
+    @Published var overallProgressFraction: Double = 0
     @Published var sortMode: CandidateSortMode
     @Published var recentlyDeletedNoticeCount: Int = 0
     @Published var recentlyDeletedNoticeBytes: Int64 = 0
@@ -27,6 +28,8 @@ final class CompressorViewModel: ObservableObject {
     private var activeBgTaskId: UIBackgroundTaskIdentifier = .invalid
     private var activeUploadTask: Task<Void, Never>?
     private var activeContinuedSession: ContinuedUploadSession?
+    private var activeItemProgress: [String: Double] = [:]
+    private var hasAutoStartedThisSession: Bool = false
 
     init(settings: AppSettings) {
         self.settings = settings
@@ -100,10 +103,17 @@ final class CompressorViewModel: ObservableObject {
         }
     }
 
-    func scanAndAutoCompressIfEnabled() {
+    func scanAndAutoCompressIfEnabled(forceNow: Bool = false) {
+        if !forceNow {
+            guard !hasAutoStartedThisSession,
+                  (settings.autoCompressOnOpen || settings.nightlyAutoBackupEnabled) else {
+                return
+            }
+            hasAutoStartedThisSession = true
+        }
         guard !isScanning && !isProcessing else { return }
         isScanning = true
-        statusBanner = nil
+        statusBanner = "Finding new photos & videos to back up…"
         BackgroundBackupManager.shared.pruneMissingAssetsFromStaged()
 
         photoService.requestAuthorization { [weak self] status in
@@ -112,6 +122,7 @@ final class CompressorViewModel: ObservableObject {
                 self.permissionStatus = status
                 guard status == .authorized || status == .limited else {
                     self.isScanning = false
+                    self.statusBanner = "Allow Full Photos Access in iOS Settings to auto-upload and delete originals."
                     return
                 }
 
@@ -123,15 +134,23 @@ final class CompressorViewModel: ObservableObject {
                     apiKey: self.settings.apiKey
                 )
                 Task.detached(priority: .userInitiated) { [weak self] in
-                    let raw = service.scanCandidates(tracker: tracker, knownServerPhotos: cachedServerPhotos)
+                    // Bounded fast scan so auto-upload & iOS 26 Home Screen progress start in under a second
+                    let raw = service.scanCandidates(
+                        tracker: tracker,
+                        knownServerPhotos: cachedServerPhotos,
+                        maxResults: 200,
+                        maxInspect: 3000
+                    )
                     let sorted = PhotoBackupPipeline.sortCandidates(raw, by: mode)
                     await MainActor.run {
                         guard let self else { return }
                         self.applyScannedCandidates(sorted)
                         self.isScanning = false
-                        if !sorted.isEmpty && self.settings.autoCompressOnOpen {
+                        if !sorted.isEmpty && (forceNow || self.settings.autoCompressOnOpen || self.settings.nightlyAutoBackupEnabled) {
                             self.selectAllEligible(true)
                             self.startProcessingSelectedPhotos()
+                        } else if sorted.isEmpty {
+                            self.statusBanner = "All scanned photos & videos are already backed up."
                         }
                     }
                 }
@@ -231,6 +250,8 @@ final class CompressorViewModel: ObservableObject {
         isProcessing = true
         completedCount = 0
         totalToProcess = targetIds.count
+        overallProgressFraction = 0
+        activeItemProgress.removeAll()
         statusBanner = nil
 
         if settings.notifyWhenBackgroundUploadFinishes {
@@ -343,16 +364,20 @@ final class CompressorViewModel: ObservableObject {
             }
 
             let finishedCleanly = !Task.isCancelled && failedCount == 0
-            continuedSession?.finish(success: finishedCleanly)
 
             await MainActor.run {
                 self.activeContinuedSession = nil
                 self.activeUploadTask = nil
                 self.isProcessing = false
+                self.overallProgressFraction = finishedCleanly ? 1.0 : self.overallProgressFraction
                 self.endAppBackgroundTask()
                 let savedStr = ByteCountFormatter.string(fromByteCount: self.totalSavedBytes, countStyle: .file)
                 if !self.pendingDeleteAssets.isEmpty {
                     let readyCount = self.pendingDeleteAssets.count
+                    continuedSession?.finish(
+                        success: finishedCleanly,
+                        completionNote: "Done · Tap notification to delete \(readyCount) original(s)"
+                    )
                     if notifyOnFinish && UIApplication.shared.applicationState != .active {
                         BackgroundBackupManager.shared.sendDeleteOriginalsNotification(
                             count: readyCount,
@@ -362,10 +387,13 @@ final class CompressorViewModel: ObservableObject {
                         )
                     }
                     self.scheduleAutomaticDeletePrompt()
-                } else if failedCount > 0 && self.statusBanner == nil {
-                    self.statusBanner = "Finished with \(failedCount) error(s). Space saved: \(savedStr)."
-                } else if failedCount == 0 {
-                    self.statusBanner = "Finished! All originals backed up & verified."
+                } else {
+                    continuedSession?.finish(success: finishedCleanly, completionNote: "All originals backed up")
+                    if failedCount > 0 && self.statusBanner == nil {
+                        self.statusBanner = "Finished with \(failedCount) error(s). Space saved: \(savedStr)."
+                    } else if failedCount == 0 {
+                        self.statusBanner = "Finished! All originals backed up & verified."
+                    }
                 }
             }
         }
@@ -412,7 +440,13 @@ final class CompressorViewModel: ObservableObject {
         guard let candidate else {
             await MainActor.run {
                 self.completedCount += 1
-                continuedSession?.update(completed: self.completedCount, total: totalCount, currentFilename: "")
+                self.recordItemProgress(
+                    id: currentId,
+                    fraction: 1.0,
+                    totalCount: totalCount,
+                    statusText: "",
+                    continuedSession: continuedSession
+                )
             }
             return true
         }
@@ -434,7 +468,15 @@ final class CompressorViewModel: ObservableObject {
                 photosSaveSemaphore: photosSaveSemaphore
             ) { [weak self] newState in
                 Task { @MainActor in
-                    self?.updateState(id: currentId, state: newState)
+                    guard let self else { return }
+                    self.updateState(id: currentId, state: newState)
+                    self.recordItemProgress(
+                        id: currentId,
+                        fraction: Self.stageFraction(for: newState),
+                        totalCount: totalCount,
+                        statusText: candidate.filename,
+                        continuedSession: continuedSession
+                    )
                 }
             }
 
@@ -467,10 +509,12 @@ final class CompressorViewModel: ObservableObject {
                     }
                 }
                 self.completedCount += 1
-                continuedSession?.update(
-                    completed: self.completedCount,
-                    total: totalCount,
-                    currentFilename: candidate.filename
+                self.recordItemProgress(
+                    id: currentId,
+                    fraction: 1.0,
+                    totalCount: totalCount,
+                    statusText: candidate.filename,
+                    continuedSession: continuedSession
                 )
             }
             return true
@@ -479,13 +523,47 @@ final class CompressorViewModel: ObservableObject {
                 self.updateState(id: currentId, state: .failed(error.localizedDescription))
                 self.statusBanner = error.localizedDescription
                 self.completedCount += 1
-                continuedSession?.update(
-                    completed: self.completedCount,
-                    total: totalCount,
-                    currentFilename: candidate.filename
+                self.recordItemProgress(
+                    id: currentId,
+                    fraction: 1.0,
+                    totalCount: totalCount,
+                    statusText: candidate.filename,
+                    continuedSession: continuedSession
                 )
             }
             return false
+        }
+    }
+
+    private func recordItemProgress(
+        id: String,
+        fraction: Double,
+        totalCount: Int,
+        statusText: String,
+        continuedSession: ContinuedUploadSession?
+    ) {
+        let existing = activeItemProgress[id] ?? 0.0
+        activeItemProgress[id] = max(existing, min(1.0, max(0.0, fraction)))
+        let totalSum = activeItemProgress.values.reduce(0.0, +)
+        let overall = min(1.0, max(0.0, totalSum / Double(max(1, totalCount))))
+        overallProgressFraction = overall
+        continuedSession?.update(
+            fraction: overall,
+            completed: completedCount,
+            total: totalCount,
+            statusText: statusText
+        )
+    }
+
+    private static func stageFraction(for state: PhotoCompressionState) -> Double {
+        switch state {
+        case .pending: return 0.0
+        case .hashing: return 0.06
+        case .uploading(let p): return 0.12 + min(1.0, max(0.0, p)) * 0.62
+        case .verifyingChecksum: return 0.78
+        case .creatingProxy: return 0.86
+        case .replacingInPhotos: return 0.94
+        case .alreadyProxy, .readyToDelete, .completed, .skipped, .failed: return 1.0
         }
     }
 

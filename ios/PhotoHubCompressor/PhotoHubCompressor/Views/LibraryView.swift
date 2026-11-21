@@ -56,11 +56,9 @@ struct LibraryView: View {
 
                 if viewModel.isProcessing {
                     VStack(alignment: .leading, spacing: 6) {
-                        ProgressView(
-                            value: Double(viewModel.completedCount),
-                            total: Double(max(1, viewModel.totalToProcess))
-                        )
-                        Text("Processing \(viewModel.completedCount) of \(viewModel.totalToProcess) item(s)…")
+                        ProgressView(value: viewModel.overallProgressFraction, total: 1.0)
+                        let pct = Int((viewModel.overallProgressFraction * 100).rounded())
+                        Text("Uploading & Compressing \(pct)% (\(viewModel.completedCount)/\(viewModel.totalToProcess)) — You can switch to Home Screen on iOS 26+")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -70,11 +68,11 @@ struct LibraryView: View {
 
                 if viewModel.candidates.isEmpty {
                     CompatibleEmptyStateView(
-                        title: "No Photos Scanned",
+                        title: "Ready to Back Up & Free Space",
                         systemImage: "photo.on.rectangle.angled",
                         description: (viewModel.permissionStatus == .denied || viewModel.permissionStatus == .restricted)
                             ? "Photos permission is required. Open iOS Settings to allow access."
-                            : "Tap Scan Library to prioritize your largest videos & photos, verify SHA-256 backups on your server, and reclaim space safely."
+                            : "Tap Auto-Upload New Photos to scan and upload immediately (continues on Home Screen on iOS 26+), or scan to pick individual photos first."
                     ) {
                         if viewModel.permissionStatus == .denied || viewModel.permissionStatus == .restricted {
                             Button("Open iOS Settings") {
@@ -84,11 +82,19 @@ struct LibraryView: View {
                             }
                             .buttonStyle(.borderedProminent)
                         } else {
-                            Button("Scan Library") {
-                                viewModel.scanLibrary()
+                            VStack(spacing: 10) {
+                                Button("Auto-Upload New Photos & Videos") {
+                                    viewModel.scanAndAutoCompressIfEnabled(forceNow: true)
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(viewModel.isScanning || viewModel.isProcessing)
+
+                                Button("Scan & Choose Manually") {
+                                    viewModel.scanLibrary()
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(viewModel.isScanning || viewModel.isProcessing)
                             }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(viewModel.isScanning)
                         }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -193,7 +199,7 @@ struct LibraryView: View {
             }
             .onAppear {
                 bgManager.pruneMissingAssetsFromStaged()
-                if viewModel.candidates.isEmpty && viewModel.settings.autoCompressOnOpen {
+                if viewModel.candidates.isEmpty {
                     viewModel.scanAndAutoCompressIfEnabled()
                 }
             }

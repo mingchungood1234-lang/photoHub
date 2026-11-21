@@ -80,7 +80,9 @@ final class PhotoLibraryService {
 
     func scanCandidates(
         tracker: LocalProxyTracker,
-        knownServerPhotos: [ServerPhoto] = []
+        knownServerPhotos: [ServerPhoto] = [],
+        maxResults: Int? = nil,
+        maxInspect: Int? = nil
     ) -> [PhotoCandidate] {
         let fetchOptions = PHFetchOptions()
         fetchOptions.predicate = NSPredicate(
@@ -89,6 +91,9 @@ final class PhotoLibraryService {
             PHAssetMediaType.video.rawValue
         )
         fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        if let maxInspect, maxInspect > 0 {
+            fetchOptions.fetchLimit = maxInspect
+        }
         let assets = PHAsset.fetchAssets(with: fetchOptions)
 
         var candidates: [PhotoCandidate] = []
@@ -96,7 +101,8 @@ final class PhotoLibraryService {
         if totalCount == 0 {
             return []
         }
-        candidates.reserveCapacity(min(totalCount, 500))
+        let targetCap = maxResults.map { min(totalCount, $0) } ?? min(totalCount, 500)
+        candidates.reserveCapacity(targetCap)
 
         var prefixToServerPhoto: [String: ServerPhoto] = [:]
         prefixToServerPhoto.reserveCapacity(knownServerPhotos.count)
@@ -108,6 +114,9 @@ final class PhotoLibraryService {
         }
 
         for i in 0..<totalCount {
+            if let maxResults, candidates.count >= maxResults {
+                break
+            }
             autoreleasepool {
                 let asset = assets.object(at: i)
                 let localId = asset.localIdentifier

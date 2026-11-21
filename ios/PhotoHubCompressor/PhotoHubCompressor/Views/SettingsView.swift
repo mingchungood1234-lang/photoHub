@@ -44,6 +44,7 @@ struct SettingsView: View {
             }
             .onChange(of: settings.nightlyAutoBackupEnabled) { enabled in
                 if enabled {
+                    settings.autoCompressOnOpen = true
                     bgManager.requestNotificationPermissionAndSchedule(settings: settings)
                 } else {
                     bgManager.scheduleNightlyBackupIfEnabled(settings: settings)
