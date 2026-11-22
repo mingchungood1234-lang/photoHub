@@ -306,6 +306,9 @@ data class ServerGalleryUiState(
     val restoreStatusText: String = "",
     val restoreBannerMessage: String? = null,
     val restoreConfirmRequest: BatchRestoreConfirmRequest? = null,
+    val isBatchDeleting: Boolean = false,
+    val deleteBannerMessage: String? = null,
+    val deleteConfirmTargets: List<ServerPhoto>? = null,
     val isResolvingPick: Boolean = false,
     val pickStatusText: String = "Preparing original…",
     val pickerErrorMessage: String? = null,
@@ -547,7 +550,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
     fun startBatchProxy() {
         val targets = _uiState.value.photos.filter { it.needsProxy }
-        if (_uiState.value.isBatchProxying || _uiState.value.isBatchRestoring || targets.isEmpty()) return
+        if (_uiState.value.isBatchProxying || _uiState.value.isBatchRestoring || _uiState.value.isBatchDeleting || targets.isEmpty()) return
 
         batchJob?.cancel()
         _uiState.update {
@@ -943,7 +946,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
     fun enterSelectionMode(initialHash: String? = null) {
         val prev = _uiState.value
-        if (prev.isBatchRestoring || prev.isBatchProxying || prev.photos.isEmpty()) return
+        if (prev.isBatchRestoring || prev.isBatchProxying || prev.isBatchDeleting || prev.photos.isEmpty()) return
         val initial = initialHash?.let(::normHash)?.takeIf { it.isNotEmpty() }
         _uiState.update {
             it.copy(
@@ -996,7 +999,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
     fun requestRestoreAll() {
         val state = _uiState.value
-        if (state.isBatchRestoring || state.isBatchProxying || state.photos.isEmpty()) return
+        if (state.isBatchRestoring || state.isBatchProxying || state.isBatchDeleting || state.photos.isEmpty()) return
         openRestoreConfirm(
             title = "Restore All Originals",
             targets = state.photos,
@@ -1006,7 +1009,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
     fun requestRestoreSelected() {
         val state = _uiState.value
-        if (state.isBatchRestoring || state.isBatchProxying || state.selectedHashes.isEmpty()) return
+        if (state.isBatchRestoring || state.isBatchProxying || state.isBatchDeleting || state.selectedHashes.isEmpty()) return
         val targets = state.photos.filter { normHash(it.hash) in state.selectedHashes }
         if (targets.isEmpty()) return
         openRestoreConfirm(
@@ -1014,6 +1017,131 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
             targets = targets,
             isRestoreAll = false
         )
+    }
+
+    fun requestDeleteSelected() {
+        val state = _uiState.value
+        if (state.isBatchRestoring || state.isBatchProxying || state.isBatchDeleting || state.selectedHashes.isEmpty()) return
+        val targets = state.photos.filter { normHash(it.hash) in state.selectedHashes }
+        if (targets.isEmpty()) return
+        _uiState.update { it.copy(deleteConfirmTargets = targets) }
+    }
+
+    fun dismissDeleteConfirm() {
+        _uiState.update { it.copy(deleteConfirmTargets = null) }
+    }
+
+    fun dismissDeleteBanner() {
+        _uiState.update { it.copy(deleteBannerMessage = null) }
+    }
+
+    fun executeDeleteSelected() {
+        val targets = _uiState.value.deleteConfirmTargets ?: return
+        if (_uiState.value.isBatchDeleting || _uiState.value.isBatchRestoring || _uiState.value.isBatchProxying) return
+        _uiState.update {
+            it.copy(
+                deleteConfirmTargets = null,
+                isBatchDeleting = true,
+                deleteBannerMessage = null,
+                isSelectionMode = false,
+                selectedHashes = emptySet()
+            )
+        }
+
+        viewModelScope.launch {
+            try {
+                val result = PhotoHubApiClient(context, settings).deleteServerPhotosBatch(targets.map { it.hash })
+                val removedSet = (result.deleted + result.missing).map { normHash(it) }.toSet()
+                applyDeletedHashes(removedSet)
+                val deletedCount = result.deleted.size
+                val freedStr = android.text.format.Formatter.formatFileSize(context, result.freedBytes)
+                val msg = when {
+                    deletedCount > 0 && result.success ->
+                        "Deleted $deletedCount photo(s) from server (freed ~$freedStr)."
+                    deletedCount > 0 ->
+                        "Deleted $deletedCount photo(s) from server; some items failed."
+                    result.missing.isNotEmpty() ->
+                        "Removed ${result.missing.size} missing item(s) from gallery."
+                    else -> "Delete failed on server."
+                }
+                _uiState.update { it.copy(isBatchDeleting = false, deleteBannerMessage = msg) }
+            } catch (err: ApiHttpException) {
+                if (err.statusCode == 401) {
+                    syncManager.cancel()
+                    settings.signOut()
+                }
+                _uiState.update {
+                    it.copy(isBatchDeleting = false, deleteBannerMessage = "Delete failed: ${err.message}")
+                }
+            } catch (err: Exception) {
+                _uiState.update {
+                    it.copy(
+                        isBatchDeleting = false,
+                        deleteBannerMessage = "Delete failed: ${err.localizedMessage ?: "Unknown error"}"
+                    )
+                }
+            }
+        }
+    }
+
+    fun deletePhotoFromDetail() {
+        val photo = _detailState.value?.photo ?: return
+        _detailState.update { it?.copy(isBusy = true, busyLabel = "Deleting from server…", saveMessage = null) }
+        speculativePrefetchJob?.cancel()
+
+        viewModelScope.launch {
+            try {
+                PhotoHubApiClient(context, settings).deleteServerPhoto(photo.hash)
+                applyDeletedHashes(setOf(normHash(photo.hash)))
+                _detailState.value = null
+                _uiState.update {
+                    it.copy(deleteBannerMessage = "Deleted ${photo.originalName} from server.")
+                }
+            } catch (err: ApiHttpException) {
+                if (err.statusCode == 401) {
+                    syncManager.cancel()
+                    settings.signOut()
+                }
+                _detailState.update {
+                    it?.copy(isBusy = false, busyLabel = "", saveMessage = "Delete failed: ${err.message}")
+                }
+            } catch (err: Exception) {
+                _detailState.update {
+                    it?.copy(
+                        isBusy = false,
+                        busyLabel = "",
+                        saveMessage = "Delete failed: ${err.localizedMessage ?: "Unknown error"}"
+                    )
+                }
+            }
+        }
+    }
+
+    private fun applyDeletedHashes(removedHashes: Set<String>) {
+        if (removedHashes.isEmpty()) return
+        _uiState.update { prev ->
+            val nextPhotos = prev.photos.filterNot { normHash(it.hash) in removedHashes }
+            val nextCache = prev.imageCache.filterKeys { normHash(it) !in removedHashes }
+            val nextFailed = prev.failedPreviewHashes.filterNot { normHash(it) in removedHashes }.toSet()
+            val nextSelected = prev.selectedHashes.filterNot { normHash(it) in removedHashes }.toSet()
+            val nextProtected = prev.locallyProtectedHashes - removedHashes
+            val rebuilt = rebuildTimelineData(
+                nextPhotos,
+                prev.filterMode,
+                prev.mediaTypeFilter,
+                prev.timelineGrouping,
+                prev.selectedYearAnchor
+            )
+            prev.copy(
+                photos = nextPhotos,
+                imageCache = nextCache,
+                failedPreviewHashes = nextFailed,
+                selectedHashes = nextSelected,
+                locallyProtectedHashes = nextProtected,
+                timeline = rebuilt.first,
+                selectedYearAnchor = rebuilt.second
+            )
+        }
     }
 
     private fun openRestoreConfirm(
@@ -1047,7 +1175,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
         exitSelectionAfter: Boolean
     ) {
         val curState = _uiState.value
-        if (curState.isBatchRestoring || curState.isBatchProxying || targets.isEmpty()) return
+        if (curState.isBatchRestoring || curState.isBatchProxying || curState.isBatchDeleting || targets.isEmpty()) return
         if (!mediaService.canWriteGallery()) {
             reportRestorePermissionDenied()
             return

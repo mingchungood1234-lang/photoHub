@@ -198,8 +198,32 @@ async function verifyS3ObjectChecksum({ s3Config, objectKey, expectedSha256 }) {
   };
 }
 
+/**
+ * Deletes an object from S3/MinIO/R2 using a SigV4 pre-signed DELETE URL.
+ * Treats HTTP 404 as already deleted so retries stay idempotent.
+ */
+async function deleteS3Object({ s3Config, objectKey }) {
+  const deleteUrl = createPresignedUrl({
+    s3Config,
+    method: 'DELETE',
+    objectKey,
+    expiresIn: 300,
+  });
+
+  const response = await fetch(deleteUrl, { method: 'DELETE' });
+  if (response.ok || response.status === 404) {
+    return;
+  }
+  const err = new Error(
+    `Failed to delete S3 object (HTTP ${response.status})`
+  );
+  err.statusCode = 502;
+  throw err;
+}
+
 module.exports = {
   isS3Configured,
   createPresignedUrl,
   verifyS3ObjectChecksum,
+  deleteS3Object,
 };

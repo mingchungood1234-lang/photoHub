@@ -3,8 +3,10 @@ package com.photohub.compressor.network
 import android.content.Context
 import android.util.Base64
 import com.photohub.compressor.data.*
+import com.photohub.compressor.media.OriginalDownloadCache
 import com.photohub.compressor.media.ProxyGenerator
 import com.photohub.compressor.sync.LocalProxyStore
+import com.photohub.compressor.sync.LocalProxyTracker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -25,6 +27,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.ResponseBody
 import okio.BufferedSink
 import okio.source
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.IOException
@@ -38,6 +41,7 @@ import java.nio.charset.StandardCharsets
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -168,6 +172,13 @@ object DownloadRangePlanner {
         return ranges
     }
 }
+
+data class DeletePhotosResult(
+    val success: Boolean,
+    val deleted: List<String>,
+    val missing: List<String>,
+    val freedBytes: Long
+)
 
 class PhotoHubApiClient(
     private val context: Context,
@@ -1121,6 +1132,110 @@ class PhotoHubApiClient(
             )
             updated
         }
+    }
+
+    suspend fun deleteServerPhoto(hash: String) = withContext(Dispatchers.IO) {
+        val cleanHash = hash.trim().lowercase(Locale.ROOT)
+        if (cleanHash.isEmpty()) throw IOException("Photo hash is required.")
+
+        val req = Request.Builder()
+            .url(makeUrl("/api/photo/$cleanHash"))
+            .applyAuth()
+            .delete()
+            .build()
+
+        client.newCall(req).execute().use { resp ->
+            val text = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw ApiHttpException(resp.code, parseErrorMessage(resp.code, text))
+        }
+
+        val cur = settings.current
+        LocalProxyStore.getInstance(context).removePhoto(
+            hash = cleanHash,
+            baseUrl = cur.normalizedBaseUrl,
+            scopeKey = cur.apiKeyCacheScope,
+            notify = true
+        )
+        LocalProxyTracker.getInstance(context).clearRestoredProtection(cleanHash)
+        OriginalDownloadCache.removeCachedOriginals(context, listOf(cleanHash))
+    }
+
+    suspend fun deleteServerPhotosBatch(hashes: List<String>): DeletePhotosResult = withContext(Dispatchers.IO) {
+        val cleaned = hashes
+            .map { it.trim().lowercase(Locale.ROOT) }
+            .filter { it.isNotEmpty() }
+            .distinct()
+        if (cleaned.isEmpty()) {
+            return@withContext DeletePhotosResult(
+                success = true,
+                deleted = emptyList(),
+                missing = emptyList(),
+                freedBytes = 0L
+            )
+        }
+
+        val allDeleted = mutableListOf<String>()
+        val allMissing = mutableListOf<String>()
+        var totalFreed = 0L
+        var anyFailed = false
+
+        var idx = 0
+        while (idx < cleaned.size) {
+            val end = minOf(cleaned.size, idx + 200)
+            val chunk = cleaned.subList(idx, end)
+            idx = end
+
+            val payload = JSONObject().apply {
+                put("hashes", JSONArray(chunk))
+            }.toString()
+
+            val req = Request.Builder()
+                .url(makeUrl("/api/photos/delete"))
+                .applyAuth()
+                .post(payload.toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull()))
+                .build()
+
+            client.newCall(req).execute().use { resp ->
+                val text = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) throw ApiHttpException(resp.code, parseErrorMessage(resp.code, text))
+                val json = JSONObject(text)
+                if (!json.optBoolean("success", false)) {
+                    anyFailed = true
+                }
+                json.optJSONArray("deleted")?.let { arr ->
+                    for (i in 0 until arr.length()) {
+                        arr.optString(i).takeIf { it.isNotBlank() }?.let { allDeleted.add(it) }
+                    }
+                }
+                json.optJSONArray("missing")?.let { arr ->
+                    for (i in 0 until arr.length()) {
+                        arr.optString(i).takeIf { it.isNotBlank() }?.let { allMissing.add(it) }
+                    }
+                }
+                totalFreed += json.optLong("freedBytes", 0L)
+            }
+        }
+
+        val toEvict = (allDeleted + allMissing).distinct()
+        if (toEvict.isNotEmpty()) {
+            val cur = settings.current
+            LocalProxyStore.getInstance(context).removePhotos(
+                hashes = toEvict,
+                baseUrl = cur.normalizedBaseUrl,
+                scopeKey = cur.apiKeyCacheScope,
+                notify = true
+            )
+            val tracker = LocalProxyTracker.getInstance(context)
+            toEvict.forEach { tracker.clearRestoredProtection(it) }
+            OriginalDownloadCache.removeCachedOriginals(context, toEvict)
+        }
+
+        DeletePhotosResult(
+            success = !anyFailed,
+            deleted = allDeleted,
+            missing = allMissing,
+            freedBytes = totalFreed
+        )
     }
 
     private fun extractDispositionFilename(header: String?): String? {

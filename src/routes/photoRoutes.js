@@ -7,6 +7,8 @@
  *   - `GET /api/photo/:hash/preview`           -> `streamPreview` (lightweight compressed thumbnail/preview)
  *   - `GET /api/photo/:hash/video-proxy`       -> `streamVideoProxy` (lightweight H.264 MP4 proxy)
  *   - `POST /api/photo/:hash/protect-original` -> `setProtectOriginal` (prevents auto re-compression)
+ *   - `DELETE /api/photo/:hash`                -> `deletePhoto` (deletes master + server proxies + index entry)
+ *   - `POST /api/photos/delete` / `DELETE /api/photos` -> `deletePhotosBatch` (batch server delete)
  *   - `GET /api/photo/:hash`                   -> `downloadMaster` (full-res original w/ HTTP Range support)
  *     (Note: `/preview` and `/video-proxy` are defined BEFORE `/photo/:hash` so Express matches specific suffixes first.)
  */
@@ -17,9 +19,12 @@ function createPhotoRoutes({ photoController }) {
   const router = express.Router();
 
   router.get('/photos', photoController.listPhotos);
+  router.post('/photos/delete', photoController.deletePhotosBatch);
+  router.delete('/photos', photoController.deletePhotosBatch);
   router.get('/photo/:hash/preview', photoController.streamPreview);
   router.get('/photo/:hash/video-proxy', photoController.streamVideoProxy);
   router.post('/photo/:hash/protect-original', photoController.setProtectOriginal);
+  router.delete('/photo/:hash', photoController.deletePhoto);
   router.get('/photo/:hash', photoController.downloadMaster);
 
   return router;

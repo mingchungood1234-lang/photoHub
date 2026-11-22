@@ -45,6 +45,7 @@ fun ServerPhotoDetailDialog(
     onShareOriginal: () -> Unit,
     onSaveProxy: () -> Unit,
     onRestoreOriginal: () -> Unit,
+    onDeleteFromServer: () -> Unit,
     onToggleProtection: (Boolean) -> Unit,
     onShareFileConsumed: (File) -> Unit
 ) {
@@ -53,10 +54,43 @@ fun ServerPhotoDetailDialog(
     val needsProxyAction = photo.needsProxy ||
         (photo.isVideo && detail.videoFile == null && photo.hasVideoProxy != true && !detail.isLoadingVideo)
     val isOriginalProtected = photo.isProtectedOriginal || detail.isLocallyProtected
+    var showDeleteConfirm by remember(photo.hash) { mutableStateOf(false) }
 
     LaunchedEffect(detail.shareFileReady) {
         val f = detail.shareFileReady ?: return@LaunchedEffect
         onShareFileConsumed(f)
+    }
+
+    if (showDeleteConfirm) {
+        val masterStr = Formatter.formatFileSize(context, photo.size)
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirm = false },
+            title = { Text("Delete from Server?") },
+            text = {
+                Text(
+                    "Permanently delete ${photo.originalName} (~$masterStr) and its compressed proxies from your PhotoHub server? This cannot be undone."
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showDeleteConfirm = false
+                        onDeleteFromServer()
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError
+                    )
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteConfirm = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 
     Dialog(
@@ -296,6 +330,19 @@ fun ServerPhotoDetailDialog(
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text("Restore")
                             }
+                        }
+
+                        OutlinedButton(
+                            onClick = { showDeleteConfirm = true },
+                            enabled = !detail.isBusy,
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                contentColor = MaterialTheme.colorScheme.error
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Icon(Icons.Rounded.DeleteOutline, null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Delete from Server")
                         }
                     }
                 }

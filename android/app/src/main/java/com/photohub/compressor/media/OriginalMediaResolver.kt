@@ -187,6 +187,18 @@ object OriginalDownloadCache {
         }
     }
 
+    fun removeCachedOriginals(context: Context, hashes: Collection<String>) {
+        for (raw in hashes) {
+            val key = raw.trim().lowercase(Locale.ROOT)
+            if (key.isEmpty()) continue
+            inFlight.remove(key)?.let { entry ->
+                entry.job?.cancel()
+                entry.deferred.cancel()
+            }
+            runCatching { hashDir(context, key).deleteRecursively() }
+        }
+    }
+
     private fun enforceSizeBudget(context: Context, protectedFile: File?) {
         val root = rootDir(context)
         val files = root.walkTopDown()

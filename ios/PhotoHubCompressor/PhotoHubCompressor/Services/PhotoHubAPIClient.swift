@@ -188,6 +188,13 @@ private struct ProtectOriginalResponse: Decodable {
     let photo: ServerPhoto?
 }
 
+struct DeletePhotosResult: Decodable, Sendable {
+    let success: Bool
+    let deleted: [String]?
+    let missing: [String]?
+    let freedBytes: Int64?
+}
+
 struct UploadConfirmResponse: Decodable {
     let success: Bool
     let canDelete: Bool?
@@ -829,6 +836,93 @@ final class PhotoHubAPIClient {
             notify: true
         )
         return updated
+    }
+
+    func deleteServerPhoto(hash: String) async throws {
+        let cleanHash = hash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !cleanHash.isEmpty else {
+            throw APIClientError.invalidResponse
+        }
+        let url = try makeURL("/api/photo/\(cleanHash)")
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        applyAuth(to: &request)
+
+        let (data, response) = try await pooledSession.data(for: request)
+        try validateHTTP(response: response, data: data)
+
+        LocalProxyStore.shared.removePhoto(
+            hash: cleanHash,
+            baseURL: settings.normalizedBaseURL,
+            apiKey: settings.apiKey,
+            notify: true
+        )
+        LocalProxyTracker.shared.clearRestoredProtection(masterHash: cleanHash)
+    }
+
+    func deleteServerPhotosBatch(hashes: [String]) async throws -> DeletePhotosResult {
+        var seen = Set<String>()
+        let cleaned = hashes.compactMap { raw -> String? in
+            let norm = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !norm.isEmpty, seen.insert(norm).inserted else { return nil }
+            return norm
+        }
+        guard !cleaned.isEmpty else {
+            return DeletePhotosResult(success: true, deleted: [], missing: [], freedBytes: 0)
+        }
+
+        var allDeleted: [String] = []
+        var allMissing: [String] = []
+        var totalFreed: Int64 = 0
+        var anyFailed = false
+
+        var idx = 0
+        while idx < cleaned.count {
+            let end = min(cleaned.count, idx + 200)
+            let chunk = Array(cleaned[idx..<end])
+            idx = end
+
+            let url = try makeURL("/api/photos/delete")
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            applyAuth(to: &request)
+            request.httpBody = try JSONSerialization.data(withJSONObject: ["hashes": chunk])
+
+            let (data, response) = try await pooledSession.data(for: request)
+            try validateHTTP(response: response, data: data)
+            let decoded = try JSONDecoder().decode(DeletePhotosResult.self, from: data)
+            if !decoded.success {
+                anyFailed = true
+            }
+            if let deleted = decoded.deleted {
+                allDeleted.append(contentsOf: deleted)
+            }
+            if let missing = decoded.missing {
+                allMissing.append(contentsOf: missing)
+            }
+            totalFreed += decoded.freedBytes ?? 0
+        }
+
+        let toEvict = allDeleted + allMissing
+        if !toEvict.isEmpty {
+            LocalProxyStore.shared.removePhotos(
+                hashes: toEvict,
+                baseURL: settings.normalizedBaseURL,
+                apiKey: settings.apiKey,
+                notify: true
+            )
+            for h in toEvict {
+                LocalProxyTracker.shared.clearRestoredProtection(masterHash: h)
+            }
+        }
+
+        return DeletePhotosResult(
+            success: !anyFailed,
+            deleted: allDeleted,
+            missing: allMissing,
+            freedBytes: totalFreed
+        )
     }
 
     func uploadMasterDirect(

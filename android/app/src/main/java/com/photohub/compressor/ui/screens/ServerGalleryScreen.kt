@@ -186,6 +186,36 @@ fun ServerGalleryScreen(
         )
     }
 
+    uiState.deleteConfirmTargets?.let { targets ->
+        val totalBytes = targets.sumOf { maxOf(0L, it.size) }
+        val sizeStr = Formatter.formatFileSize(context, totalBytes)
+        AlertDialog(
+            onDismissRequest = { viewModel.dismissDeleteConfirm() },
+            title = { Text("Delete from Server?") },
+            text = {
+                Text(
+                    "Permanently delete ${targets.size} backed-up original(s) (~$sizeStr) and their server proxies from your PhotoHub server? This cannot be undone."
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = { viewModel.executeDeleteSelected() },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError
+                    )
+                ) {
+                    Text("Delete ${targets.size}")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { viewModel.dismissDeleteConfirm() }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
     if (detailState != null) {
         ServerPhotoDetailDialog(
             detail = detailState!!,
@@ -194,6 +224,7 @@ fun ServerGalleryScreen(
             onShareOriginal = { viewModel.shareOriginalFromDetail() },
             onSaveProxy = { viewModel.saveProxyToGalleryFromDetail() },
             onRestoreOriginal = { viewModel.restoreFullMasterFromDetail() },
+            onDeleteFromServer = { viewModel.deletePhotoFromDetail() },
             onToggleProtection = { viewModel.updateOriginalProtection(it) },
             onShareFileConsumed = { file ->
                 shareFileViaChooser(context, file)
@@ -259,7 +290,7 @@ fun ServerGalleryScreen(
                     actions = {
                         TextButton(
                             onClick = { viewModel.enterSelectionMode() },
-                            enabled = uiState.photos.isNotEmpty() && !uiState.isBatchRestoring && !uiState.isBatchProxying
+                            enabled = uiState.photos.isNotEmpty() && !uiState.isBatchRestoring && !uiState.isBatchProxying && !uiState.isBatchDeleting
                         ) {
                             Text("Select")
                         }
@@ -278,16 +309,16 @@ fun ServerGalleryScreen(
                                     DropdownMenuItem(
                                         text = { Text("Restore All Originals (${uiState.photos.size})") },
                                         leadingIcon = { Icon(Icons.Rounded.CloudDownload, null) },
-                                        enabled = !uiState.isBatchRestoring && !uiState.isBatchProxying,
+                                        enabled = !uiState.isBatchRestoring && !uiState.isBatchProxying && !uiState.isBatchDeleting,
                                         onClick = {
                                             showMenu = false
                                             viewModel.requestRestoreAll()
                                         }
                                     )
                                     DropdownMenuItem(
-                                        text = { Text("Select Photos to Restore") },
+                                        text = { Text("Select Photos to Restore or Delete") },
                                         leadingIcon = { Icon(Icons.Rounded.CheckBox, null) },
-                                        enabled = !uiState.isBatchRestoring && !uiState.isBatchProxying,
+                                        enabled = !uiState.isBatchRestoring && !uiState.isBatchProxying && !uiState.isBatchDeleting,
                                         onClick = {
                                             showMenu = false
                                             viewModel.enterSelectionMode()
@@ -374,7 +405,11 @@ fun ServerGalleryScreen(
         },
         bottomBar = {
             if (uiState.isSelectionMode) {
-                SelectionRestoreBottomBar(uiState = uiState, onRestoreSelected = { viewModel.requestRestoreSelected() })
+                SelectionRestoreBottomBar(
+                    uiState = uiState,
+                    onRestoreSelected = { viewModel.requestRestoreSelected() },
+                    onDeleteSelected = { viewModel.requestDeleteSelected() }
+                )
             }
         }
     ) { padding ->
@@ -480,6 +515,12 @@ fun ServerGalleryScreen(
                                 if (uiState.isBatchRestoring || uiState.restoreBannerMessage != null || (!uiState.isSelectionMode && uiState.photos.isNotEmpty())) {
                                     item(span = { GridItemSpan(maxLineSpan) }) {
                                         RestoreOriginalsBanner(uiState = uiState, viewModel = viewModel)
+                                    }
+                                }
+
+                                if (uiState.isBatchDeleting || uiState.deleteBannerMessage != null) {
+                                    item(span = { GridItemSpan(maxLineSpan) }) {
+                                        DeletePhotosBanner(uiState = uiState, viewModel = viewModel)
                                     }
                                 }
 
@@ -594,7 +635,7 @@ fun ServerGalleryScreen(
                                                     }
                                                 },
                                                 onLongClick = {
-                                                    if (!uiState.isSelectionMode && !uiState.isBatchRestoring && !uiState.isBatchProxying) {
+                                                    if (!uiState.isSelectionMode && !uiState.isBatchRestoring && !uiState.isBatchProxying && !uiState.isBatchDeleting) {
                                                         viewModel.enterSelectionMode(photo.hash)
                                                     }
                                                 }
@@ -704,7 +745,7 @@ private fun UnproxiedBanner(
                     }
                     TextButton(
                         onClick = { viewModel.startBatchProxy() },
-                        enabled = !uiState.isBatchRestoring
+                        enabled = !uiState.isBatchRestoring && !uiState.isBatchDeleting
                     ) {
                         Text("Proxy All", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
                     }
@@ -795,7 +836,7 @@ private fun RestoreOriginalsBanner(
                     )
                     TextButton(
                         onClick = { viewModel.requestRestoreAll() },
-                        enabled = !uiState.isBatchProxying && uiState.photos.isNotEmpty()
+                        enabled = !uiState.isBatchProxying && !uiState.isBatchDeleting && uiState.photos.isNotEmpty()
                     ) {
                         Text("Restore All", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
                     }
@@ -806,21 +847,75 @@ private fun RestoreOriginalsBanner(
 }
 
 @Composable
+private fun DeletePhotosBanner(
+    uiState: ServerGalleryUiState,
+    viewModel: ServerGalleryViewModel
+) {
+    Surface(
+        shape = CircleShape,
+        color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.55f),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 4.dp)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (uiState.isBatchDeleting) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(16.dp),
+                    strokeWidth = 2.dp,
+                    color = MaterialTheme.colorScheme.error
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    "Deleting selected photos from server…",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.weight(1f)
+                )
+            } else if (uiState.deleteBannerMessage != null) {
+                Icon(
+                    Icons.Rounded.DeleteOutline,
+                    null,
+                    tint = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    uiState.deleteBannerMessage.orEmpty(),
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                IconButton(onClick = { viewModel.dismissDeleteBanner() }, modifier = Modifier.size(24.dp)) {
+                    Icon(Icons.Rounded.Close, null, modifier = Modifier.size(14.dp))
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun SelectionRestoreBottomBar(
     uiState: ServerGalleryUiState,
-    onRestoreSelected: () -> Unit
+    onRestoreSelected: () -> Unit,
+    onDeleteSelected: () -> Unit
 ) {
     val context = LocalContext.current
     val selectedList = uiState.photos.filter { it.hash.lowercase(Locale.ROOT) in uiState.selectedHashes }
     val unrestored = selectedList.filter { !uiState.isRestoredOrProtected(it) }
     val targetBytes = (if (unrestored.isNotEmpty()) unrestored else selectedList).sumOf { maxOf(0L, it.size) }
     val sizeStr = Formatter.formatFileSize(context, targetBytes)
+    val actionsEnabled = selectedList.isNotEmpty() && !uiState.isBatchRestoring && !uiState.isBatchProxying && !uiState.isBatchDeleting
 
     Surface(tonalElevation = 6.dp, shadowElevation = 8.dp) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 12.dp),
+                .padding(horizontal = 14.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
@@ -839,18 +934,35 @@ private fun SelectionRestoreBottomBar(
                             "${unrestored.size} original(s) to download"
                         },
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
             }
-            Spacer(modifier = Modifier.width(12.dp))
-            Button(
-                onClick = onRestoreSelected,
-                enabled = selectedList.isNotEmpty() && !uiState.isBatchRestoring && !uiState.isBatchProxying
-            ) {
-                Icon(Icons.Rounded.CloudDownload, null, modifier = Modifier.size(18.dp))
-                Spacer(modifier = Modifier.width(6.dp))
-                Text("Restore")
+            Spacer(modifier = Modifier.width(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                OutlinedButton(
+                    onClick = onDeleteSelected,
+                    enabled = actionsEnabled,
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error
+                    ),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+                ) {
+                    Icon(Icons.Rounded.DeleteOutline, contentDescription = "Delete from Server", modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Delete")
+                }
+                Button(
+                    onClick = onRestoreSelected,
+                    enabled = actionsEnabled,
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+                ) {
+                    Icon(Icons.Rounded.CloudDownload, null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Restore")
+                }
             }
         }
     }

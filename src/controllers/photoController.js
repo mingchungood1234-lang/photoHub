@@ -7,16 +7,21 @@
  *   - `streamPreview`      (`GET /api/photo/:hash/preview` — fast compressed JPEG preview for grid browsing)
  *   - `streamVideoProxy`   (`GET /api/photo/:hash/video-proxy` — lightweight MP4 video playback w/ Range seek)
  *   - `setProtectOriginal` (`POST /api/photo/:hash/protect-original` — marks restored originals safe from auto re-compression)
+ *   - `deletePhoto`        (`DELETE /api/photo/:hash` — deletes master + server proxies from storage and HashIndex)
+ *   - `deletePhotosBatch`  (`POST /api/photos/delete` / `DELETE /api/photos` — batch delete from storage and HashIndex)
  *   - `downloadMaster`     (`GET /api/photo/:hash` — full-resolution original via S3 302 redirect or Express `sendFile` HTTP 206 Ranges)
  * Calls: `req.userContext.hashIndex` (`models/hashIndexModel.js`) and `services/s3Service.js`.
  */
 
 const fs = require('fs');
+const fsp = require('fs/promises');
 const path = require('path');
 const zlib = require('zlib');
 const { promisify } = require('util');
-const { isS3Configured, createPresignedUrl } = require('../services/s3Service');
+const { isS3Configured, createPresignedUrl, deleteS3Object } = require('../services/s3Service');
 const { isVideoFilename } = require('../services/proxyService');
+
+const MAX_BATCH_DELETE_COUNT = 500;
 
 const gzipAsync = promisify(zlib.gzip);
 
@@ -107,6 +112,75 @@ function createPhotoController({ config }) {
     });
     res.redirect(downloadUrl);
     return true;
+  }
+
+  function resolveInsideStorageDir(storageDir, relativePath) {
+    if (!relativePath || typeof relativePath !== 'string') return null;
+    const root = path.resolve(storageDir);
+    const resolved = path.resolve(root, relativePath);
+    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+      throw new Error('Unsafe relative path outside storage root');
+    }
+    return resolved;
+  }
+
+  async function unlinkIfExists(filePath) {
+    if (!filePath) return;
+    try {
+      await fsp.unlink(filePath);
+    } catch (err) {
+      if (err && err.code !== 'ENOENT') {
+        throw err;
+      }
+    }
+  }
+
+  async function pruneEmptyParentDirs(storageDir, deletedFilePath) {
+    const root = path.resolve(storageDir);
+    let current = path.dirname(path.resolve(deletedFilePath));
+    while (current !== root && current.startsWith(root + path.sep)) {
+      if (path.basename(current) === '.proxies') break;
+      try {
+        await fsp.rmdir(current);
+      } catch {
+        break;
+      }
+      current = path.dirname(current);
+    }
+  }
+
+  async function deleteRecordFiles({ storageDir, record }) {
+    if (!record) return 0;
+
+    if (record.storageType === 's3') {
+      if (record.relativePath && isS3Configured(config.s3)) {
+        await deleteS3Object({
+          s3Config: config.s3,
+          objectKey: record.relativePath,
+        });
+      }
+    } else if (record.relativePath) {
+      const masterFullPath = resolveInsideStorageDir(storageDir, record.relativePath);
+      if (masterFullPath) {
+        await unlinkIfExists(masterFullPath);
+        await pruneEmptyParentDirs(storageDir, masterFullPath);
+      }
+    }
+
+    if (record.proxyRelativePath) {
+      const proxyFullPath = resolveInsideStorageDir(storageDir, record.proxyRelativePath);
+      await unlinkIfExists(proxyFullPath);
+    }
+    if (record.videoProxyRelativePath) {
+      const videoProxyFullPath = resolveInsideStorageDir(storageDir, record.videoProxyRelativePath);
+      await unlinkIfExists(videoProxyFullPath);
+    }
+
+    return (
+      (Number(record.size) || 0) +
+      (Number(record.proxySize) || 0) +
+      (Number(record.videoProxySize) || 0)
+    );
   }
 
   return {
@@ -268,6 +342,123 @@ function createPhotoController({ config }) {
         });
       } catch (err) {
         return res.status(500).json({
+          success: false,
+          error: err.message,
+        });
+      }
+    },
+
+    async deletePhoto(req, res) {
+      try {
+        const { hashIndex, storageDir } = req.userContext;
+        const found = hashIndex.findMasterRecordKeys(req.params.hash);
+        if (!found) {
+          return res.status(404).json({
+            success: false,
+            error: 'Photo not found',
+          });
+        }
+
+        const freedBytes = await deleteRecordFiles({
+          storageDir,
+          record: found.record,
+        });
+        await hashIndex.removeKeys(found.keys, { persist: true });
+
+        return res.json({
+          success: true,
+          hash: found.canonicalHash,
+          deleted: [found.canonicalHash],
+          freedBytes,
+          storage: hashIndex.getStorageUsage(),
+        });
+      } catch (err) {
+        return res.status(err.statusCode || 500).json({
+          success: false,
+          error: err.message,
+        });
+      }
+    },
+
+    async deletePhotosBatch(req, res) {
+      try {
+        const { hashIndex, storageDir } = req.userContext;
+        const rawHashes =
+          req.body && Array.isArray(req.body.hashes) ? req.body.hashes : null;
+        if (!rawHashes) {
+          return res.status(400).json({
+            success: false,
+            error: 'JSON body must include a "hashes" array.',
+          });
+        }
+
+        const cleaned = [];
+        const seenInput = new Set();
+        for (const h of rawHashes) {
+          const norm = String(h || '').trim().toLowerCase();
+          if (!norm || seenInput.has(norm)) continue;
+          seenInput.add(norm);
+          cleaned.push(norm);
+          if (cleaned.length >= MAX_BATCH_DELETE_COUNT) break;
+        }
+        if (cleaned.length === 0) {
+          return res.status(400).json({
+            success: false,
+            error: 'At least one photo hash is required.',
+          });
+        }
+
+        const keysToRemove = new Set();
+        const handledCanonical = new Set();
+        const deleted = [];
+        const missing = [];
+        const failed = [];
+        let freedBytes = 0;
+
+        for (const normHash of cleaned) {
+          const found = hashIndex.findMasterRecordKeys(normHash);
+          if (!found) {
+            missing.push(normHash);
+            continue;
+          }
+          if (handledCanonical.has(found.canonicalHash)) {
+            continue;
+          }
+          handledCanonical.add(found.canonicalHash);
+
+          try {
+            const bytes = await deleteRecordFiles({
+              storageDir,
+              record: found.record,
+            });
+            freedBytes += bytes;
+            deleted.push(found.canonicalHash);
+            for (const k of found.keys) {
+              keysToRemove.add(k);
+            }
+          } catch (err) {
+            failed.push({
+              hash: found.canonicalHash,
+              error: err.message || 'Delete failed',
+            });
+          }
+        }
+
+        if (keysToRemove.size > 0) {
+          await hashIndex.removeKeys(Array.from(keysToRemove), { persist: true });
+        }
+
+        return res.json({
+          success: failed.length === 0,
+          deleted,
+          missing,
+          failed,
+          deletedCount: deleted.length,
+          freedBytes,
+          storage: hashIndex.getStorageUsage(),
+        });
+      } catch (err) {
+        return res.status(err.statusCode || 500).json({
           success: false,
           error: err.message,
         });

@@ -1495,3 +1495,118 @@ test('Admin refresh and rescan do not create phantom root user slot in multi-use
   assert.equal(healedOv.capacity.totalItems, 1);
   assert.equal(healedOv.capacity.totalUsedBytes, 90);
 });
+
+test('Server-side single and batch photo deletion removes files, proxies, and quota usage while enforcing isolation', async (t) => {
+  const ctx = await startTestServer({
+    userKeys: 'alice_key:alice,bob_key:bob',
+    adminKey: 'del_admin_secret',
+  });
+  t.after(() => ctx.cleanup());
+
+  const uploadSample = async (apiKey, name, bytes, dateStr) => {
+    const form = new FormData();
+    form.append('photo', new Blob([bytes], { type: 'image/jpeg' }), name);
+    form.append('createdAt', dateStr);
+    const res = await ctx.request('/api/upload', {
+      method: 'POST',
+      headers: { 'X-API-Key': apiKey },
+      body: form,
+    });
+    assert.equal(res.status, 200);
+    return res.json();
+  };
+
+  const a1Bytes = Buffer.from('alice-photo-1-master-payload-bytes');
+  const a2Bytes = Buffer.from('alice-photo-2-master-payload-bytes');
+  const b1Bytes = Buffer.from('bob-photo-1-master-payload-bytes');
+
+  const upA1 = await uploadSample('alice_key', 'A1.JPG', a1Bytes, '2026-10-10T10:00:00Z');
+  const upA2 = await uploadSample('alice_key', 'A2.JPG', a2Bytes, '2026-10-11T10:00:00Z');
+  const upB1 = await uploadSample('bob_key', 'B1.JPG', b1Bytes, '2026-10-12T10:00:00Z');
+
+  // Register a proxy + preview + video proxy for A1 so we verify proxy cleanup too
+  const regA1 = await ctx.request('/api/proxy/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-Key': 'alice_key' },
+    body: JSON.stringify({
+      masterHash: upA1.hash,
+      proxyHash: crypto.createHash('sha256').update('proxy-a1').digest('hex'),
+      proxyBase64: Buffer.from('tiny-jpeg-preview-a1').toString('base64'),
+      videoProxyBase64: Buffer.from('tiny-mp4-proxy-a1').toString('base64'),
+    }),
+  });
+  assert.equal(regA1.status, 200);
+
+  const a1MasterPath = path.join(ctx.storageDir, 'alice', upA1.savedPath);
+  const a1ProxyPath = path.join(ctx.storageDir, 'alice', '.proxies', `${upA1.hash}.jpg`);
+  const a1VideoProxyPath = path.join(ctx.storageDir, 'alice', '.proxies', `${upA1.hash}.mp4`);
+  assert.ok(await fsp.stat(a1MasterPath));
+  assert.ok(await fsp.stat(a1ProxyPath));
+  assert.ok(await fsp.stat(a1VideoProxyPath));
+
+  // Cross-user isolation: Bob cannot delete Alice's photo
+  const bobDeleteAlice = await ctx.request(`/api/photo/${upA1.hash}`, {
+    method: 'DELETE',
+    headers: { 'X-API-Key': 'bob_key' },
+  });
+  assert.equal(bobDeleteAlice.status, 404);
+  assert.ok(await fsp.stat(a1MasterPath));
+
+  // Alice deletes A1 via single DELETE /api/photo/:hash
+  const delA1 = await ctx.request(`/api/photo/${upA1.hash}`, {
+    method: 'DELETE',
+    headers: { 'X-API-Key': 'alice_key' },
+  });
+  assert.equal(delA1.status, 200);
+  const delA1Body = await delA1.json();
+  assert.equal(delA1Body.success, true);
+  assert.deepEqual(delA1Body.deleted, [upA1.hash]);
+  assert.ok(delA1Body.freedBytes >= a1Bytes.length);
+
+  await assert.rejects(() => fsp.stat(a1MasterPath));
+  await assert.rejects(() => fsp.stat(a1ProxyPath));
+  await assert.rejects(() => fsp.stat(a1VideoProxyPath));
+
+  // Deleting again returns 404; check hash now reports missing
+  const delA1Again = await ctx.request(`/api/photo/${upA1.hash}`, {
+    method: 'DELETE',
+    headers: { 'X-API-Key': 'alice_key' },
+  });
+  assert.equal(delA1Again.status, 404);
+
+  const chkA1 = await (
+    await ctx.request(`/api/check/${upA1.hash}`, {
+      headers: { 'X-API-Key': 'alice_key' },
+    })
+  ).json();
+  assert.equal(chkA1.exists, false);
+
+  // Batch delete removes A2 + ignores missing/other-user hashes safely
+  const batchDel = await ctx.request('/api/photos/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-Key': 'alice_key' },
+    body: JSON.stringify({
+      hashes: [upA2.hash, upB1.hash, '0'.repeat(64)],
+    }),
+  });
+  assert.equal(batchDel.status, 200);
+  const batchBody = await batchDel.json();
+  assert.equal(batchBody.success, true);
+  assert.deepEqual(batchBody.deleted, [upA2.hash]);
+  assert.equal(batchBody.deletedCount, 1);
+  assert.equal(batchBody.missing.length, 2);
+  assert.equal(batchBody.storage.itemCount, 0);
+  assert.equal(batchBody.storage.usedBytes, 0);
+
+  // Alice gallery is now empty, Bob's B1 is untouched
+  const aliceList = await (
+    await ctx.request('/api/photos', { headers: { 'X-API-Key': 'alice_key' } })
+  ).json();
+  assert.equal(aliceList.total, 0);
+
+  const bobList = await (
+    await ctx.request('/api/photos', { headers: { 'X-API-Key': 'bob_key' } })
+  ).json();
+  assert.equal(bobList.total, 1);
+  assert.equal(bobList.photos[0].hash, upB1.hash);
+});

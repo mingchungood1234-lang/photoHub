@@ -96,6 +96,41 @@ final class LocalProxyStore {
         }
     }
 
+    func removePhoto(hash: String, baseURL: URL?, apiKey: String, notify: Bool = true) {
+        removePhotos(hashes: [hash], baseURL: baseURL, apiKey: apiKey, notify: notify)
+    }
+
+    func removePhotos(hashes: [String], baseURL: URL?, apiKey: String, notify: Bool = true) {
+        let targetSet = Set(
+            hashes
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter { !$0.isEmpty }
+        )
+        guard !targetSet.isEmpty else { return }
+
+        lock.lock()
+        ensureDirectoriesExistLocked()
+        let url = indexFileURL(baseURL: baseURL, apiKey: apiKey)
+        if let existingData = try? Data(contentsOf: url),
+           var decoded = try? JSONDecoder().decode([ServerPhoto].self, from: existingData) {
+            decoded.removeAll { targetSet.contains($0.hash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) }
+            if let encoded = try? JSONEncoder().encode(decoded) {
+                try? encoded.write(to: url, options: .atomic)
+            }
+        }
+        for hash in targetSet {
+            try? fm.removeItem(at: previewFileURL(forHash: hash))
+            try? fm.removeItem(at: videoFileURL(forHash: hash))
+        }
+        lock.unlock()
+
+        if notify {
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .localProxyStoreDidChange, object: nil)
+            }
+        }
+    }
+
     private func mutateIndex(
         baseURL: URL?,
         apiKey: String,

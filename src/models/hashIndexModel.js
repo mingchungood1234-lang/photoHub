@@ -653,6 +653,63 @@ class HashIndex {
     return record;
   }
 
+  /**
+   * Collects every record key (canonical hash plus any pre-transcode aliases)
+   * pointing to the same underlying stored master photo as `rawHash`.
+   */
+  findMasterRecordKeys(rawHash) {
+    const clean = String(rawHash || '').trim().toLowerCase();
+    if (!clean) return null;
+
+    const direct = this.records.get(clean);
+    if (!direct) return null;
+
+    const canonicalHash = String(direct.diskHash || direct.hash || clean)
+      .trim()
+      .toLowerCase();
+    const canonicalEntry = this.records.get(canonicalHash) || direct;
+    const relPath = canonicalEntry.relativePath || direct.relativePath || null;
+
+    const keys = [];
+    for (const [k, entry] of this.records.entries()) {
+      if (!entry) continue;
+      const entryCanonical = String(entry.diskHash || entry.hash || k)
+        .trim()
+        .toLowerCase();
+      if (
+        k === clean ||
+        k === canonicalHash ||
+        entryCanonical === canonicalHash ||
+        (relPath && entry.relativePath === relPath)
+      ) {
+        keys.push(k);
+      }
+    }
+
+    return {
+      canonicalHash,
+      record: canonicalEntry,
+      keys,
+    };
+  }
+
+  /**
+   * Removes the specified index keys (and their proxyToMaster mappings) and persists once.
+   */
+  async removeKeys(keysToRemove, { persist = true } = {}) {
+    let removedCount = 0;
+    for (const key of keysToRemove || []) {
+      const entry = this.records.get(key);
+      if (!entry) continue;
+      this._deleteIndexedRecord(key, entry);
+      removedCount += 1;
+    }
+    if (removedCount > 0 && persist) {
+      await this.persist();
+    }
+    return removedCount;
+  }
+
   async set(hash, record) {
     const normalized = hash.trim().toLowerCase();
     this.records.set(normalized, {

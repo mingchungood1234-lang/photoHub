@@ -59,6 +59,11 @@ private struct RestoreConfirmPrompt {
     let isRestoreAll: Bool
 }
 
+private struct DeleteConfirmPrompt {
+    let targets: [ServerPhoto]
+    let totalBytes: Int64
+}
+
 struct ServerGalleryView: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject private var syncManager: LocalProxySyncManager
@@ -102,6 +107,10 @@ struct ServerGalleryView: View {
     @State private var restoreBannerMessage: String?
     @State private var restoreTask: Task<Void, Never>?
     @State private var restoreConfirmPrompt: RestoreConfirmPrompt?
+
+    @State private var isBatchDeleting: Bool = false
+    @State private var deleteBannerMessage: String?
+    @State private var deleteConfirmPrompt: DeleteConfirmPrompt?
 
     @State private var showingPhotoPicker: Bool = false
     @State private var isResolvingPick: Bool = false
@@ -199,6 +208,12 @@ struct ServerGalleryView: View {
                                                 .padding(.vertical, 4)
                                         }
 
+                                        if isBatchDeleting || deleteBannerMessage != nil {
+                                            deleteBannerView
+                                                .padding(.horizontal, 12)
+                                                .padding(.vertical, 4)
+                                        }
+
                                         if syncManager.isSyncing {
                                             HStack(spacing: 8) {
                                                 ProgressView()
@@ -274,7 +289,7 @@ struct ServerGalleryView: View {
                                                                 }
                                                             }
                                                             .onLongPressGesture {
-                                                                if !isSelectionMode && !isBatchRestoring && !isBatchProxying {
+                                                                if !isSelectionMode && !isBatchRestoring && !isBatchProxying && !isBatchDeleting {
                                                                     enterSelectionMode(initialPhoto: photo)
                                                                 }
                                                             }
@@ -357,7 +372,7 @@ struct ServerGalleryView: View {
                         Button("Select") {
                             enterSelectionMode()
                         }
-                        .disabled(photos.isEmpty || isBatchRestoring || isBatchProxying)
+                        .disabled(photos.isEmpty || isBatchRestoring || isBatchProxying || isBatchDeleting)
 
                         Menu {
                             if !photos.isEmpty {
@@ -369,14 +384,14 @@ struct ServerGalleryView: View {
                                         systemImage: "icloud.and.arrow.down"
                                     )
                                 }
-                                .disabled(isBatchRestoring || isBatchProxying)
+                                .disabled(isBatchRestoring || isBatchProxying || isBatchDeleting)
 
                                 Button {
                                     enterSelectionMode()
                                 } label: {
-                                    Label("Select Photos to Restore", systemImage: "checkmark.circle")
+                                    Label("Select Photos to Restore or Delete", systemImage: "checkmark.circle")
                                 }
-                                .disabled(isBatchRestoring || isBatchProxying)
+                                .disabled(isBatchRestoring || isBatchProxying || isBatchDeleting)
 
                                 Divider()
                             }
@@ -442,10 +457,15 @@ struct ServerGalleryView: View {
                     photo: photo,
                     settings: settings,
                     initialImage: imageCache[photo.hash],
-                    initialCompressedData: compressedDataCache[photo.hash]
-                ) { updated in
-                    applyUpdatedPhoto(updated)
-                }
+                    initialCompressedData: compressedDataCache[photo.hash],
+                    onPhotoUpdated: { updated in
+                        applyUpdatedPhoto(updated)
+                    },
+                    onPhotoDeleted: { deletedHash, deletedName in
+                        applyDeletedHashes([deletedHash])
+                        deleteBannerMessage = "Deleted \(deletedName) from server."
+                    }
+                )
             }
             .sheet(isPresented: $showingPhotoPicker) {
                 PhotoPickerSheet(
@@ -512,6 +532,29 @@ struct ServerGalleryView: View {
                     )
                 }
             }
+            .alert(
+                "Delete from Server?",
+                isPresented: Binding(
+                    get: { deleteConfirmPrompt != nil },
+                    set: { if !$0 { deleteConfirmPrompt = nil } }
+                ),
+                presenting: deleteConfirmPrompt
+            ) { prompt in
+                Button(
+                    "Delete \(prompt.targets.count) Photo\(prompt.targets.count == 1 ? "" : "s")",
+                    role: .destructive
+                ) {
+                    startBatchDelete(targets: prompt.targets)
+                }
+                Button("Cancel", role: .cancel) {
+                    deleteConfirmPrompt = nil
+                }
+            } message: { prompt in
+                let sizeStr = ByteCountFormatter.string(fromByteCount: max(0, prompt.totalBytes), countStyle: .file)
+                Text(
+                    "Permanently delete \(prompt.targets.count) backed-up original(s) (~\(sizeStr)) and their server proxies from your PhotoHub server? This cannot be undone."
+                )
+            }
         }
     }
 
@@ -553,7 +596,7 @@ struct ServerGalleryView: View {
                     startBatchProxy()
                 }
                 .font(.caption.weight(.semibold))
-                .disabled(isBatchRestoring)
+                .disabled(isBatchRestoring || isBatchDeleting)
             } else if let msg = batchBannerMessage {
                 Image(systemName: "checkmark.circle.fill")
                     .font(.caption)
@@ -628,12 +671,45 @@ struct ServerGalleryView: View {
                     requestRestoreAll()
                 }
                 .font(.caption.weight(.semibold))
-                .disabled(isBatchProxying || photos.isEmpty)
+                .disabled(isBatchProxying || isBatchDeleting || photos.isEmpty)
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(Color.accentColor.opacity(0.09), in: Capsule())
+    }
+
+    @ViewBuilder
+    private var deleteBannerView: some View {
+        HStack(spacing: 10) {
+            if isBatchDeleting {
+                ProgressView()
+                    .scaleEffect(0.85)
+                Text("Deleting selected photos from server...")
+                    .font(.caption.weight(.medium))
+                Spacer()
+            } else if let msg = deleteBannerMessage {
+                Image(systemName: "trash.circle.fill")
+                    .font(.caption)
+                    .foregroundColor(.red)
+                Text(msg)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                Spacer()
+                Button {
+                    deleteBannerMessage = nil
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.red.opacity(0.09), in: Capsule())
     }
 
     @ViewBuilder
@@ -644,8 +720,9 @@ struct ServerGalleryView: View {
             ? selectedList.reduce(into: Int64(0)) { $0 += max(0, $1.size) }
             : unrestored.reduce(into: Int64(0)) { $0 += max(0, $1.size) }
         let sizeStr = ByteCountFormatter.string(fromByteCount: targetBytes, countStyle: .file)
+        let actionsDisabled = selectedList.isEmpty || isBatchRestoring || isBatchProxying || isBatchDeleting
 
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(selectedList.isEmpty ? "Tap photos to select" : "\(selectedList.count) selected (~\(sizeStr))")
                     .font(.subheadline.weight(.semibold))
@@ -658,9 +735,19 @@ struct ServerGalleryView: View {
                     )
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
                 }
             }
             Spacer()
+            Button(role: .destructive) {
+                requestDeleteSelected()
+            } label: {
+                Label("Delete", systemImage: "trash")
+                    .font(.subheadline.weight(.semibold))
+            }
+            .buttonStyle(.bordered)
+            .disabled(actionsDisabled)
+
             Button {
                 requestRestoreSelected()
             } label: {
@@ -668,7 +755,7 @@ struct ServerGalleryView: View {
                     .font(.subheadline.weight(.semibold))
             }
             .buttonStyle(.borderedProminent)
-            .disabled(selectedList.isEmpty || isBatchRestoring || isBatchProxying)
+            .disabled(actionsDisabled)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
@@ -679,7 +766,7 @@ struct ServerGalleryView: View {
     }
 
     private func enterSelectionMode(initialPhoto: ServerPhoto? = nil) {
-        guard !isBatchRestoring, !isBatchProxying, !photos.isEmpty else { return }
+        guard !isBatchRestoring, !isBatchProxying, !isBatchDeleting, !photos.isEmpty else { return }
         if let initialPhoto {
             selectedPhotoHashes = [initialPhoto.hash.lowercased()]
         } else {
@@ -703,7 +790,7 @@ struct ServerGalleryView: View {
     }
 
     private func requestRestoreAll() {
-        guard !isBatchRestoring, !isBatchProxying, !photos.isEmpty else { return }
+        guard !isBatchRestoring, !isBatchProxying, !isBatchDeleting, !photos.isEmpty else { return }
         restoreConfirmPrompt = buildRestoreConfirmPrompt(
             title: "Restore All Originals",
             targets: photos,
@@ -713,12 +800,80 @@ struct ServerGalleryView: View {
 
     private func requestRestoreSelected() {
         let targets = selectedPhotos
-        guard !isBatchRestoring, !isBatchProxying, !targets.isEmpty else { return }
+        guard !isBatchRestoring, !isBatchProxying, !isBatchDeleting, !targets.isEmpty else { return }
         restoreConfirmPrompt = buildRestoreConfirmPrompt(
             title: "Restore Selected Originals",
             targets: targets,
             isRestoreAll: false
         )
+    }
+
+    private func requestDeleteSelected() {
+        let targets = selectedPhotos
+        guard !isBatchRestoring, !isBatchProxying, !isBatchDeleting, !targets.isEmpty else { return }
+        let totalBytes = targets.reduce(into: Int64(0)) { $0 += max(0, $1.size) }
+        deleteConfirmPrompt = DeleteConfirmPrompt(targets: targets, totalBytes: totalBytes)
+    }
+
+    private func startBatchDelete(targets: [ServerPhoto]) {
+        guard !isBatchDeleting, !isBatchRestoring, !isBatchProxying, !targets.isEmpty else { return }
+        deleteConfirmPrompt = nil
+        exitSelectionMode()
+        deleteBannerMessage = nil
+        isBatchDeleting = true
+
+        let targetHashes = targets.map(\.hash)
+        let settings = self.settings
+        Task {
+            do {
+                let client = PhotoHubAPIClient(settings: settings)
+                let result = try await client.deleteServerPhotosBatch(hashes: targetHashes)
+                let removed = (result.deleted ?? []) + (result.missing ?? [])
+                applyDeletedHashes(removed)
+
+                let deletedCount = result.deleted?.count ?? 0
+                let missingCount = result.missing?.count ?? 0
+                let freedStr = ByteCountFormatter.string(fromByteCount: max(0, result.freedBytes ?? 0), countStyle: .file)
+                isBatchDeleting = false
+                if deletedCount > 0 && result.success {
+                    deleteBannerMessage = "Deleted \(deletedCount) photo(s) from server (freed ~\(freedStr))."
+                } else if deletedCount > 0 {
+                    deleteBannerMessage = "Deleted \(deletedCount) photo(s) from server; some items failed."
+                } else if missingCount > 0 {
+                    deleteBannerMessage = "Removed \(missingCount) missing item(s) from gallery."
+                } else {
+                    deleteBannerMessage = "Delete failed on server."
+                }
+            } catch APIClientError.httpError(401, _) {
+                isBatchDeleting = false
+                LocalProxySyncManager.shared.cancel()
+                settings.signOut()
+            } catch {
+                isBatchDeleting = false
+                deleteBannerMessage = "Delete failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func applyDeletedHashes(_ rawHashes: [String]) {
+        let removedSet = Set(
+            rawHashes
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter { !$0.isEmpty }
+        )
+        guard !removedSet.isEmpty else { return }
+
+        photos.removeAll { removedSet.contains($0.hash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) }
+        for key in Array(imageCache.keys) where removedSet.contains(key.lowercased()) {
+            imageCache.removeValue(forKey: key)
+        }
+        for key in Array(compressedDataCache.keys) where removedSet.contains(key.lowercased()) {
+            compressedDataCache.removeValue(forKey: key)
+        }
+        failedPreviewHashes = failedPreviewHashes.filter { !removedSet.contains($0.lowercased()) }
+        selectedPhotoHashes = selectedPhotoHashes.filter { !removedSet.contains($0.lowercased()) }
+        refreshLocallyProtectedHashes()
+        rebuildTimeline()
     }
 
     private func buildRestoreConfirmPrompt(
@@ -1607,19 +1762,22 @@ private struct ServerPhotoDetailView: View {
     let initialImage: UIImage?
     let initialCompressedData: Data?
     let onPhotoUpdated: (ServerPhoto) -> Void
+    let onPhotoDeleted: (String, String) -> Void
 
     init(
         photo: ServerPhoto,
         settings: AppSettings,
         initialImage: UIImage?,
         initialCompressedData: Data?,
-        onPhotoUpdated: @escaping (ServerPhoto) -> Void
+        onPhotoUpdated: @escaping (ServerPhoto) -> Void,
+        onPhotoDeleted: @escaping (String, String) -> Void
     ) {
         self._currentPhoto = State(initialValue: photo)
         self.settings = settings
         self.initialImage = initialImage
         self.initialCompressedData = initialCompressedData
         self.onPhotoUpdated = onPhotoUpdated
+        self.onPhotoDeleted = onPhotoDeleted
     }
 
     @Environment(\.dismiss) private var dismiss
@@ -1634,6 +1792,7 @@ private struct ServerPhotoDetailView: View {
     @State private var busyLabel: String = ""
     @State private var saveMessage: String?
     @State private var shareSheetItem: ShareSheetItem?
+    @State private var showDeleteConfirm: Bool = false
 
     private static let detailDateFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -1842,6 +2001,15 @@ private struct ServerPhotoDetailView: View {
                         .buttonStyle(.bordered)
                         .disabled(isBusy)
                     }
+
+                    Button(role: .destructive) {
+                        showDeleteConfirm = true
+                    } label: {
+                        Label("Delete from Server", systemImage: "trash")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(isBusy)
                 }
                 .padding()
                 .background(.ultraThinMaterial)
@@ -1888,6 +2056,17 @@ private struct ServerPhotoDetailView: View {
                     cleanupTempShareURL(item.fileURL)
                     shareSheetItem = nil
                 }
+            }
+            .alert("Delete from Server?", isPresented: $showDeleteConfirm) {
+                Button("Delete", role: .destructive) {
+                    Task { await deleteCurrentItemFromServer() }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                let masterStr = ByteCountFormatter.string(fromByteCount: currentPhoto.size, countStyle: .file)
+                Text(
+                    "Permanently delete \(currentPhoto.originalName) (~\(masterStr)) and its compressed proxies from your PhotoHub server? This cannot be undone."
+                )
             }
         }
     }
@@ -2118,6 +2297,33 @@ private struct ServerPhotoDetailView: View {
                 : "Unlocked: this photo can be compressed into a proxy again."
         } catch {
             saveMessage = "Failed to update protection: \(error.localizedDescription)"
+        }
+    }
+
+    private func deleteCurrentItemFromServer() async {
+        isBusy = true
+        busyLabel = "Deleting from server..."
+        saveMessage = nil
+        defer {
+            isBusy = false
+            busyLabel = ""
+        }
+
+        do {
+            let client = PhotoHubAPIClient(settings: settings)
+            try await client.deleteServerPhoto(hash: currentPhoto.hash)
+            player?.pause()
+            player = nil
+            let deletedHash = currentPhoto.hash
+            let deletedName = currentPhoto.originalName
+            onPhotoDeleted(deletedHash, deletedName)
+            dismiss()
+        } catch APIClientError.httpError(401, _) {
+            LocalProxySyncManager.shared.cancel()
+            settings.signOut()
+            dismiss()
+        } catch {
+            saveMessage = "Delete failed: \(error.localizedDescription)"
         }
     }
 }

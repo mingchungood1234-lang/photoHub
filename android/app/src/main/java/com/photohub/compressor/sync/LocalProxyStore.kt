@@ -83,6 +83,41 @@ class LocalProxyStore private constructor(context: Context) {
         }
     }
 
+    fun removePhoto(hash: String, baseUrl: String?, scopeKey: String, notify: Boolean = true) {
+        removePhotos(listOf(hash), baseUrl, scopeKey, notify)
+    }
+
+    fun removePhotos(hashes: Collection<String>, baseUrl: String?, scopeKey: String, notify: Boolean = true) {
+        val targetSet = hashes
+            .map { it.trim().lowercase() }
+            .filter { it.isNotEmpty() }
+            .toSet()
+        if (targetSet.isEmpty()) return
+
+        synchronized(lock) {
+            ensureDirsLocked()
+            val file = indexFile(baseUrl, scopeKey)
+            if (file.exists()) {
+                val list = try {
+                    ServerPhoto.listFromJsonArray(JSONArray(file.readText())).toMutableList()
+                } catch (_: Exception) {
+                    mutableListOf()
+                }
+                val changed = list.removeAll { it.hash.trim().lowercase() in targetSet }
+                if (changed) {
+                    file.writeText(ServerPhoto.listToJsonArray(list).toString())
+                }
+            }
+            for (h in targetSet) {
+                runCatching { previewFile(h).delete() }
+                runCatching { videoFile(h).delete() }
+            }
+        }
+        if (notify) {
+            _changes.tryEmit(Unit)
+        }
+    }
+
     private fun mutateIndex(
         baseUrl: String?,
         scopeKey: String,
