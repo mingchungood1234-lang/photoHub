@@ -725,7 +725,7 @@ private struct GalleryProxyInspectionSheet: View {
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Done") { onClose() }
-                        .fontWeight(.semibold)
+                        .font(.body.weight(.semibold))
                 }
             }
         }

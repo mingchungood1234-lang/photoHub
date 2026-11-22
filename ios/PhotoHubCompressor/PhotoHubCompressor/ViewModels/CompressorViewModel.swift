@@ -228,8 +228,8 @@ final class CompressorViewModel: ObservableObject {
         guard snapshot.contains(where: { $0.state == .pending && !$0.isVideo }) else { return }
 
         isCheckingServerProxies = true
-        let client = PhotoHubAPIClient(settings: settings)
-        let tracker = tracker
+        let client = PhotoHubAPIClient(settings: self.settings)
+        let tracker = self.tracker
 
         deepProxyScanTask = Task.detached(priority: .utility) { [weak self] in
             let matches = await GalleryProxyDetector.enrichCandidatesWithServer(
@@ -834,9 +834,9 @@ final class CompressorViewModel: ObservableObject {
         isInspectingGalleryPicks = true
         inspectorActionMessage = nil
 
-        let apiClient = PhotoHubAPIClient(settings: settings)
-        let tracker = tracker
-        let isSignedIn = settings.isSignedIn
+        let apiClient = PhotoHubAPIClient(settings: self.settings)
+        let tracker = self.tracker
+        let isSignedIn = self.settings.isSignedIn
         let cachedPhotos = LocalProxyStore.shared.cachedPhotos(
             baseURL: settings.normalizedBaseURL,
             apiKey: settings.apiKey
@@ -898,7 +898,7 @@ final class CompressorViewModel: ObservableObject {
         inspectionBusyId = itemId
         inspectorActionMessage = "Restoring full-resolution original..."
 
-        let settings = settings
+        let settings = self.settings
         Task { [weak self] in
             guard let self else { return }
             let authorized = await PhotoLibraryService.requestWriteAuthorizationAsync()
@@ -967,7 +967,7 @@ final class CompressorViewModel: ObservableObject {
         inspectionBusyId = itemId
         inspectorActionMessage = "Downloading original for Share..."
 
-        let settings = settings
+        let settings = self.settings
         Task { [weak self] in
             guard let self else { return }
             do {

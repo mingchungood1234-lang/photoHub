@@ -36,7 +36,7 @@ jobs:
       - name: Generate Xcode project with XcodeGen
         working-directory: ios/PhotoHubCompressor
         run: |
-          command -v xcodegen >/dev/null 2>&1 || HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+          command -v xcodegen >/dev/null 2>&1 || HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install xcodegen
           rm -rf PhotoHubCompressor.xcodeproj
           xcodegen generate
           if [ -n "${{ vars.PHOTOHUB_GATEWAY_URL }}" ]; then
@@ -53,6 +53,7 @@ jobs:
       - name: Build unsigned iOS device app (.app)
         run: |
           set -o pipefail
+          set +e
           xcodebuild \
             -project ios/PhotoHubCompressor/PhotoHubCompressor.xcodeproj \
             -scheme PhotoHubCompressor \
@@ -65,6 +66,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             clean build 2>&1 | tee build.log
           BUILD_RC=${PIPESTATUS[0]}
+          set -e
           if [ "$BUILD_RC" -ne 0 ]; then
             echo "=== XCODEBUILD ERRORS (exit $BUILD_RC) ==="
             ERRORS=$(grep -nE -C 2 "error:|fatal error:|xcodebuild: error:" build.log | head -n 120 || true)

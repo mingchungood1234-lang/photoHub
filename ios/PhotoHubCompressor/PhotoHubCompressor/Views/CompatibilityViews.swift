@@ -155,24 +155,45 @@ struct MultiPhotoPickerSheet: UIViewControllerRepresentable {
             }
 
             let finishBatch = onPickBatch
-            let lock = NSLock()
-            var loaded = Array<PickedMediaResult?>(repeating: nil, count: results.count)
+            let collector = PickedBatchCollector(count: results.count)
             let group = DispatchGroup()
 
             for (idx, item) in results.enumerated() {
                 group.enter()
                 PhotoPickerItemLoader.loadPickedResult(from: item, skipCopyIfTracked: false) { picked in
-                    lock.lock()
-                    loaded[idx] = picked
-                    lock.unlock()
+                    collector.store(picked, at: idx)
                     group.leave()
                 }
             }
 
             group.notify(queue: .main) {
-                finishBatch(loaded.compactMap { $0 })
+                finishBatch(collector.snapshot())
             }
         }
+    }
+}
+
+/// Thread-safe collector for batch `PHPickerResult` loading across callback closures.
+private final class PickedBatchCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var items: [PickedMediaResult?]
+
+    init(count: Int) {
+        self.items = Array(repeating: nil, count: count)
+    }
+
+    func store(_ item: PickedMediaResult, at index: Int) {
+        lock.lock()
+        if items.indices.contains(index) {
+            items[index] = item
+        }
+        lock.unlock()
+    }
+
+    func snapshot() -> [PickedMediaResult] {
+        lock.lock()
+        defer { lock.unlock() }
+        return items.compactMap { $0 }
     }
 }
 
