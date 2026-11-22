@@ -52,7 +52,7 @@ fun ServerPhotoDetailDialog(
     val photo = detail.photo
     val needsProxyAction = photo.needsProxy ||
         (photo.isVideo && detail.videoFile == null && photo.hasVideoProxy != true && !detail.isLoadingVideo)
-    val isOriginalProtected = photo.isProtectedOriginal
+    val isOriginalProtected = photo.isProtectedOriginal || detail.isLocallyProtected
 
     LaunchedEffect(detail.shareFileReady) {
         val f = detail.shareFileReady ?: return@LaunchedEffect

@@ -18,6 +18,13 @@ final class CompressorViewModel: ObservableObject {
     @Published var totalToProcess: Int = 0
     @Published var overallProgressFraction: Double = 0
     @Published var sortMode: CandidateSortMode
+    @Published var filterMode: CandidateFilterMode = .all
+    @Published var isCheckingServerProxies: Bool = false
+    @Published var isInspectingGalleryPicks: Bool = false
+    @Published var galleryInspectionItems: [GalleryProxyInspectionItem]? = nil
+    @Published var inspectionBusyId: String? = nil
+    @Published var inspectorActionMessage: String? = nil
+    @Published var inspectorShareItem: ShareSheetItem? = nil
     @Published var recentlyDeletedNoticeCount: Int = 0
     @Published var recentlyDeletedNoticeBytes: Int64 = 0
     @Published private(set) var backgroundActiveCount: Int = 0
@@ -28,6 +35,7 @@ final class CompressorViewModel: ObservableObject {
     private var pendingAutoDeleteWhenActive: Bool = false
     private var activeBgTaskId: UIBackgroundTaskIdentifier = .invalid
     private var activeUploadTask: Task<Void, Never>?
+    private var deepProxyScanTask: Task<Void, Never>?
     private var activeItemProgress: [String: Double] = [:]
     private var hasAutoStartedThisSession: Bool = false
 
@@ -40,6 +48,29 @@ final class CompressorViewModel: ObservableObject {
 
     var selectedCount: Int {
         candidates.filter { $0.isSelected && !$0.state.isFinished }.count
+    }
+
+    var detectedProxies: [PhotoCandidate] {
+        candidates.filter { $0.isDetectedProxy }
+    }
+
+    var detectedProxyCount: Int {
+        detectedProxies.count
+    }
+
+    var originalCandidatesCount: Int {
+        candidates.filter { !$0.isDetectedProxy }.count
+    }
+
+    var displayedCandidates: [PhotoCandidate] {
+        switch filterMode {
+        case .all:
+            return candidates
+        case .originals:
+            return candidates.filter { !$0.isDetectedProxy }
+        case .proxies:
+            return candidates.filter { $0.isDetectedProxy }
+        }
     }
 
     var pendingVideoCandidates: [PhotoCandidate] {
@@ -64,7 +95,9 @@ final class CompressorViewModel: ObservableObject {
 
     func scanLibrary() {
         guard !isScanning else { return }
+        deepProxyScanTask?.cancel()
         isScanning = true
+        isCheckingServerProxies = false
         statusBanner = nil
         BackgroundBackupManager.shared.pruneMissingAssetsFromStaged()
 
@@ -83,6 +116,7 @@ final class CompressorViewModel: ObservableObject {
                 let service = self.photoService
                 let tracker = self.tracker
                 let mode = self.sortMode
+                let isSignedIn = self.settings.isSignedIn
                 let cachedServerPhotos = LocalProxyStore.shared.cachedPhotos(
                     baseURL: self.settings.normalizedBaseURL,
                     apiKey: self.settings.apiKey
@@ -90,14 +124,22 @@ final class CompressorViewModel: ObservableObject {
                 Task.detached(priority: .userInitiated) { [weak self] in
                     let raw = service.scanCandidates(tracker: tracker, knownServerPhotos: cachedServerPhotos)
                     let sorted = PhotoBackupPipeline.sortCandidates(raw, by: mode)
+                    let proxyCount = sorted.filter(\.isDetectedProxy).count
+                    let eligibleCount = sorted.filter { !$0.state.isFinished }.count
                     await MainActor.run {
                         guard let self else { return }
                         self.applyScannedCandidates(sorted)
                         self.pendingDeleteAssets.removeAll()
                         self.pendingAutoDeleteWhenActive = false
                         self.isScanning = false
-                        if sorted.isEmpty {
-                            self.statusBanner = "No uncompressed photos or videos found."
+                        if eligibleCount == 0 && proxyCount > 0 {
+                            self.filterMode = .proxies
+                            self.statusBanner = "Auto-detected \(proxyCount) compressed proxy item(s) in Apple Photos."
+                        } else if sorted.isEmpty {
+                            self.statusBanner = "No photos or videos found in Apple Photos."
+                        }
+                        if eligibleCount > 0 && isSignedIn {
+                            self.launchDeepProxyDetection(cachedServerPhotos: cachedServerPhotos)
                         }
                     }
                 }
@@ -113,6 +155,7 @@ final class CompressorViewModel: ObservableObject {
             hasAutoStartedThisSession = true
         }
         guard !isScanning && !isProcessing else { return }
+        deepProxyScanTask?.cancel()
         isScanning = true
         statusBanner = "Finding new photos & videos to back up…"
         BackgroundBackupManager.shared.pruneMissingAssetsFromStaged()
@@ -131,6 +174,8 @@ final class CompressorViewModel: ObservableObject {
                 let service = self.photoService
                 let tracker = self.tracker
                 let mode = self.sortMode
+                let isSignedIn = self.settings.isSignedIn
+                let apiClient = PhotoHubAPIClient(settings: self.settings)
                 let cachedServerPhotos = LocalProxyStore.shared.cachedPhotos(
                     baseURL: self.settings.normalizedBaseURL,
                     apiKey: self.settings.apiKey
@@ -142,20 +187,97 @@ final class CompressorViewModel: ObservableObject {
                         maxResults: 200,
                         maxInspect: 3000
                     )
-                    let sorted = PhotoBackupPipeline.sortCandidates(raw, by: mode)
+                    var sorted = PhotoBackupPipeline.sortCandidates(raw, by: mode)
+                    if isSignedIn && sorted.contains(where: { $0.state == .pending }) {
+                        await MainActor.run {
+                            self?.statusBanner = "Checking Photos items for compressed proxies…"
+                        }
+                        let matches = await GalleryProxyDetector.enrichCandidatesWithServer(
+                            candidates: sorted,
+                            tracker: tracker,
+                            client: apiClient,
+                            cachedServerPhotos: cachedServerPhotos
+                        )
+                        if !matches.isEmpty {
+                            sorted = Self.applyDeepMatches(sorted, matches: matches)
+                        }
+                    }
+                    let eligibleCount = sorted.filter { !$0.state.isFinished }.count
+                    let proxyCount = sorted.filter(\.isDetectedProxy).count
                     await MainActor.run {
                         guard let self else { return }
                         self.applyScannedCandidates(sorted)
                         self.isScanning = false
-                        if !sorted.isEmpty && (forceNow || self.settings.autoCompressOnOpen) {
+                        if eligibleCount > 0 && (forceNow || self.settings.autoCompressOnOpen) {
                             self.selectAllEligible(true)
                             self.startProcessingSelectedPhotos()
-                        } else if sorted.isEmpty {
-                            self.statusBanner = "All scanned photos & videos are already backed up."
+                        } else if eligibleCount == 0 {
+                            self.statusBanner = proxyCount > 0
+                                ? "All scanned photos & videos are already backed up or compressed proxies (\(proxyCount) proxy detected)."
+                                : "All scanned photos & videos are already backed up."
                         }
                     }
                 }
             }
+        }
+    }
+
+    private func launchDeepProxyDetection(cachedServerPhotos: [ServerPhoto]) {
+        deepProxyScanTask?.cancel()
+        let snapshot = candidates
+        guard snapshot.contains(where: { $0.state == .pending && !$0.isVideo }) else { return }
+
+        isCheckingServerProxies = true
+        let client = PhotoHubAPIClient(settings: settings)
+        let tracker = tracker
+
+        deepProxyScanTask = Task.detached(priority: .utility) { [weak self] in
+            let matches = await GalleryProxyDetector.enrichCandidatesWithServer(
+                candidates: snapshot,
+                tracker: tracker,
+                client: client,
+                cachedServerPhotos: cachedServerPhotos
+            )
+            await MainActor.run {
+                guard let self else { return }
+                if !matches.isEmpty {
+                    self.candidates = Self.applyDeepMatches(self.candidates, matches: matches)
+                }
+                self.isCheckingServerProxies = false
+            }
+        }
+    }
+
+    private nonisolated static func applyDeepMatches(
+        _ items: [PhotoCandidate],
+        matches: [String: CandidateDeepCheckMatch]
+    ) -> [PhotoCandidate] {
+        items.map { item in
+            guard let m = matches[item.id] else { return item }
+            var copy = item
+            if m.isProxy {
+                copy.state = .alreadyProxy
+                copy.isSelected = false
+                copy.masterHash = m.masterHash ?? item.masterHash
+                copy.detectionSource = m.signal
+                copy.linkedOriginalName = m.originalName ?? item.linkedOriginalName
+                copy.linkedOriginalBytes = m.originalSizeBytes ?? item.linkedOriginalBytes
+                copy.isBackedUpOnServer = true
+            } else if m.isMaster && m.isProtectedOriginal {
+                copy.state = .skipped("Restored Original (Protected)")
+                copy.isSelected = false
+                copy.masterHash = m.masterHash ?? item.masterHash
+                copy.detectionSource = m.signal
+                copy.linkedOriginalName = m.originalName ?? item.linkedOriginalName
+                copy.linkedOriginalBytes = m.originalSizeBytes ?? item.linkedOriginalBytes
+                copy.isBackedUpOnServer = true
+            } else if m.isMaster {
+                copy.masterHash = m.masterHash ?? item.masterHash
+                copy.linkedOriginalName = m.originalName ?? item.linkedOriginalName
+                copy.linkedOriginalBytes = m.originalSizeBytes ?? item.linkedOriginalBytes
+                copy.isBackedUpOnServer = true
+            }
+            return copy
         }
     }
 
@@ -703,5 +825,223 @@ final class CompressorViewModel: ObservableObject {
         if let idx = candidates.firstIndex(where: { $0.id == id }) {
             candidates[idx].state = state
         }
+    }
+
+    // MARK: - Native Gallery Proxy Detection & Inspector
+
+    func inspectPickedGalleryItems(_ picked: [PickedMediaResult]) {
+        guard !picked.isEmpty else { return }
+        isInspectingGalleryPicks = true
+        inspectorActionMessage = nil
+
+        let apiClient = PhotoHubAPIClient(settings: settings)
+        let tracker = tracker
+        let isSignedIn = settings.isSignedIn
+        let cachedPhotos = LocalProxyStore.shared.cachedPhotos(
+            baseURL: settings.normalizedBaseURL,
+            apiKey: settings.apiKey
+        )
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let results = await GalleryProxyDetector.inspectPickedItems(
+                picked,
+                client: apiClient,
+                tracker: tracker,
+                cachedServerPhotos: cachedPhotos,
+                isSignedIn: isSignedIn
+            )
+            let proxyCount = results.filter { $0.kind == .proxy }.count
+            await MainActor.run {
+                guard let self else { return }
+                self.isInspectingGalleryPicks = false
+                self.galleryInspectionItems = results
+                self.statusBanner = proxyCount > 0
+                    ? "Gallery Check: detected \(proxyCount) compressed proxy item(s) out of \(results.count)."
+                    : "Gallery Check: all \(results.count) selected item(s) are full originals."
+
+                // Also sync detected proxies back into currently loaded candidates list
+                for idx in self.candidates.indices {
+                    let cand = self.candidates[idx]
+                    if let match = results.first(where: {
+                        $0.kind == .proxy && ($0.assetId == cand.id || (cand.masterHash != nil && cand.masterHash == $0.masterHash))
+                    }) {
+                        self.candidates[idx].state = .alreadyProxy
+                        self.candidates[idx].isSelected = false
+                        self.candidates[idx].masterHash = match.masterHash ?? cand.masterHash
+                        self.candidates[idx].detectionSource = match.signals.first ?? "Gallery Check"
+                        self.candidates[idx].linkedOriginalName = match.originalName
+                        self.candidates[idx].linkedOriginalBytes = match.originalSizeBytes
+                        self.candidates[idx].isBackedUpOnServer = match.masterHash != nil
+                    }
+                }
+            }
+        }
+    }
+
+    func dismissGalleryInspection() {
+        galleryInspectionItems = nil
+        inspectionBusyId = nil
+        inspectorActionMessage = nil
+    }
+
+    func restoreOriginalFromDetectedProxy(
+        itemId: String,
+        rawMasterHash: String?,
+        originalFilename: String?,
+        isVideo: Bool
+    ) {
+        guard let rawMasterHash, !rawMasterHash.isEmpty else {
+            inspectorActionMessage = "Master hash unavailable while offline."
+            statusBanner = inspectorActionMessage
+            return
+        }
+        inspectionBusyId = itemId
+        inspectorActionMessage = "Restoring full-resolution original..."
+
+        let settings = settings
+        Task { [weak self] in
+            guard let self else { return }
+            let authorized = await PhotoLibraryService.requestWriteAuthorizationAsync()
+            guard authorized else {
+                self.inspectionBusyId = nil
+                self.inspectorActionMessage = "Photos permission is required to save originals."
+                return
+            }
+
+            do {
+                let client = PhotoHubAPIClient(settings: settings)
+                let serverPhoto = try await self.resolveServerPhotoForHashOrPrefix(
+                    rawMasterHash,
+                    fallbackFilename: originalFilename,
+                    isVideo: isVideo,
+                    client: client
+                )
+                let (_, savedBytes) = try await PhotoLibraryService.restoreMasterToPhotos(
+                    photo: serverPhoto,
+                    client: client
+                )
+                let sizeStr = ByteCountFormatter.string(fromByteCount: savedBytes, countStyle: .file)
+                let msg = "Restored \(serverPhoto.originalName) (\(sizeStr)) to Photos & protected it."
+                self.inspectionBusyId = nil
+                self.inspectorActionMessage = msg
+                self.statusBanner = msg
+                if var list = self.galleryInspectionItems,
+                   let idx = list.firstIndex(where: { $0.id == itemId }) {
+                    let old = list[idx]
+                    list[idx] = GalleryProxyInspectionItem(
+                        id: old.id,
+                        assetId: old.assetId,
+                        displayName: old.displayName,
+                        isVideo: old.isVideo,
+                        localSizeBytes: old.localSizeBytes,
+                        kind: old.kind,
+                        signals: old.signals,
+                        masterHash: serverPhoto.hash,
+                        proxySha256: old.proxySha256,
+                        originalName: serverPhoto.originalName,
+                        originalSizeBytes: serverPhoto.size,
+                        isProtectedOriginal: true,
+                        hasServerProxy: old.hasServerProxy
+                    )
+                    self.galleryInspectionItems = list
+                }
+            } catch {
+                self.inspectionBusyId = nil
+                let msg = "Restore failed: \(error.localizedDescription)"
+                self.inspectorActionMessage = msg
+                self.statusBanner = msg
+            }
+        }
+    }
+
+    func shareOriginalFromDetectedProxy(
+        itemId: String,
+        rawMasterHash: String?,
+        originalFilename: String?
+    ) {
+        guard let rawMasterHash, !rawMasterHash.isEmpty else {
+            inspectorActionMessage = "Master hash unavailable while offline."
+            statusBanner = inspectorActionMessage
+            return
+        }
+        inspectionBusyId = itemId
+        inspectorActionMessage = "Downloading original for Share..."
+
+        let settings = settings
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let client = PhotoHubAPIClient(settings: settings)
+                let serverPhoto = try await self.resolveServerPhotoForHashOrPrefix(
+                    rawMasterHash,
+                    fallbackFilename: originalFilename,
+                    isVideo: false,
+                    client: client
+                )
+                let tempURL = try await client.downloadMasterToTempFile(
+                    hash: serverPhoto.hash,
+                    preferredFilename: serverPhoto.originalName
+                )
+                self.inspectionBusyId = nil
+                self.inspectorActionMessage = nil
+                self.inspectorShareItem = ShareSheetItem(fileURL: tempURL)
+            } catch {
+                self.inspectionBusyId = nil
+                let msg = "Share failed: \(error.localizedDescription)"
+                self.inspectorActionMessage = msg
+                self.statusBanner = msg
+            }
+        }
+    }
+
+    private func resolveServerPhotoForHashOrPrefix(
+        _ rawHashOrPrefix: String,
+        fallbackFilename: String?,
+        isVideo: Bool,
+        client: PhotoHubAPIClient
+    ) async throws -> ServerPhoto {
+        let clean = rawHashOrPrefix.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let cached = LocalProxyStore.shared.cachedPhotos(
+            baseURL: settings.normalizedBaseURL,
+            apiKey: settings.apiKey
+        )
+        if let found = cached.first(where: {
+            $0.hash.lowercased() == clean || ProxyGenerator.proxyPrefixTag(forMasterHash: $0.hash) == clean
+        }) {
+            return found
+        }
+
+        if let fresh = try? await client.fetchAllServerPhotos(sync: false) {
+            LocalProxyStore.shared.savePhotos(
+                fresh,
+                baseURL: settings.normalizedBaseURL,
+                apiKey: settings.apiKey
+            )
+            if let found = fresh.first(where: {
+                $0.hash.lowercased() == clean || ProxyGenerator.proxyPrefixTag(forMasterHash: $0.hash) == clean
+            }) {
+                return found
+            }
+        }
+
+        guard clean.count == 64 else {
+            throw PhotoLibraryError.proxyReplacementFailed("Original photo hash could not be resolved on server.")
+        }
+        return ServerPhoto(
+            hash: clean,
+            originalName: fallbackFilename ?? (isVideo ? "RESTORED_\(clean.prefix(8)).mp4" : "RESTORED_\(clean.prefix(8)).jpg"),
+            size: 0,
+            photoDate: "",
+            takenAt: nil,
+            uploadedAt: "",
+            savedPath: fallbackFilename ?? "",
+            hasProxy: true,
+            hasPreview: true,
+            proxyHash: nil,
+            proxySize: nil,
+            hasVideoProxy: nil,
+            videoProxySize: nil,
+            keepOriginalOnDevice: true
+        )
     }
 }

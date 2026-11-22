@@ -177,6 +177,11 @@ struct CheckResponse: Decodable {
     let savedPath: String?
 }
 
+private struct BatchCheckResponse: Decodable {
+    let success: Bool
+    let results: [String: CheckResponse]?
+}
+
 private struct ProtectOriginalResponse: Decodable {
     let success: Bool
     let keepOriginalOnDevice: Bool?
@@ -764,6 +769,41 @@ final class PhotoHubAPIClient {
         let (data, response) = try await pooledSession.data(for: request)
         try validateHTTP(response: response, data: data)
         return try JSONDecoder().decode(CheckResponse.self, from: data)
+    }
+
+    func checkHashesBatch(_ hashes: [String]) async throws -> [String: CheckResponse] {
+        var seen = Set<String>()
+        let cleaned: [String] = hashes.compactMap { raw in
+            let norm = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !norm.isEmpty, seen.insert(norm).inserted else { return nil }
+            return norm
+        }
+        guard !cleaned.isEmpty else { return [:] }
+
+        var merged: [String: CheckResponse] = [:]
+        var idx = 0
+        while idx < cleaned.count {
+            let end = min(cleaned.count, idx + 500)
+            let chunk = Array(cleaned[idx..<end])
+            idx = end
+
+            let url = try makeURL("/api/check/batch")
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            applyAuth(to: &request)
+            request.httpBody = try JSONSerialization.data(withJSONObject: ["hashes": chunk])
+
+            let (data, response) = try await pooledSession.data(for: request)
+            try validateHTTP(response: response, data: data)
+            let decoded = try JSONDecoder().decode(BatchCheckResponse.self, from: data)
+            if let results = decoded.results {
+                for (hashKey, checkItem) in results {
+                    merged[hashKey.lowercased()] = checkItem
+                }
+            }
+        }
+        return merged
     }
 
     func setOriginalProtected(masterHash: String, protected: Bool) async throws -> ServerPhoto {

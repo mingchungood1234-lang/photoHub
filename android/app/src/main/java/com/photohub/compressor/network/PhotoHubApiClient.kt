@@ -348,6 +348,20 @@ class PhotoHubApiClient(
         collected
     }
 
+    private fun parseCheckResponse(json: JSONObject): CheckResponse = CheckResponse(
+        success = json.optBoolean("success", true),
+        exists = json.optBoolean("exists", false),
+        isMaster = json.optBoolean("isMaster", false),
+        isProxy = json.optBoolean("isProxy", false),
+        hasProxy = json.optBoolean("hasProxy", false),
+        proxySize = if (json.has("proxySize") && !json.isNull("proxySize")) json.optLong("proxySize") else null,
+        isProtectedOriginal = json.optBoolean("isProtectedOriginal", false),
+        keepOriginalOnDevice = json.optBoolean("keepOriginalOnDevice", false),
+        canReplaceWithProxy = json.optBoolean("canReplaceWithProxy", false),
+        masterHash = json.optString("masterHash").takeIf { it.isNotBlank() && !json.isNull("masterHash") },
+        savedPath = json.optString("savedPath").takeIf { it.isNotBlank() && !json.isNull("savedPath") }
+    )
+
     suspend fun checkHash(sha256: String): CheckResponse = withContext(Dispatchers.IO) {
         val req = Request.Builder()
             .url(makeUrl("/api/check/$sha256"))
@@ -357,21 +371,43 @@ class PhotoHubApiClient(
         client.newCall(req).execute().use { resp ->
             val text = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) throw ApiHttpException(resp.code, parseErrorMessage(resp.code, text))
-            val json = JSONObject(text)
-            CheckResponse(
-                success = json.optBoolean("success", false),
-                exists = json.optBoolean("exists", false),
-                isMaster = json.optBoolean("isMaster", false),
-                isProxy = json.optBoolean("isProxy", false),
-                hasProxy = json.optBoolean("hasProxy", false),
-                proxySize = if (json.has("proxySize") && !json.isNull("proxySize")) json.optLong("proxySize") else null,
-                isProtectedOriginal = json.optBoolean("isProtectedOriginal", false),
-                keepOriginalOnDevice = json.optBoolean("keepOriginalOnDevice", false),
-                canReplaceWithProxy = json.optBoolean("canReplaceWithProxy", false),
-                masterHash = json.optString("masterHash").takeIf { it.isNotBlank() },
-                savedPath = json.optString("savedPath").takeIf { it.isNotBlank() }
-            )
+            parseCheckResponse(JSONObject(text))
         }
+    }
+
+    suspend fun checkHashesBatch(hashes: List<String>): Map<String, CheckResponse> = withContext(Dispatchers.IO) {
+        val cleaned = hashes
+            .map { it.trim().lowercase() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+        if (cleaned.isEmpty()) return@withContext emptyMap()
+
+        val merged = mutableMapOf<String, CheckResponse>()
+        for (chunk in cleaned.chunked(500)) {
+            val payload = JSONObject().apply {
+                val arr = org.json.JSONArray()
+                chunk.forEach { arr.put(it) }
+                put("hashes", arr)
+            }.toString()
+            val req = Request.Builder()
+                .url(makeUrl("/api/check/batch"))
+                .post(payload.toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull()))
+                .applyAuth()
+                .build()
+            client.newCall(req).execute().use { resp ->
+                val text = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) throw ApiHttpException(resp.code, parseErrorMessage(resp.code, text))
+                val json = JSONObject(text)
+                val resultsObj = json.optJSONObject("results") ?: continue
+                val keys = resultsObj.keys()
+                while (keys.hasNext()) {
+                    val key = keys.next()
+                    val itemObj = resultsObj.optJSONObject(key) ?: continue
+                    merged[key.lowercase()] = parseCheckResponse(itemObj)
+                }
+            }
+        }
+        merged
     }
 
     suspend fun uploadMasterDirect(

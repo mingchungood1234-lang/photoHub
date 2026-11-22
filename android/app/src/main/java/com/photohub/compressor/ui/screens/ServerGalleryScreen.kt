@@ -1,6 +1,10 @@
 package com.photohub.compressor.ui.screens
 
+import android.Manifest
+import android.content.ComponentName
 import android.content.Intent
+import android.os.Build
+import android.text.format.Formatter
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -9,6 +13,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
@@ -34,7 +39,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import android.content.ComponentName
 import com.photohub.compressor.ShareOriginalActivity
 import com.photohub.compressor.data.ServerPhoto
 import com.photohub.compressor.media.ShareUtils
@@ -44,6 +48,7 @@ import com.photohub.compressor.ui.theme.PhotoHubOrange
 import com.photohub.compressor.viewmodel.*
 import kotlinx.coroutines.launch
 import java.io.File
+import java.util.Locale
 import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
@@ -60,11 +65,54 @@ fun ServerGalleryScreen(
     val scope = rememberCoroutineScope()
     val gridState = rememberLazyGridState()
     var showMenu by remember { mutableStateOf(false) }
+    var pendingRestoreIncludeProtected by remember { mutableStateOf<Boolean?>(null) }
 
     val mediaPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri ->
         if (uri != null) viewModel.resolvePickedGalleryUri(uri)
+    }
+
+    val galleryPermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { _ ->
+        val includeProtected = pendingRestoreIncludeProtected
+        pendingRestoreIncludeProtected = null
+        if (includeProtected != null) {
+            if (viewModel.canWriteGallery()) {
+                viewModel.executeRestoreConfirm(includeProtected)
+            } else {
+                viewModel.dismissRestoreConfirm()
+                viewModel.reportRestorePermissionDenied()
+            }
+        }
+    }
+
+    fun triggerConfirmedRestore(includeAlreadyRestored: Boolean) {
+        if (viewModel.canWriteGallery()) {
+            viewModel.executeRestoreConfirm(includeAlreadyRestored)
+        } else {
+            pendingRestoreIncludeProtected = includeAlreadyRestored
+            val perms = when {
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE -> arrayOf(
+                    Manifest.permission.READ_MEDIA_IMAGES,
+                    Manifest.permission.READ_MEDIA_VIDEO,
+                    Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED
+                )
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> arrayOf(
+                    Manifest.permission.READ_MEDIA_IMAGES,
+                    Manifest.permission.READ_MEDIA_VIDEO
+                )
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> arrayOf(
+                    Manifest.permission.READ_EXTERNAL_STORAGE
+                )
+                else -> arrayOf(
+                    Manifest.permission.READ_EXTERNAL_STORAGE,
+                    Manifest.permission.WRITE_EXTERNAL_STORAGE
+                )
+            }
+            galleryPermLauncher.launch(perms)
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -84,6 +132,56 @@ fun ServerGalleryScreen(
             text = { Text(uiState.pickerErrorMessage.orEmpty()) },
             confirmButton = {
                 TextButton(onClick = { viewModel.clearPickerError() }) { Text("OK") }
+            }
+        )
+    }
+
+    uiState.restoreConfirmRequest?.let { req ->
+        AlertDialog(
+            onDismissRequest = { viewModel.dismissRestoreConfirm() },
+            title = { Text(req.title) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (req.unrestoredTargets.isEmpty()) {
+                        Text(
+                            "All ${req.allTargets.size} selected item(s) are already restored & protected on this device."
+                        )
+                    } else {
+                        val sizeStr = Formatter.formatFileSize(context, req.unrestoredBytes)
+                        Text(
+                            "Download ${req.unrestoredTargets.size} full-resolution original(s) (~$sizeStr) to your Gallery and protect them from auto re-compression."
+                        )
+                        if (req.skippedCount > 0) {
+                            Text(
+                                "${req.skippedCount} already protected/restored item(s) will be skipped.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            TextButton(
+                                onClick = { triggerConfirmedRestore(includeAlreadyRestored = true) },
+                                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp)
+                            ) {
+                                Text("Include ${req.skippedCount} already restored (${req.allTargets.size} total)")
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                if (req.unrestoredTargets.isEmpty()) {
+                    Button(onClick = { triggerConfirmedRestore(includeAlreadyRestored = true) }) {
+                        Text("Re-download All (${req.allTargets.size})")
+                    }
+                } else {
+                    Button(onClick = { triggerConfirmedRestore(includeAlreadyRestored = false) }) {
+                        Text("Restore ${req.unrestoredTargets.size}")
+                    }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { viewModel.dismissRestoreConfirm() }) {
+                    Text("Cancel")
+                }
             }
         )
     }
@@ -124,104 +222,160 @@ fun ServerGalleryScreen(
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = { Text("Server", fontWeight = FontWeight.SemiBold) },
-                navigationIcon = {
-                    IconButton(
-                        onClick = {
-                            mediaPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
-                        },
-                        enabled = !uiState.isResolvingPick
-                    ) {
-                        Icon(Icons.Rounded.IosShare, contentDescription = "Share Original from Gallery")
-                    }
-                },
-                actions = {
-                    Box {
-                        val isFiltered = uiState.filterMode != ServerGalleryFilter.ALL ||
-                            uiState.mediaTypeFilter != ServerMediaTypeFilter.ALL
-                        IconButton(onClick = { showMenu = true }) {
-                            Icon(
-                                imageVector = if (isFiltered) Icons.Rounded.FilterAlt else Icons.Rounded.MoreVert,
-                                contentDescription = "Filters"
-                            )
+            if (uiState.isSelectionMode) {
+                val visible = uiState.visiblePhotos
+                val allVisibleSelected = visible.isNotEmpty() &&
+                    visible.all { it.hash.lowercase(Locale.ROOT) in uiState.selectedHashes }
+                TopAppBar(
+                    title = {
+                        Text("${uiState.selectedHashes.size} Selected", fontWeight = FontWeight.SemiBold)
+                    },
+                    navigationIcon = {
+                        TextButton(onClick = {
+                            if (allVisibleSelected) viewModel.clearSelection() else viewModel.selectAllVisible()
+                        }) {
+                            Text(if (allVisibleSelected) "Clear" else "All")
                         }
-                        DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
-                            Text(
-                                "Timeline View",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
-                            )
-                            ServerTimelineGrouping.entries.forEach { mode ->
-                                DropdownMenuItem(
-                                    text = { Text(mode.title) },
-                                    leadingIcon = {
-                                        if (uiState.timelineGrouping == mode) Icon(Icons.Rounded.Check, null)
-                                    },
-                                    onClick = {
-                                        viewModel.setTimelineGrouping(mode)
-                                        showMenu = false
-                                    }
-                                )
-                            }
-                            HorizontalDivider()
-                            Text(
-                                "Media Type",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
-                            )
-                            ServerMediaTypeFilter.entries.forEach { media ->
-                                DropdownMenuItem(
-                                    text = { Text(media.title) },
-                                    leadingIcon = {
-                                        if (uiState.mediaTypeFilter == media) Icon(Icons.Rounded.Check, null)
-                                    },
-                                    onClick = {
-                                        viewModel.setMediaTypeFilter(media)
-                                        showMenu = false
-                                    }
-                                )
-                            }
-                            if (uiState.unproxiedCount > 0 || uiState.filterMode == ServerGalleryFilter.NEEDS_PROXY) {
-                                HorizontalDivider()
-                                DropdownMenuItem(
-                                    text = { Text("All (${uiState.photos.size})") },
-                                    leadingIcon = {
-                                        if (uiState.filterMode == ServerGalleryFilter.ALL) Icon(Icons.Rounded.Check, null)
-                                    },
-                                    onClick = {
-                                        viewModel.setFilterMode(ServerGalleryFilter.ALL)
-                                        showMenu = false
-                                    }
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("Needs Proxy (${uiState.unproxiedCount})") },
-                                    leadingIcon = {
-                                        if (uiState.filterMode == ServerGalleryFilter.NEEDS_PROXY) Icon(Icons.Rounded.Check, null)
-                                    },
-                                    onClick = {
-                                        viewModel.setFilterMode(ServerGalleryFilter.NEEDS_PROXY)
-                                        showMenu = false
-                                    }
-                                )
-                            }
+                    },
+                    actions = {
+                        TextButton(onClick = { viewModel.exitSelectionMode() }) {
+                            Text("Done", fontWeight = FontWeight.SemiBold)
                         }
                     }
+                )
+            } else {
+                TopAppBar(
+                    title = { Text("Server", fontWeight = FontWeight.SemiBold) },
+                    navigationIcon = {
+                        IconButton(
+                            onClick = {
+                                mediaPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
+                            },
+                            enabled = !uiState.isResolvingPick
+                        ) {
+                            Icon(Icons.Rounded.IosShare, contentDescription = "Share Original from Gallery")
+                        }
+                    },
+                    actions = {
+                        TextButton(
+                            onClick = { viewModel.enterSelectionMode() },
+                            enabled = uiState.photos.isNotEmpty() && !uiState.isBatchRestoring && !uiState.isBatchProxying
+                        ) {
+                            Text("Select")
+                        }
 
-                    IconButton(
-                        onClick = { viewModel.loadPhotos() },
-                        enabled = !uiState.isLoading
-                    ) {
-                        if (uiState.isLoading) {
-                            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-                        } else {
-                            Icon(Icons.Rounded.Refresh, contentDescription = "Refresh")
+                        Box {
+                            val isFiltered = uiState.filterMode != ServerGalleryFilter.ALL ||
+                                uiState.mediaTypeFilter != ServerMediaTypeFilter.ALL
+                            IconButton(onClick = { showMenu = true }) {
+                                Icon(
+                                    imageVector = if (isFiltered) Icons.Rounded.FilterAlt else Icons.Rounded.MoreVert,
+                                    contentDescription = "Filters and Actions"
+                                )
+                            }
+                            DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+                                if (uiState.photos.isNotEmpty()) {
+                                    DropdownMenuItem(
+                                        text = { Text("Restore All Originals (${uiState.photos.size})") },
+                                        leadingIcon = { Icon(Icons.Rounded.CloudDownload, null) },
+                                        enabled = !uiState.isBatchRestoring && !uiState.isBatchProxying,
+                                        onClick = {
+                                            showMenu = false
+                                            viewModel.requestRestoreAll()
+                                        }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Select Photos to Restore") },
+                                        leadingIcon = { Icon(Icons.Rounded.CheckBox, null) },
+                                        enabled = !uiState.isBatchRestoring && !uiState.isBatchProxying,
+                                        onClick = {
+                                            showMenu = false
+                                            viewModel.enterSelectionMode()
+                                        }
+                                    )
+                                    HorizontalDivider()
+                                }
+                                Text(
+                                    "Timeline View",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+                                )
+                                ServerTimelineGrouping.entries.forEach { mode ->
+                                    DropdownMenuItem(
+                                        text = { Text(mode.title) },
+                                        leadingIcon = {
+                                            if (uiState.timelineGrouping == mode) Icon(Icons.Rounded.Check, null)
+                                        },
+                                        onClick = {
+                                            viewModel.setTimelineGrouping(mode)
+                                            showMenu = false
+                                        }
+                                    )
+                                }
+                                HorizontalDivider()
+                                Text(
+                                    "Media Type",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+                                )
+                                ServerMediaTypeFilter.entries.forEach { media ->
+                                    DropdownMenuItem(
+                                        text = { Text(media.title) },
+                                        leadingIcon = {
+                                            if (uiState.mediaTypeFilter == media) Icon(Icons.Rounded.Check, null)
+                                        },
+                                        onClick = {
+                                            viewModel.setMediaTypeFilter(media)
+                                            showMenu = false
+                                        }
+                                    )
+                                }
+                                if (uiState.unproxiedCount > 0 || uiState.filterMode == ServerGalleryFilter.NEEDS_PROXY) {
+                                    HorizontalDivider()
+                                    DropdownMenuItem(
+                                        text = { Text("All (${uiState.photos.size})") },
+                                        leadingIcon = {
+                                            if (uiState.filterMode == ServerGalleryFilter.ALL) Icon(Icons.Rounded.Check, null)
+                                        },
+                                        onClick = {
+                                            viewModel.setFilterMode(ServerGalleryFilter.ALL)
+                                            showMenu = false
+                                        }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Needs Proxy (${uiState.unproxiedCount})") },
+                                        leadingIcon = {
+                                            if (uiState.filterMode == ServerGalleryFilter.NEEDS_PROXY) Icon(Icons.Rounded.Check, null)
+                                        },
+                                        onClick = {
+                                            viewModel.setFilterMode(ServerGalleryFilter.NEEDS_PROXY)
+                                            showMenu = false
+                                        }
+                                    )
+                                }
+                            }
+                        }
+
+                        IconButton(
+                            onClick = { viewModel.loadPhotos() },
+                            enabled = !uiState.isLoading
+                        ) {
+                            if (uiState.isLoading) {
+                                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                            } else {
+                                Icon(Icons.Rounded.Refresh, contentDescription = "Refresh")
+                            }
                         }
                     }
-                }
-            )
+                )
+            }
+        },
+        bottomBar = {
+            if (uiState.isSelectionMode) {
+                SelectionRestoreBottomBar(uiState = uiState, onRestoreSelected = { viewModel.requestRestoreSelected() })
+            }
         }
     ) { padding ->
         Box(
@@ -323,6 +477,12 @@ fun ServerGalleryScreen(
                                     }
                                 }
 
+                                if (uiState.isBatchRestoring || uiState.restoreBannerMessage != null || (!uiState.isSelectionMode && uiState.photos.isNotEmpty())) {
+                                    item(span = { GridItemSpan(maxLineSpan) }) {
+                                        RestoreOriginalsBanner(uiState = uiState, viewModel = viewModel)
+                                    }
+                                }
+
                                 if (syncState.isSyncing) {
                                     item(span = { GridItemSpan(maxLineSpan) }) {
                                         Row(
@@ -392,7 +552,23 @@ fun ServerGalleryScreen(
                                                 verticalAlignment = Alignment.CenterVertically
                                             ) {
                                                 Text(sec.title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                                                Text("${sec.photos.size}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                                if (uiState.isSelectionMode) {
+                                                    val secAllSelected = sec.photos.isNotEmpty() &&
+                                                        sec.photos.all { it.hash.lowercase(Locale.ROOT) in uiState.selectedHashes }
+                                                    TextButton(
+                                                        onClick = { viewModel.toggleSectionSelection(sec.photos) },
+                                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                                                        modifier = Modifier.height(28.dp)
+                                                    ) {
+                                                        Text(
+                                                            if (secAllSelected) "Clear" else "Select",
+                                                            style = MaterialTheme.typography.labelSmall,
+                                                            fontWeight = FontWeight.SemiBold
+                                                        )
+                                                    }
+                                                } else {
+                                                    Text("${sec.photos.size}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                                }
                                             }
                                         }
 
@@ -400,11 +576,28 @@ fun ServerGalleryScreen(
                                             LaunchedEffect(photo.hash, photo.needsProxy) {
                                                 viewModel.loadCompressedPreviewIfNeeded(photo)
                                             }
+                                            val normHash = photo.hash.lowercase(Locale.ROOT)
+                                            val isSelected = normHash in uiState.selectedHashes
+                                            val restoredOrProtected = uiState.isRestoredOrProtected(photo)
                                             ServerThumbnailCell(
                                                 photo = photo,
                                                 bitmap = uiState.imageCache[photo.hash],
                                                 showPlaceholder = (photo.hash in uiState.failedPreviewHashes) || (photo.isVideo && photo.needsProxy),
-                                                onClick = { viewModel.openPhotoDetail(photo) }
+                                                isSelectionMode = uiState.isSelectionMode,
+                                                isSelected = isSelected,
+                                                isRestoredOrProtected = restoredOrProtected,
+                                                onClick = {
+                                                    if (uiState.isSelectionMode) {
+                                                        viewModel.togglePhotoSelection(photo.hash)
+                                                    } else {
+                                                        viewModel.openPhotoDetail(photo)
+                                                    }
+                                                },
+                                                onLongClick = {
+                                                    if (!uiState.isSelectionMode && !uiState.isBatchRestoring && !uiState.isBatchProxying) {
+                                                        viewModel.enterSelectionMode(photo.hash)
+                                                    }
+                                                }
                                             )
                                         }
                                     }
@@ -509,7 +702,10 @@ private fun UnproxiedBanner(
                             fontWeight = FontWeight.Medium
                         )
                     }
-                    TextButton(onClick = { viewModel.startBatchProxy() }) {
+                    TextButton(
+                        onClick = { viewModel.startBatchProxy() },
+                        enabled = !uiState.isBatchRestoring
+                    ) {
                         Text("Proxy All", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
                     }
                 }
@@ -533,17 +729,156 @@ private fun UnproxiedBanner(
 }
 
 @Composable
+private fun RestoreOriginalsBanner(
+    uiState: ServerGalleryUiState,
+    viewModel: ServerGalleryViewModel
+) {
+    Surface(
+        shape = CircleShape,
+        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 4.dp)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            when {
+                uiState.isBatchRestoring -> {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        "Restoring originals ${uiState.restoreCompleted}/${uiState.restoreTotal}",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier.weight(1f)
+                    )
+                    TextButton(onClick = { viewModel.stopBatchRestore() }) {
+                        Text("Stop", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+                uiState.restoreBannerMessage != null -> {
+                    Icon(Icons.Rounded.CheckCircle, null, tint = PhotoHubGreen, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        uiState.restoreBannerMessage.orEmpty(),
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(onClick = { viewModel.dismissRestoreBanner() }, modifier = Modifier.size(24.dp)) {
+                        Icon(Icons.Rounded.Close, null, modifier = Modifier.size(14.dp))
+                    }
+                }
+                else -> {
+                    val pending = uiState.unrestoredCount
+                    Icon(
+                        Icons.Rounded.CloudDownload,
+                        null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = if (pending > 0) {
+                            "$pending of ${uiState.photos.size} original(s) not restored"
+                        } else {
+                            "All ${uiState.photos.size} original(s) protected/restored"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    TextButton(
+                        onClick = { viewModel.requestRestoreAll() },
+                        enabled = !uiState.isBatchProxying && uiState.photos.isNotEmpty()
+                    ) {
+                        Text("Restore All", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SelectionRestoreBottomBar(
+    uiState: ServerGalleryUiState,
+    onRestoreSelected: () -> Unit
+) {
+    val context = LocalContext.current
+    val selectedList = uiState.photos.filter { it.hash.lowercase(Locale.ROOT) in uiState.selectedHashes }
+    val unrestored = selectedList.filter { !uiState.isRestoredOrProtected(it) }
+    val targetBytes = (if (unrestored.isNotEmpty()) unrestored else selectedList).sumOf { maxOf(0L, it.size) }
+    val sizeStr = Formatter.formatFileSize(context, targetBytes)
+
+    Surface(tonalElevation = 6.dp, shadowElevation = 8.dp) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = if (selectedList.isEmpty()) "Tap photos to select" else "${selectedList.size} selected (~$sizeStr)",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                if (selectedList.isNotEmpty()) {
+                    val alreadyCount = selectedList.size - unrestored.size
+                    Text(
+                        text = if (alreadyCount > 0) {
+                            "${unrestored.size} to restore · $alreadyCount already restored"
+                        } else {
+                            "${unrestored.size} original(s) to download"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.width(12.dp))
+            Button(
+                onClick = onRestoreSelected,
+                enabled = selectedList.isNotEmpty() && !uiState.isBatchRestoring && !uiState.isBatchProxying
+            ) {
+                Icon(Icons.Rounded.CloudDownload, null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Restore")
+            }
+        }
+    }
+}
+
+@Composable
 private fun ServerThumbnailCell(
     photo: ServerPhoto,
     bitmap: android.graphics.Bitmap?,
     showPlaceholder: Boolean,
-    onClick: () -> Unit
+    isSelectionMode: Boolean,
+    isSelected: Boolean,
+    isRestoredOrProtected: Boolean,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit
 ) {
     Box(
         modifier = Modifier
             .aspectRatio(1f)
             .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
-            .clickable(onClick = onClick),
+            .then(
+                if (isSelected) Modifier.border(2.5.dp, MaterialTheme.colorScheme.primary)
+                else Modifier
+            )
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = onLongClick
+            ),
         contentAlignment = Alignment.Center
     ) {
         if (bitmap != null) {
@@ -563,6 +898,14 @@ private fun ServerThumbnailCell(
             CircularProgressIndicator(modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
         }
 
+        if (isSelected) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.22f))
+            )
+        }
+
         if (photo.isVideo && bitmap != null) {
             Box(
                 modifier = Modifier
@@ -573,6 +916,53 @@ private fun ServerThumbnailCell(
                     .padding(5.dp)
             ) {
                 Icon(Icons.Rounded.PlayArrow, null, tint = Color.White, modifier = Modifier.size(14.dp))
+            }
+        }
+
+        if (isSelectionMode) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(6.dp)
+                    .size(22.dp)
+                    .clip(CircleShape)
+                    .background(
+                        if (isSelected) MaterialTheme.colorScheme.primary
+                        else Color.Black.copy(alpha = 0.38f)
+                    )
+                    .border(
+                        width = 1.5.dp,
+                        color = Color.White,
+                        shape = CircleShape
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                if (isSelected) {
+                    Icon(
+                        Icons.Rounded.Check,
+                        contentDescription = "Selected",
+                        tint = Color.White,
+                        modifier = Modifier.size(14.dp)
+                    )
+                }
+            }
+        }
+
+        if (isRestoredOrProtected) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(5.dp)
+                    .clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.45f))
+                    .padding(3.dp)
+            ) {
+                Icon(
+                    Icons.Rounded.VerifiedUser,
+                    contentDescription = "Restored Original",
+                    tint = PhotoHubGreen,
+                    modifier = Modifier.size(12.dp)
+                )
             }
         }
 

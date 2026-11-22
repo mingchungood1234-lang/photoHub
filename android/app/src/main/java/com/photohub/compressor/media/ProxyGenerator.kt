@@ -121,10 +121,57 @@ object ProxyGenerator {
                 val exifHash = parseExifProxyMarker(ExifInterface(file))
                 if (exifHash != null) return exifHash
             } catch (_: Exception) {
-                // Fall back to filename prefix below.
+                // Fall back to container / filename scan below.
             }
+        } else {
+            // QuickTime / MP4 proxies created on iOS store `PhotoHubProxy:<masterHash>` in container atoms.
+            val containerHash = runCatching { extractProxyMarkerFromVideoContainer(file) }.getOrNull()
+            if (containerHash != null) return containerHash
         }
         return extractMasterHashPrefix(file.name)
+    }
+
+    /**
+     * Scans the leading & trailing container metadata chunks (up to 256 KB each) of an MP4/MOV
+     * file for an embedded UTF-8 `PhotoHubProxy:<masterHash>` marker without external muxer deps.
+     */
+    fun extractProxyMarkerFromVideoContainer(file: File): String? {
+        val len = file.length()
+        if (len <= 0L) return null
+        val chunkLimit = 256 * 1024
+        java.io.RandomAccessFile(file, "r").use { raf ->
+            val headSize = minOf(len, chunkLimit.toLong()).toInt()
+            val headBuf = ByteArray(headSize)
+            raf.readFully(headBuf)
+            findProxyMarkerInByteArray(headBuf)?.let { return it }
+
+            if (len > chunkLimit.toLong()) {
+                val tailOffset = (len - chunkLimit.toLong()).coerceAtLeast(0L)
+                raf.seek(tailOffset)
+                val tailSize = (len - tailOffset).toInt()
+                val tailBuf = ByteArray(tailSize)
+                raf.readFully(tailBuf)
+                findProxyMarkerInByteArray(tailBuf)?.let { return it }
+            }
+        }
+        return null
+    }
+
+    fun findProxyMarkerInByteArray(bytes: ByteArray): String? {
+        if (bytes.size < PROXY_MARKER_PREFIX.length + 8) return null
+        val text = String(bytes, Charsets.ISO_8859_1)
+        return parseMarkerHash(text)
+    }
+
+    fun computeStreamSha256(input: InputStream): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(1024 * 1024)
+        while (true) {
+            val read = input.read(buffer)
+            if (read <= 0) break
+            digest.update(buffer, 0, read)
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     suspend fun createImageProxy(
@@ -358,18 +405,8 @@ object ProxyGenerator {
         )
     }
 
-    fun computeFileSha256(file: File): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        val buffer = ByteArray(1024 * 1024)
-        FileInputStream(file).use { input ->
-            while (true) {
-                val read = input.read(buffer)
-                if (read <= 0) break
-                digest.update(buffer, 0, read)
-            }
-        }
-        return digest.digest().joinToString("") { "%02x".format(it) }
-    }
+    fun computeFileSha256(file: File): String =
+        FileInputStream(file).use { input -> computeStreamSha256(input) }
 
     private fun cleanMasterHashString(raw: String?): String? {
         raw ?: return null

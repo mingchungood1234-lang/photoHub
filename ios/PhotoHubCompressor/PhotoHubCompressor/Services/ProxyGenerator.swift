@@ -162,6 +162,17 @@ enum ProxyGenerator {
         }
     }
 
+    /// Reads embedded PhotoHub EXIF / TIFF marker (`PhotoHubProxy:<masterHash>`) directly from image bytes
+    /// without writing temporary files to disk.
+    static func extractEmbeddedProxyMasterHash(fromImageData imageData: Data) -> String? {
+        guard !imageData.isEmpty,
+              let source = CGImageSourceCreateWithData(imageData as CFData, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] else {
+            return nil
+        }
+        return extractEmbeddedMasterHash(fromImageProperties: props)
+    }
+
     /// Reads embedded PhotoHub EXIF / TIFF / QuickTime marker (`PhotoHubProxy:<masterHash>`)
     /// from an exported file when synced via iCloud across devices.
     static func extractEmbeddedProxyMasterHash(fromFileURL fileURL: URL, isVideo: Bool) async -> String? {
@@ -170,17 +181,7 @@ enum ProxyGenerator {
                   let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] else {
                 return nil
             }
-            if let exif = props[kCGImagePropertyExifDictionary] as? [CFString: Any],
-               let comment = exif[kCGImagePropertyExifUserComment] as? String,
-               let parsed = parseMarkerHash(from: comment) {
-                return parsed
-            }
-            if let tiff = props[kCGImagePropertyTIFFDictionary] as? [CFString: Any],
-               let desc = tiff[kCGImagePropertyTIFFImageDescription] as? String,
-               let parsed = parseMarkerHash(from: desc) {
-                return parsed
-            }
-            return nil
+            return extractEmbeddedMasterHash(fromImageProperties: props)
         }
 
         let avAsset = AVURLAsset(url: fileURL)
@@ -231,6 +232,20 @@ enum ProxyGenerator {
         let remainder = String(raw[range.upperBound...])
         let hex = extractLowercaseHexPrefix(from: remainder, maxLength: 64)
         return hex.count >= 8 ? hex : nil
+    }
+
+    private static func extractEmbeddedMasterHash(fromImageProperties props: [CFString: Any]) -> String? {
+        if let exif = props[kCGImagePropertyExifDictionary] as? [CFString: Any],
+           let comment = exif[kCGImagePropertyExifUserComment] as? String,
+           let parsed = parseMarkerHash(from: comment) {
+            return parsed
+        }
+        if let tiff = props[kCGImagePropertyTIFFDictionary] as? [CFString: Any],
+           let desc = tiff[kCGImagePropertyTIFFImageDescription] as? String,
+           let parsed = parseMarkerHash(from: desc) {
+            return parsed
+        }
+        return nil
     }
 
     static func createProxy(

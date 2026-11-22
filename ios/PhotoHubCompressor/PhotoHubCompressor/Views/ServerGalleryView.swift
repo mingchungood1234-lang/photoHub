@@ -37,6 +37,28 @@ private enum BatchProxyOutcome: Sendable {
     }
 }
 
+private enum BatchRestoreOutcome: Sendable {
+    case restored(ServerPhoto?, String)
+    case failed(String)
+
+    var displayName: String {
+        switch self {
+        case .restored(_, let name): return name
+        case .failed(let name): return name
+        }
+    }
+}
+
+private struct RestoreConfirmPrompt {
+    let title: String
+    let allTargets: [ServerPhoto]
+    let unrestoredTargets: [ServerPhoto]
+    let skippedCount: Int
+    let unrestoredBytes: Int64
+    let allBytes: Int64
+    let isRestoreAll: Bool
+}
+
 struct ServerGalleryView: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject private var syncManager: LocalProxySyncManager
@@ -62,12 +84,24 @@ struct ServerGalleryView: View {
     @State private var scrubSectionIndex: Int?
     @State private var scrubFraction: CGFloat = 0
 
+    @State private var isSelectionMode: Bool = false
+    @State private var selectedPhotoHashes: Set<String> = []
+    @State private var locallyProtectedHashes: Set<String> = []
+
     @State private var isBatchProxying: Bool = false
     @State private var batchCompleted: Int = 0
     @State private var batchTotal: Int = 0
     @State private var batchStatusText: String = ""
     @State private var batchBannerMessage: String?
     @State private var batchTask: Task<Void, Never>?
+
+    @State private var isBatchRestoring: Bool = false
+    @State private var restoreCompleted: Int = 0
+    @State private var restoreTotal: Int = 0
+    @State private var restoreStatusText: String = ""
+    @State private var restoreBannerMessage: String?
+    @State private var restoreTask: Task<Void, Never>?
+    @State private var restoreConfirmPrompt: RestoreConfirmPrompt?
 
     @State private var showingPhotoPicker: Bool = false
     @State private var isResolvingPick: Bool = false
@@ -81,6 +115,23 @@ struct ServerGalleryView: View {
 
     private var unproxiedPhotos: [ServerPhoto] {
         photos.filter { $0.needsProxy }
+    }
+
+    private func isRestoredOrProtected(_ photo: ServerPhoto) -> Bool {
+        photo.isProtectedOriginal || locallyProtectedHashes.contains(photo.hash.lowercased())
+    }
+
+    private var unrestoredPhotos: [ServerPhoto] {
+        photos.filter { !isRestoredOrProtected($0) }
+    }
+
+    private var visiblePhotos: [ServerPhoto] {
+        timelineData.sections.flatMap(\.photos)
+    }
+
+    private var selectedPhotos: [ServerPhoto] {
+        guard !selectedPhotoHashes.isEmpty else { return [] }
+        return photos.filter { selectedPhotoHashes.contains($0.hash.lowercased()) }
     }
 
     var body: some View {
@@ -142,6 +193,12 @@ struct ServerGalleryView: View {
                                                 .padding(.vertical, 6)
                                         }
 
+                                        if isBatchRestoring || restoreBannerMessage != nil || (!isSelectionMode && !photos.isEmpty) {
+                                            restoreBannerView
+                                                .padding(.horizontal, 12)
+                                                .padding(.vertical, 4)
+                                        }
+
                                         if syncManager.isSyncing {
                                             HStack(spacing: 8) {
                                                 ProgressView()
@@ -197,13 +254,29 @@ struct ServerGalleryView: View {
                                                 Section {
                                                     LazyVGrid(columns: columns, spacing: 2) {
                                                         ForEach(section.photos) { photo in
+                                                            let norm = photo.hash.lowercased()
+                                                            let isSelected = selectedPhotoHashes.contains(norm)
+                                                            let protectedOrRestored = isRestoredOrProtected(photo)
                                                             ServerThumbnailCell(
                                                                 photo: photo,
                                                                 image: imageCache[photo.hash],
-                                                                showPlaceholder: failedPreviewHashes.contains(photo.hash) || (photo.isVideo && photo.needsProxy)
+                                                                showPlaceholder: failedPreviewHashes.contains(photo.hash) || (photo.isVideo && photo.needsProxy),
+                                                                isSelectionMode: isSelectionMode,
+                                                                isSelected: isSelected,
+                                                                isRestoredOrProtected: protectedOrRestored
                                                             )
+                                                            .contentShape(Rectangle())
                                                             .onTapGesture {
-                                                                selectedPhoto = photo
+                                                                if isSelectionMode {
+                                                                    toggleSelection(for: photo)
+                                                                } else {
+                                                                    selectedPhoto = photo
+                                                                }
+                                                            }
+                                                            .onLongPressGesture {
+                                                                if !isSelectionMode && !isBatchRestoring && !isBatchProxying {
+                                                                    enterSelectionMode(initialPhoto: photo)
+                                                                }
                                                             }
                                                             .task(id: "\(photo.hash)-\(photo.needsProxy ? 0 : 1)") {
                                                                 await loadCompressedPreviewIfNeeded(for: photo)
@@ -231,6 +304,11 @@ struct ServerGalleryView: View {
                     }
                 }
             }
+            .safeAreaInset(edge: .bottom) {
+                if isSelectionMode {
+                    selectionRestoreBottomBar
+                }
+            }
             .overlay {
                 if isResolvingPick {
                     ZStack {
@@ -246,52 +324,97 @@ struct ServerGalleryView: View {
                     }
                 }
             }
-            .navigationTitle("Server")
+            .navigationTitle(isSelectionMode ? "\(selectedPhotoHashes.count) Selected" : "Server")
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
-                    Button {
-                        showingPhotoPicker = true
-                    } label: {
-                        Label("From Photos", systemImage: "square.and.arrow.up.on.square")
+                    if isSelectionMode {
+                        let visible = visiblePhotos
+                        let allSelected = !visible.isEmpty && visible.allSatisfy { selectedPhotoHashes.contains($0.hash.lowercased()) }
+                        Button(allSelected ? "Clear" : "Select All") {
+                            if allSelected {
+                                selectedPhotoHashes.removeAll()
+                            } else {
+                                selectedPhotoHashes = Set(visible.map { $0.hash.lowercased() })
+                            }
+                        }
+                    } else {
+                        Button {
+                            showingPhotoPicker = true
+                        } label: {
+                            Label("From Photos", systemImage: "square.and.arrow.up.on.square")
+                        }
+                        .disabled(isResolvingPick)
                     }
-                    .disabled(isResolvingPick)
                 }
 
                 ToolbarItemGroup(placement: .navigationBarTrailing) {
-                    Menu {
-                        Picker("Timeline View", selection: $timelineGrouping) {
-                            ForEach(ServerTimelineGrouping.allCases) { mode in
-                                Text(mode.rawValue).tag(mode)
+                    if isSelectionMode {
+                        Button("Done") {
+                            exitSelectionMode()
+                        }
+                        .font(.body.weight(.semibold))
+                    } else {
+                        Button("Select") {
+                            enterSelectionMode()
+                        }
+                        .disabled(photos.isEmpty || isBatchRestoring || isBatchProxying)
+
+                        Menu {
+                            if !photos.isEmpty {
+                                Button {
+                                    requestRestoreAll()
+                                } label: {
+                                    Label(
+                                        "Restore All Originals (\(photos.count))",
+                                        systemImage: "icloud.and.arrow.down"
+                                    )
+                                }
+                                .disabled(isBatchRestoring || isBatchProxying)
+
+                                Button {
+                                    enterSelectionMode()
+                                } label: {
+                                    Label("Select Photos to Restore", systemImage: "checkmark.circle")
+                                }
+                                .disabled(isBatchRestoring || isBatchProxying)
+
+                                Divider()
                             }
+
+                            Picker("Timeline View", selection: $timelineGrouping) {
+                                ForEach(ServerTimelineGrouping.allCases) { mode in
+                                    Text(mode.rawValue).tag(mode)
+                                }
+                            }
+
+                            Picker("Media Type", selection: $mediaTypeFilter) {
+                                ForEach(ServerMediaTypeFilter.allCases) { media in
+                                    Text(media.rawValue).tag(media)
+                                }
+                            }
+
+                            if !unproxiedPhotos.isEmpty || filterMode == .needsProxy {
+                                Picker("Proxy Status", selection: $filterMode) {
+                                    Text("All (\(photos.count))").tag(ServerGalleryFilter.all)
+                                    Text("Needs Proxy (\(unproxiedPhotos.count))").tag(ServerGalleryFilter.needsProxy)
+                                }
+                            }
+                        } label: {
+                            let isFiltered = (filterMode != .all || mediaTypeFilter != .all)
+                            Image(systemName: isFiltered ? "line.3.horizontal.decrease.circle.fill" : "ellipsis.circle")
                         }
 
-                        Picker("Media Type", selection: $mediaTypeFilter) {
-                            ForEach(ServerMediaTypeFilter.allCases) { media in
-                                Text(media.rawValue).tag(media)
+                        Button {
+                            Task { await loadPhotos() }
+                        } label: {
+                            if isLoading {
+                                ProgressView()
+                            } else {
+                                Image(systemName: "arrow.clockwise")
                             }
                         }
-
-                        if !unproxiedPhotos.isEmpty || filterMode == .needsProxy {
-                            Picker("Proxy Status", selection: $filterMode) {
-                                Text("All (\(photos.count))").tag(ServerGalleryFilter.all)
-                                Text("Needs Proxy (\(unproxiedPhotos.count))").tag(ServerGalleryFilter.needsProxy)
-                            }
-                        }
-                    } label: {
-                        let isFiltered = (filterMode != .all || mediaTypeFilter != .all)
-                        Image(systemName: isFiltered ? "line.3.horizontal.decrease.circle.fill" : "ellipsis.circle")
+                        .disabled(isLoading)
                     }
-
-                    Button {
-                        Task { await loadPhotos() }
-                    } label: {
-                        if isLoading {
-                            ProgressView()
-                        } else {
-                            Image(systemName: "arrow.clockwise")
-                        }
-                    }
-                    .disabled(isLoading)
                 }
             }
             .onAppear {
@@ -309,6 +432,7 @@ struct ServerGalleryView: View {
             }
             .onDisappear {
                 batchTask?.cancel()
+                restoreTask?.cancel()
             }
             .onReceive(NotificationCenter.default.publisher(for: .localProxyStoreDidChange)) { _ in
                 loadFromLocalStore()
@@ -347,6 +471,46 @@ struct ServerGalleryView: View {
                 Button("OK", role: .cancel) { pickerErrorMessage = nil }
             } message: {
                 Text(pickerErrorMessage ?? "")
+            }
+            .alert(
+                restoreConfirmPrompt?.title ?? "Restore Originals",
+                isPresented: Binding(
+                    get: { restoreConfirmPrompt != nil },
+                    set: { if !$0 { restoreConfirmPrompt = nil } }
+                ),
+                presenting: restoreConfirmPrompt
+            ) { prompt in
+                if !prompt.unrestoredTargets.isEmpty {
+                    Button("Restore \(prompt.unrestoredTargets.count)") {
+                        startBatchRestore(targets: prompt.unrestoredTargets, exitSelectionAfter: !prompt.isRestoreAll)
+                    }
+                    if prompt.skippedCount > 0 {
+                        Button("Include \(prompt.skippedCount) Already Restored (\(prompt.allTargets.count))") {
+                            startBatchRestore(targets: prompt.allTargets, exitSelectionAfter: !prompt.isRestoreAll)
+                        }
+                    }
+                } else {
+                    Button("Re-download All (\(prompt.allTargets.count))") {
+                        startBatchRestore(targets: prompt.allTargets, exitSelectionAfter: !prompt.isRestoreAll)
+                    }
+                }
+                Button("Cancel", role: .cancel) {
+                    restoreConfirmPrompt = nil
+                }
+            } message: { prompt in
+                if prompt.unrestoredTargets.isEmpty {
+                    Text(
+                        "All \(prompt.allTargets.count) selected item(s) are already restored & protected on this device."
+                    )
+                } else {
+                    let sizeStr = ByteCountFormatter.string(fromByteCount: max(0, prompt.unrestoredBytes), countStyle: .file)
+                    let skipNote = prompt.skippedCount > 0
+                        ? "\n\n\(prompt.skippedCount) already protected/restored item(s) will be skipped."
+                        : ""
+                    Text(
+                        "Download \(prompt.unrestoredTargets.count) full-resolution original(s) (~\(sizeStr)) to Photos and protect them from auto re-compression.\(skipNote)"
+                    )
+                }
             }
         }
     }
@@ -389,6 +553,7 @@ struct ServerGalleryView: View {
                     startBatchProxy()
                 }
                 .font(.caption.weight(.semibold))
+                .disabled(isBatchRestoring)
             } else if let msg = batchBannerMessage {
                 Image(systemName: "checkmark.circle.fill")
                     .font(.caption)
@@ -413,8 +578,281 @@ struct ServerGalleryView: View {
         .background(Color.secondary.opacity(0.09), in: Capsule())
     }
 
+    @ViewBuilder
+    private var restoreBannerView: some View {
+        HStack(spacing: 10) {
+            if isBatchRestoring {
+                ProgressView()
+                    .scaleEffect(0.85)
+                Text("Restoring originals \(restoreCompleted)/\(restoreTotal)")
+                    .font(.caption.weight(.medium))
+                Spacer()
+                Button("Stop") {
+                    restoreTask?.cancel()
+                }
+                .font(.caption.weight(.semibold))
+            } else if let msg = restoreBannerMessage {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.caption)
+                    .foregroundColor(.green)
+                Text(msg)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                Spacer()
+                Button {
+                    restoreBannerMessage = nil
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            } else {
+                Image(systemName: "icloud.and.arrow.down")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(.accentColor)
+                let pending = unrestoredPhotos.count
+                Text(
+                    pending > 0
+                    ? "\(pending) of \(photos.count) original(s) not restored"
+                    : "All \(photos.count) original(s) protected/restored"
+                )
+                .font(.caption.weight(.medium))
+                .foregroundColor(.primary)
+                .lineLimit(1)
+
+                Spacer()
+
+                Button("Restore All") {
+                    requestRestoreAll()
+                }
+                .font(.caption.weight(.semibold))
+                .disabled(isBatchProxying || photos.isEmpty)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.accentColor.opacity(0.09), in: Capsule())
+    }
+
+    @ViewBuilder
+    private var selectionRestoreBottomBar: some View {
+        let selectedList = selectedPhotos
+        let unrestored = selectedList.filter { !isRestoredOrProtected($0) }
+        let targetBytes = unrestored.isEmpty
+            ? selectedList.reduce(into: Int64(0)) { $0 += max(0, $1.size) }
+            : unrestored.reduce(into: Int64(0)) { $0 += max(0, $1.size) }
+        let sizeStr = ByteCountFormatter.string(fromByteCount: targetBytes, countStyle: .file)
+
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(selectedList.isEmpty ? "Tap photos to select" : "\(selectedList.count) selected (~\(sizeStr))")
+                    .font(.subheadline.weight(.semibold))
+                if !selectedList.isEmpty {
+                    let alreadyCount = selectedList.count - unrestored.count
+                    Text(
+                        alreadyCount > 0
+                        ? "\(unrestored.count) to restore · \(alreadyCount) already restored"
+                        : "\(unrestored.count) original(s) to download"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            Button {
+                requestRestoreSelected()
+            } label: {
+                Label("Restore", systemImage: "icloud.and.arrow.down")
+                    .font(.subheadline.weight(.semibold))
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(selectedList.isEmpty || isBatchRestoring || isBatchProxying)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(.ultraThinMaterial)
+        .overlay(alignment: .top) {
+            Divider()
+        }
+    }
+
+    private func enterSelectionMode(initialPhoto: ServerPhoto? = nil) {
+        guard !isBatchRestoring, !isBatchProxying, !photos.isEmpty else { return }
+        if let initialPhoto {
+            selectedPhotoHashes = [initialPhoto.hash.lowercased()]
+        } else {
+            selectedPhotoHashes = []
+        }
+        isSelectionMode = true
+    }
+
+    private func exitSelectionMode() {
+        isSelectionMode = false
+        selectedPhotoHashes = []
+    }
+
+    private func toggleSelection(for photo: ServerPhoto) {
+        let key = photo.hash.lowercased()
+        if selectedPhotoHashes.contains(key) {
+            selectedPhotoHashes.remove(key)
+        } else {
+            selectedPhotoHashes.insert(key)
+        }
+    }
+
+    private func requestRestoreAll() {
+        guard !isBatchRestoring, !isBatchProxying, !photos.isEmpty else { return }
+        restoreConfirmPrompt = buildRestoreConfirmPrompt(
+            title: "Restore All Originals",
+            targets: photos,
+            isRestoreAll: true
+        )
+    }
+
+    private func requestRestoreSelected() {
+        let targets = selectedPhotos
+        guard !isBatchRestoring, !isBatchProxying, !targets.isEmpty else { return }
+        restoreConfirmPrompt = buildRestoreConfirmPrompt(
+            title: "Restore Selected Originals",
+            targets: targets,
+            isRestoreAll: false
+        )
+    }
+
+    private func buildRestoreConfirmPrompt(
+        title: String,
+        targets: [ServerPhoto],
+        isRestoreAll: Bool
+    ) -> RestoreConfirmPrompt {
+        let unrestored = targets.filter { !isRestoredOrProtected($0) }
+        return RestoreConfirmPrompt(
+            title: title,
+            allTargets: targets,
+            unrestoredTargets: unrestored,
+            skippedCount: max(0, targets.count - unrestored.count),
+            unrestoredBytes: unrestored.reduce(into: Int64(0)) { $0 += max(0, $1.size) },
+            allBytes: targets.reduce(into: Int64(0)) { $0 += max(0, $1.size) },
+            isRestoreAll: isRestoreAll
+        )
+    }
+
+    private func startBatchRestore(targets: [ServerPhoto], exitSelectionAfter: Bool) {
+        guard !isBatchRestoring, !isBatchProxying, !targets.isEmpty else { return }
+        restoreConfirmPrompt = nil
+        if exitSelectionAfter {
+            exitSelectionMode()
+        }
+        restoreTask?.cancel()
+        restoreBannerMessage = nil
+        restoreCompleted = 0
+        restoreTotal = targets.count
+        restoreStatusText = "Preparing..."
+        isBatchRestoring = true
+
+        restoreTask = Task {
+            let authorized = await PhotoLibraryService.requestWriteAuthorizationAsync()
+            guard authorized else {
+                isBatchRestoring = false
+                restoreStatusText = ""
+                restoreTask = nil
+                restoreBannerMessage = "Photos permission is required to save originals."
+                return
+            }
+
+            let client = PhotoHubAPIClient(settings: settings)
+            let queue = AsyncWorkQueue(targets)
+            let photosWriteSemaphore = AsyncSemaphore(value: 1)
+            let workerCount = min(3, targets.count)
+
+            var succeeded = 0
+            var failed = 0
+
+            await withTaskGroup(of: BatchRestoreOutcome?.self) { group in
+                for _ in 0..<workerCount {
+                    group.addTask {
+                        await Self.processNextBatchRestoreItem(
+                            queue: queue,
+                            client: client,
+                            photoWriteSemaphore: photosWriteSemaphore
+                        )
+                    }
+                }
+
+                for await outcome in group {
+                    guard let outcome else { continue }
+                    switch outcome {
+                    case .restored(let updated, _):
+                        if let updated {
+                            applyUpdatedPhoto(updated)
+                        }
+                        succeeded += 1
+                    case .failed:
+                        failed += 1
+                    }
+                    restoreCompleted += 1
+                    restoreStatusText = outcome.displayName
+
+                    if !Task.isCancelled {
+                        group.addTask {
+                            await Self.processNextBatchRestoreItem(
+                                queue: queue,
+                                client: client,
+                                photoWriteSemaphore: photosWriteSemaphore
+                            )
+                        }
+                    }
+                }
+            }
+
+            let cancelled = Task.isCancelled
+            isBatchRestoring = false
+            restoreStatusText = ""
+            restoreTask = nil
+            refreshLocallyProtectedHashes()
+
+            if cancelled {
+                restoreBannerMessage = "Stopped after restoring \(succeeded) original(s)."
+            } else if failed > 0 && succeeded == 0 {
+                restoreBannerMessage = "Restore failed for \(failed) item(s)."
+            } else if failed > 0 {
+                restoreBannerMessage = "Restored \(succeeded) original(s) & protected them; \(failed) failed."
+            } else {
+                restoreBannerMessage = "Restored \(succeeded) original(s) to Photos & protected them."
+            }
+        }
+    }
+
+    private static func processNextBatchRestoreItem(
+        queue: AsyncWorkQueue<ServerPhoto>,
+        client: PhotoHubAPIClient,
+        photoWriteSemaphore: AsyncSemaphore
+    ) async -> BatchRestoreOutcome? {
+        guard !Task.isCancelled, let item = await queue.next() else {
+            return nil
+        }
+        do {
+            let (updated, _) = try await PhotoLibraryService.restoreMasterToPhotos(
+                photo: item,
+                client: client,
+                photoWriteSemaphore: photoWriteSemaphore
+            )
+            return .restored(updated, item.originalName)
+        } catch {
+            return .failed(item.originalName)
+        }
+    }
+
+    private func refreshLocallyProtectedHashes() {
+        locallyProtectedHashes = Set(
+            photos.map { $0.hash.lowercased() }
+                .filter { LocalProxyTracker.shared.isRestoredMasterHash($0) }
+        )
+    }
+
     private func startBatchProxy() {
-        guard !isBatchProxying else { return }
+        guard !isBatchProxying, !isBatchRestoring else { return }
         let targets = unproxiedPhotos
         guard !targets.isEmpty else { return }
 
@@ -583,9 +1021,22 @@ struct ServerGalleryView: View {
             Text(section.title)
                 .font(.subheadline.weight(.semibold))
             Spacer()
-            Text("\(section.photos.count)")
-                .font(.caption2.monospacedDigit())
-                .foregroundStyle(.secondary)
+            if isSelectionMode {
+                let secHashes = section.photos.map { $0.hash.lowercased() }
+                let allSecSelected = !secHashes.isEmpty && secHashes.allSatisfy { selectedPhotoHashes.contains($0) }
+                Button(allSecSelected ? "Clear" : "Select") {
+                    if allSecSelected {
+                        for h in secHashes { selectedPhotoHashes.remove(h) }
+                    } else {
+                        for h in secHashes { selectedPhotoHashes.insert(h) }
+                    }
+                }
+                .font(.caption.weight(.semibold))
+            } else {
+                Text("\(section.photos.count)")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
@@ -673,6 +1124,7 @@ struct ServerGalleryView: View {
             photos[idx] = updated
             rebuildTimeline()
         }
+        refreshLocallyProtectedHashes()
         failedPreviewHashes.remove(updated.hash)
         if let data = LocalProxyStore.shared.previewData(forHash: updated.hash),
            let img = UIImage(data: data) {
@@ -688,6 +1140,7 @@ struct ServerGalleryView: View {
         )
         if !cached.isEmpty || photos.isEmpty {
             photos = cached
+            refreshLocallyProtectedHashes()
             rebuildTimeline()
         }
         for photo in cached {
@@ -712,6 +1165,7 @@ struct ServerGalleryView: View {
                 apiKey: settings.apiKey
             )
             photos = fetched
+            refreshLocallyProtectedHashes()
             rebuildTimeline()
             for photo in fetched where !photo.needsProxy {
                 failedPreviewHashes.remove(photo.hash)
@@ -1055,6 +1509,9 @@ private struct ServerThumbnailCell: View {
     let photo: ServerPhoto
     let image: UIImage?
     let showPlaceholder: Bool
+    let isSelectionMode: Bool
+    let isSelected: Bool
+    let isRestoredOrProtected: Bool
 
     var body: some View {
         GeometryReader { geo in
@@ -1076,6 +1533,17 @@ private struct ServerThumbnailCell: View {
                     ProgressView()
                         .scaleEffect(0.8)
                 }
+
+                if isSelected {
+                    Rectangle()
+                        .fill(Color.accentColor.opacity(0.24))
+                }
+            }
+            .overlay {
+                if isSelected {
+                    Rectangle()
+                        .stroke(Color.accentColor, lineWidth: 2.5)
+                }
             }
             .overlay(alignment: .bottomTrailing) {
                 if photo.isVideo && image != nil {
@@ -1083,6 +1551,33 @@ private struct ServerThumbnailCell: View {
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundColor(.white)
                         .padding(6)
+                        .background(Color.black.opacity(0.48), in: Circle())
+                        .padding(5)
+                }
+            }
+            .overlay(alignment: .topLeading) {
+                if isSelectionMode {
+                    Group {
+                        if isSelected {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 19, weight: .semibold))
+                                .foregroundStyle(.white, Color.accentColor)
+                        } else {
+                            Image(systemName: "circle")
+                                .font(.system(size: 19, weight: .semibold))
+                                .foregroundColor(.white)
+                        }
+                    }
+                    .shadow(color: Color.black.opacity(0.45), radius: 2, x: 0, y: 1)
+                    .padding(6)
+                }
+            }
+            .overlay(alignment: .bottomLeading) {
+                if isRestoredOrProtected {
+                    Image(systemName: "checkmark.shield.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.green)
+                        .padding(4)
                         .background(Color.black.opacity(0.48), in: Circle())
                         .padding(5)
                 }
@@ -1577,51 +2072,19 @@ private struct ServerPhotoDetailView: View {
             busyLabel = ""
         }
 
+        let authorized = await PhotoLibraryService.requestWriteAuthorizationAsync()
+        guard authorized else {
+            saveMessage = "Photos permission is required to save originals."
+            return
+        }
+
         do {
             let client = PhotoHubAPIClient(settings: settings)
-            let tempURL = try await client.downloadMasterToTempFile(
-                hash: currentPhoto.hash,
-                preferredFilename: currentPhoto.originalName
+            let (updated, fileSize) = try await PhotoLibraryService.restoreMasterToPhotos(
+                photo: currentPhoto,
+                client: client
             )
-            defer { cleanupTempShareURL(tempURL) }
-
-            let fileSize = (try? tempURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { Int64($0) } ?? currentPhoto.size
-            let isVideo = currentPhoto.isVideo
-            let targetFilename = currentPhoto.originalName
-            let targetDate = currentPhoto.parsedCreationDate
-
-            let createdLocalId: String? = try await withCheckedThrowingContinuation { continuation in
-                var placeholderId: String?
-                PHPhotoLibrary.shared().performChanges({
-                    let request: PHAssetChangeRequest?
-                    if isVideo {
-                        request = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: tempURL)
-                    } else {
-                        let creationReq = PHAssetCreationRequest.forAsset()
-                        let options = PHAssetResourceCreationOptions()
-                        options.originalFilename = targetFilename
-                        creationReq.addResource(with: .photo, fileURL: tempURL, options: options)
-                        request = creationReq
-                    }
-                    request?.creationDate = targetDate
-                    placeholderId = request?.placeholderForCreatedAsset?.localIdentifier
-                }) { success, error in
-                    if success {
-                        continuation.resume(returning: placeholderId)
-                    } else {
-                        let msg = error?.localizedDescription ?? "Unknown error"
-                        continuation.resume(throwing: PhotoLibraryError.proxyReplacementFailed(msg))
-                    }
-                }
-            }
-
-            // Record both locally (asset ID + hash) and on the server so neither this iPhone nor
-            // another iPhone sharing the account will re-compress or delete the restored original.
-            LocalProxyTracker.shared.markRestoredOriginal(
-                assetId: createdLocalId,
-                masterHash: currentPhoto.hash
-            )
-            if let updated = try? await client.setOriginalProtected(masterHash: currentPhoto.hash, protected: true) {
+            if let updated {
                 currentPhoto = updated
                 onPhotoUpdated(updated)
             }

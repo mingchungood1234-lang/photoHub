@@ -35,7 +35,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.photohub.compressor.background.BackgroundBackupManager
 import com.photohub.compressor.data.*
-import com.photohub.compressor.media.MediaAccessLevel
+import com.photohub.compressor.media.*
 import com.photohub.compressor.ui.theme.*
 import com.photohub.compressor.viewmodel.CompressViewModel
 
@@ -52,6 +52,43 @@ fun CompressScreen(
     val bgState by bgManager.state.collectAsStateWithLifecycle()
 
     var showMenu by remember { mutableStateOf(false) }
+
+    val detectProxyPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickMultipleVisualMedia(25)
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            viewModel.inspectGalleryUris(uris)
+        }
+    }
+
+    LaunchedEffect(uiState.shareFileReady) {
+        val f = uiState.shareFileReady ?: return@LaunchedEffect
+        shareFileViaChooser(context, f)
+        viewModel.clearShareFileReady()
+    }
+
+    uiState.galleryInspectionResults?.let { inspectionList ->
+        GalleryProxyInspectionDialog(
+            items = inspectionList,
+            busyItemId = uiState.inspectionBusyId,
+            onRestore = { item ->
+                viewModel.restoreOriginalFromDetectedProxy(
+                    itemId = item.id,
+                    rawMasterHash = item.masterHash,
+                    originalFilename = item.originalName,
+                    isVideo = item.isVideo
+                )
+            },
+            onShareOriginal = { item ->
+                viewModel.shareOriginalFromDetectedProxy(
+                    itemId = item.id,
+                    rawMasterHash = item.masterHash,
+                    originalFilename = item.originalName
+                )
+            },
+            onDismiss = { viewModel.dismissGalleryInspection() }
+        )
+    }
 
     val trashLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartIntentSenderForResult()
@@ -125,6 +162,19 @@ fun CompressScreen(
                     }
                 },
                 actions = {
+                    IconButton(
+                        onClick = {
+                            detectProxyPicker.launch(
+                                androidx.activity.result.PickVisualMediaRequest(
+                                    ActivityResultContracts.PickVisualMedia.ImageAndVideo
+                                )
+                            )
+                        },
+                        enabled = !uiState.isInspectingGalleryUris && !uiState.isProcessing
+                    ) {
+                        Icon(Icons.Rounded.ImageSearch, contentDescription = "Detect Proxy in Gallery")
+                    }
+
                     if (uiState.candidates.isNotEmpty()) {
                         Box {
                             IconButton(
@@ -213,11 +263,12 @@ fun CompressScreen(
             }
         }
     ) { padding ->
-        Column(
+        Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
         ) {
+            Column(modifier = Modifier.fillMaxSize()) {
             if (uiState.accessLevel == MediaAccessLevel.LIMITED_ACCESS) {
                 Row(
                     modifier = Modifier
@@ -435,6 +486,21 @@ fun CompressScreen(
                         ) {
                             Text("Scan & Choose Manually")
                         }
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = {
+                                detectProxyPicker.launch(
+                                    androidx.activity.result.PickVisualMediaRequest(
+                                        ActivityResultContracts.PickVisualMedia.ImageAndVideo
+                                    )
+                                )
+                            },
+                            enabled = !uiState.isInspectingGalleryUris && !uiState.isProcessing
+                        ) {
+                            Icon(Icons.Rounded.ImageSearch, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Detect Proxy in Gallery")
+                        }
                     }
                 }
             } else {
@@ -442,23 +508,59 @@ fun CompressScreen(
                     uiState = uiState,
                     keepLocalProxy = settingsState.keepLocalProxyInPhotos,
                     onToggleKeepLocal = { settings.setKeepLocalProxyInPhotos(it) },
-                    onSelectVideos = { viewModel.selectTopVideos() }
+                    onSelectVideos = { viewModel.selectTopVideos() },
+                    onSelectFilter = { viewModel.setFilterMode(it) }
                 )
 
+                val visibleList = uiState.displayedCandidates
                 LazyColumn(modifier = Modifier.fillMaxSize()) {
-                    items(uiState.candidates, key = { it.id }) { item ->
+                    items(visibleList, key = { it.id }) { item ->
                         LaunchedEffect(item.id) {
                             viewModel.loadThumbnailIfNeeded(item)
                         }
                         CandidateRow(
                             item = item,
                             thumbnail = uiState.thumbnails[item.id],
-                            onClick = { viewModel.toggleSelection(item.id) }
+                            isBusy = uiState.inspectionBusyId == item.id,
+                            onClick = { viewModel.toggleSelection(item.id) },
+                            onRestoreProxy = if (item.isDetectedProxy && !item.masterHash.isNullOrBlank()) {
+                                {
+                                    viewModel.restoreOriginalFromDetectedProxy(
+                                        itemId = item.id,
+                                        rawMasterHash = item.masterHash,
+                                        originalFilename = item.linkedOriginalName ?: item.filename,
+                                        isVideo = item.isVideo
+                                    )
+                                }
+                            } else {
+                                null
+                            }
                         )
                         HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
                     }
                 }
             }
+        }
+
+        if (uiState.isInspectingGalleryUris) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.45f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Surface(shape = RoundedCornerShape(16.dp), tonalElevation = 6.dp) {
+                    Column(
+                        modifier = Modifier.padding(24.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        CircularProgressIndicator()
+                        Text("Detecting Proxy vs Original status…", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                    }
+                }
+            }
+        }
         }
     }
 }
@@ -468,7 +570,8 @@ private fun SummaryHeader(
     uiState: com.photohub.compressor.viewmodel.CompressUiState,
     keepLocalProxy: Boolean,
     onToggleKeepLocal: (Boolean) -> Unit,
-    onSelectVideos: () -> Unit
+    onSelectVideos: () -> Unit,
+    onSelectFilter: (CompressFilterMode) -> Unit
 ) {
     val context = LocalContext.current
     Column(
@@ -513,7 +616,11 @@ private fun SummaryHeader(
                 )
                 val estStr = Formatter.formatFileSize(context, uiState.totalEligibleEstimatedBytes)
                 Text(
-                    text = "Estimated phone space: ~$estStr",
+                    text = if (uiState.detectedProxyCount > 0) {
+                        "Uncompressed: ~$estStr · ${uiState.detectedProxyCount} proxy(s) detected"
+                    } else {
+                        "Estimated phone space: ~$estStr"
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -529,6 +636,36 @@ private fun SummaryHeader(
                     Spacer(modifier = Modifier.width(4.dp))
                     Text("Videos (~$vidStr)", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold)
                 }
+            }
+        }
+
+        if (uiState.detectedProxyCount > 0 || uiState.filterMode != CompressFilterMode.ALL) {
+            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                val modes = listOf(
+                    CompressFilterMode.ALL to "All (${uiState.candidates.size})",
+                    CompressFilterMode.ORIGINALS to "Originals (${uiState.originalCandidatesCount})",
+                    CompressFilterMode.PROXIES to "Proxies (${uiState.detectedProxyCount})"
+                )
+                modes.forEachIndexed { index, (mode, label) ->
+                    SegmentedButton(
+                        selected = uiState.filterMode == mode,
+                        onClick = { onSelectFilter(mode) },
+                        shape = SegmentedButtonDefaults.itemShape(index = index, count = modes.size)
+                    ) {
+                        Text(label, style = MaterialTheme.typography.labelSmall, maxLines = 1)
+                    }
+                }
+            }
+        }
+
+        if (uiState.isCheckingServerProxies) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                Text(
+                    text = "Checking server index for renamed Gallery proxies…",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
 
@@ -565,13 +702,16 @@ private fun SummaryHeader(
 private fun CandidateRow(
     item: PhotoCandidate,
     thumbnail: android.graphics.Bitmap?,
-    onClick: () -> Unit
+    isBusy: Boolean,
+    onClick: () -> Unit,
+    onRestoreProxy: (() -> Unit)?
 ) {
     val context = LocalContext.current
     val badgeColor = when (item.state) {
         is PhotoCompressionState.Completed -> PhotoHubGreen
         is PhotoCompressionState.ReadyToDelete -> PhotoHubOrange
-        is PhotoCompressionState.AlreadyProxy, is PhotoCompressionState.Skipped, is PhotoCompressionState.Pending ->
+        is PhotoCompressionState.AlreadyProxy -> PhotoHubBlue
+        is PhotoCompressionState.Skipped, is PhotoCompressionState.Pending ->
             MaterialTheme.colorScheme.onSurfaceVariant
         is PhotoCompressionState.Failed -> PhotoHubRed
         else -> PhotoHubBlue
@@ -580,7 +720,7 @@ private fun CandidateRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .clickable(enabled = !item.state.isFinished, onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -667,7 +807,7 @@ private fun CandidateRow(
                 }
             }
 
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 if (item.state.isIntegrityVerified) {
                     Icon(
                         imageVector = Icons.Rounded.VerifiedUser,
@@ -675,16 +815,210 @@ private fun CandidateRow(
                         tint = PhotoHubGreen,
                         modifier = Modifier.size(14.dp)
                     )
+                } else if (item.isDetectedProxy) {
+                    Surface(shape = CircleShape, color = PhotoHubBlue.copy(alpha = 0.14f)) {
+                        Text(
+                            text = "PROXY",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = PhotoHubBlue,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)
+                        )
+                    }
+                } else if (item.isBackedUpOnServer) {
+                    Surface(shape = CircleShape, color = PhotoHubGreen.copy(alpha = 0.14f)) {
+                        Text(
+                            text = "ORIGINAL · BACKED UP",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = PhotoHubGreen,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)
+                        )
+                    }
+                }
+
+                val statusText = when {
+                    item.isDetectedProxy -> {
+                        val src = item.detectionSource ?: "Detected"
+                        val origSz = item.linkedOriginalBytes?.takeIf { it > 0L }?.let {
+                            " · Orig ${Formatter.formatFileSize(context, it)}"
+                        }.orEmpty()
+                        "$src$origSz"
+                    }
+                    else -> item.state.label(context)
                 }
                 Text(
-                    text = item.state.label(context),
+                    text = statusText,
                     style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.SemiBold,
-                    color = badgeColor
+                    color = badgeColor,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
         }
+
+        if (onRestoreProxy != null) {
+            Spacer(modifier = Modifier.width(6.dp))
+            if (isBusy) {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+            } else {
+                IconButton(onClick = onRestoreProxy) {
+                    Icon(
+                        Icons.Rounded.CloudDownload,
+                        contentDescription = "Restore Original",
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
+        }
     }
+}
+
+@Composable
+private fun GalleryProxyInspectionDialog(
+    items: List<GalleryProxyInspectionItem>,
+    busyItemId: String?,
+    onRestore: (GalleryProxyInspectionItem) -> Unit,
+    onShareOriginal: (GalleryProxyInspectionItem) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    val proxyCount = items.count { it.kind == GalleryMediaKind.PROXY }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                text = if (proxyCount > 0) {
+                    "Detected $proxyCount Proxy of ${items.size}"
+                } else {
+                    "Checked ${items.size} Gallery Item(s)"
+                },
+                fontWeight = FontWeight.SemiBold
+            )
+        },
+        text = {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 420.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                items(items, key = { it.id }) { item ->
+                    val isBusy = busyItemId == item.id
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(48.dp)
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(MaterialTheme.colorScheme.surface),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    if (item.thumbnail != null) {
+                                        Image(
+                                            bitmap = item.thumbnail.asImageBitmap(),
+                                            contentDescription = item.displayName,
+                                            contentScale = ContentScale.Crop,
+                                            modifier = Modifier.fillMaxSize()
+                                        )
+                                    } else {
+                                        Icon(
+                                            if (item.isVideo) Icons.Rounded.Videocam else Icons.Rounded.Photo,
+                                            contentDescription = null
+                                        )
+                                    }
+                                }
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        item.originalName ?: item.displayName,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.Medium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    val (verdictLabel, verdictColor) = when (item.kind) {
+                                        GalleryMediaKind.PROXY -> "COMPRESSED PROXY" to PhotoHubOrange
+                                        GalleryMediaKind.ORIGINAL_BACKED_UP -> "ORIGINAL (BACKED UP)" to PhotoHubGreen
+                                        GalleryMediaKind.ORIGINAL_UNBACKED -> "ORIGINAL (NOT BACKED UP)" to MaterialTheme.colorScheme.onSurfaceVariant
+                                        GalleryMediaKind.UNKNOWN -> "ORIGINAL / UNKNOWN (OFFLINE)" to MaterialTheme.colorScheme.onSurfaceVariant
+                                    }
+                                    Surface(shape = CircleShape, color = verdictColor.copy(alpha = 0.14f)) {
+                                        Text(
+                                            verdictLabel,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = verdictColor,
+                                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                }
+                            }
+
+                            val localStr = Formatter.formatFileSize(context, item.localSizeBytes)
+                            val origStr = item.originalSizeBytes?.takeIf { it > 0L }?.let {
+                                " · Server Original: ${Formatter.formatFileSize(context, it)}"
+                            }.orEmpty()
+                            val signalText = if (item.signals.isNotEmpty()) {
+                                "Detected via: ${item.signals.joinToString(", ")}"
+                            } else {
+                                "No proxy tag or server proxy match found"
+                            }
+                            Text(
+                                "Local size: $localStr$origStr\n$signalText",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+
+                            if (item.kind == GalleryMediaKind.PROXY && !item.masterHash.isNullOrBlank()) {
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    OutlinedButton(
+                                        onClick = { onShareOriginal(item) },
+                                        enabled = busyItemId == null,
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                    ) {
+                                        Icon(Icons.Rounded.IosShare, null, modifier = Modifier.size(16.dp))
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text("Share Original", style = MaterialTheme.typography.labelSmall)
+                                    }
+                                    Button(
+                                        onClick = { onRestore(item) },
+                                        enabled = busyItemId == null,
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                    ) {
+                                        if (isBusy) {
+                                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = Color.White)
+                                        } else {
+                                            Icon(Icons.Rounded.CloudDownload, null, modifier = Modifier.size(16.dp))
+                                        }
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text(
+                                            if (item.isProtectedOriginal) "Restored ✓" else "Restore",
+                                            style = MaterialTheme.typography.labelSmall
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Close") }
+        }
+    )
 }
 
 private fun openAppSettings(context: android.content.Context) {

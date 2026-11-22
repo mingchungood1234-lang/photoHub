@@ -31,6 +31,12 @@ data class TrashPromptRequest(
 data class CompressUiState(
     val candidates: List<PhotoCandidate> = emptyList(),
     val thumbnails: Map<String, Bitmap> = emptyMap(),
+    val filterMode: CompressFilterMode = CompressFilterMode.ALL,
+    val isCheckingServerProxies: Boolean = false,
+    val isInspectingGalleryUris: Boolean = false,
+    val galleryInspectionResults: List<GalleryProxyInspectionItem>? = null,
+    val inspectionBusyId: String? = null,
+    val shareFileReady: java.io.File? = null,
     val pendingDeleteIds: List<String> = emptyList(),
     val trashPromptRequest: TrashPromptRequest? = null,
     val isAwaitingDeleteConfirmation: Boolean = false,
@@ -50,6 +56,22 @@ data class CompressUiState(
 ) {
     val selectedCount: Int
         get() = candidates.count { it.isSelected && !it.state.isFinished }
+
+    val detectedProxies: List<PhotoCandidate>
+        get() = candidates.filter { it.isDetectedProxy }
+
+    val detectedProxyCount: Int
+        get() = detectedProxies.size
+
+    val originalCandidatesCount: Int
+        get() = candidates.count { !it.isDetectedProxy }
+
+    val displayedCandidates: List<PhotoCandidate>
+        get() = when (filterMode) {
+            CompressFilterMode.ALL -> candidates
+            CompressFilterMode.ORIGINALS -> candidates.filter { !it.isDetectedProxy }
+            CompressFilterMode.PROXIES -> candidates.filter { it.isDetectedProxy }
+        }
 
     val pendingVideoCandidates: List<PhotoCandidate>
         get() = candidates.filter { it.isVideo && !it.state.isFinished }
@@ -80,6 +102,7 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
     private val itemProgress = ConcurrentHashMap<String, Double>()
     private var hasAutoStartedThisSession = false
     private var activeUploadJob: Job? = null
+    private var deepProxyScanJob: Job? = null
 
     init {
         viewModelScope.launch {
@@ -92,6 +115,10 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
                 handleNotificationOpenCleanup()
             }
         }
+    }
+
+    fun setFilterMode(mode: CompressFilterMode) {
+        _uiState.update { it.copy(filterMode = mode) }
     }
 
     fun refreshPermissionsAndSync() {
@@ -116,7 +143,8 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
 
     fun scanLibrary() {
         if (_uiState.value.isScanning) return
-        _uiState.update { it.copy(isScanning = true, statusBanner = null) }
+        deepProxyScanJob?.cancel()
+        _uiState.update { it.copy(isScanning = true, isCheckingServerProxies = false, statusBanner = null) }
         bgManager.pruneMissingAssetsFromStaged()
 
         val level = mediaService.currentAccessLevel()
@@ -139,14 +167,24 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
                 .cachedPhotos(cur.normalizedBaseUrl, cur.apiKeyCacheScope)
             val raw = mediaService.scanCandidates(tracker = tracker, knownServerPhotos = cached)
             val sorted = PhotoBackupPipeline.sortCandidates(raw, mode)
+            val proxyCount = sorted.count { it.isDetectedProxy }
+            val eligibleCount = sorted.count { !it.state.isFinished }
             withContext(Dispatchers.Main) {
                 applyScannedCandidates(sorted)
                 _uiState.update {
                     it.copy(
                         pendingDeleteIds = emptyList(),
                         isScanning = false,
-                        statusBanner = if (sorted.isEmpty()) "No uncompressed photos or videos found." else it.statusBanner
+                        filterMode = if (eligibleCount == 0 && proxyCount > 0) CompressFilterMode.PROXIES else it.filterMode,
+                        statusBanner = when {
+                            sorted.isEmpty() -> "No photos or videos found in your Gallery."
+                            eligibleCount == 0 && proxyCount > 0 -> "Auto-detected $proxyCount compressed proxy item(s) in your Gallery."
+                            else -> it.statusBanner
+                        }
                     )
+                }
+                if (eligibleCount > 0 && cur.isSignedIn) {
+                    launchDeepProxyDetection(cached)
                 }
             }
         }
@@ -158,6 +196,7 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
             hasAutoStartedThisSession = true
         }
         if (_uiState.value.isScanning || _uiState.value.isProcessing) return
+        deepProxyScanJob?.cancel()
         _uiState.update { it.copy(isScanning = true, statusBanner = "Finding new photos & videos to back up…") }
         bgManager.pruneMissingAssetsFromStaged()
 
@@ -185,17 +224,113 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
                 maxResults = 200,
                 maxInspect = 3000
             )
-            val sorted = PhotoBackupPipeline.sortCandidates(raw, mode)
+            var sorted = PhotoBackupPipeline.sortCandidates(raw, mode)
+            if (cur.isSignedIn && sorted.any { it.state is PhotoCompressionState.Pending }) {
+                withContext(Dispatchers.Main) {
+                    _uiState.update { it.copy(statusBanner = "Checking Gallery items for compressed proxies…") }
+                }
+                val client = PhotoHubApiClient(context, settings)
+                val matches = GalleryProxyDetector.enrichCandidatesWithServer(
+                    context = context,
+                    candidates = sorted,
+                    tracker = tracker,
+                    client = client,
+                    cachedServerPhotos = cached
+                )
+                if (matches.isNotEmpty()) {
+                    sorted = applyDeepMatches(sorted, matches)
+                }
+            }
+            val eligibleCount = sorted.count { !it.state.isFinished }
+            val proxyCount = sorted.count { it.isDetectedProxy }
             withContext(Dispatchers.Main) {
                 applyScannedCandidates(sorted)
                 _uiState.update { it.copy(isScanning = false) }
-                if (sorted.isNotEmpty() && (forceNow || settings.current.autoCompressOnOpen)) {
+                if (eligibleCount > 0 && (forceNow || settings.current.autoCompressOnOpen)) {
                     selectAllEligible(true)
                     startProcessingSelectedPhotos()
-                } else if (sorted.isEmpty()) {
-                    _uiState.update { it.copy(statusBanner = "All scanned photos & videos are already backed up.") }
+                } else if (eligibleCount == 0) {
+                    _uiState.update {
+                        it.copy(
+                            statusBanner = if (proxyCount > 0) {
+                                "All scanned photos & videos are already backed up or compressed proxies ($proxyCount proxy detected)."
+                            } else {
+                                "All scanned photos & videos are already backed up."
+                            }
+                        )
+                    }
                 }
             }
+        }
+    }
+
+    private fun launchDeepProxyDetection(cachedServerPhotos: List<ServerPhoto>) {
+        deepProxyScanJob?.cancel()
+        val snapshot = _uiState.value.candidates
+        if (snapshot.none { it.state is PhotoCompressionState.Pending && !it.isVideo }) return
+
+        _uiState.update { it.copy(isCheckingServerProxies = true) }
+        deepProxyScanJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val client = PhotoHubApiClient(context, settings)
+                val matches = GalleryProxyDetector.enrichCandidatesWithServer(
+                    context = context,
+                    candidates = snapshot,
+                    tracker = tracker,
+                    client = client,
+                    cachedServerPhotos = cachedServerPhotos
+                )
+                if (matches.isNotEmpty()) {
+                    withContext(Dispatchers.Main) {
+                        _uiState.update { prev ->
+                            val updated = applyDeepMatches(prev.candidates, matches)
+                            prev.copy(candidates = updated, isCheckingServerProxies = false)
+                        }
+                    }
+                } else {
+                    withContext(Dispatchers.Main) {
+                        _uiState.update { it.copy(isCheckingServerProxies = false) }
+                    }
+                }
+            } catch (_: Exception) {
+                withContext(Dispatchers.Main) {
+                    _uiState.update { it.copy(isCheckingServerProxies = false) }
+                }
+            }
+        }
+    }
+
+    private fun applyDeepMatches(
+        candidates: List<PhotoCandidate>,
+        matches: Map<String, CandidateDeepCheckMatch>
+    ): List<PhotoCandidate> = candidates.map { item ->
+        val m = matches[item.id] ?: return@map item
+        when {
+            m.isProxy -> item.copy(
+                state = PhotoCompressionState.AlreadyProxy,
+                isSelected = false,
+                masterHash = m.masterHash ?: item.masterHash,
+                detectionSource = m.signal,
+                linkedOriginalName = m.originalName ?: item.linkedOriginalName,
+                linkedOriginalBytes = m.originalSizeBytes ?: item.linkedOriginalBytes,
+                isBackedUpOnServer = true
+            )
+            m.isMaster && m.isProtectedOriginal -> item.copy(
+                state = PhotoCompressionState.Skipped("Restored Original (Protected)"),
+                isSelected = false,
+                masterHash = m.masterHash ?: item.masterHash,
+                detectionSource = m.signal,
+                linkedOriginalName = m.originalName ?: item.linkedOriginalName,
+                linkedOriginalBytes = m.originalSizeBytes ?: item.linkedOriginalBytes,
+                isBackedUpOnServer = true
+            )
+            m.isMaster -> item.copy(
+                masterHash = m.masterHash ?: item.masterHash,
+                linkedOriginalName = m.originalName ?: item.linkedOriginalName,
+                linkedOriginalBytes = m.originalSizeBytes ?: item.linkedOriginalBytes,
+                isBackedUpOnServer = true
+            )
+            else -> item
         }
     }
 
@@ -720,5 +855,188 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
 
     fun clearDeleteError() {
         _uiState.update { it.copy(deleteErrorAlertMessage = null) }
+    }
+
+    fun clearShareFileReady() {
+        _uiState.update { it.copy(shareFileReady = null) }
+    }
+
+    fun inspectGalleryUris(uris: List<android.net.Uri>) {
+        if (uris.isEmpty()) return
+        _uiState.update {
+            it.copy(
+                isInspectingGalleryUris = true,
+                galleryInspectionResults = null,
+                statusBanner = null
+            )
+        }
+        viewModelScope.launch {
+            try {
+                val results = GalleryProxyDetector.inspectPickedUris(context, settings, uris)
+                val proxyCount = results.count { it.kind == GalleryMediaKind.PROXY }
+                val updatedCandidates = _uiState.value.candidates.map { cand ->
+                    val match = results.firstOrNull {
+                        it.kind == GalleryMediaKind.PROXY &&
+                            (it.id == cand.id || (cand.masterHash != null && cand.masterHash.equals(it.masterHash, ignoreCase = true)))
+                    }
+                    if (match != null) {
+                        cand.copy(
+                            state = PhotoCompressionState.AlreadyProxy,
+                            isSelected = false,
+                            masterHash = match.masterHash ?: cand.masterHash,
+                            detectionSource = match.signals.firstOrNull() ?: "Gallery Check",
+                            linkedOriginalName = match.originalName,
+                            linkedOriginalBytes = match.originalSizeBytes,
+                            isBackedUpOnServer = match.masterHash != null
+                        )
+                    } else {
+                        cand
+                    }
+                }
+                _uiState.update {
+                    it.copy(
+                        candidates = updatedCandidates,
+                        isInspectingGalleryUris = false,
+                        galleryInspectionResults = results,
+                        statusBanner = if (proxyCount > 0) {
+                            "Gallery Check: detected $proxyCount compressed proxy(s) out of ${results.size} item(s)."
+                        } else {
+                            "Gallery Check: all ${results.size} selected item(s) are full originals."
+                        }
+                    )
+                }
+            } catch (err: Exception) {
+                _uiState.update {
+                    it.copy(
+                        isInspectingGalleryUris = false,
+                        statusBanner = "Gallery Check failed: ${err.localizedMessage ?: "Unknown error"}"
+                    )
+                }
+            }
+        }
+    }
+
+    fun dismissGalleryInspection() {
+        _uiState.update { it.copy(galleryInspectionResults = null, inspectionBusyId = null) }
+    }
+
+    fun restoreOriginalFromDetectedProxy(
+        itemId: String,
+        rawMasterHash: String?,
+        originalFilename: String?,
+        isVideo: Boolean
+    ) {
+        if (rawMasterHash.isNullOrBlank()) {
+            _uiState.update { it.copy(statusBanner = "Master hash unavailable for this offline proxy.") }
+            return
+        }
+        if (!mediaService.canWriteGallery()) {
+            _uiState.update { it.copy(statusBanner = "Photos & Videos permission is required to restore originals.") }
+            return
+        }
+        _uiState.update { it.copy(inspectionBusyId = itemId, statusBanner = "Restoring original to Gallery…") }
+        viewModelScope.launch {
+            try {
+                val client = PhotoHubApiClient(context, settings)
+                val resolved = resolveFullServerPhotoForHashOrPrefix(client, rawMasterHash)
+                val fullHash = resolved?.hash ?: rawMasterHash.takeIf { ProxyGenerator.isFullSha256Hex(it) }
+                    ?: throw IllegalStateException("Could not resolve server master photo for this proxy.")
+                val preferredName = resolved?.originalName ?: originalFilename ?: "RESTORED_$fullHash.jpg"
+                val (file, _) = OriginalDownloadCache.getOrFetchOriginal(
+                    context = context,
+                    apiClient = client,
+                    masterHash = fullHash,
+                    preferredFilename = preferredName,
+                    expectedSizeBytes = resolved?.size
+                )
+                val savedId = mediaService.saveRestoredOriginalToGallery(
+                    file = file,
+                    isVideo = resolved?.isVideo ?: isVideo,
+                    originalFilename = preferredName,
+                    creationDateMs = resolved?.parsedCreationDateMs
+                )
+                tracker.markRestoredOriginal(savedId, fullHash)
+                runCatching { client.setOriginalProtected(fullHash, true) }
+                val sz = Formatter.formatFileSize(context, file.length())
+                _uiState.update { prev ->
+                    val updatedList = prev.galleryInspectionResults?.map { row ->
+                        if (row.id == itemId) {
+                            row.copy(isProtectedOriginal = true, masterHash = fullHash, originalName = preferredName)
+                        } else {
+                            row
+                        }
+                    }
+                    prev.copy(
+                        inspectionBusyId = null,
+                        galleryInspectionResults = updatedList,
+                        statusBanner = "Restored original $preferredName ($sz) to Gallery & protected it."
+                    )
+                }
+            } catch (err: Exception) {
+                _uiState.update {
+                    it.copy(
+                        inspectionBusyId = null,
+                        statusBanner = "Restore failed: ${err.localizedMessage ?: "Error"}"
+                    )
+                }
+            }
+        }
+    }
+
+    fun shareOriginalFromDetectedProxy(
+        itemId: String,
+        rawMasterHash: String?,
+        originalFilename: String?
+    ) {
+        if (rawMasterHash.isNullOrBlank()) {
+            _uiState.update { it.copy(statusBanner = "Master hash unavailable for this offline proxy.") }
+            return
+        }
+        _uiState.update { it.copy(inspectionBusyId = itemId) }
+        viewModelScope.launch {
+            try {
+                val client = PhotoHubApiClient(context, settings)
+                val resolved = resolveFullServerPhotoForHashOrPrefix(client, rawMasterHash)
+                val fullHash = resolved?.hash ?: rawMasterHash.takeIf { ProxyGenerator.isFullSha256Hex(it) }
+                    ?: throw IllegalStateException("Could not resolve server master photo.")
+                val preferredName = resolved?.originalName ?: originalFilename ?: "ORIGINAL_$fullHash.jpg"
+                val (file, _) = OriginalDownloadCache.getOrFetchOriginal(
+                    context = context,
+                    apiClient = client,
+                    masterHash = fullHash,
+                    preferredFilename = preferredName,
+                    expectedSizeBytes = resolved?.size
+                )
+                _uiState.update { it.copy(inspectionBusyId = null, shareFileReady = file) }
+            } catch (err: Exception) {
+                _uiState.update {
+                    it.copy(
+                        inspectionBusyId = null,
+                        statusBanner = "Share failed: ${err.localizedMessage ?: "Error"}"
+                    )
+                }
+            }
+        }
+    }
+
+    private suspend fun resolveFullServerPhotoForHashOrPrefix(
+        client: PhotoHubApiClient,
+        rawHashOrPrefix: String
+    ): ServerPhoto? {
+        val clean = rawHashOrPrefix.trim().lowercase(java.util.Locale.ROOT)
+        val cur = settings.current
+        val store = LocalProxyStore.getInstance(context)
+        val cached = store.cachedPhotos(cur.normalizedBaseUrl, cur.apiKeyCacheScope)
+        cached.firstOrNull {
+            it.hash.equals(clean, ignoreCase = true) ||
+                ProxyGenerator.proxyPrefixTag(it.hash) == clean
+        }?.let { return it }
+
+        val fresh = runCatching { client.fetchAllServerPhotos(sync = false) }.getOrNull() ?: return null
+        store.savePhotos(fresh, cur.normalizedBaseUrl, cur.apiKeyCacheScope)
+        return fresh.firstOrNull {
+            it.hash.equals(clean, ignoreCase = true) ||
+                ProxyGenerator.proxyPrefixTag(it.hash) == clean
+        }
     }
 }

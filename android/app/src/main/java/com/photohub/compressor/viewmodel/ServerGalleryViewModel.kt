@@ -238,6 +238,49 @@ object ServerTimelineBuilder {
     }
 }
 
+data class BatchRestoreConfirmRequest(
+    val title: String,
+    val allTargets: List<ServerPhoto>,
+    val unrestoredTargets: List<ServerPhoto>,
+    val skippedCount: Int,
+    val unrestoredBytes: Long,
+    val allBytes: Long,
+    val isRestoreAll: Boolean
+)
+
+object BatchRestorePlanner {
+    fun buildConfirmRequest(
+        title: String,
+        targets: List<ServerPhoto>,
+        locallyProtectedHashes: Set<String>,
+        isRestoreAll: Boolean
+    ): BatchRestoreConfirmRequest {
+        val normProtected = locallyProtectedHashes.map { it.trim().lowercase(Locale.ROOT) }.toSet()
+        val unrestored = targets.filter { photo ->
+            !photo.isProtectedOriginal && !normProtected.contains(photo.hash.trim().lowercase(Locale.ROOT))
+        }
+        return BatchRestoreConfirmRequest(
+            title = title,
+            allTargets = targets,
+            unrestoredTargets = unrestored,
+            skippedCount = (targets.size - unrestored.size).coerceAtLeast(0),
+            unrestoredBytes = unrestored.sumOf { maxOf(0L, it.size) },
+            allBytes = targets.sumOf { maxOf(0L, it.size) },
+            isRestoreAll = isRestoreAll
+        )
+    }
+
+    fun resolveExecutionTargets(
+        request: BatchRestoreConfirmRequest,
+        includeAlreadyRestored: Boolean
+    ): List<ServerPhoto> =
+        if (includeAlreadyRestored || request.unrestoredTargets.isEmpty()) {
+            request.allTargets
+        } else {
+            request.unrestoredTargets
+        }
+}
+
 data class ServerGalleryUiState(
     val photos: List<ServerPhoto> = emptyList(),
     val timeline: ServerTimelineData = ServerTimelineData(),
@@ -249,21 +292,35 @@ data class ServerGalleryUiState(
     val mediaTypeFilter: ServerMediaTypeFilter = ServerMediaTypeFilter.ALL,
     val timelineGrouping: ServerTimelineGrouping = ServerTimelineGrouping.DAY,
     val selectedYearAnchor: String? = null,
+    val isSelectionMode: Boolean = false,
+    val selectedHashes: Set<String> = emptySet(),
+    val locallyProtectedHashes: Set<String> = emptySet(),
     val isBatchProxying: Boolean = false,
     val batchCompleted: Int = 0,
     val batchTotal: Int = 0,
     val batchStatusText: String = "",
     val batchBannerMessage: String? = null,
+    val isBatchRestoring: Boolean = false,
+    val restoreCompleted: Int = 0,
+    val restoreTotal: Int = 0,
+    val restoreStatusText: String = "",
+    val restoreBannerMessage: String? = null,
+    val restoreConfirmRequest: BatchRestoreConfirmRequest? = null,
     val isResolvingPick: Boolean = false,
     val pickStatusText: String = "Preparing original…",
     val pickerErrorMessage: String? = null,
     val shareFileReady: File? = null
 ) {
     val unproxiedCount: Int get() = photos.count { it.needsProxy }
+    val visiblePhotos: List<ServerPhoto> get() = timeline.sections.flatMap { it.photos }
+    fun isRestoredOrProtected(photo: ServerPhoto): Boolean =
+        photo.isProtectedOriginal || locallyProtectedHashes.contains(photo.hash.lowercase(Locale.ROOT))
+    val unrestoredCount: Int get() = photos.count { !isRestoredOrProtected(it) }
 }
 
 data class PhotoDetailUiState(
     val photo: ServerPhoto,
+    val isLocallyProtected: Boolean = false,
     val previewBitmap: Bitmap? = null,
     val videoFile: File? = null,
     val isLoadingVideo: Boolean = false,
@@ -290,6 +347,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
     private val inFlightPreviews = Collections.synchronizedSet(mutableSetOf<String>())
     private var batchJob: Job? = null
+    private var restoreJob: Job? = null
     private var speculativePrefetchJob: Job? = null
 
     init {
@@ -308,6 +366,20 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
         }
     }
 
+    private fun normHash(hash: String): String = hash.trim().lowercase(Locale.ROOT)
+
+    private fun computeLocallyProtectedHashes(photos: List<ServerPhoto>): Set<String> =
+        photos.asSequence()
+            .map { normHash(it.hash) }
+            .filter { it.isNotEmpty() && tracker.isRestoredMasterHash(it) }
+            .toSet()
+
+    fun refreshProtectedHashes() {
+        val currentPhotos = _uiState.value.photos
+        val protectedSet = computeLocallyProtectedHashes(currentPhotos)
+        _uiState.update { it.copy(locallyProtectedHashes = protectedSet) }
+    }
+
     fun loadFromLocalStore() {
         val cur = settings.current
         val cached = store.cachedPhotos(cur.normalizedBaseUrl, cur.apiKeyCacheScope)
@@ -322,6 +394,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                     }
                 }
             }
+            val protectedSet = computeLocallyProtectedHashes(cached)
             withContext(Dispatchers.Main) {
                 _uiState.update { prev ->
                     val nextPhotos = if (cached.isNotEmpty() || prev.photos.isEmpty()) cached else prev.photos
@@ -330,6 +403,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                     prev.copy(
                         photos = nextPhotos,
                         imageCache = nextCache,
+                        locallyProtectedHashes = if (nextPhotos === cached) protectedSet else computeLocallyProtectedHashes(nextPhotos),
                         timeline = rebuilt.first,
                         selectedYearAnchor = rebuilt.second
                     )
@@ -348,6 +422,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                 val fetched = client.fetchAllServerPhotos(sync = true)
                 val cur = settings.current
                 store.savePhotos(fetched, cur.normalizedBaseUrl, cur.apiKeyCacheScope)
+                val protectedSet = withContext(Dispatchers.IO) { computeLocallyProtectedHashes(fetched) }
                 _uiState.update { prev ->
                     val rebuilt = rebuildTimelineData(fetched, prev.filterMode, prev.mediaTypeFilter, prev.timelineGrouping, prev.selectedYearAnchor)
                     val clearedFailed = prev.failedPreviewHashes.filterNot { h ->
@@ -355,6 +430,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                     }.toSet()
                     prev.copy(
                         photos = fetched,
+                        locallyProtectedHashes = protectedSet,
                         timeline = rebuilt.first,
                         selectedYearAnchor = rebuilt.second,
                         failedPreviewHashes = clearedFailed,
@@ -471,7 +547,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
     fun startBatchProxy() {
         val targets = _uiState.value.photos.filter { it.needsProxy }
-        if (_uiState.value.isBatchProxying || targets.isEmpty()) return
+        if (_uiState.value.isBatchProxying || _uiState.value.isBatchRestoring || targets.isEmpty()) return
 
         batchJob?.cancel()
         _uiState.update {
@@ -566,16 +642,24 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
             val previewBmp = store.previewData(updated.hash)?.let {
                 BitmapFactory.decodeByteArray(it, 0, it.size)
             }
+            val norm = normHash(updated.hash)
+            val isLocProtected = tracker.isRestoredMasterHash(norm)
             withContext(Dispatchers.Main) {
                 _uiState.update { prev ->
                     val nextPhotos = prev.photos.map {
                         if (it.hash.equals(updated.hash, ignoreCase = true)) updated else it
                     }
                     val nextCache = if (previewBmp != null) prev.imageCache + (updated.hash to previewBmp) else prev.imageCache
+                    val nextLocallyProtected = if (isLocProtected) {
+                        prev.locallyProtectedHashes + norm
+                    } else {
+                        prev.locallyProtectedHashes - norm
+                    }
                     val rebuilt = rebuildTimelineData(nextPhotos, prev.filterMode, prev.mediaTypeFilter, prev.timelineGrouping, prev.selectedYearAnchor)
                     prev.copy(
                         photos = nextPhotos,
                         imageCache = nextCache,
+                        locallyProtectedHashes = nextLocallyProtected,
                         failedPreviewHashes = prev.failedPreviewHashes - updated.hash,
                         timeline = rebuilt.first,
                         selectedYearAnchor = rebuilt.second
@@ -624,7 +708,11 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
     fun openPhotoDetail(photo: ServerPhoto) {
         val initialBmp = _uiState.value.imageCache[photo.hash]
-        _detailState.value = PhotoDetailUiState(photo = photo, previewBitmap = initialBmp)
+        _detailState.value = PhotoDetailUiState(
+            photo = photo,
+            isLocallyProtected = tracker.isRestoredMasterHash(photo.hash),
+            previewBitmap = initialBmp
+        )
         speculativePrefetchJob?.cancel()
 
         viewModelScope.launch(Dispatchers.IO) {
@@ -843,6 +931,235 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
         }
     }
 
+    // MARK: - Selection & Batch / Restore All Actions
+
+    fun canWriteGallery(): Boolean = mediaService.canWriteGallery()
+
+    fun reportRestorePermissionDenied() {
+        _uiState.update {
+            it.copy(restoreBannerMessage = "Photos & Videos permission is required to save originals to Gallery.")
+        }
+    }
+
+    fun enterSelectionMode(initialHash: String? = null) {
+        val prev = _uiState.value
+        if (prev.isBatchRestoring || prev.isBatchProxying || prev.photos.isEmpty()) return
+        val initial = initialHash?.let(::normHash)?.takeIf { it.isNotEmpty() }
+        _uiState.update {
+            it.copy(
+                isSelectionMode = true,
+                selectedHashes = if (initial != null) setOf(initial) else emptySet()
+            )
+        }
+    }
+
+    fun exitSelectionMode() {
+        _uiState.update { it.copy(isSelectionMode = false, selectedHashes = emptySet()) }
+    }
+
+    fun togglePhotoSelection(hash: String) {
+        val norm = normHash(hash)
+        if (norm.isEmpty()) return
+        _uiState.update { prev ->
+            val next = if (norm in prev.selectedHashes) {
+                prev.selectedHashes - norm
+            } else {
+                prev.selectedHashes + norm
+            }
+            prev.copy(selectedHashes = next)
+        }
+    }
+
+    fun selectAllVisible() {
+        _uiState.update { prev ->
+            prev.copy(selectedHashes = prev.visiblePhotos.map { normHash(it.hash) }.toSet())
+        }
+    }
+
+    fun clearSelection() {
+        _uiState.update { it.copy(selectedHashes = emptySet()) }
+    }
+
+    fun toggleSectionSelection(sectionPhotos: List<ServerPhoto>) {
+        if (sectionPhotos.isEmpty()) return
+        val sectionHashes = sectionPhotos.map { normHash(it.hash) }.toSet()
+        _uiState.update { prev ->
+            val allSelected = sectionHashes.all { it in prev.selectedHashes }
+            val next = if (allSelected) {
+                prev.selectedHashes - sectionHashes
+            } else {
+                prev.selectedHashes + sectionHashes
+            }
+            prev.copy(selectedHashes = next)
+        }
+    }
+
+    fun requestRestoreAll() {
+        val state = _uiState.value
+        if (state.isBatchRestoring || state.isBatchProxying || state.photos.isEmpty()) return
+        openRestoreConfirm(
+            title = "Restore All Originals",
+            targets = state.photos,
+            isRestoreAll = true
+        )
+    }
+
+    fun requestRestoreSelected() {
+        val state = _uiState.value
+        if (state.isBatchRestoring || state.isBatchProxying || state.selectedHashes.isEmpty()) return
+        val targets = state.photos.filter { normHash(it.hash) in state.selectedHashes }
+        if (targets.isEmpty()) return
+        openRestoreConfirm(
+            title = "Restore Selected Originals",
+            targets = targets,
+            isRestoreAll = false
+        )
+    }
+
+    private fun openRestoreConfirm(
+        title: String,
+        targets: List<ServerPhoto>,
+        isRestoreAll: Boolean
+    ) {
+        val protectedSet = computeLocallyProtectedHashes(targets)
+        val req = BatchRestorePlanner.buildConfirmRequest(
+            title = title,
+            targets = targets,
+            locallyProtectedHashes = protectedSet,
+            isRestoreAll = isRestoreAll
+        )
+        _uiState.update { it.copy(restoreConfirmRequest = req) }
+    }
+
+    fun dismissRestoreConfirm() {
+        _uiState.update { it.copy(restoreConfirmRequest = null) }
+    }
+
+    fun executeRestoreConfirm(includeAlreadyRestored: Boolean = false) {
+        val req = _uiState.value.restoreConfirmRequest ?: return
+        _uiState.update { it.copy(restoreConfirmRequest = null) }
+        val targets = BatchRestorePlanner.resolveExecutionTargets(req, includeAlreadyRestored)
+        startBatchRestore(targets = targets, exitSelectionAfter = !req.isRestoreAll)
+    }
+
+    private fun startBatchRestore(
+        targets: List<ServerPhoto>,
+        exitSelectionAfter: Boolean
+    ) {
+        val curState = _uiState.value
+        if (curState.isBatchRestoring || curState.isBatchProxying || targets.isEmpty()) return
+        if (!mediaService.canWriteGallery()) {
+            reportRestorePermissionDenied()
+            return
+        }
+
+        restoreJob?.cancel()
+        _uiState.update {
+            it.copy(
+                isBatchRestoring = true,
+                restoreBannerMessage = null,
+                restoreCompleted = 0,
+                restoreTotal = targets.size,
+                restoreStatusText = "Preparing…",
+                isSelectionMode = if (exitSelectionAfter) false else it.isSelectionMode,
+                selectedHashes = if (exitSelectionAfter) emptySet() else it.selectedHashes
+            )
+        }
+
+        restoreJob = viewModelScope.launch {
+            val client = PhotoHubApiClient(context, settings)
+            val queue = Channel<ServerPhoto>(Channel.UNLIMITED)
+            targets.forEach { queue.trySend(it) }
+            queue.close()
+
+            val succeeded = AtomicInteger(0)
+            val failed = AtomicInteger(0)
+            val completed = AtomicInteger(0)
+
+            try {
+                coroutineScope {
+                    val workerCount = minOf(3, targets.size)
+                    val workers = List(workerCount) {
+                        launch(Dispatchers.IO) {
+                            for (item in queue) {
+                                if (!isActive) break
+                                try {
+                                    restoreSinglePhotoToGallery(client, item)
+                                    succeeded.incrementAndGet()
+                                } catch (c: CancellationException) {
+                                    throw c
+                                } catch (_: Exception) {
+                                    failed.incrementAndGet()
+                                }
+                                val done = completed.incrementAndGet()
+                                _uiState.update {
+                                    it.copy(restoreCompleted = done, restoreStatusText = item.originalName)
+                                }
+                            }
+                        }
+                    }
+                    workers.joinAll()
+                }
+            } finally {
+                val ok = succeeded.get()
+                val errCount = failed.get()
+                val cancelled = !isActive
+                val protectedSet = withContext(NonCancellable + Dispatchers.IO) {
+                    computeLocallyProtectedHashes(_uiState.value.photos)
+                }
+                _uiState.update { prev ->
+                    prev.copy(
+                        isBatchRestoring = false,
+                        restoreStatusText = "",
+                        locallyProtectedHashes = protectedSet,
+                        restoreBannerMessage = when {
+                            cancelled -> "Stopped after restoring $ok original(s)."
+                            errCount > 0 && ok == 0 -> "Restore failed for $errCount item(s)."
+                            errCount > 0 -> "Restored $ok original(s) & protected them; $errCount failed."
+                            else -> "Restored $ok original(s) to Gallery & protected them."
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    fun stopBatchRestore() {
+        restoreJob?.cancel()
+    }
+
+    fun dismissRestoreBanner() {
+        _uiState.update { it.copy(restoreBannerMessage = null) }
+    }
+
+    private suspend fun restoreSinglePhotoToGallery(
+        client: PhotoHubApiClient,
+        photo: ServerPhoto,
+        onProgress: ((Long, Long?) -> Unit)? = null
+    ): Pair<ServerPhoto?, Long> {
+        val (originalFile, _) = OriginalDownloadCache.getOrFetchOriginal(
+            context = context,
+            apiClient = client,
+            masterHash = photo.hash,
+            preferredFilename = photo.originalName,
+            expectedSizeBytes = photo.size,
+            onProgress = onProgress
+        )
+        val fileSize = originalFile.length()
+        val savedId = mediaService.saveRestoredOriginalToGallery(
+            file = originalFile,
+            isVideo = photo.isVideo,
+            originalFilename = photo.originalName,
+            creationDateMs = photo.parsedCreationDateMs
+        )
+        tracker.markRestoredOriginal(savedId, photo.hash)
+        val updated = runCatching { client.setOriginalProtected(photo.hash, true) }.getOrNull()
+        if (updated != null) {
+            applyUpdatedPhoto(updated)
+        }
+        return updated to fileSize
+    }
+
     fun restoreFullMasterFromDetail() {
         val photo = _detailState.value?.photo ?: return
         _detailState.update { it?.copy(isBusy = true, busyLabel = "Downloading full-resolution original…", saveMessage = null) }
@@ -855,33 +1172,20 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
             }
             val client = PhotoHubApiClient(context, settings)
             try {
-                val (originalFile, _) = OriginalDownloadCache.getOrFetchOriginal(
-                    context = context,
-                    apiClient = client,
-                    masterHash = photo.hash,
-                    preferredFilename = photo.originalName,
-                    expectedSizeBytes = photo.size,
+                val (updated, fileSize) = restoreSinglePhotoToGallery(
+                    client = client,
+                    photo = photo,
                     onProgress = { down, total ->
                         val label = formatDetailProgressLabel("Downloading original…", down, total)
                         _detailState.update { it?.copy(busyLabel = label) }
                     }
                 )
-                val fileSize = originalFile.length()
-                val savedId = mediaService.saveRestoredOriginalToGallery(
-                    file = originalFile,
-                    isVideo = photo.isVideo,
-                    originalFilename = photo.originalName,
-                    creationDateMs = photo.parsedCreationDateMs
-                )
-                tracker.markRestoredOriginal(savedId, photo.hash)
-                val updated = runCatching { client.setOriginalProtected(photo.hash, true) }.getOrNull()
-                if (updated != null) {
-                    applyUpdatedPhoto(updated)
-                }
+                refreshProtectedHashes()
                 val sz = android.text.format.Formatter.formatFileSize(context, fileSize)
                 _detailState.update {
                     it?.copy(
                         photo = updated ?: it.photo,
+                        isLocallyProtected = true,
                         isBusy = false,
                         busyLabel = "",
                         saveMessage = "Restored original ($sz) to Gallery & protected it from re-proxying."
@@ -927,6 +1231,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                 _detailState.update {
                     it?.copy(
                         photo = updated,
+                        isLocallyProtected = protected || tracker.isRestoredMasterHash(updated.hash),
                         isBusy = false,
                         busyLabel = "",
                         saveMessage = if (protected) {

@@ -1,3 +1,4 @@
+import Photos
 import SwiftUI
 import UIKit
 
@@ -5,6 +6,7 @@ struct LibraryView: View {
     @ObservedObject var viewModel: CompressorViewModel
     @ObservedObject private var bgManager: BackgroundBackupManager
     @AppStorage("keepLocalProxyInPhotos") private var keepLocalProxyInPhotos: Bool = true
+    @State private var showingProxyDetectorPicker: Bool = false
 
     init(viewModel: CompressorViewModel) {
         self.viewModel = viewModel
@@ -108,6 +110,14 @@ struct LibraryView: View {
                                 }
                                 .buttonStyle(.bordered)
                                 .disabled(viewModel.isScanning || viewModel.isProcessing)
+
+                                Button {
+                                    showingProxyDetectorPicker = true
+                                } label: {
+                                    Label("Detect Proxy in Photos", systemImage: "magnifyingglass")
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(viewModel.isInspectingGalleryPicks || viewModel.isProcessing)
                             }
                         }
                     }
@@ -115,12 +125,21 @@ struct LibraryView: View {
                 } else {
                     summaryHeader
                     List {
-                        ForEach(viewModel.candidates) { item in
+                        ForEach(viewModel.displayedCandidates) { item in
                             PhotoCandidateRow(
                                 item: item,
                                 onToggleSelect: {
                                     viewModel.toggleSelection(for: item.id)
-                                }
+                                },
+                                onRestoreProxy: item.isDetectedProxy && item.masterHash != nil ? {
+                                    viewModel.restoreOriginalFromDetectedProxy(
+                                        itemId: item.id,
+                                        rawMasterHash: item.masterHash,
+                                        originalFilename: item.linkedOriginalName ?? item.filename,
+                                        isVideo: item.isVideo
+                                    )
+                                } : nil,
+                                isBusy: viewModel.inspectionBusyId == item.id
                             )
                             .onAppear {
                                 viewModel.loadThumbnailIfNeeded(for: item.id)
@@ -128,6 +147,21 @@ struct LibraryView: View {
                         }
                     }
                     .listStyle(.plain)
+                }
+            }
+            .overlay {
+                if viewModel.isInspectingGalleryPicks {
+                    ZStack {
+                        Color.black.opacity(0.45).ignoresSafeArea()
+                        VStack(spacing: 12) {
+                            ProgressView()
+                                .scaleEffect(1.2)
+                            Text("Detecting Proxy vs Original status…")
+                                .font(.subheadline.weight(.medium))
+                        }
+                        .padding(24)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                    }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -147,7 +181,14 @@ struct LibraryView: View {
                     .disabled(viewModel.isScanning || viewModel.isProcessing)
                 }
 
-                ToolbarItem(placement: .navigationBarTrailing) {
+                ToolbarItemGroup(placement: .navigationBarTrailing) {
+                    Button {
+                        showingProxyDetectorPicker = true
+                    } label: {
+                        Label("Detect Proxy", systemImage: "magnifyingglass")
+                    }
+                    .disabled(viewModel.isInspectingGalleryPicks || viewModel.isProcessing)
+
                     if !viewModel.candidates.isEmpty {
                         Menu {
                             Picker("Sort Order", selection: Binding(
@@ -179,6 +220,52 @@ struct LibraryView: View {
             .safeAreaInset(edge: .bottom) {
                 if viewModel.selectedCount > 0 {
                     actionBar
+                }
+            }
+            .sheet(isPresented: $showingProxyDetectorPicker) {
+                MultiPhotoPickerSheet(
+                    selectionLimit: 25,
+                    onPickBatch: { picked in
+                        showingProxyDetectorPicker = false
+                        viewModel.inspectPickedGalleryItems(picked)
+                    },
+                    onCancel: {
+                        showingProxyDetectorPicker = false
+                    }
+                )
+            }
+            .sheet(isPresented: Binding(
+                get: { viewModel.galleryInspectionItems != nil },
+                set: { if !$0 { viewModel.dismissGalleryInspection() } }
+            )) {
+                GalleryProxyInspectionSheet(
+                    items: viewModel.galleryInspectionItems ?? [],
+                    busyItemId: viewModel.inspectionBusyId,
+                    actionMessage: viewModel.inspectorActionMessage,
+                    onRestore: { item in
+                        viewModel.restoreOriginalFromDetectedProxy(
+                            itemId: item.id,
+                            rawMasterHash: item.masterHash,
+                            originalFilename: item.originalName,
+                            isVideo: item.isVideo
+                        )
+                    },
+                    onShareOriginal: { item in
+                        viewModel.shareOriginalFromDetectedProxy(
+                            itemId: item.id,
+                            rawMasterHash: item.masterHash,
+                            originalFilename: item.originalName
+                        )
+                    },
+                    onClose: {
+                        viewModel.dismissGalleryInspection()
+                    }
+                )
+            }
+            .sheet(item: $viewModel.inspectorShareItem) { item in
+                ShareSheet(activityItems: [item.fileURL]) {
+                    cleanupTempShareURL(item.fileURL)
+                    viewModel.inspectorShareItem = nil
                 }
             }
             .alert(
@@ -316,9 +403,13 @@ struct LibraryView: View {
                     Text("\(viewModel.candidates.count) Items · Selected \(viewModel.selectedCount)")
                         .font(.subheadline.weight(.semibold))
                     let estStr = ByteCountFormatter.string(fromByteCount: viewModel.totalEligibleEstimatedBytes, countStyle: .file)
-                    Text("Estimated iPhone space: ~\(estStr)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    Text(
+                        viewModel.detectedProxyCount > 0
+                        ? "Uncompressed: ~\(estStr) · \(viewModel.detectedProxyCount) proxy(s) detected"
+                        : "Estimated iPhone space: ~\(estStr)"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
                 Spacer()
 
@@ -332,6 +423,26 @@ struct LibraryView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                }
+            }
+
+            if viewModel.detectedProxyCount > 0 || viewModel.filterMode != .all {
+                Picker("Gallery Filter", selection: $viewModel.filterMode) {
+                    Text("All (\(viewModel.candidates.count))").tag(CandidateFilterMode.all)
+                    Text("Originals (\(viewModel.originalCandidatesCount))").tag(CandidateFilterMode.originals)
+                    Text("Proxies (\(viewModel.detectedProxyCount))").tag(CandidateFilterMode.proxies)
+                }
+                .pickerStyle(.segmented)
+            }
+
+            if viewModel.isCheckingServerProxies {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Checking server index for renamed Photos proxies…")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Spacer()
                 }
             }
 
@@ -381,6 +492,8 @@ struct LibraryView: View {
 private struct PhotoCandidateRow: View {
     let item: PhotoCandidate
     let onToggleSelect: () -> Void
+    let onRestoreProxy: (() -> Void)?
+    let isBusy: Bool
 
     var body: some View {
         HStack(spacing: 12) {
@@ -436,33 +549,249 @@ private struct PhotoCandidateRow: View {
                     }
                 }
 
-                HStack(spacing: 4) {
+                HStack(spacing: 6) {
                     if item.state.isIntegrityVerified {
                         Image(systemName: "checkmark.shield.fill")
                             .font(.caption2)
                             .foregroundStyle(.green)
+                    } else if item.isDetectedProxy {
+                        Text("PROXY")
+                            .font(.caption2.bold())
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(Color.blue.opacity(0.15), in: Capsule())
+                            .foregroundStyle(.blue)
+                    } else if item.isBackedUpOnServer {
+                        Text("ORIGINAL · BACKED UP")
+                            .font(.caption2.bold())
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(Color.green.opacity(0.15), in: Capsule())
+                            .foregroundStyle(.green)
                     }
-                    Text(item.state.label)
+
+                    Text(statusLineText)
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(badgeColor(for: item.state))
+                        .lineLimit(1)
+                }
+            }
+
+            if let onRestoreProxy {
+                if isBusy {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Button {
+                        onRestoreProxy()
+                    } label: {
+                        Image(systemName: "icloud.and.arrow.down")
+                            .foregroundStyle(Color.accentColor)
+                    }
+                    .buttonStyle(.borderless)
                 }
             }
         }
         .contentShape(Rectangle())
         .onTapGesture {
-            onToggleSelect()
+            if !item.state.isFinished {
+                onToggleSelect()
+            }
         }
         .padding(.vertical, 4)
+    }
+
+    private var statusLineText: String {
+        if item.isDetectedProxy {
+            let src = item.detectionSource ?? "Detected"
+            if let origSize = item.linkedOriginalBytes, origSize > 0 {
+                let sz = ByteCountFormatter.string(fromByteCount: origSize, countStyle: .file)
+                return "\(src) · Orig \(sz)"
+            }
+            return src
+        }
+        return item.state.label
     }
 
     private func badgeColor(for state: PhotoCompressionState) -> Color {
         switch state {
         case .completed: return .green
         case .readyToDelete: return .orange
-        case .alreadyProxy, .skipped: return .secondary
+        case .alreadyProxy: return .blue
+        case .skipped: return .secondary
         case .failed: return .red
         case .uploading, .uploadingInBackground, .hashing, .verifyingChecksum, .creatingProxy, .replacingInPhotos: return .blue
         case .pending: return .secondary
+        }
+    }
+}
+
+private struct GalleryProxyInspectionSheet: View {
+    let items: [GalleryProxyInspectionItem]
+    let busyItemId: String?
+    let actionMessage: String?
+    let onRestore: (GalleryProxyInspectionItem) -> Void
+    let onShareOriginal: (GalleryProxyInspectionItem) -> Void
+    let onClose: () -> Void
+
+    private var proxyCount: Int {
+        items.filter { $0.kind == .proxy }.count
+    }
+
+    var body: some View {
+        AdaptiveNavigationStack {
+            List {
+                if let actionMessage, !actionMessage.isEmpty {
+                    Section {
+                        HStack(spacing: 8) {
+                            Image(systemName: "info.circle.fill")
+                                .foregroundStyle(.blue)
+                            Text(actionMessage)
+                                .font(.caption)
+                        }
+                    }
+                }
+
+                Section {
+                    ForEach(items) { item in
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(spacing: 12) {
+                                PHAssetThumbView(assetId: item.assetId, isVideo: item.isVideo)
+
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(item.originalName ?? item.displayName)
+                                        .font(.subheadline.weight(.medium))
+                                        .lineLimit(1)
+
+                                    verdictBadge(for: item.kind)
+                                }
+                            }
+
+                            let localStr = ByteCountFormatter.string(fromByteCount: item.localSizeBytes, countStyle: .file)
+                            let origStr = item.originalSizeBytes.flatMap { sz in
+                                sz > 0 ? " · Server Original: \(ByteCountFormatter.string(fromByteCount: sz, countStyle: .file))" : nil
+                            } ?? ""
+                            let signalText = item.signals.isEmpty
+                                ? "No proxy tag or server proxy match found"
+                                : "Detected via: \(item.signals.joined(separator: ", "))"
+
+                            Text("Local size: \(localStr)\(origStr)\n\(signalText)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                            if item.kind == .proxy, item.masterHash != nil {
+                                HStack(spacing: 10) {
+                                    Button {
+                                        onShareOriginal(item)
+                                    } label: {
+                                        Label("Share Original", systemImage: "square.and.arrow.up")
+                                            .font(.caption.weight(.semibold))
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .disabled(busyItemId != nil)
+
+                                    Button {
+                                        onRestore(item)
+                                    } label: {
+                                        if busyItemId == item.id {
+                                            ProgressView()
+                                                .controlSize(.small)
+                                        } else {
+                                            Label(
+                                                item.isProtectedOriginal ? "Restored" : "Restore",
+                                                systemImage: "icloud.and.arrow.down"
+                                            )
+                                            .font(.caption.weight(.semibold))
+                                        }
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .disabled(busyItemId != nil)
+                                }
+                                .padding(.top, 2)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                } header: {
+                    Text(
+                        proxyCount > 0
+                        ? "Detected \(proxyCount) compressed proxy of \(items.count) item(s)"
+                        : "All \(items.count) checked item(s) look like originals"
+                    )
+                }
+            }
+            .navigationTitle("Gallery Proxy Check")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { onClose() }
+                        .fontWeight(.semibold)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func verdictBadge(for kind: GalleryMediaKind) -> some View {
+        let (title, color): (String, Color) = {
+            switch kind {
+            case .proxy: return ("COMPRESSED PROXY", .orange)
+            case .originalBackedUp: return ("ORIGINAL (BACKED UP)", .green)
+            case .originalUnbacked: return ("ORIGINAL (NOT BACKED UP)", .secondary)
+            case .unknown: return ("ORIGINAL / UNKNOWN (OFFLINE)", .secondary)
+            }
+        }()
+        Text(title)
+            .font(.caption2.bold())
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(color.opacity(0.15), in: Capsule())
+            .foregroundStyle(color)
+    }
+}
+
+private struct PHAssetThumbView: View {
+    let assetId: String?
+    let isVideo: Bool
+    @State private var image: UIImage?
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.secondary.opacity(0.16))
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 48, height: 48)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            } else {
+                Image(systemName: isVideo ? "video" : "photo")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(width: 48, height: 48)
+        .task(id: assetId ?? "") {
+            guard image == nil, let assetId else { return }
+            guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [assetId], options: nil).firstObject else {
+                return
+            }
+            let opts = PHImageRequestOptions()
+            opts.deliveryMode = .opportunistic
+            opts.resizeMode = .fast
+            opts.isNetworkAccessAllowed = true
+            PHImageManager.default().requestImage(
+                for: asset,
+                targetSize: CGSize(width: 120, height: 120),
+                contentMode: .aspectFill,
+                options: opts
+            ) { img, _ in
+                if let img {
+                    DispatchQueue.main.async {
+                        self.image = img
+                    }
+                }
+            }
         }
     }
 }

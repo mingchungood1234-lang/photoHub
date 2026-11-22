@@ -18,6 +18,14 @@ enum CandidateSortMode: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+enum CandidateFilterMode: String, CaseIterable, Identifiable, Sendable {
+    case all = "All"
+    case originals = "Originals"
+    case proxies = "Proxies"
+
+    var id: String { rawValue }
+}
+
 enum PhotoCompressionState: Equatable, Sendable {
     case pending
     case hashing
@@ -97,9 +105,18 @@ struct PhotoCandidate: Identifiable {
     var thumbnail: UIImage?
     var state: PhotoCompressionState = .pending
     var isSelected: Bool = false
+    var masterHash: String? = nil
+    var detectionSource: String? = nil
+    var linkedOriginalName: String? = nil
+    var linkedOriginalBytes: Int64? = nil
+    var isBackedUpOnServer: Bool = false
 
     var isVideo: Bool {
         mediaType == .video
+    }
+
+    var isDetectedProxy: Bool {
+        state == .alreadyProxy
     }
 
     var estimatedSizeLabel: String {

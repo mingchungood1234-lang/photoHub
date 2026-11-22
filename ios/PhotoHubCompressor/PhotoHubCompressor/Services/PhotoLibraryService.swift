@@ -78,6 +78,21 @@ final class PhotoLibraryService {
         return map
     }
 
+    static func readLocalImageDataIfCached(for asset: PHAsset, maxBytes: Int64 = 4_000_000) -> Data? {
+        guard asset.mediaType == .image else { return nil }
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .highQualityFormat
+        options.isNetworkAccessAllowed = false
+        options.isSynchronous = true
+        var resultData: Data?
+        PHImageManager.default().requestImageDataAndOrientation(for: asset, options: options) { data, _, _, _ in
+            if let data, data.count <= Int(maxBytes) {
+                resultData = data
+            }
+        }
+        return resultData
+    }
+
     func scanCandidates(
         tracker: LocalProxyTracker,
         knownServerPhotos: [ServerPhoto] = [],
@@ -105,26 +120,84 @@ final class PhotoLibraryService {
         candidates.reserveCapacity(targetCap)
 
         var prefixToServerPhoto: [String: ServerPhoto] = [:]
+        var hashToServerPhoto: [String: ServerPhoto] = [:]
         prefixToServerPhoto.reserveCapacity(knownServerPhotos.count)
+        hashToServerPhoto.reserveCapacity(knownServerPhotos.count)
         for serverPhoto in knownServerPhotos {
+            hashToServerPhoto[serverPhoto.hash.lowercased()] = serverPhoto
             let prefix = ProxyGenerator.proxyPrefixTag(forMasterHash: serverPhoto.hash)
             if prefix.count >= 8 {
                 prefixToServerPhoto[prefix] = serverPhoto
             }
         }
 
+        var eligibleCount = 0
+        var detectedProxyCount = 0
+        let maxProxyRows = maxResults ?? 300
+
         for i in 0..<totalCount {
-            if let maxResults, candidates.count >= maxResults {
+            if let maxResults, eligibleCount >= maxResults {
                 break
             }
             autoreleasepool {
                 let asset = assets.object(at: i)
                 let localId = asset.localIdentifier
-                if tracker.isKnownProxy(assetId: localId) || tracker.isRestoredOriginal(assetId: localId) {
+                let prefixLen = min(8, localId.count)
+                let shortId = String(localId.prefix(prefixLen))
+                let prefixLabel = asset.mediaType == .video ? "Video" : "Photo"
+
+                func makeCandidate(
+                    filename: String = "\(prefixLabel)_\(shortId)",
+                    state: PhotoCompressionState,
+                    masterHash: String? = nil,
+                    detectionSource: String? = nil,
+                    linkedServerPhoto: ServerPhoto? = nil,
+                    isBackedUp: Bool = false
+                ) -> PhotoCandidate {
+                    PhotoCandidate(
+                        id: localId,
+                        asset: asset,
+                        mediaType: asset.mediaType,
+                        duration: asset.duration,
+                        filename: filename,
+                        pixelWidth: asset.pixelWidth,
+                        pixelHeight: asset.pixelHeight,
+                        creationDate: asset.creationDate,
+                        estimatedBytes: Self.estimateBytes(for: asset),
+                        state: state,
+                        isSelected: false,
+                        masterHash: masterHash,
+                        detectionSource: detectionSource,
+                        linkedOriginalName: linkedServerPhoto?.originalName,
+                        linkedOriginalBytes: linkedServerPhoto?.size,
+                        isBackedUpOnServer: isBackedUp
+                    )
+                }
+
+                // 1. Tracked proxy in LocalProxyTracker
+                if tracker.isKnownProxy(assetId: localId) {
+                    let match = tracker.masterLookup(forAssetId: localId)
+                    let serverMatch = match.flatMap { hashToServerPhoto[$0.masterHash.lowercased()] }
+                    if detectedProxyCount < maxProxyRows {
+                        candidates.append(makeCandidate(
+                            filename: match?.originalName ?? serverMatch?.originalName ?? "\(prefixLabel)_\(shortId)",
+                            state: .alreadyProxy,
+                            masterHash: match?.masterHash,
+                            detectionSource: "Tracked Proxy",
+                            linkedServerPhoto: serverMatch,
+                            isBackedUp: serverMatch != nil
+                        ))
+                        detectedProxyCount += 1
+                    }
                     return
                 }
 
-                // Detect PhotoHub proxies synced across iPhones via iCloud Photos without triggering downloads
+                // 2. Restored original protected on this device
+                if tracker.isRestoredOriginal(assetId: localId) {
+                    return
+                }
+
+                // 3. Filename tag PHOTOHUB_PROXY_<prefix16> from local or iCloud PHAssetResource
                 if let proxyMatch = Self.proxyHashPrefixFromAssetResources(asset) {
                     let matchedServerPhoto = prefixToServerPhoto[proxyMatch.prefix]
                     tracker.markAsProxy(
@@ -133,26 +206,50 @@ final class PhotoLibraryService {
                         masterHash: matchedServerPhoto?.hash,
                         originalName: matchedServerPhoto?.originalName ?? proxyMatch.filename
                     )
+                    if detectedProxyCount < maxProxyRows {
+                        candidates.append(makeCandidate(
+                            filename: matchedServerPhoto?.originalName ?? proxyMatch.filename,
+                            state: .alreadyProxy,
+                            masterHash: matchedServerPhoto?.hash,
+                            detectionSource: "Filename Tag",
+                            linkedServerPhoto: matchedServerPhoto,
+                            isBackedUp: matchedServerPhoto != nil
+                        ))
+                        detectedProxyCount += 1
+                    }
                     return
                 }
 
-                let prefixLen = min(8, localId.count)
-                let shortId = String(localId.prefix(prefixLen))
-                let prefixLabel = asset.mediaType == .video ? "Video" : "Photo"
+                // 4. Embedded EXIF PhotoHubProxy:<masterHash> marker on compact local images
+                if asset.mediaType == .image,
+                   max(asset.pixelWidth, asset.pixelHeight) <= 2400,
+                   let localData = Self.readLocalImageDataIfCached(for: asset, maxBytes: 4_000_000),
+                   let embeddedMaster = ProxyGenerator.extractEmbeddedProxyMasterHash(fromImageData: localData) {
+                    let prefix = ProxyGenerator.proxyPrefixTag(forMasterHash: embeddedMaster)
+                    let matchedServerPhoto = hashToServerPhoto[embeddedMaster.lowercased()] ?? prefixToServerPhoto[prefix]
+                    let resolvedMaster = matchedServerPhoto?.hash ?? embeddedMaster
+                    tracker.markAsProxy(
+                        assetId: localId,
+                        proxySha256: matchedServerPhoto?.proxyHash ?? "",
+                        masterHash: resolvedMaster,
+                        originalName: matchedServerPhoto?.originalName
+                    )
+                    if detectedProxyCount < maxProxyRows {
+                        candidates.append(makeCandidate(
+                            filename: matchedServerPhoto?.originalName ?? "\(prefixLabel)_\(shortId)",
+                            state: .alreadyProxy,
+                            masterHash: resolvedMaster,
+                            detectionSource: "EXIF Metadata",
+                            linkedServerPhoto: matchedServerPhoto,
+                            isBackedUp: matchedServerPhoto != nil
+                        ))
+                        detectedProxyCount += 1
+                    }
+                    return
+                }
 
-                let candidate = PhotoCandidate(
-                    id: localId,
-                    asset: asset,
-                    mediaType: asset.mediaType,
-                    duration: asset.duration,
-                    filename: "\(prefixLabel)_\(shortId)",
-                    pixelWidth: asset.pixelWidth,
-                    pixelHeight: asset.pixelHeight,
-                    creationDate: asset.creationDate,
-                    estimatedBytes: Self.estimateBytes(for: asset)
-                )
-
-                candidates.append(candidate)
+                eligibleCount += 1
+                candidates.append(makeCandidate(state: .pending))
             }
         }
 
@@ -576,6 +673,88 @@ final class PhotoLibraryService {
                 }
             })
         }
+    }
+
+    /// Saves a full-resolution restored original (photo or video) back into Apple Photos,
+    /// preserving original filename and creation timestamp.
+    static func saveRestoredOriginalToPhotosAsync(
+        photo: ServerPhoto,
+        fileURL: URL
+    ) async throws -> String {
+        let isVideo = photo.isVideo
+        let targetFilename = photo.originalName
+        let targetDate = photo.parsedCreationDate
+
+        return try await withCheckedThrowingContinuation { continuation in
+            var placeholderId: String?
+            PHPhotoLibrary.shared().performChanges({
+                let request: PHAssetChangeRequest?
+                if isVideo {
+                    request = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: fileURL)
+                } else {
+                    let creationReq = PHAssetCreationRequest.forAsset()
+                    let options = PHAssetResourceCreationOptions()
+                    options.originalFilename = targetFilename
+                    creationReq.addResource(with: .photo, fileURL: fileURL, options: options)
+                    request = creationReq
+                }
+                request?.creationDate = targetDate
+                placeholderId = request?.placeholderForCreatedAsset?.localIdentifier
+            }) { success, error in
+                if success {
+                    continuation.resume(returning: placeholderId ?? "")
+                } else {
+                    let msg = error?.localizedDescription ?? "Unknown error"
+                    continuation.resume(throwing: PhotoLibraryError.proxyReplacementFailed(msg))
+                }
+            }
+        }
+    }
+
+    /// Downloads the master original for `photo`, saves it into Apple Photos (optionally throttled
+    /// via `photoWriteSemaphore` for batch jobs), marks it restored locally, and protects it on the server.
+    static func restoreMasterToPhotos(
+        photo: ServerPhoto,
+        client: PhotoHubAPIClient,
+        photoWriteSemaphore: AsyncSemaphore? = nil
+    ) async throws -> (updatedPhoto: ServerPhoto?, savedBytes: Int64) {
+        let tempURL = try await client.downloadMasterToTempFile(
+            hash: photo.hash,
+            preferredFilename: photo.originalName
+        )
+        defer {
+            let parent = tempURL.deletingLastPathComponent()
+            if parent.lastPathComponent.hasPrefix("photohub_share_") {
+                try? FileManager.default.removeItem(at: parent)
+            } else {
+                try? FileManager.default.removeItem(at: tempURL)
+            }
+        }
+
+        let fileSize = (try? tempURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { Int64($0) } ?? photo.size
+        if let sem = photoWriteSemaphore {
+            await sem.acquire()
+        }
+        let createdLocalId: String
+        do {
+            createdLocalId = try await saveRestoredOriginalToPhotosAsync(photo: photo, fileURL: tempURL)
+            if let sem = photoWriteSemaphore {
+                await sem.release()
+            }
+        } catch {
+            if let sem = photoWriteSemaphore {
+                await sem.release()
+            }
+            throw error
+        }
+
+        // Record both locally (asset ID + hash) and on the server so auto-cleanup won't re-compress it.
+        LocalProxyTracker.shared.markRestoredOriginal(
+            assetId: createdLocalId.isEmpty ? nil : createdLocalId,
+            masterHash: photo.hash
+        )
+        let updated = try? await client.setOriginalProtected(masterHash: photo.hash, protected: true)
+        return (updated, fileSize)
     }
 
     func testDeletePromptOnLatestAsset(completion: @escaping (String) -> Void) {
