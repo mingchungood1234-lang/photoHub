@@ -138,12 +138,12 @@ final class AppSettings: ObservableObject {
     }
 
     var gatewayURL: URL? {
-        Self.normalizeURL(Self.buildGatewayURLString)
+        Self.normalizeURL(Self.buildGatewayURLString, defaultScheme: "https")
     }
 
-    /// Automatic storage server endpoint assigned by the gateway after login (falls back to gateway URL).
+    /// Automatic storage server endpoint assigned by the gateway after login (supports HTTP or HTTPS storage nodes).
     var normalizedBaseURL: URL? {
-        Self.normalizeURL(assignedServerURLString) ?? gatewayURL
+        Self.normalizeURL(assignedServerURLString, defaultScheme: "http") ?? gatewayURL
     }
 
     /// Stable account cache scope key (never stores the raw JWT inside filenames).
@@ -231,7 +231,7 @@ final class AppSettings: ObservableObject {
         serverStorage = nil
     }
 
-    private static func normalizeURL(_ raw: String) -> URL? {
+    private static func normalizeURL(_ raw: String, defaultScheme: String = "https") -> URL? {
         let trimmed = raw
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -239,6 +239,6 @@ final class AppSettings: ObservableObject {
         if trimmed.lowercased().hasPrefix("http://") || trimmed.lowercased().hasPrefix("https://") {
             return URL(string: trimmed)
         }
-        return URL(string: "https://\(trimmed)")
+        return URL(string: "\(defaultScheme)://\(trimmed)")
     }
 }

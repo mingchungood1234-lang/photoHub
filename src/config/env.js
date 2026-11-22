@@ -83,7 +83,22 @@ function parseListCsv(raw) {
 }
 
 /**
- * Parses STORAGE_NODES="node1=https://s1.example.com,node2=https://s2.example.com"
+ * Normalizes a storage node URL without forcing HTTPS.
+ * Explicit `http://` or `https://` schemes are preserved; scheme-less hosts default
+ * to `http://` (or `https://` if port `:443`) so LAN/VPN/IP storage nodes work over HTTP.
+ */
+function normalizeNodeUrl(rawUrl, defaultProtocol = 'http') {
+  const trimmed = String(rawUrl || '').trim().replace(/\/+$/, '');
+  if (!trimmed) return '';
+  if (/^https?:\/\//i.test(trimmed)) {
+    return trimmed;
+  }
+  const proto = /:443(?:\/|$)/.test(trimmed) ? 'https' : defaultProtocol;
+  return `${proto}://${trimmed}`;
+}
+
+/**
+ * Parses STORAGE_NODES="node1=https://s1.example.com,node2=http://192.168.1.50:3000"
  * into [{ id, url }].
  */
 function parseStorageNodes(rawNodes) {
@@ -91,7 +106,7 @@ function parseStorageNodes(rawNodes) {
     return rawNodes
       .map((item) => ({
         id: String(item.id || '').trim(),
-        url: String(item.url || '').trim().replace(/\/+$/, ''),
+        url: normalizeNodeUrl(item.url, 'http'),
       }))
       .filter((item) => item.id && item.url);
   }
@@ -104,7 +119,8 @@ function parseStorageNodes(rawNodes) {
     if (!trimmed) continue;
     const eqIdx = trimmed.indexOf('=');
     const id = (eqIdx !== -1 ? trimmed.slice(0, eqIdx) : `node${nodes.length + 1}`).trim();
-    const url = (eqIdx !== -1 ? trimmed.slice(eqIdx + 1) : trimmed).trim().replace(/\/+$/, '');
+    const rawUrl = eqIdx !== -1 ? trimmed.slice(eqIdx + 1) : trimmed;
+    const url = normalizeNodeUrl(rawUrl, 'http');
     if (id && url && !seen.has(id)) {
       seen.add(id);
       nodes.push({ id, url });
@@ -302,4 +318,4 @@ function getConfig(overrides = {}) {
   };
 }
 
-module.exports = { getConfig, resolvePath, parseUserKeys, sanitizeUserFolder, gbToBytes };
+module.exports = { getConfig, resolvePath, parseUserKeys, sanitizeUserFolder, normalizeNodeUrl, gbToBytes };

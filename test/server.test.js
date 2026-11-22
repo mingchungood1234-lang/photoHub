@@ -1610,3 +1610,69 @@ test('Server-side single and batch photo deletion removes files, proxies, and qu
   assert.equal(bobList.total, 1);
   assert.equal(bobList.photos[0].hash, upB1.hash);
 });
+
+test('Gateway stays HTTPS while storage nodes support explicit http:// and scheme-less HTTP defaults', async (t) => {
+  const sharedSecret = 'http-storage-node-shared-secret-1234567890abcdef';
+  const gwCtx = await startTestServer({
+    publicUrl: 'https://photohub.mingchun.us.ci',
+    googleClientId: 'google-client-id.apps.googleusercontent.com',
+    googleClientSecret: 'google-client-secret',
+    authSessionSecret: sharedSecret,
+    storageNodes: 'node1=https://photohub.mingchun.us.ci,node2=http://192.168.1.50:3000,node3=100.64.0.12:3000',
+    userNodeMap: 'lan@gmail.com=node2,tailscale@gmail.com=node3,custom@gmail.com=192.168.1.99:3000',
+    exchangeGoogleCodeForProfile: async ({ code }) => ({
+      sub: `sub-${code}`,
+      email: `${code}@gmail.com`,
+      name: code,
+    }),
+  });
+  t.after(() => gwCtx.cleanup());
+
+  const loginAs = async (name) => {
+    const verifier = `verifier_${name}_0123456789abcdefghijklmnopqrstuvwxyz`;
+    const challenge = crypto
+      .createHash('sha256')
+      .update(verifier, 'utf8')
+      .digest('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/g, '');
+    const startRes = await gwCtx.request(
+      `/api/auth/google/start?code_challenge=${encodeURIComponent(challenge)}&redirect_uri=${encodeURIComponent('photohub://auth/callback')}`
+    );
+    const signedState = new URL(startRes.headers.location).searchParams.get('state');
+    const cbRes = await gwCtx.request(
+      `/api/auth/google/callback?code=${encodeURIComponent(name)}&state=${encodeURIComponent(signedState)}`
+    );
+    const code = new URL(cbRes.headers.location).searchParams.get('code');
+    const exRes = await gwCtx.request('/api/auth/exchange', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code, codeVerifier: verifier }),
+    });
+    assert.equal(exRes.status, 200);
+    return exRes.json();
+  };
+
+  const lanSession = await loginAs('lan');
+  assert.equal(lanSession.nodeId, 'node2');
+  assert.equal(lanSession.serverUrl, 'http://192.168.1.50:3000');
+
+  const tsSession = await loginAs('tailscale');
+  assert.equal(tsSession.nodeId, 'node3');
+  assert.equal(tsSession.serverUrl, 'http://100.64.0.12:3000');
+
+  const customSession = await loginAs('custom');
+  assert.equal(customSession.nodeId, 'custom');
+  assert.equal(customSession.serverUrl, 'http://192.168.1.99:3000');
+
+  // Verify /api/auth/resolve also returns http:// node2 URL while gateway stays HTTPS
+  const resolveRes = await gwCtx.request('/api/auth/resolve', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${lanSession.token}` },
+  });
+  assert.equal(resolveRes.status, 200);
+  const resolved = await resolveRes.json();
+  assert.equal(resolved.nodeId, 'node2');
+  assert.equal(resolved.serverUrl, 'http://192.168.1.50:3000');
+});

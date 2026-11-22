@@ -226,4 +226,21 @@ class PhotoHubUnitTest {
         assertFalse(originalCandidate.isDetectedProxy)
         assertFalse(originalCandidate.state.isFinished)
     }
+
+    @Test
+    fun `storage node normalization supports http without forcing https while gateway defaults to https`() {
+        val httpNodeState = AppSettingsState(assignedServerUrl = "http://192.168.1.50:3000")
+        assertEquals("http://192.168.1.50:3000", httpNodeState.normalizedBaseUrl)
+
+        val schemelessNodeState = AppSettingsState(assignedServerUrl = "100.64.0.12:3000")
+        assertEquals("http://100.64.0.12:3000", schemelessNodeState.normalizedBaseUrl)
+
+        val httpsNodeState = AppSettingsState(assignedServerUrl = "https://photohub.mingchun.us.ci")
+        assertEquals("https://photohub.mingchun.us.ci", httpsNodeState.normalizedBaseUrl)
+
+        assertEquals(
+            "https://photohub.mingchun.us.ci",
+            AppSettingsState.normalizeUrl("photohub.mingchun.us.ci", defaultScheme = "https")
+        )
+    }
 }

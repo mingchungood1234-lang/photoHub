@@ -84,6 +84,12 @@ struct SettingsView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+                    if let nodeURL = settings.normalizedBaseURL?.absoluteString {
+                        Text(nodeURL)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
                 }
 
                 Spacer()

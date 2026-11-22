@@ -15,7 +15,7 @@
 const fsp = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
-const { sanitizeUserFolder } = require('../config/env');
+const { sanitizeUserFolder, normalizeNodeUrl } = require('../config/env');
 
 function toBase64Url(input) {
   const buf = Buffer.isBuffer(input) ? input : Buffer.from(String(input), 'utf8');
@@ -169,8 +169,11 @@ function selectNodeForUser({ sub, email, publicBaseUrl, config, existingNodeId }
     if (mappedNode) {
       return { nodeId: mappedNode.id, serverUrl: mappedNode.url };
     }
-    if (/^https?:\/\//i.test(mappedId)) {
-      return { nodeId: 'custom', serverUrl: mappedId.replace(/\/+$/, '') };
+    if (/^https?:\/\//i.test(mappedId) || /[:./]/.test(mappedId)) {
+      const normalizedCustom = normalizeNodeUrl(mappedId, 'http');
+      if (normalizedCustom) {
+        return { nodeId: 'custom', serverUrl: normalizedCustom };
+      }
     }
   }
 

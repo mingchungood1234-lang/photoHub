@@ -114,6 +114,14 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
+                            settingsState.normalizedBaseUrl?.let { nodeUrl ->
+                                Text(
+                                    text = nodeUrl,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1
+                                )
+                            }
                         }
                         Surface(shape = CircleShape, color = PhotoHubGreen.copy(alpha = 0.14f)) {
                             Text(
