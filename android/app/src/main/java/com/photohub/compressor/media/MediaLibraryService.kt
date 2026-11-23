@@ -190,8 +190,6 @@ class MediaLibraryService(private val context: Context) {
         val candidates = mutableListOf<PhotoCandidate>()
         var inspected = 0
         var eligibleCount = 0
-        var detectedProxyCount = 0
-        val maxProxyRows = maxResults ?: 300
 
         resolver.query(collection, projection.toTypedArray(), selection, args, sortOrder)?.use { cursor ->
             val idCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID)
@@ -235,46 +233,8 @@ class MediaLibraryService(private val context: Context) {
                 val dateMs = (takenMs.takeIf { it > 0L } ?: addedMs).takeIf { it > 0L }
                 val durMs = if (isVideo && durCol >= 0 && !cursor.isNull(durCol)) cursor.getLong(durCol) else 0L
 
-                fun makeCandidate(
-                    state: PhotoCompressionState,
-                    masterHash: String? = null,
-                    detectionSource: String? = null,
-                    linkedServer: ServerPhoto? = null
-                ) = PhotoCandidate(
-                    id = assetId,
-                    mediaStoreId = id,
-                    isVideo = isVideo,
-                    durationMs = durMs,
-                    filename = linkedServer?.originalName ?: displayName,
-                    mimeType = mime,
-                    pixelWidth = w,
-                    pixelHeight = h,
-                    creationDateMs = dateMs,
-                    estimatedBytes = sizeBytes,
-                    state = state,
-                    isSelected = false,
-                    masterHash = masterHash,
-                    detectionSource = detectionSource,
-                    linkedOriginalName = linkedServer?.originalName,
-                    linkedOriginalBytes = linkedServer?.size,
-                    isBackedUpOnServer = linkedServer != null
-                )
-
-                // 1. Tracked proxy in LocalProxyTracker
+                // 1. Tracked proxy in LocalProxyTracker (auto-detected & skipped cleanly)
                 if (tracker.isKnownProxy(assetId)) {
-                    val match = tracker.masterLookup(assetId)
-                    val linkedServer = match?.masterHash?.let { hashToServer[it.lowercase()] }
-                    if (detectedProxyCount < maxProxyRows) {
-                        candidates.add(
-                            makeCandidate(
-                                state = PhotoCompressionState.AlreadyProxy,
-                                masterHash = match?.masterHash,
-                                detectionSource = "Tracked Proxy",
-                                linkedServer = linkedServer
-                            )
-                        )
-                        detectedProxyCount++
-                    }
                     continue
                 }
 
@@ -288,17 +248,6 @@ class MediaLibraryService(private val context: Context) {
                         masterHash = matched?.hash,
                         originalName = matched?.originalName ?: displayName
                     )
-                    if (detectedProxyCount < maxProxyRows) {
-                        candidates.add(
-                            makeCandidate(
-                                state = PhotoCompressionState.AlreadyProxy,
-                                masterHash = matched?.hash,
-                                detectionSource = "Filename Tag",
-                                linkedServer = matched
-                            )
-                        )
-                        detectedProxyCount++
-                    }
                     continue
                 }
 
@@ -319,23 +268,27 @@ class MediaLibraryService(private val context: Context) {
                             masterHash = resolvedMaster,
                             originalName = matched?.originalName ?: displayName
                         )
-                        if (detectedProxyCount < maxProxyRows) {
-                            candidates.add(
-                                makeCandidate(
-                                    state = PhotoCompressionState.AlreadyProxy,
-                                    masterHash = resolvedMaster,
-                                    detectionSource = "EXIF Metadata",
-                                    linkedServer = matched
-                                )
-                            )
-                            detectedProxyCount++
-                        }
                         continue
                     }
                 }
 
                 eligibleCount++
-                candidates.add(makeCandidate(state = PhotoCompressionState.Pending))
+                candidates.add(
+                    PhotoCandidate(
+                        id = assetId,
+                        mediaStoreId = id,
+                        isVideo = isVideo,
+                        durationMs = durMs,
+                        filename = displayName,
+                        mimeType = mime,
+                        pixelWidth = w,
+                        pixelHeight = h,
+                        creationDateMs = dateMs,
+                        estimatedBytes = sizeBytes,
+                        state = PhotoCompressionState.Pending,
+                        isSelected = false
+                    )
+                )
             }
         }
 

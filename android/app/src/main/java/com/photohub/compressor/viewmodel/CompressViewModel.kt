@@ -31,7 +31,6 @@ data class TrashPromptRequest(
 data class CompressUiState(
     val candidates: List<PhotoCandidate> = emptyList(),
     val thumbnails: Map<String, Bitmap> = emptyMap(),
-    val filterMode: CompressFilterMode = CompressFilterMode.ALL,
     val isCheckingServerProxies: Boolean = false,
     val isInspectingGalleryUris: Boolean = false,
     val galleryInspectionResults: List<GalleryProxyInspectionItem>? = null,
@@ -56,22 +55,6 @@ data class CompressUiState(
 ) {
     val selectedCount: Int
         get() = candidates.count { it.isSelected && !it.state.isFinished }
-
-    val detectedProxies: List<PhotoCandidate>
-        get() = candidates.filter { it.isDetectedProxy }
-
-    val detectedProxyCount: Int
-        get() = detectedProxies.size
-
-    val originalCandidatesCount: Int
-        get() = candidates.count { !it.isDetectedProxy }
-
-    val displayedCandidates: List<PhotoCandidate>
-        get() = when (filterMode) {
-            CompressFilterMode.ALL -> candidates
-            CompressFilterMode.ORIGINALS -> candidates.filter { !it.isDetectedProxy }
-            CompressFilterMode.PROXIES -> candidates.filter { it.isDetectedProxy }
-        }
 
     val pendingVideoCandidates: List<PhotoCandidate>
         get() = candidates.filter { it.isVideo && !it.state.isFinished }
@@ -115,10 +98,6 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
                 handleNotificationOpenCleanup()
             }
         }
-    }
-
-    fun setFilterMode(mode: CompressFilterMode) {
-        _uiState.update { it.copy(filterMode = mode) }
     }
 
     fun refreshPermissionsAndSync() {
@@ -167,7 +146,6 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
                 .cachedPhotos(cur.normalizedBaseUrl, cur.apiKeyCacheScope)
             val raw = mediaService.scanCandidates(tracker = tracker, knownServerPhotos = cached)
             val sorted = PhotoBackupPipeline.sortCandidates(raw, mode)
-            val proxyCount = sorted.count { it.isDetectedProxy }
             val eligibleCount = sorted.count { !it.state.isFinished }
             withContext(Dispatchers.Main) {
                 applyScannedCandidates(sorted)
@@ -175,11 +153,10 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
                     it.copy(
                         pendingDeleteIds = emptyList(),
                         isScanning = false,
-                        filterMode = if (eligibleCount == 0 && proxyCount > 0) CompressFilterMode.PROXIES else it.filterMode,
-                        statusBanner = when {
-                            sorted.isEmpty() -> "No photos or videos found in your Gallery."
-                            eligibleCount == 0 && proxyCount > 0 -> "Auto-detected $proxyCount compressed proxy item(s) in your Gallery."
-                            else -> it.statusBanner
+                        statusBanner = if (sorted.isEmpty()) {
+                            "No uncompressed gallery photos or videos found to compress."
+                        } else {
+                            null
                         }
                     )
                 }
@@ -242,7 +219,6 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
                 }
             }
             val eligibleCount = sorted.count { !it.state.isFinished }
-            val proxyCount = sorted.count { it.isDetectedProxy }
             withContext(Dispatchers.Main) {
                 applyScannedCandidates(sorted)
                 _uiState.update { it.copy(isScanning = false) }
@@ -251,13 +227,7 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
                     startProcessingSelectedPhotos()
                 } else if (eligibleCount == 0) {
                     _uiState.update {
-                        it.copy(
-                            statusBanner = if (proxyCount > 0) {
-                                "All scanned photos & videos are already backed up or compressed proxies ($proxyCount proxy detected)."
-                            } else {
-                                "All scanned photos & videos are already backed up."
-                            }
-                        )
+                        it.copy(statusBanner = "All scanned photos & videos are already backed up.")
                     }
                 }
             }
@@ -284,7 +254,15 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
                     withContext(Dispatchers.Main) {
                         _uiState.update { prev ->
                             val updated = applyDeepMatches(prev.candidates, matches)
-                            prev.copy(candidates = updated, isCheckingServerProxies = false)
+                            prev.copy(
+                                candidates = updated,
+                                isCheckingServerProxies = false,
+                                statusBanner = if (updated.isEmpty()) {
+                                    "All scanned photos & videos are already backed up."
+                                } else {
+                                    prev.statusBanner
+                                }
+                            )
                         }
                     }
                 } else {
@@ -303,29 +281,13 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
     private fun applyDeepMatches(
         candidates: List<PhotoCandidate>,
         matches: Map<String, CandidateDeepCheckMatch>
-    ): List<PhotoCandidate> = candidates.map { item ->
-        val m = matches[item.id] ?: return@map item
+    ): List<PhotoCandidate> = candidates.mapNotNull { item ->
+        val m = matches[item.id] ?: return@mapNotNull item
         when {
-            m.isProxy -> item.copy(
-                state = PhotoCompressionState.AlreadyProxy,
-                isSelected = false,
-                masterHash = m.masterHash ?: item.masterHash,
-                detectionSource = m.signal,
-                linkedOriginalName = m.originalName ?: item.linkedOriginalName,
-                linkedOriginalBytes = m.originalSizeBytes ?: item.linkedOriginalBytes,
-                isBackedUpOnServer = true
-            )
-            m.isMaster && m.isProtectedOriginal -> item.copy(
-                state = PhotoCompressionState.Skipped("Restored Original (Protected)"),
-                isSelected = false,
-                masterHash = m.masterHash ?: item.masterHash,
-                detectionSource = m.signal,
-                linkedOriginalName = m.originalName ?: item.linkedOriginalName,
-                linkedOriginalBytes = m.originalSizeBytes ?: item.linkedOriginalBytes,
-                isBackedUpOnServer = true
-            )
+            m.isProxy || (m.isMaster && m.isProtectedOriginal) -> null
             m.isMaster -> item.copy(
                 masterHash = m.masterHash ?: item.masterHash,
+                detectionSource = m.signal,
                 linkedOriginalName = m.originalName ?: item.linkedOriginalName,
                 linkedOriginalBytes = m.originalSizeBytes ?: item.linkedOriginalBytes,
                 isBackedUpOnServer = true
@@ -632,11 +594,11 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
                             )
                         )
                     }
-                    is BackupPipelineResult.SkippedExistingProxy -> {
-                        updateCandidateState(id, PhotoCompressionState.AlreadyProxy, clearSelect = true)
-                    }
+                    is BackupPipelineResult.SkippedExistingProxy,
                     is BackupPipelineResult.SkippedProtectedOriginal -> {
-                        updateCandidateState(id, PhotoCompressionState.Skipped("Restored Original Protected"), clearSelect = true)
+                        _uiState.update { prev ->
+                            prev.copy(candidates = prev.candidates.filterNot { it.id == id })
+                        }
                     }
                     is BackupPipelineResult.SkippedInFlight -> {
                         val state = if (AssetUploadCoordinator.isClaimedByBackground(id)) {
@@ -873,36 +835,17 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             try {
                 val results = GalleryProxyDetector.inspectPickedUris(context, settings, uris)
-                val proxyCount = results.count { it.kind == GalleryMediaKind.PROXY }
-                val updatedCandidates = _uiState.value.candidates.map { cand ->
-                    val match = results.firstOrNull {
-                        it.kind == GalleryMediaKind.PROXY &&
+                val updatedCandidates = _uiState.value.candidates.filterNot { cand ->
+                    results.any {
+                        (it.kind == GalleryMediaKind.PROXY || it.isProtectedOriginal) &&
                             (it.id == cand.id || (cand.masterHash != null && cand.masterHash.equals(it.masterHash, ignoreCase = true)))
-                    }
-                    if (match != null) {
-                        cand.copy(
-                            state = PhotoCompressionState.AlreadyProxy,
-                            isSelected = false,
-                            masterHash = match.masterHash ?: cand.masterHash,
-                            detectionSource = match.signals.firstOrNull() ?: "Gallery Check",
-                            linkedOriginalName = match.originalName,
-                            linkedOriginalBytes = match.originalSizeBytes,
-                            isBackedUpOnServer = match.masterHash != null
-                        )
-                    } else {
-                        cand
                     }
                 }
                 _uiState.update {
                     it.copy(
                         candidates = updatedCandidates,
                         isInspectingGalleryUris = false,
-                        galleryInspectionResults = results,
-                        statusBanner = if (proxyCount > 0) {
-                            "Gallery Check: detected $proxyCount compressed proxy(s) out of ${results.size} item(s)."
-                        } else {
-                            "Gallery Check: all ${results.size} selected item(s) are full originals."
-                        }
+                        galleryInspectionResults = results
                     )
                 }
             } catch (err: Exception) {

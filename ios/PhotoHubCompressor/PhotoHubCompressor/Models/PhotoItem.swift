@@ -18,14 +18,6 @@ enum CandidateSortMode: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
-enum CandidateFilterMode: String, CaseIterable, Identifiable, Sendable {
-    case all = "All"
-    case originals = "Originals"
-    case proxies = "Proxies"
-
-    var id: String { rawValue }
-}
-
 enum PhotoCompressionState: Equatable, Sendable {
     case pending
     case hashing

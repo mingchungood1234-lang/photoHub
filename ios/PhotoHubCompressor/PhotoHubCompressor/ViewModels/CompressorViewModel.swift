@@ -18,7 +18,6 @@ final class CompressorViewModel: ObservableObject {
     @Published var totalToProcess: Int = 0
     @Published var overallProgressFraction: Double = 0
     @Published var sortMode: CandidateSortMode
-    @Published var filterMode: CandidateFilterMode = .all
     @Published var isCheckingServerProxies: Bool = false
     @Published var isInspectingGalleryPicks: Bool = false
     @Published var galleryInspectionItems: [GalleryProxyInspectionItem]? = nil
@@ -48,29 +47,6 @@ final class CompressorViewModel: ObservableObject {
 
     var selectedCount: Int {
         candidates.filter { $0.isSelected && !$0.state.isFinished }.count
-    }
-
-    var detectedProxies: [PhotoCandidate] {
-        candidates.filter { $0.isDetectedProxy }
-    }
-
-    var detectedProxyCount: Int {
-        detectedProxies.count
-    }
-
-    var originalCandidatesCount: Int {
-        candidates.filter { !$0.isDetectedProxy }.count
-    }
-
-    var displayedCandidates: [PhotoCandidate] {
-        switch filterMode {
-        case .all:
-            return candidates
-        case .originals:
-            return candidates.filter { !$0.isDetectedProxy }
-        case .proxies:
-            return candidates.filter { $0.isDetectedProxy }
-        }
     }
 
     var pendingVideoCandidates: [PhotoCandidate] {
@@ -124,7 +100,6 @@ final class CompressorViewModel: ObservableObject {
                 Task.detached(priority: .userInitiated) { [weak self] in
                     let raw = service.scanCandidates(tracker: tracker, knownServerPhotos: cachedServerPhotos)
                     let sorted = PhotoBackupPipeline.sortCandidates(raw, by: mode)
-                    let proxyCount = sorted.filter(\.isDetectedProxy).count
                     let eligibleCount = sorted.filter { !$0.state.isFinished }.count
                     await MainActor.run {
                         guard let self else { return }
@@ -132,11 +107,8 @@ final class CompressorViewModel: ObservableObject {
                         self.pendingDeleteAssets.removeAll()
                         self.pendingAutoDeleteWhenActive = false
                         self.isScanning = false
-                        if eligibleCount == 0 && proxyCount > 0 {
-                            self.filterMode = .proxies
-                            self.statusBanner = "Auto-detected \(proxyCount) compressed proxy item(s) in Apple Photos."
-                        } else if sorted.isEmpty {
-                            self.statusBanner = "No photos or videos found in Apple Photos."
+                        if sorted.isEmpty {
+                            self.statusBanner = "No uncompressed photos or videos found to compress."
                         }
                         if eligibleCount > 0 && isSignedIn {
                             self.launchDeepProxyDetection(cachedServerPhotos: cachedServerPhotos)
@@ -203,7 +175,6 @@ final class CompressorViewModel: ObservableObject {
                         }
                     }
                     let eligibleCount = sorted.filter { !$0.state.isFinished }.count
-                    let proxyCount = sorted.filter(\.isDetectedProxy).count
                     await MainActor.run {
                         guard let self else { return }
                         self.applyScannedCandidates(sorted)
@@ -212,9 +183,7 @@ final class CompressorViewModel: ObservableObject {
                             self.selectAllEligible(true)
                             self.startProcessingSelectedPhotos()
                         } else if eligibleCount == 0 {
-                            self.statusBanner = proxyCount > 0
-                                ? "All scanned photos & videos are already backed up or compressed proxies (\(proxyCount) proxy detected)."
-                                : "All scanned photos & videos are already backed up."
+                            self.statusBanner = "All scanned photos & videos are already backed up."
                         }
                     }
                 }
@@ -242,6 +211,9 @@ final class CompressorViewModel: ObservableObject {
                 guard let self else { return }
                 if !matches.isEmpty {
                     self.candidates = Self.applyDeepMatches(self.candidates, matches: matches)
+                    if self.candidates.isEmpty {
+                        self.statusBanner = "All scanned photos & videos are already backed up."
+                    }
                 }
                 self.isCheckingServerProxies = false
             }
@@ -252,27 +224,16 @@ final class CompressorViewModel: ObservableObject {
         _ items: [PhotoCandidate],
         matches: [String: CandidateDeepCheckMatch]
     ) -> [PhotoCandidate] {
-        items.map { item in
+        items.compactMap { item in
             guard let m = matches[item.id] else { return item }
+            if m.isProxy || (m.isMaster && m.isProtectedOriginal) {
+                // Already recorded in LocalProxyTracker; remove cleanly so Compress stays focused on uncompressed items.
+                return nil
+            }
             var copy = item
-            if m.isProxy {
-                copy.state = .alreadyProxy
-                copy.isSelected = false
+            if m.isMaster {
                 copy.masterHash = m.masterHash ?? item.masterHash
                 copy.detectionSource = m.signal
-                copy.linkedOriginalName = m.originalName ?? item.linkedOriginalName
-                copy.linkedOriginalBytes = m.originalSizeBytes ?? item.linkedOriginalBytes
-                copy.isBackedUpOnServer = true
-            } else if m.isMaster && m.isProtectedOriginal {
-                copy.state = .skipped("Restored Original (Protected)")
-                copy.isSelected = false
-                copy.masterHash = m.masterHash ?? item.masterHash
-                copy.detectionSource = m.signal
-                copy.linkedOriginalName = m.originalName ?? item.linkedOriginalName
-                copy.linkedOriginalBytes = m.originalSizeBytes ?? item.linkedOriginalBytes
-                copy.isBackedUpOnServer = true
-            } else if m.isMaster {
-                copy.masterHash = m.masterHash ?? item.masterHash
                 copy.linkedOriginalName = m.originalName ?? item.linkedOriginalName
                 copy.linkedOriginalBytes = m.originalSizeBytes ?? item.linkedOriginalBytes
                 copy.isBackedUpOnServer = true
@@ -636,16 +597,8 @@ final class CompressorViewModel: ObservableObject {
                             verifiedAt: Date()
                         ),
                     ])
-                case .skippedExistingProxy:
-                    if let idx = self.candidates.firstIndex(where: { $0.id == currentId }) {
-                        self.candidates[idx].state = .alreadyProxy
-                        self.candidates[idx].isSelected = false
-                    }
-                case .skippedProtectedOriginal:
-                    if let idx = self.candidates.firstIndex(where: { $0.id == currentId }) {
-                        self.candidates[idx].state = .skipped("Restored Original Protected")
-                        self.candidates[idx].isSelected = false
-                    }
+                case .skippedExistingProxy, .skippedProtectedOriginal:
+                    self.candidates.removeAll { $0.id == currentId }
                 case .skippedInFlight:
                     if let staged = BackgroundBackupManager.shared.stagedItems.first(where: { $0.id == currentId }) {
                         self.stageOriginalForDeletion(id: currentId, asset: candidate.asset, savedBytes: staged.savedBytes)
@@ -850,28 +803,16 @@ final class CompressorViewModel: ObservableObject {
                 cachedServerPhotos: cachedPhotos,
                 isSignedIn: isSignedIn
             )
-            let proxyCount = results.filter { $0.kind == .proxy }.count
             await MainActor.run {
                 guard let self else { return }
                 self.isInspectingGalleryPicks = false
                 self.galleryInspectionItems = results
-                self.statusBanner = proxyCount > 0
-                    ? "Gallery Check: detected \(proxyCount) compressed proxy item(s) out of \(results.count)."
-                    : "Gallery Check: all \(results.count) selected item(s) are full originals."
 
-                // Also sync detected proxies back into currently loaded candidates list
-                for idx in self.candidates.indices {
-                    let cand = self.candidates[idx]
-                    if let match = results.first(where: {
-                        $0.kind == .proxy && ($0.assetId == cand.id || (cand.masterHash != nil && cand.masterHash == $0.masterHash))
-                    }) {
-                        self.candidates[idx].state = .alreadyProxy
-                        self.candidates[idx].isSelected = false
-                        self.candidates[idx].masterHash = match.masterHash ?? cand.masterHash
-                        self.candidates[idx].detectionSource = match.signals.first ?? "Gallery Check"
-                        self.candidates[idx].linkedOriginalName = match.originalName
-                        self.candidates[idx].linkedOriginalBytes = match.originalSizeBytes
-                        self.candidates[idx].isBackedUpOnServer = match.masterHash != nil
+                // Remove any confirmed proxies / protected restored originals from the active Compress queue
+                self.candidates.removeAll { cand in
+                    results.contains {
+                        ($0.kind == .proxy || $0.isProtectedOriginal) &&
+                            ($0.assetId == cand.id || (cand.masterHash != nil && cand.masterHash == $0.masterHash))
                     }
                 }
             }

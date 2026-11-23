@@ -125,21 +125,12 @@ struct LibraryView: View {
                 } else {
                     summaryHeader
                     List {
-                        ForEach(viewModel.displayedCandidates) { item in
+                        ForEach(viewModel.candidates) { item in
                             PhotoCandidateRow(
                                 item: item,
                                 onToggleSelect: {
                                     viewModel.toggleSelection(for: item.id)
-                                },
-                                onRestoreProxy: item.isDetectedProxy && item.masterHash != nil ? {
-                                    viewModel.restoreOriginalFromDetectedProxy(
-                                        itemId: item.id,
-                                        rawMasterHash: item.masterHash,
-                                        originalFilename: item.linkedOriginalName ?? item.filename,
-                                        isVideo: item.isVideo
-                                    )
-                                } : nil,
-                                isBusy: viewModel.inspectionBusyId == item.id
+                                }
                             )
                             .onAppear {
                                 viewModel.loadThumbnailIfNeeded(for: item.id)
@@ -380,38 +371,25 @@ struct LibraryView: View {
 
     private var summaryHeader: some View {
         VStack(spacing: 8) {
-            HStack(spacing: 6) {
-                Image(systemName: "checkmark.shield.fill")
-                    .font(.caption)
-                    .foregroundColor(.green)
-                Text("SHA-256 verified before delete · Originals stay restorable")
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                if viewModel.totalSavedBytes > 0 {
-                    Text("Saved \(ByteCountFormatter.string(fromByteCount: viewModel.totalSavedBytes, countStyle: .file))")
-                        .font(.caption2.bold())
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(Color.green.opacity(0.15), in: Capsule())
-                        .foregroundStyle(.green)
-                }
-            }
-
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("\(viewModel.candidates.count) Items · Selected \(viewModel.selectedCount)")
                         .font(.subheadline.weight(.semibold))
                     let estStr = ByteCountFormatter.string(fromByteCount: viewModel.totalEligibleEstimatedBytes, countStyle: .file)
-                    Text(
-                        viewModel.detectedProxyCount > 0
-                        ? "Uncompressed: ~\(estStr) · \(viewModel.detectedProxyCount) proxy(s) detected"
-                        : "Estimated iPhone space: ~\(estStr)"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    Text("Est. space: ~\(estStr)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
                 Spacer()
+
+                if viewModel.totalSavedBytes > 0 {
+                    Text("Saved \(ByteCountFormatter.string(fromByteCount: viewModel.totalSavedBytes, countStyle: .file))")
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.green.opacity(0.15), in: Capsule())
+                        .foregroundStyle(.green)
+                }
 
                 if !viewModel.pendingVideoCandidates.isEmpty && !viewModel.isProcessing {
                     let vidStr = ByteCountFormatter.string(fromByteCount: viewModel.pendingVideoEstimatedBytes, countStyle: .file)
@@ -426,20 +404,11 @@ struct LibraryView: View {
                 }
             }
 
-            if viewModel.detectedProxyCount > 0 || viewModel.filterMode != .all {
-                Picker("Gallery Filter", selection: $viewModel.filterMode) {
-                    Text("All (\(viewModel.candidates.count))").tag(CandidateFilterMode.all)
-                    Text("Originals (\(viewModel.originalCandidatesCount))").tag(CandidateFilterMode.originals)
-                    Text("Proxies (\(viewModel.detectedProxyCount))").tag(CandidateFilterMode.proxies)
-                }
-                .pickerStyle(.segmented)
-            }
-
             if viewModel.isCheckingServerProxies {
                 HStack(spacing: 6) {
                     ProgressView()
                         .controlSize(.small)
-                    Text("Checking server index for renamed Photos proxies…")
+                    Text("Filtering out already-compressed proxies…")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -452,13 +421,19 @@ struct LibraryView: View {
             }
             .pickerStyle(.segmented)
 
-            Text(
-                keepLocalProxyInPhotos
-                ? "After upload & SHA-256 verification: keeps a lightweight proxy in Apple Photos and prompts you to delete the large original."
-                : "After upload & SHA-256 verification: prompts you to delete the original from Apple Photos completely (stays backed up on Server)."
-            )
-            .font(.caption2)
-            .foregroundStyle(.secondary)
+            HStack(spacing: 5) {
+                Image(systemName: "checkmark.shield.fill")
+                    .font(.caption2)
+                    .foregroundColor(.green)
+                Text(
+                    keepLocalProxyInPhotos
+                    ? "SHA-256 verified before delete · Keeps a lightweight proxy in Apple Photos"
+                    : "SHA-256 verified before delete · Removes local copy (stays on Server)"
+                )
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.horizontal)
@@ -492,8 +467,13 @@ struct LibraryView: View {
 private struct PhotoCandidateRow: View {
     let item: PhotoCandidate
     let onToggleSelect: () -> Void
-    let onRestoreProxy: (() -> Void)?
-    let isBusy: Bool
+
+    private static let dateFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.dateStyle = .medium
+        df.timeStyle = .none
+        return df
+    }()
 
     var body: some View {
         HStack(spacing: 12) {
@@ -535,60 +515,26 @@ private struct PhotoCandidateRow: View {
                     Text(item.estimatedSizeLabel)
                         .font(.caption.monospacedDigit().weight(.medium))
                         .foregroundStyle(item.isVideo ? .orange : .secondary)
-                }
-
-                HStack(spacing: 8) {
-                    Text(item.resolutionLabel)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    if let date = item.creationDate {
-                        Text(date, style: .date)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                HStack(spacing: 6) {
-                    if item.state.isIntegrityVerified {
-                        Image(systemName: "checkmark.shield.fill")
-                            .font(.caption2)
-                            .foregroundStyle(.green)
-                    } else if item.isDetectedProxy {
-                        Text("PROXY")
-                            .font(.caption2.bold())
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1)
-                            .background(Color.blue.opacity(0.15), in: Capsule())
-                            .foregroundStyle(.blue)
-                    } else if item.isBackedUpOnServer {
-                        Text("ORIGINAL · BACKED UP")
-                            .font(.caption2.bold())
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1)
-                            .background(Color.green.opacity(0.15), in: Capsule())
-                            .foregroundStyle(.green)
-                    }
-
-                    Text(statusLineText)
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(badgeColor(for: item.state))
                         .lineLimit(1)
                 }
-            }
 
-            if let onRestoreProxy {
-                if isBusy {
-                    ProgressView()
-                        .controlSize(.small)
-                } else {
-                    Button {
-                        onRestoreProxy()
-                    } label: {
-                        Image(systemName: "icloud.and.arrow.down")
-                            .foregroundStyle(Color.accentColor)
+                Text(subtitleLineText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+
+                if item.state != .pending || item.isBackedUpOnServer {
+                    HStack(spacing: 5) {
+                        if item.state.isIntegrityVerified || item.isBackedUpOnServer {
+                            Image(systemName: "checkmark.shield.fill")
+                                .font(.caption2)
+                                .foregroundStyle(.green)
+                        }
+                        Text(statusLineText)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(item.state == .pending && item.isBackedUpOnServer ? .green : badgeColor(for: item.state))
+                            .lineLimit(1)
                     }
-                    .buttonStyle(.borderless)
                 }
             }
         }
@@ -601,14 +547,16 @@ private struct PhotoCandidateRow: View {
         .padding(.vertical, 4)
     }
 
+    private var subtitleLineText: String {
+        if let date = item.creationDate {
+            return "\(item.resolutionLabel) · \(Self.dateFormatter.string(from: date))"
+        }
+        return item.resolutionLabel
+    }
+
     private var statusLineText: String {
-        if item.isDetectedProxy {
-            let src = item.detectionSource ?? "Detected"
-            if let origSize = item.linkedOriginalBytes, origSize > 0 {
-                let sz = ByteCountFormatter.string(fromByteCount: origSize, countStyle: .file)
-                return "\(src) · Orig \(sz)"
-            }
-            return src
+        if item.state == .pending && item.isBackedUpOnServer {
+            return "Backed up on Server"
         }
         return item.state.label
     }

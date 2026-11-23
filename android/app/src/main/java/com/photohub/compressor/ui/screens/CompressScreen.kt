@@ -508,33 +508,18 @@ fun CompressScreen(
                     uiState = uiState,
                     keepLocalProxy = settingsState.keepLocalProxyInPhotos,
                     onToggleKeepLocal = { settings.setKeepLocalProxyInPhotos(it) },
-                    onSelectVideos = { viewModel.selectTopVideos() },
-                    onSelectFilter = { viewModel.setFilterMode(it) }
+                    onSelectVideos = { viewModel.selectTopVideos() }
                 )
 
-                val visibleList = uiState.displayedCandidates
                 LazyColumn(modifier = Modifier.fillMaxSize()) {
-                    items(visibleList, key = { it.id }) { item ->
+                    items(uiState.candidates, key = { it.id }) { item ->
                         LaunchedEffect(item.id) {
                             viewModel.loadThumbnailIfNeeded(item)
                         }
                         CandidateRow(
                             item = item,
                             thumbnail = uiState.thumbnails[item.id],
-                            isBusy = uiState.inspectionBusyId == item.id,
-                            onClick = { viewModel.toggleSelection(item.id) },
-                            onRestoreProxy = if (item.isDetectedProxy && !item.masterHash.isNullOrBlank()) {
-                                {
-                                    viewModel.restoreOriginalFromDetectedProxy(
-                                        itemId = item.id,
-                                        rawMasterHash = item.masterHash,
-                                        originalFilename = item.linkedOriginalName ?: item.filename,
-                                        isVideo = item.isVideo
-                                    )
-                                }
-                            } else {
-                                null
-                            }
+                            onClick = { viewModel.toggleSelection(item.id) }
                         )
                         HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
                     }
@@ -570,8 +555,7 @@ private fun SummaryHeader(
     uiState: com.photohub.compressor.viewmodel.CompressUiState,
     keepLocalProxy: Boolean,
     onToggleKeepLocal: (Boolean) -> Unit,
-    onSelectVideos: () -> Unit,
-    onSelectFilter: (CompressFilterMode) -> Unit
+    onSelectVideos: () -> Unit
 ) {
     val context = LocalContext.current
     Column(
@@ -582,14 +566,20 @@ private fun SummaryHeader(
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.Rounded.VerifiedUser, contentDescription = null, tint = PhotoHubGreen, modifier = Modifier.size(16.dp))
-            Spacer(modifier = Modifier.width(6.dp))
-            Text(
-                text = "SHA-256 verified before delete · Originals stay restorable",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.weight(1f)
-            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "${uiState.candidates.size} Items · Selected ${uiState.selectedCount}",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                val estStr = Formatter.formatFileSize(context, uiState.totalEligibleEstimatedBytes)
+                Text(
+                    text = "Est. space: ~$estStr",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
             if (uiState.totalSavedBytes > 0L) {
                 val savedStr = Formatter.formatFileSize(context, uiState.totalSavedBytes)
                 Surface(
@@ -601,29 +591,10 @@ private fun SummaryHeader(
                         style = MaterialTheme.typography.labelSmall,
                         fontWeight = FontWeight.Bold,
                         color = PhotoHubGreen,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                     )
                 }
-            }
-        }
-
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = "${uiState.candidates.size} Items · Selected ${uiState.selectedCount}",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold
-                )
-                val estStr = Formatter.formatFileSize(context, uiState.totalEligibleEstimatedBytes)
-                Text(
-                    text = if (uiState.detectedProxyCount > 0) {
-                        "Uncompressed: ~$estStr · ${uiState.detectedProxyCount} proxy(s) detected"
-                    } else {
-                        "Estimated phone space: ~$estStr"
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+                Spacer(modifier = Modifier.width(6.dp))
             }
 
             if (uiState.pendingVideoCandidates.isNotEmpty() && !uiState.isProcessing) {
@@ -639,30 +610,11 @@ private fun SummaryHeader(
             }
         }
 
-        if (uiState.detectedProxyCount > 0 || uiState.filterMode != CompressFilterMode.ALL) {
-            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-                val modes = listOf(
-                    CompressFilterMode.ALL to "All (${uiState.candidates.size})",
-                    CompressFilterMode.ORIGINALS to "Originals (${uiState.originalCandidatesCount})",
-                    CompressFilterMode.PROXIES to "Proxies (${uiState.detectedProxyCount})"
-                )
-                modes.forEachIndexed { index, (mode, label) ->
-                    SegmentedButton(
-                        selected = uiState.filterMode == mode,
-                        onClick = { onSelectFilter(mode) },
-                        shape = SegmentedButtonDefaults.itemShape(index = index, count = modes.size)
-                    ) {
-                        Text(label, style = MaterialTheme.typography.labelSmall, maxLines = 1)
-                    }
-                }
-            }
-        }
-
         if (uiState.isCheckingServerProxies) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
                 Text(
-                    text = "Checking server index for renamed Gallery proxies…",
+                    text = "Filtering out already-compressed proxies…",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -686,15 +638,20 @@ private fun SummaryHeader(
             }
         }
 
-        Text(
-            text = if (keepLocalProxy) {
-                "After upload & SHA-256 verification: keeps a lightweight proxy in Gallery and prompts you to delete the large original."
-            } else {
-                "After upload & SHA-256 verification: prompts you to delete the original from Gallery completely (stays backed up on Server)."
-            },
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+            Icon(Icons.Rounded.VerifiedUser, contentDescription = null, tint = PhotoHubGreen, modifier = Modifier.size(14.dp))
+            Text(
+                text = if (keepLocalProxy) {
+                    "SHA-256 verified before delete · Keeps a lightweight proxy in Gallery"
+                } else {
+                    "SHA-256 verified before delete · Removes local copy (stays on Server)"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
     }
 }
 
@@ -702,9 +659,7 @@ private fun SummaryHeader(
 private fun CandidateRow(
     item: PhotoCandidate,
     thumbnail: android.graphics.Bitmap?,
-    isBusy: Boolean,
-    onClick: () -> Unit,
-    onRestoreProxy: (() -> Unit)?
+    onClick: () -> Unit
 ) {
     val context = LocalContext.current
     val badgeColor = when (item.state) {
@@ -789,85 +744,42 @@ private fun CandidateRow(
                 )
             }
 
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(
-                    text = item.resolutionLabel,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                item.creationDateMs?.let { ms ->
-                    val dateText = remember(ms) {
-                        java.text.DateFormat.getDateInstance(java.text.DateFormat.MEDIUM).format(java.util.Date(ms))
+            val dateSuffix = item.creationDateMs?.let { ms ->
+                remember(ms) {
+                    " · ${java.text.DateFormat.getDateInstance(java.text.DateFormat.MEDIUM).format(java.util.Date(ms))}"
+                }
+            }.orEmpty()
+            Text(
+                text = "${item.resolutionLabel}$dateSuffix",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+
+            if (item.state !is PhotoCompressionState.Pending || item.isBackedUpOnServer) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                    if (item.state.isIntegrityVerified || item.isBackedUpOnServer) {
+                        Icon(
+                            imageVector = Icons.Rounded.VerifiedUser,
+                            contentDescription = null,
+                            tint = PhotoHubGreen,
+                            modifier = Modifier.size(14.dp)
+                        )
+                    }
+
+                    val statusText = if (item.state is PhotoCompressionState.Pending && item.isBackedUpOnServer) {
+                        "Backed up on Server"
+                    } else {
+                        item.state.label(context)
                     }
                     Text(
-                        text = dateText,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                if (item.state.isIntegrityVerified) {
-                    Icon(
-                        imageVector = Icons.Rounded.VerifiedUser,
-                        contentDescription = null,
-                        tint = PhotoHubGreen,
-                        modifier = Modifier.size(14.dp)
-                    )
-                } else if (item.isDetectedProxy) {
-                    Surface(shape = CircleShape, color = PhotoHubBlue.copy(alpha = 0.14f)) {
-                        Text(
-                            text = "PROXY",
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = PhotoHubBlue,
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)
-                        )
-                    }
-                } else if (item.isBackedUpOnServer) {
-                    Surface(shape = CircleShape, color = PhotoHubGreen.copy(alpha = 0.14f)) {
-                        Text(
-                            text = "ORIGINAL · BACKED UP",
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = PhotoHubGreen,
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)
-                        )
-                    }
-                }
-
-                val statusText = when {
-                    item.isDetectedProxy -> {
-                        val src = item.detectionSource ?: "Detected"
-                        val origSz = item.linkedOriginalBytes?.takeIf { it > 0L }?.let {
-                            " · Orig ${Formatter.formatFileSize(context, it)}"
-                        }.orEmpty()
-                        "$src$origSz"
-                    }
-                    else -> item.state.label(context)
-                }
-                Text(
-                    text = statusText,
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.SemiBold,
-                    color = badgeColor,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
-        }
-
-        if (onRestoreProxy != null) {
-            Spacer(modifier = Modifier.width(6.dp))
-            if (isBusy) {
-                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-            } else {
-                IconButton(onClick = onRestoreProxy) {
-                    Icon(
-                        Icons.Rounded.CloudDownload,
-                        contentDescription = "Restore Original",
-                        tint = MaterialTheme.colorScheme.primary
+                        text = statusText,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (item.state is PhotoCompressionState.Pending && item.isBackedUpOnServer) PhotoHubGreen else badgeColor,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
             }

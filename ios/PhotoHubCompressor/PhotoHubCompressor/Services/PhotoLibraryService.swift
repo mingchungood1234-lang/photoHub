@@ -46,14 +46,31 @@ final class PhotoLibraryService {
     }
 
     /// Reads the original filename stored in Photos SQLite/CoreData without downloading iCloud media bytes.
-    static func proxyHashPrefixFromAssetResources(_ asset: PHAsset) -> (prefix: String, filename: String)? {
+    static func inspectAssetResources(
+        for asset: PHAsset
+    ) -> (proxyMatch: (prefix: String, filename: String)?, originalFilename: String?) {
         let resources = PHAssetResource.assetResources(for: asset)
+        var primaryFilename: String?
+        var fallbackFilename: String?
         for resource in resources {
-            if let prefix = ProxyGenerator.extractMasterHashPrefix(fromProxyFilename: resource.originalFilename) {
-                return (prefix, resource.originalFilename)
+            let name = resource.originalFilename.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let prefix = ProxyGenerator.extractMasterHashPrefix(fromProxyFilename: name) {
+                return ((prefix, name), name)
+            }
+            guard !name.isEmpty else { continue }
+            if resource.type == .photo || resource.type == .video {
+                if primaryFilename == nil { primaryFilename = name }
+            } else if resource.type == .fullSizePhoto || resource.type == .fullSizeVideo {
+                fallbackFilename = name
+            } else if fallbackFilename == nil {
+                fallbackFilename = name
             }
         }
-        return nil
+        return (nil, primaryFilename ?? fallbackFilename)
+    }
+
+    static func proxyHashPrefixFromAssetResources(_ asset: PHAsset) -> (prefix: String, filename: String)? {
+        inspectAssetResources(for: asset).proxyMatch
     }
 
     /// Scans local Photos metadata (zero iCloud download) for any synced or locally created
@@ -132,8 +149,6 @@ final class PhotoLibraryService {
         }
 
         var eligibleCount = 0
-        var detectedProxyCount = 0
-        let maxProxyRows = maxResults ?? 300
 
         for i in 0..<totalCount {
             if let maxResults, eligibleCount >= maxResults {
@@ -146,49 +161,8 @@ final class PhotoLibraryService {
                 let shortId = String(localId.prefix(prefixLen))
                 let prefixLabel = asset.mediaType == .video ? "Video" : "Photo"
 
-                func makeCandidate(
-                    filename: String = "\(prefixLabel)_\(shortId)",
-                    state: PhotoCompressionState,
-                    masterHash: String? = nil,
-                    detectionSource: String? = nil,
-                    linkedServerPhoto: ServerPhoto? = nil,
-                    isBackedUp: Bool = false
-                ) -> PhotoCandidate {
-                    PhotoCandidate(
-                        id: localId,
-                        asset: asset,
-                        mediaType: asset.mediaType,
-                        duration: asset.duration,
-                        filename: filename,
-                        pixelWidth: asset.pixelWidth,
-                        pixelHeight: asset.pixelHeight,
-                        creationDate: asset.creationDate,
-                        estimatedBytes: Self.estimateBytes(for: asset),
-                        state: state,
-                        isSelected: false,
-                        masterHash: masterHash,
-                        detectionSource: detectionSource,
-                        linkedOriginalName: linkedServerPhoto?.originalName,
-                        linkedOriginalBytes: linkedServerPhoto?.size,
-                        isBackedUpOnServer: isBackedUp
-                    )
-                }
-
-                // 1. Tracked proxy in LocalProxyTracker
+                // 1. Tracked proxy in LocalProxyTracker (auto-detected & skipped cleanly)
                 if tracker.isKnownProxy(assetId: localId) {
-                    let match = tracker.masterLookup(forAssetId: localId)
-                    let serverMatch = match.flatMap { hashToServerPhoto[$0.masterHash.lowercased()] }
-                    if detectedProxyCount < maxProxyRows {
-                        candidates.append(makeCandidate(
-                            filename: match?.originalName ?? serverMatch?.originalName ?? "\(prefixLabel)_\(shortId)",
-                            state: .alreadyProxy,
-                            masterHash: match?.masterHash,
-                            detectionSource: "Tracked Proxy",
-                            linkedServerPhoto: serverMatch,
-                            isBackedUp: serverMatch != nil
-                        ))
-                        detectedProxyCount += 1
-                    }
                     return
                 }
 
@@ -198,7 +172,8 @@ final class PhotoLibraryService {
                 }
 
                 // 3. Filename tag PHOTOHUB_PROXY_<prefix16> from local or iCloud PHAssetResource
-                if let proxyMatch = Self.proxyHashPrefixFromAssetResources(asset) {
+                let resourceInfo = Self.inspectAssetResources(for: asset)
+                if let proxyMatch = resourceInfo.proxyMatch {
                     let matchedServerPhoto = prefixToServerPhoto[proxyMatch.prefix]
                     tracker.markAsProxy(
                         assetId: localId,
@@ -206,17 +181,6 @@ final class PhotoLibraryService {
                         masterHash: matchedServerPhoto?.hash,
                         originalName: matchedServerPhoto?.originalName ?? proxyMatch.filename
                     )
-                    if detectedProxyCount < maxProxyRows {
-                        candidates.append(makeCandidate(
-                            filename: matchedServerPhoto?.originalName ?? proxyMatch.filename,
-                            state: .alreadyProxy,
-                            masterHash: matchedServerPhoto?.hash,
-                            detectionSource: "Filename Tag",
-                            linkedServerPhoto: matchedServerPhoto,
-                            isBackedUp: matchedServerPhoto != nil
-                        ))
-                        detectedProxyCount += 1
-                    }
                     return
                 }
 
@@ -234,22 +198,26 @@ final class PhotoLibraryService {
                         masterHash: resolvedMaster,
                         originalName: matchedServerPhoto?.originalName
                     )
-                    if detectedProxyCount < maxProxyRows {
-                        candidates.append(makeCandidate(
-                            filename: matchedServerPhoto?.originalName ?? "\(prefixLabel)_\(shortId)",
-                            state: .alreadyProxy,
-                            masterHash: resolvedMaster,
-                            detectionSource: "EXIF Metadata",
-                            linkedServerPhoto: matchedServerPhoto,
-                            isBackedUp: matchedServerPhoto != nil
-                        ))
-                        detectedProxyCount += 1
-                    }
                     return
                 }
 
                 eligibleCount += 1
-                candidates.append(makeCandidate(state: .pending))
+                let displayName = resourceInfo.originalFilename ?? "\(prefixLabel)_\(shortId)"
+                candidates.append(
+                    PhotoCandidate(
+                        id: localId,
+                        asset: asset,
+                        mediaType: asset.mediaType,
+                        duration: asset.duration,
+                        filename: displayName,
+                        pixelWidth: asset.pixelWidth,
+                        pixelHeight: asset.pixelHeight,
+                        creationDate: asset.creationDate,
+                        estimatedBytes: Self.estimateBytes(for: asset),
+                        state: .pending,
+                        isSelected: false
+                    )
+                )
             }
         }
 
@@ -260,18 +228,19 @@ final class PhotoLibraryService {
         let pixels = Int64(max(0, asset.pixelWidth)) * Int64(max(0, asset.pixelHeight))
         if asset.mediaType == .video {
             let durationSec = max(1.0, asset.duration)
-            let maxDim = max(asset.pixelWidth, asset.pixelHeight)
             let bytesPerSecond: Double
-            if maxDim >= 3800 {
-                bytesPerSecond = 5_500_000 // ~44 Mbps 4K HEVC/H.264
-            } else if maxDim >= 1900 {
-                bytesPerSecond = 2_200_000 // ~17 Mbps 1080p
+            if pixels >= 7_000_000 {
+                bytesPerSecond = 4_500_000 // ~36 Mbps 4K HEVC/H.264
+            } else if pixels >= 1_800_000 {
+                bytesPerSecond = 1_800_000 // ~14 Mbps 1080p
+            } else if pixels >= 800_000 {
+                bytesPerSecond = 900_000 // ~7 Mbps 720p
             } else {
-                bytesPerSecond = 1_200_000
+                bytesPerSecond = max(120_000, Double(max(pixels, 1)) * 0.45)
             }
-            return max(8_000_000, Int64(durationSec * bytesPerSecond))
+            return max(200_000, Int64(durationSec * bytesPerSecond))
         }
-        return max(1_500_000, pixels / 4)
+        return max(200_000, pixels / 6)
     }
 
     static func fetchLiveAssets(forLocalIdentifiers ids: [String]) -> [PHAsset] {
