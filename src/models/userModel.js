@@ -155,11 +155,12 @@ function sanitizeGoogleFolderName(email, sub) {
 /**
  * Selects the user's storage server URL using:
  * 1) Explicit USER_NODE_MAP override
- * 2) Existing pinned node if still configured in STORAGE_NODES
- * 3) Highest-Random-Weight (Rendezvous) consistent hashing across STORAGE_NODES
- * 4) Gateway itself as single-node fallback
+ * 2) Gateway itself when STORAGE_NODES is not configured
+ * 3) Existing pinned node if still configured in STORAGE_NODES
+ * 4) Pre-resolved `preferredNodeId` (from ordered capacity failover)
+ * 5) Consistent hashing (when NODE_ALLOCATION_MODE=hash) OR first configured node (`node1`, ordered default)
  */
-function selectNodeForUser({ sub, email, publicBaseUrl, config, existingNodeId }) {
+function selectNodeForUser({ sub, email, publicBaseUrl, config, existingNodeId, preferredNodeId }) {
   const nodes = Array.isArray(config.storageNodes) ? config.storageNodes : [];
   const lowerEmail = String(email || '').trim().toLowerCase();
 
@@ -188,17 +189,28 @@ function selectNodeForUser({ sub, email, publicBaseUrl, config, existingNodeId }
     }
   }
 
-  const key = String(sub || lowerEmail || 'default');
-  let bestNode = nodes[0];
-  let bestScore = '';
-  for (const node of nodes) {
-    const score = crypto.createHash('sha256').update(`${key}:${node.id}`).digest('hex');
-    if (score > bestScore) {
-      bestScore = score;
-      bestNode = node;
+  if (preferredNodeId) {
+    const preferredNode = nodes.find((n) => n.id === preferredNodeId);
+    if (preferredNode) {
+      return { nodeId: preferredNode.id, serverUrl: preferredNode.url };
     }
   }
-  return { nodeId: bestNode.id, serverUrl: bestNode.url };
+
+  if (config.nodeAllocationMode === 'hash') {
+    const key = String(sub || lowerEmail || 'default');
+    let bestNode = nodes[0];
+    let bestScore = '';
+    for (const node of nodes) {
+      const score = crypto.createHash('sha256').update(`${key}:${node.id}`).digest('hex');
+      if (score > bestScore) {
+        bestScore = score;
+        bestNode = node;
+      }
+    }
+    return { nodeId: bestNode.id, serverUrl: bestNode.url };
+  }
+
+  return { nodeId: nodes[0].id, serverUrl: nodes[0].url };
 }
 
 function resolveQuotaBytes({ email, folderName, apiKey }, config) {
@@ -290,7 +302,7 @@ class UserDirectory {
     return record;
   }
 
-  async upsertGoogleUser({ sub, email, name, picture, publicBaseUrl, config }) {
+  async upsertGoogleUser({ sub, email, name, picture, publicBaseUrl, config, preferredNodeId = null }) {
     const cleanSub = String(sub || '').trim();
     const cleanEmail = String(email || '').trim().toLowerCase();
     const existing = this.usersBySub.get(cleanSub);
@@ -307,6 +319,7 @@ class UserDirectory {
       publicBaseUrl,
       config,
       existingNodeId: existing ? existing.nodeId : null,
+      preferredNodeId,
     });
     const quotaBytes =
       existing && existing.quotaBytesOverride !== undefined

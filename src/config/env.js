@@ -165,6 +165,12 @@ function parsePairMap(raw, valueTransform = (v) => v) {
   return map;
 }
 
+function normalizeNodeAllocationMode(rawMode) {
+  const clean = String(rawMode || 'ordered').trim().toLowerCase();
+  if (clean === 'hash' || clean === 'rendezvous') return 'hash';
+  return 'ordered';
+}
+
 function gbToBytes(rawGb) {
   const num = Number(rawGb);
   if (!Number.isFinite(num) || num <= 0) return 0;
@@ -269,8 +275,12 @@ function getConfig(overrides = {}) {
       60,
       Number(overrides.sessionTtlSeconds ?? process.env.AUTH_SESSION_TTL_SECONDS ?? 30 * 24 * 3600) || 30 * 24 * 3600
     ),
+    nodeId: String(overrides.nodeId ?? process.env.NODE_ID ?? '').trim(),
     storageNodes: parseStorageNodes(
       overrides.storageNodes ?? process.env.STORAGE_NODES ?? ''
+    ),
+    nodeAllocationMode: normalizeNodeAllocationMode(
+      overrides.nodeAllocationMode ?? process.env.NODE_ALLOCATION_MODE ?? 'ordered'
     ),
     userNodeMap: parsePairMap(
       overrides.userNodeMap ?? process.env.USER_NODE_MAP ?? '',

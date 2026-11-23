@@ -1676,3 +1676,217 @@ test('Gateway stays HTTPS while storage nodes support explicit http:// and schem
   assert.equal(resolved.nodeId, 'node2');
   assert.equal(resolved.serverUrl, 'http://192.168.1.50:3000');
 });
+
+test('Ordered node allocation prefers node1 and spills new users to node2 when node1 is full', async (t) => {
+  const sharedSecret = 'ordered-failover-shared-secret-0123456789abcdef';
+
+  async function startTcpNode(extraOverrides = {}) {
+    const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'photohub-tcp-node-'));
+    const storageDir = path.join(tmpRoot, 'uploads');
+    const dataDir = path.join(tmpRoot, 'data');
+    const app = await createApp({
+      port: 0,
+      storageDir,
+      dataDir,
+      apiKey: '',
+      userKeys: '',
+      userNodeMap: '',
+      userFolders: '',
+      userQuotas: '',
+      defaultQuotaGb: 0,
+      serverCapacityGb: 0,
+      minFreeDiskGb: 0,
+      maxUsers: 0,
+      requireAuth: true,
+      authSessionSecret: sharedSecret,
+      ...extraOverrides,
+    });
+    const server = await new Promise((resolve) => {
+      const s = app.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    const { port } = server.address();
+    const baseUrl = `http://127.0.0.1:${port}`;
+    return {
+      app,
+      baseUrl,
+      storageDir,
+      dataDir,
+      async cleanup() {
+        await new Promise((resolve) => server.close(resolve));
+        await fsp.rm(tmpRoot, { recursive: true, force: true });
+      },
+    };
+  }
+
+  // Start node2 first so we know its live HTTP port
+  const node2 = await startTcpNode({
+    nodeId: 'node2',
+    googleClientId: '',
+    googleClientSecret: '',
+    maxUsers: 1,
+    adminKey: 'node2_admin_key',
+  });
+  t.after(() => node2.cleanup());
+
+  let activeProfile = {
+    sub: 'sub-order-1',
+    email: 'u1@gmail.com',
+    name: 'User One',
+  };
+
+  // Start gateway + node1 with maxUsers=1 so User 2 spills cleanly to node2
+  const gwTmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'photohub-tcp-gw-'));
+  const gwStorageDir = path.join(gwTmpRoot, 'uploads');
+  const gwDataDir = path.join(gwTmpRoot, 'data');
+
+  let gwPort = 0;
+  // Allocate a free ephemeral port cleanly or bind first and set publicUrl via NODE_ID=node1
+  const gwApp = await createApp({
+    port: 0,
+    nodeId: 'node1',
+    storageDir: gwStorageDir,
+    dataDir: gwDataDir,
+    apiKey: '',
+    userKeys: '',
+    userNodeMap: '',
+    userFolders: '',
+    userQuotas: '',
+    defaultQuotaGb: 0,
+    serverCapacityGb: 0,
+    minFreeDiskGb: 0,
+    maxUsers: 1,
+    requireAuth: true,
+    googleClientId: 'ordered-google-client-id',
+    googleClientSecret: 'ordered-google-client-secret',
+    authSessionSecret: sharedSecret,
+    adminKey: 'gw_admin_key',
+    nodeAllocationMode: 'ordered',
+    storageNodes: `node1=http://127.0.0.1:1,node2=${node2.baseUrl}`,
+    exchangeGoogleCodeForProfile: async () => activeProfile,
+  });
+  const gwServer = await new Promise((resolve) => {
+    const s = gwApp.listen(0, '127.0.0.1', () => resolve(s));
+  });
+  gwPort = gwServer.address().port;
+  const gwBaseUrl = `http://127.0.0.1:${gwPort}`;
+  // Point gateway config's node1 URL & publicUrl to its real listening address cleanly
+  gwApp.locals.config.publicUrl = gwBaseUrl;
+  gwApp.locals.config.storageNodes[0].url = gwBaseUrl;
+
+  t.after(async () => {
+    await new Promise((resolve) => gwServer.close(resolve));
+    await fsp.rm(gwTmpRoot, { recursive: true, force: true });
+  });
+
+  async function oauthSignInViaGateway(profile) {
+    activeProfile = profile;
+    const verifier = `ordered_verifier_${profile.sub}_0123456789abcdefghijklmnopqrstuvwxyz`;
+    const challenge = crypto
+      .createHash('sha256')
+      .update(verifier, 'utf8')
+      .digest('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/g, '');
+
+    const startRes = await fetch(
+      `${gwBaseUrl}/api/auth/google/start?code_challenge=${encodeURIComponent(challenge)}&redirect_uri=${encodeURIComponent('photohub://auth/callback')}`,
+      { redirect: 'manual' }
+    );
+    assert.equal(startRes.status, 302);
+    const state = new URL(startRes.headers.get('location')).searchParams.get('state');
+
+    const cbRes = await fetch(
+      `${gwBaseUrl}/api/auth/google/callback?code=mock&state=${encodeURIComponent(state)}`,
+      { redirect: 'manual' }
+    );
+    assert.equal(cbRes.status, 302);
+    const appRedirect = new URL(cbRes.headers.get('location'));
+    const errorParam = appRedirect.searchParams.get('error');
+    const code = appRedirect.searchParams.get('code');
+    if (errorParam || !code) {
+      return { error: errorParam, session: null };
+    }
+
+    const exRes = await fetch(`${gwBaseUrl}/api/auth/exchange`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code, codeVerifier: verifier }),
+    });
+    assert.equal(exRes.status, 200);
+    return { error: null, session: await exRes.json() };
+  }
+
+  // Unauthenticated capacity endpoint must reject cleanly with 401
+  const unauthNodeCap = await fetch(`${node2.baseUrl}/api/node/capacity`);
+  assert.equal(unauthNodeCap.status, 401);
+
+  // 1. User 1 (unmapped) lands on preferred node1 first
+  const res1 = await oauthSignInViaGateway({
+    sub: 'sub-order-1',
+    email: 'u1@gmail.com',
+    name: 'User One',
+  });
+  assert.equal(res1.error, null);
+  assert.equal(res1.session.nodeId, 'node1');
+  assert.equal(res1.session.serverUrl, gwBaseUrl);
+
+  // 2. node1 is now at maxUsers=1 -> User 2 automatically spills to node2
+  const res2 = await oauthSignInViaGateway({
+    sub: 'sub-order-2',
+    email: 'u2@gmail.com',
+    name: 'User Two',
+  });
+  assert.equal(res2.error, null);
+  assert.equal(res2.session.nodeId, 'node2');
+  assert.equal(res2.session.serverUrl, node2.baseUrl);
+
+  // User 2 can upload directly to node2 using Gateway JWT
+  const upForm = new FormData();
+  upForm.append('photo', new Blob([Buffer.from('ordered-spillover-node2-bytes')], { type: 'image/jpeg' }), 'SPILL2.JPG');
+  const upNode2Res = await fetch(`${node2.baseUrl}/api/upload`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${res2.session.token}` },
+    body: upForm,
+  });
+  assert.equal(upNode2Res.status, 200);
+
+  // 3. User 3 exceeds both node1 (1/1) and node2 (1/1) -> signup blocked with clear reason
+  const res3 = await oauthSignInViaGateway({
+    sub: 'sub-order-3',
+    email: 'u3@gmail.com',
+    name: 'User Three',
+  });
+  assert.equal(res3.session, null);
+  assert.match(String(res3.error || ''), /node1.*node2/i);
+
+  // 4. Existing User 1 and User 2 still sign in and stay pinned to node1 and node2 respectively
+  const res1Again = await oauthSignInViaGateway({
+    sub: 'sub-order-1',
+    email: 'u1@gmail.com',
+    name: 'User One',
+  });
+  assert.equal(res1Again.error, null);
+  assert.equal(res1Again.session.nodeId, 'node1');
+
+  const res2Again = await oauthSignInViaGateway({
+    sub: 'sub-order-2',
+    email: 'u2@gmail.com',
+    name: 'User Two',
+  });
+  assert.equal(res2Again.error, null);
+  assert.equal(res2Again.session.nodeId, 'node2');
+
+  // 5. Admin overview reports node telemetry cleanly
+  const overviewRes = await fetch(`${gwBaseUrl}/api/admin/overview`, {
+    headers: { 'X-Admin-Key': 'gw_admin_key' },
+  });
+  assert.equal(overviewRes.status, 200);
+  const overview = await overviewRes.json();
+  assert.equal(overview.server.nodeAllocationMode, 'ordered');
+  assert.equal(overview.nodes.length, 2);
+  assert.equal(overview.nodes[0].id, 'node1');
+  assert.equal(overview.nodes[0].isFullForNewUsers, true);
+  assert.equal(overview.nodes[1].id, 'node2');
+  assert.equal(overview.nodes[1].isFullForNewUsers, true);
+});

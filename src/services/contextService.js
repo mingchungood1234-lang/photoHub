@@ -156,13 +156,72 @@ function createContextService(config, { userDirectory = null } = {}) {
     }
   }
 
-  async function ensureKnownUserContextsReady() {
+  function resolveEffectiveLocalNodeId(explicitLocalNodeId = null, publicBaseUrl = '') {
+    if (explicitLocalNodeId) return explicitLocalNodeId;
+    if (config.nodeId) return config.nodeId;
+    const nodes = Array.isArray(config.storageNodes) ? config.storageNodes : [];
+    const urls = [config.publicUrl, publicBaseUrl].filter(Boolean);
+    for (const node of nodes) {
+      for (const candidateUrl of urls) {
+        try {
+          const u1 = new URL(node.url);
+          const u2 = new URL(candidateUrl);
+          const p1 = u1.port || (u1.protocol === 'https:' ? '443' : '80');
+          const p2 = u2.port || (u2.protocol === 'https:' ? '443' : '80');
+          if (
+            u1.protocol === u2.protocol &&
+            u1.hostname.toLowerCase() === u2.hostname.toLowerCase() &&
+            p1 === p2
+          ) {
+            return node.id;
+          }
+        } catch {
+          // ignore invalid URL formats
+        }
+      }
+    }
+    return null;
+  }
+
+  function userBelongsToLocalNode(user, localNodeId) {
+    if (!user) return false;
+    const nodes = Array.isArray(config.storageNodes) ? config.storageNodes : [];
+    if (nodes.length === 0) return true;
+    if (!user.nodeId || user.nodeId === 'primary') return true;
+    return Boolean(localNodeId && user.nodeId === localNodeId);
+  }
+
+  async function discoverExistingGoogleDiskFolders() {
+    // Only discover unindexed google_* folders on pure federated worker nodes (no local Google OAuth or USER_KEYS);
+    // gateways track active Google accounts strictly in users.json.
+    if (config.googleClientId || config.userKeyMap.size > 0) return;
+    let entries;
+    try {
+      entries = await fsp.readdir(config.storageDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory() && entry.name.startsWith('google_')) {
+        await getOrCreateFolderContext(entry.name);
+      }
+    }
+  }
+
+  async function ensureKnownUserContextsReady(localNodeId = null, publicBaseUrl = '') {
+    const effectiveNodeId = resolveEffectiveLocalNodeId(localNodeId, publicBaseUrl);
     if (isRootFolderEnabled()) {
       await ensureDefaultHashIndexReady();
     }
+    await discoverExistingGoogleDiskFolders();
     if (!userDirectory) return;
     for (const user of userDirectory.listAll()) {
-      if (user && user.folderName && user.folderName !== '__ROOT__') {
+      if (
+        user &&
+        userBelongsToLocalNode(user, effectiveNodeId) &&
+        user.folderName &&
+        user.folderName !== '__ROOT__'
+      ) {
         await getOrCreateFolderContext(user.folderName);
       }
     }
@@ -256,8 +315,9 @@ function createContextService(config, { userDirectory = null } = {}) {
     };
   }
 
-  async function getServerCapacitySummary() {
-    await ensureKnownUserContextsReady();
+  async function getServerCapacitySummary({ localNodeId = null, publicBaseUrl = '' } = {}) {
+    const effectiveNodeId = resolveEffectiveLocalNodeId(localNodeId, publicBaseUrl);
+    await ensureKnownUserContextsReady(effectiveNodeId, publicBaseUrl);
     const { diskTotalBytes, diskFreeBytes } = await getDiskSpaceInfo(config.storageDir);
 
     const folderUsageMap = new Map(); // folderKey -> usage stats (dedupes physical space)
@@ -278,9 +338,12 @@ function createContextService(config, { userDirectory = null } = {}) {
 
     const userRows = [];
     const seenFolderKeys = new Set();
+    let localGoogleUserCount = 0;
 
     if (userDirectory) {
       for (const user of userDirectory.listAll()) {
+        if (!userBelongsToLocalNode(user, effectiveNodeId)) continue;
+        localGoogleUserCount += 1;
         const folderName = user.folderName && user.folderName !== '__ROOT__' ? user.folderName : null;
         const folderKey = folderName || '__ROOT__';
         seenFolderKeys.add(folderKey);
@@ -297,7 +360,7 @@ function createContextService(config, { userDirectory = null } = {}) {
           email: user.email || null,
           folderName: folderName || '/',
           folderKey,
-          nodeId: user.nodeId || 'primary',
+          nodeId: user.nodeId || effectiveNodeId || 'primary',
           itemCount: usage.itemCount,
           mastersBytes: usage.mastersBytes,
           proxiesBytes: usage.proxiesBytes,
@@ -335,6 +398,32 @@ function createContextService(config, { userDirectory = null } = {}) {
         folderName,
         folderKey: folderName,
         nodeId: 'primary',
+        itemCount: usage.itemCount,
+        mastersBytes: usage.mastersBytes,
+        proxiesBytes: usage.proxiesBytes,
+        usedBytes: usage.usedBytes,
+        quotaBytes: quotaBytes > 0 ? quotaBytes : null,
+        usagePercent:
+          quotaBytes > 0 ? Math.min(100, Math.round((usage.usedBytes / quotaBytes) * 1000) / 10) : null,
+        createdAt: null,
+        lastLoginAt: null,
+      });
+    }
+
+    // Also include disk folders created on worker storage nodes (`node2`, etc.) where users.json lives on Gateway
+    for (const [folderName] of folderContexts.entries()) {
+      if (seenFolderKeys.has(folderName)) continue;
+      seenFolderKeys.add(folderName);
+      const usage = getUsageForFolder(folderName);
+      const quotaBytes = getQuotaBytesForContext({ folderName });
+      userRows.push({
+        id: `folder:${folderName}`,
+        authType: 'federated',
+        displayName: folderName,
+        email: null,
+        folderName,
+        folderKey: folderName,
+        nodeId: effectiveNodeId || 'primary',
         itemCount: usage.itemCount,
         mastersBytes: usage.mastersBytes,
         proxiesBytes: usage.proxiesBytes,
@@ -394,8 +483,7 @@ function createContextService(config, { userDirectory = null } = {}) {
     let totalAllocatedQuotaBytes = 0;
     for (const q of quotaByFolder.values()) totalAllocatedQuotaBytes += q;
 
-    const registeredGoogleCount = userDirectory ? userDirectory.listAll().length : 0;
-    const registeredUserCount = Math.max(registeredGoogleCount, userRows.length);
+    const registeredUserCount = Math.max(localGoogleUserCount, userRows.length);
 
     const serverCap = Number(config.serverCapacityBytes) || 0;
     const minFree = Number(config.minFreeDiskBytes) || 0;
@@ -445,7 +533,7 @@ function createContextService(config, { userDirectory = null } = {}) {
    * so users never lose access to view/restore photos even when storage is full.
    * Brand-new users are blocked when server assigned storage/user capacity is exhausted.
    */
-  async function checkNewUserSignupCapacity({ sub, email }) {
+  async function checkNewUserSignupCapacity({ sub, email, localNodeId = null, publicBaseUrl = '' }) {
     const cleanEmail = String(email || '').trim().toLowerCase();
     const isExistingUser = Boolean(
       (userDirectory && sub && userDirectory.getBySub(sub)) ||
@@ -456,7 +544,7 @@ function createContextService(config, { userDirectory = null } = {}) {
       return { allowed: true, isExistingUser: true, reason: null };
     }
 
-    const capacity = await getServerCapacitySummary();
+    const capacity = await getServerCapacitySummary({ localNodeId, publicBaseUrl });
     if (capacity.isFullForNewUsers) {
       return {
         allowed: false,

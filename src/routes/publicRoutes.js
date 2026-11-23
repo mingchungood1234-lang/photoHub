@@ -16,6 +16,7 @@ function createPublicRoutes({ healthController, authController }) {
   const router = express.Router();
 
   router.get('/health', healthController.getHealth);
+  router.get('/node/capacity', healthController.getNodeCapacity);
   router.get('/auth/config', authController.getConfig);
   router.get('/auth/google/start', authController.startGoogleAuth);
   router.get('/auth/google/callback', authController.handleGoogleCallback);

@@ -32,6 +32,7 @@ function createAuthController({
   exchangeStore,
   googleExchangeFn,
   contextService,
+  nodeAllocationService = null,
 }) {
   return {
     getConfig(req, res) {
@@ -40,6 +41,7 @@ function createAuthController({
         googleEnabled: Boolean(config.googleClientId && config.googleClientSecret),
         hasStorageNodes: config.storageNodes.length > 0,
         nodeCount: config.storageNodes.length || 1,
+        nodeAllocationMode: config.nodeAllocationMode || 'ordered',
       });
     },
 
@@ -118,14 +120,21 @@ function createAuthController({
           config,
         });
 
-        const capacityCheck = await contextService.checkNewUserSignupCapacity({
-          sub: profile.sub,
-          email: profile.email,
-        });
-        if (!capacityCheck.allowed) {
+        const allocation = nodeAllocationService
+          ? await nodeAllocationService.resolveNodeAndCapacityForLogin({
+              sub: profile.sub,
+              email: profile.email,
+              publicBaseUrl: statePayload.baseUrl,
+            })
+          : await contextService.checkNewUserSignupCapacity({
+              sub: profile.sub,
+              email: profile.email,
+              publicBaseUrl: statePayload.baseUrl,
+            });
+        if (!allocation.allowed) {
           appRedirect.searchParams.set(
             'error',
-            capacityCheck.reason || 'Server assigned storage is full. New sign-ins are closed.'
+            allocation.reason || 'Server assigned storage is full. New sign-ins are closed.'
           );
           return res.redirect(appRedirect.toString());
         }
@@ -134,6 +143,7 @@ function createAuthController({
           ...profile,
           publicBaseUrl: statePayload.baseUrl,
           config,
+          preferredNodeId: allocation.preferredNodeId || null,
         });
 
         const sessionToken = signToken(

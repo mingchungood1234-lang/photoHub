@@ -9,7 +9,7 @@
 
 const { isS3Configured } = require('../services/s3Service');
 
-function createHealthController({ config, contextService }) {
+function createHealthController({ config, contextService, nodeAllocationService = null }) {
   return {
     getHealth(req, res) {
       res.json({
@@ -20,6 +20,35 @@ function createHealthController({ config, contextService }) {
         storageDir: config.storageDir,
         s3Enabled: isS3Configured(config.s3),
       });
+    },
+
+    async getNodeCapacity(req, res) {
+      try {
+        if (!nodeAllocationService) {
+          return res.status(503).json({ success: false, error: 'Node telemetry unavailable.' });
+        }
+        const auth = nodeAllocationService.verifyNodeProbeAuth(req);
+        if (!auth.authorized) {
+          return res.status(401).json({ success: false, error: 'Unauthorized node capacity probe.' });
+        }
+        const reqBaseUrl = contextService.resolveRequestBaseUrl(req);
+        const requestedNodeId =
+          auth.payload && auth.payload.targetNodeId ? String(auth.payload.targetNodeId) : null;
+        const effectiveLocalNodeId =
+          config.nodeId || requestedNodeId || nodeAllocationService.identifyLocalNodeId(reqBaseUrl);
+        const capacity = await contextService.getServerCapacitySummary({
+          localNodeId: effectiveLocalNodeId,
+          publicBaseUrl: reqBaseUrl,
+        });
+        return res.json({
+          success: true,
+          instanceId: nodeAllocationService.instanceId,
+          nodeId: effectiveLocalNodeId || 'primary',
+          capacity,
+        });
+      } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+      }
     },
   };
 }

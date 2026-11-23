@@ -25,6 +25,7 @@ const {
 } = require('./models/userModel');
 const { exchangeGoogleCodeForProfile } = require('./services/googleOAuthService');
 const { createContextService } = require('./services/contextService');
+const { createNodeAllocationService } = require('./services/nodeAllocationService');
 const { createAuthMiddleware } = require('./middleware/authMiddleware');
 const { createAdminAuthMiddleware } = require('./middleware/adminAuthMiddleware');
 const { createUploadMiddleware } = require('./middleware/uploadMiddleware');
@@ -56,6 +57,13 @@ async function createApp(configOverrides = {}) {
   const contextService = createContextService(config, { userDirectory });
   await contextService.init();
 
+  const nodeAllocationService = createNodeAllocationService({
+    config,
+    sessionSecret,
+    userDirectory,
+    contextService,
+  });
+
   // Build Express application and parse JSON/binary bodies before route handlers run
   const app = express();
   app.set('trust proxy', 1); // Respect X-Forwarded-* headers when running behind Nginx/Cloudflare/Caddy
@@ -81,7 +89,7 @@ async function createApp(configOverrides = {}) {
 
   // Controllers: thin HTTP handlers injected with config/services (Dependency Injection)
   const controllers = {
-    healthController: createHealthController({ config, contextService }),
+    healthController: createHealthController({ config, contextService, nodeAllocationService }),
     authController: createAuthController({
       config,
       sessionSecret,
@@ -89,13 +97,14 @@ async function createApp(configOverrides = {}) {
       exchangeStore,
       googleExchangeFn,
       contextService,
+      nodeAllocationService,
     }),
     accountController: createAccountController({ config, contextService }),
     checkController: createCheckController(),
     uploadController: createUploadController({ config, contextService }),
     proxyController: createProxyController({ config }),
     photoController: createPhotoController({ config }),
-    adminController: createAdminController({ config, contextService, userDirectory }),
+    adminController: createAdminController({ config, contextService, userDirectory, nodeAllocationService }),
   };
 
   // Mount all `/api/*` routes, `/admin` web page, and register errorMiddleware LAST (Express error-handler rule)
