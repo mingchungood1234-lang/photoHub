@@ -281,6 +281,131 @@ object BatchRestorePlanner {
         }
 }
 
+data class BatchRestoreProgress(
+    val completed: Int,
+    val total: Int,
+    val currentName: String,
+    val updatedPhoto: ServerPhoto?
+)
+
+data class BatchRestoreResult(
+    val succeeded: Int,
+    val failed: Int,
+    val cancelled: Boolean,
+    val summaryMessage: String
+)
+
+object BatchRestoreExecutor {
+    suspend fun restoreSinglePhotoToGallery(
+        context: android.content.Context,
+        client: PhotoHubApiClient,
+        mediaService: MediaLibraryService,
+        tracker: LocalProxyTracker,
+        photo: ServerPhoto,
+        onProgress: ((Long, Long?) -> Unit)? = null
+    ): Pair<ServerPhoto?, Long> {
+        val (originalFile, _) = OriginalDownloadCache.getOrFetchOriginal(
+            context = context,
+            apiClient = client,
+            masterHash = photo.hash,
+            preferredFilename = photo.originalName,
+            expectedSizeBytes = photo.size,
+            onProgress = onProgress
+        )
+        val fileSize = originalFile.length()
+        val savedId = mediaService.saveRestoredOriginalToGallery(
+            file = originalFile,
+            isVideo = photo.isVideo,
+            originalFilename = photo.originalName,
+            creationDateMs = photo.parsedCreationDateMs
+        )
+        tracker.markRestoredOriginal(savedId, photo.hash)
+        val updated = runCatching { client.setOriginalProtected(photo.hash, true) }.getOrNull()
+        return updated to fileSize
+    }
+
+    suspend fun runBatchRestore(
+        context: android.content.Context,
+        client: PhotoHubApiClient,
+        mediaService: MediaLibraryService,
+        tracker: LocalProxyTracker,
+        targets: List<ServerPhoto>,
+        onItemComplete: (BatchRestoreProgress) -> Unit,
+        onFinished: suspend (BatchRestoreResult) -> Unit
+    ) {
+        val queue = Channel<ServerPhoto>(Channel.UNLIMITED)
+        targets.forEach { queue.trySend(it) }
+        queue.close()
+
+        val succeeded = AtomicInteger(0)
+        val failed = AtomicInteger(0)
+        val completed = AtomicInteger(0)
+        var cancelled = false
+
+        try {
+            coroutineScope {
+                val workerCount = minOf(3, targets.size)
+                val workers = List(workerCount) {
+                    launch(Dispatchers.IO) {
+                        for (item in queue) {
+                            if (!isActive) break
+                            var updatedPhoto: ServerPhoto? = null
+                            try {
+                                updatedPhoto = restoreSinglePhotoToGallery(
+                                    context = context,
+                                    client = client,
+                                    mediaService = mediaService,
+                                    tracker = tracker,
+                                    photo = item
+                                ).first
+                                succeeded.incrementAndGet()
+                            } catch (c: CancellationException) {
+                                throw c
+                            } catch (_: Exception) {
+                                failed.incrementAndGet()
+                            }
+                            val done = completed.incrementAndGet()
+                            onItemComplete(
+                                BatchRestoreProgress(
+                                    completed = done,
+                                    total = targets.size,
+                                    currentName = item.originalName,
+                                    updatedPhoto = updatedPhoto
+                                )
+                            )
+                        }
+                    }
+                }
+                workers.joinAll()
+            }
+        } catch (c: CancellationException) {
+            cancelled = true
+            throw c
+        } finally {
+            val ok = succeeded.get()
+            val errCount = failed.get()
+            val msg = formatSummaryMessage(ok = ok, errCount = errCount, cancelled = cancelled)
+            withContext(NonCancellable) {
+                onFinished(
+                    BatchRestoreResult(
+                        succeeded = ok,
+                        failed = errCount,
+                        cancelled = cancelled,
+                        summaryMessage = msg
+                    )
+                )
+            }
+        }
+    }
+
+    fun formatSummaryMessage(ok: Int, errCount: Int, cancelled: Boolean): String = when {
+        cancelled -> "Stopped after restoring $ok original(s)."
+        errCount > 0 && ok == 0 -> "Restore failed for $errCount item(s)."
+        errCount > 0 -> "Restored $ok original(s) & protected them; $errCount failed."
+        else -> "Restored $ok original(s) to Gallery & protected them."
+    }
+}
+
 data class ServerGalleryUiState(
     val photos: List<ServerPhoto> = emptyList(),
     val timeline: ServerTimelineData = ServerTimelineData(),
@@ -997,16 +1122,6 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
         }
     }
 
-    fun requestRestoreAll() {
-        val state = _uiState.value
-        if (state.isBatchRestoring || state.isBatchProxying || state.isBatchDeleting || state.photos.isEmpty()) return
-        openRestoreConfirm(
-            title = "Restore All Originals",
-            targets = state.photos,
-            isRestoreAll = true
-        )
-    }
-
     fun requestRestoreSelected() {
         val state = _uiState.value
         if (state.isBatchRestoring || state.isBatchProxying || state.isBatchDeleting || state.selectedHashes.isEmpty()) return
@@ -1196,59 +1311,30 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
         restoreJob = viewModelScope.launch {
             val client = PhotoHubApiClient(context, settings)
-            val queue = Channel<ServerPhoto>(Channel.UNLIMITED)
-            targets.forEach { queue.trySend(it) }
-            queue.close()
-
-            val succeeded = AtomicInteger(0)
-            val failed = AtomicInteger(0)
-            val completed = AtomicInteger(0)
-
-            try {
-                coroutineScope {
-                    val workerCount = minOf(3, targets.size)
-                    val workers = List(workerCount) {
-                        launch(Dispatchers.IO) {
-                            for (item in queue) {
-                                if (!isActive) break
-                                try {
-                                    restoreSinglePhotoToGallery(client, item)
-                                    succeeded.incrementAndGet()
-                                } catch (c: CancellationException) {
-                                    throw c
-                                } catch (_: Exception) {
-                                    failed.incrementAndGet()
-                                }
-                                val done = completed.incrementAndGet()
-                                _uiState.update {
-                                    it.copy(restoreCompleted = done, restoreStatusText = item.originalName)
-                                }
-                            }
-                        }
+            BatchRestoreExecutor.runBatchRestore(
+                context = context,
+                client = client,
+                mediaService = mediaService,
+                tracker = tracker,
+                targets = targets,
+                onItemComplete = { progress ->
+                    progress.updatedPhoto?.let { applyUpdatedPhoto(it) }
+                    _uiState.update {
+                        it.copy(restoreCompleted = progress.completed, restoreStatusText = progress.currentName)
                     }
-                    workers.joinAll()
+                },
+                onFinished = { result ->
+                    val protectedSet = computeLocallyProtectedHashes(_uiState.value.photos)
+                    _uiState.update { prev ->
+                        prev.copy(
+                            isBatchRestoring = false,
+                            restoreStatusText = "",
+                            locallyProtectedHashes = protectedSet,
+                            restoreBannerMessage = result.summaryMessage
+                        )
+                    }
                 }
-            } finally {
-                val ok = succeeded.get()
-                val errCount = failed.get()
-                val cancelled = !isActive
-                val protectedSet = withContext(NonCancellable + Dispatchers.IO) {
-                    computeLocallyProtectedHashes(_uiState.value.photos)
-                }
-                _uiState.update { prev ->
-                    prev.copy(
-                        isBatchRestoring = false,
-                        restoreStatusText = "",
-                        locallyProtectedHashes = protectedSet,
-                        restoreBannerMessage = when {
-                            cancelled -> "Stopped after restoring $ok original(s)."
-                            errCount > 0 && ok == 0 -> "Restore failed for $errCount item(s)."
-                            errCount > 0 -> "Restored $ok original(s) & protected them; $errCount failed."
-                            else -> "Restored $ok original(s) to Gallery & protected them."
-                        }
-                    )
-                }
-            }
+            )
         }
     }
 
@@ -1265,23 +1351,14 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
         photo: ServerPhoto,
         onProgress: ((Long, Long?) -> Unit)? = null
     ): Pair<ServerPhoto?, Long> {
-        val (originalFile, _) = OriginalDownloadCache.getOrFetchOriginal(
+        val (updated, fileSize) = BatchRestoreExecutor.restoreSinglePhotoToGallery(
             context = context,
-            apiClient = client,
-            masterHash = photo.hash,
-            preferredFilename = photo.originalName,
-            expectedSizeBytes = photo.size,
+            client = client,
+            mediaService = mediaService,
+            tracker = tracker,
+            photo = photo,
             onProgress = onProgress
         )
-        val fileSize = originalFile.length()
-        val savedId = mediaService.saveRestoredOriginalToGallery(
-            file = originalFile,
-            isVideo = photo.isVideo,
-            originalFilename = photo.originalName,
-            creationDateMs = photo.parsedCreationDateMs
-        )
-        tracker.markRestoredOriginal(savedId, photo.hash)
-        val updated = runCatching { client.setOriginalProtected(photo.hash, true) }.getOrNull()
         if (updated != null) {
             applyUpdatedPhoto(updated)
         }

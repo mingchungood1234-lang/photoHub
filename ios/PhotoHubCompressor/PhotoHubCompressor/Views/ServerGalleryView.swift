@@ -37,28 +37,6 @@ private enum BatchProxyOutcome: Sendable {
     }
 }
 
-private enum BatchRestoreOutcome: Sendable {
-    case restored(ServerPhoto?, String)
-    case failed(String)
-
-    var displayName: String {
-        switch self {
-        case .restored(_, let name): return name
-        case .failed(let name): return name
-        }
-    }
-}
-
-private struct RestoreConfirmPrompt {
-    let title: String
-    let allTargets: [ServerPhoto]
-    let unrestoredTargets: [ServerPhoto]
-    let skippedCount: Int
-    let unrestoredBytes: Int64
-    let allBytes: Int64
-    let isRestoreAll: Bool
-}
-
 private struct DeleteConfirmPrompt {
     let targets: [ServerPhoto]
     let totalBytes: Int64
@@ -130,10 +108,6 @@ struct ServerGalleryView: View {
         photo.isProtectedOriginal || locallyProtectedHashes.contains(photo.hash.lowercased())
     }
 
-    private var unrestoredPhotos: [ServerPhoto] {
-        photos.filter { !isRestoredOrProtected($0) }
-    }
-
     private var visiblePhotos: [ServerPhoto] {
         timelineData.sections.flatMap(\.photos)
     }
@@ -202,7 +176,7 @@ struct ServerGalleryView: View {
                                                 .padding(.vertical, 6)
                                         }
 
-                                        if isBatchRestoring || restoreBannerMessage != nil || (!isSelectionMode && !photos.isEmpty) {
+                                        if isBatchRestoring || restoreBannerMessage != nil {
                                             restoreBannerView
                                                 .padding(.horizontal, 12)
                                                 .padding(.vertical, 4)
@@ -377,16 +351,6 @@ struct ServerGalleryView: View {
                         Menu {
                             if !photos.isEmpty {
                                 Button {
-                                    requestRestoreAll()
-                                } label: {
-                                    Label(
-                                        "Restore All Originals (\(photos.count))",
-                                        systemImage: "icloud.and.arrow.down"
-                                    )
-                                }
-                                .disabled(isBatchRestoring || isBatchProxying || isBatchDeleting)
-
-                                Button {
                                     enterSelectionMode()
                                 } label: {
                                     Label("Select Photos to Restore or Delete", systemImage: "checkmark.circle")
@@ -492,45 +456,8 @@ struct ServerGalleryView: View {
             } message: {
                 Text(pickerErrorMessage ?? "")
             }
-            .alert(
-                restoreConfirmPrompt?.title ?? "Restore Originals",
-                isPresented: Binding(
-                    get: { restoreConfirmPrompt != nil },
-                    set: { if !$0 { restoreConfirmPrompt = nil } }
-                ),
-                presenting: restoreConfirmPrompt
-            ) { prompt in
-                if !prompt.unrestoredTargets.isEmpty {
-                    Button("Restore \(prompt.unrestoredTargets.count)") {
-                        startBatchRestore(targets: prompt.unrestoredTargets, exitSelectionAfter: !prompt.isRestoreAll)
-                    }
-                    if prompt.skippedCount > 0 {
-                        Button("Include \(prompt.skippedCount) Already Restored (\(prompt.allTargets.count))") {
-                            startBatchRestore(targets: prompt.allTargets, exitSelectionAfter: !prompt.isRestoreAll)
-                        }
-                    }
-                } else {
-                    Button("Re-download All (\(prompt.allTargets.count))") {
-                        startBatchRestore(targets: prompt.allTargets, exitSelectionAfter: !prompt.isRestoreAll)
-                    }
-                }
-                Button("Cancel", role: .cancel) {
-                    restoreConfirmPrompt = nil
-                }
-            } message: { prompt in
-                if prompt.unrestoredTargets.isEmpty {
-                    Text(
-                        "All \(prompt.allTargets.count) selected item(s) are already restored & protected on this device."
-                    )
-                } else {
-                    let sizeStr = ByteCountFormatter.string(fromByteCount: max(0, prompt.unrestoredBytes), countStyle: .file)
-                    let skipNote = prompt.skippedCount > 0
-                        ? "\n\n\(prompt.skippedCount) already protected/restored item(s) will be skipped."
-                        : ""
-                    Text(
-                        "Download \(prompt.unrestoredTargets.count) full-resolution original(s) (~\(sizeStr)) to Photos and protect them from auto re-compression.\(skipNote)"
-                    )
-                }
+            .restoreOriginalsConfirmAlert(prompt: $restoreConfirmPrompt) { targets, prompt in
+                startBatchRestore(targets: targets, exitSelectionAfter: !prompt.isRestoreAll)
             }
             .alert(
                 "Delete from Server?",
@@ -651,27 +578,6 @@ struct ServerGalleryView: View {
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
-            } else {
-                Image(systemName: "icloud.and.arrow.down")
-                    .font(.caption.weight(.semibold))
-                    .foregroundColor(.accentColor)
-                let pending = unrestoredPhotos.count
-                Text(
-                    pending > 0
-                    ? "\(pending) of \(photos.count) original(s) not restored"
-                    : "All \(photos.count) original(s) protected/restored"
-                )
-                .font(.caption.weight(.medium))
-                .foregroundColor(.primary)
-                .lineLimit(1)
-
-                Spacer()
-
-                Button("Restore All") {
-                    requestRestoreAll()
-                }
-                .font(.caption.weight(.semibold))
-                .disabled(isBatchProxying || isBatchDeleting || photos.isEmpty)
             }
         }
         .padding(.horizontal, 12)
@@ -789,15 +695,6 @@ struct ServerGalleryView: View {
         }
     }
 
-    private func requestRestoreAll() {
-        guard !isBatchRestoring, !isBatchProxying, !isBatchDeleting, !photos.isEmpty else { return }
-        restoreConfirmPrompt = buildRestoreConfirmPrompt(
-            title: "Restore All Originals",
-            targets: photos,
-            isRestoreAll: true
-        )
-    }
-
     private func requestRestoreSelected() {
         let targets = selectedPhotos
         guard !isBatchRestoring, !isBatchProxying, !isBatchDeleting, !targets.isEmpty else { return }
@@ -881,14 +778,10 @@ struct ServerGalleryView: View {
         targets: [ServerPhoto],
         isRestoreAll: Bool
     ) -> RestoreConfirmPrompt {
-        let unrestored = targets.filter { !isRestoredOrProtected($0) }
-        return RestoreConfirmPrompt(
+        RestoreConfirmPrompt.build(
             title: title,
-            allTargets: targets,
-            unrestoredTargets: unrestored,
-            skippedCount: max(0, targets.count - unrestored.count),
-            unrestoredBytes: unrestored.reduce(into: Int64(0)) { $0 += max(0, $1.size) },
-            allBytes: targets.reduce(into: Int64(0)) { $0 += max(0, $1.size) },
+            targets: targets,
+            locallyProtectedHashes: locallyProtectedHashes,
             isRestoreAll: isRestoreAll
         )
     }
@@ -917,85 +810,22 @@ struct ServerGalleryView: View {
             }
 
             let client = PhotoHubAPIClient(settings: settings)
-            let queue = AsyncWorkQueue(targets)
-            let photosWriteSemaphore = AsyncSemaphore(value: 1)
-            let workerCount = min(3, targets.count)
-
-            var succeeded = 0
-            var failed = 0
-
-            await withTaskGroup(of: BatchRestoreOutcome?.self) { group in
-                for _ in 0..<workerCount {
-                    group.addTask {
-                        await Self.processNextBatchRestoreItem(
-                            queue: queue,
-                            client: client,
-                            photoWriteSemaphore: photosWriteSemaphore
-                        )
-                    }
+            let summary = await BatchRestoreRunner.run(
+                targets: targets,
+                client: client
+            ) { completed, _, displayName, updatedPhoto in
+                if let updatedPhoto {
+                    applyUpdatedPhoto(updatedPhoto)
                 }
-
-                for await outcome in group {
-                    guard let outcome else { continue }
-                    switch outcome {
-                    case .restored(let updated, _):
-                        if let updated {
-                            applyUpdatedPhoto(updated)
-                        }
-                        succeeded += 1
-                    case .failed:
-                        failed += 1
-                    }
-                    restoreCompleted += 1
-                    restoreStatusText = outcome.displayName
-
-                    if !Task.isCancelled {
-                        group.addTask {
-                            await Self.processNextBatchRestoreItem(
-                                queue: queue,
-                                client: client,
-                                photoWriteSemaphore: photosWriteSemaphore
-                            )
-                        }
-                    }
-                }
+                restoreCompleted = completed
+                restoreStatusText = displayName
             }
 
-            let cancelled = Task.isCancelled
             isBatchRestoring = false
             restoreStatusText = ""
             restoreTask = nil
             refreshLocallyProtectedHashes()
-
-            if cancelled {
-                restoreBannerMessage = "Stopped after restoring \(succeeded) original(s)."
-            } else if failed > 0 && succeeded == 0 {
-                restoreBannerMessage = "Restore failed for \(failed) item(s)."
-            } else if failed > 0 {
-                restoreBannerMessage = "Restored \(succeeded) original(s) & protected them; \(failed) failed."
-            } else {
-                restoreBannerMessage = "Restored \(succeeded) original(s) to Photos & protected them."
-            }
-        }
-    }
-
-    private static func processNextBatchRestoreItem(
-        queue: AsyncWorkQueue<ServerPhoto>,
-        client: PhotoHubAPIClient,
-        photoWriteSemaphore: AsyncSemaphore
-    ) async -> BatchRestoreOutcome? {
-        guard !Task.isCancelled, let item = await queue.next() else {
-            return nil
-        }
-        do {
-            let (updated, _) = try await PhotoLibraryService.restoreMasterToPhotos(
-                photo: item,
-                client: client,
-                photoWriteSemaphore: photoWriteSemaphore
-            )
-            return .restored(updated, item.originalName)
-        } catch {
-            return .failed(item.originalName)
+            restoreBannerMessage = summary.message
         }
     }
 

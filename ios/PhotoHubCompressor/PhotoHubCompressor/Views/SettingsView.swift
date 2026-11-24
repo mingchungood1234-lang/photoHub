@@ -5,12 +5,14 @@ import UIKit
 struct SettingsView: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject private var syncManager: LocalProxySyncManager
+    @ObservedObject private var restoreManager: OriginalRestoreManager
     @ObservedObject private var authService: GoogleAuthService
     @ObservedObject private var bgManager: BackgroundBackupManager
 
     init(settings: AppSettings) {
         self.settings = settings
         self._syncManager = ObservedObject(wrappedValue: LocalProxySyncManager.shared)
+        self._restoreManager = ObservedObject(wrappedValue: OriginalRestoreManager.shared)
         self._authService = ObservedObject(wrappedValue: GoogleAuthService.shared)
         self._bgManager = ObservedObject(wrappedValue: BackgroundBackupManager.shared)
     }
@@ -50,13 +52,18 @@ struct SettingsView: View {
                 safetySection
                 diagnosticsSection
                 localCacheSection
+                restoreOriginalsSection
             }
             .onAppear {
                 photosAuthText = PhotoLibraryService.currentReadWriteAuthLabel()
                 localProxyCacheBytes = LocalProxyStore.shared.totalStorageBytes()
                 bgManager.refreshNotificationPermissionLabel()
+                restoreManager.loadCachedSummary(settings: settings)
                 if settings.isSignedIn {
-                    Task { await refreshAccountAndStorage() }
+                    Task {
+                        await refreshAccountAndStorage()
+                        await restoreManager.refreshFromServer(settings: settings)
+                    }
                 }
             }
             .onChange(of: settings.nightlyAutoBackupEnabled) { enabled in
@@ -77,6 +84,10 @@ struct SettingsView: View {
             }
             .onReceive(NotificationCenter.default.publisher(for: .localProxyStoreDidChange)) { _ in
                 localProxyCacheBytes = LocalProxyStore.shared.totalStorageBytes()
+                restoreManager.loadCachedSummary(settings: settings)
+            }
+            .restoreOriginalsConfirmAlert(prompt: $restoreManager.confirmPrompt) { targets, _ in
+                restoreManager.startRestore(targets: targets, settings: settings)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .navigationTitle("Settings")
@@ -137,6 +148,7 @@ struct SettingsView: View {
 
             Button(role: .destructive) {
                 LocalProxySyncManager.shared.cancel()
+                restoreManager.reset()
                 settings.signOut()
             } label: {
                 Text("Sign Out")
@@ -429,6 +441,98 @@ struct SettingsView: View {
         }
     }
 
+    @ViewBuilder
+    private var restoreOriginalsSection: some View {
+        Section {
+            HStack {
+                Text("Originals Status")
+                Spacer()
+                if restoreManager.isLoadingSummary && !restoreManager.hasLoadedSummary {
+                    ProgressView()
+                } else if restoreManager.totalCount > 0 {
+                    if restoreManager.unrestoredCount > 0 {
+                        let sizeStr = formatBytes(restoreManager.unrestoredBytes)
+                        Text("\(restoreManager.unrestoredCount) of \(restoreManager.totalCount) not restored (~\(sizeStr))")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("All \(restoreManager.totalCount) protected/restored")
+                            .font(.subheadline)
+                            .foregroundColor(.green)
+                    }
+                } else if restoreManager.hasLoadedSummary {
+                    Text("0 items on server")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Tap Restore to check")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if restoreManager.isRestoring {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                        Text("Restoring originals (\(restoreManager.completedCount)/\(restoreManager.batchTotalCount))…")
+                            .font(.subheadline.weight(.medium))
+                        Spacer()
+                        Button("Stop") {
+                            restoreManager.stopRestore()
+                        }
+                        .font(.subheadline.weight(.semibold))
+                    }
+                    if !restoreManager.currentItemName.isEmpty {
+                        Text(restoreManager.currentItemName)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .padding(.vertical, 2)
+            } else {
+                Button {
+                    restoreManager.requestRestoreAll(settings: settings)
+                } label: {
+                    HStack {
+                        Label("Restore All Originals to Photos", systemImage: "icloud.and.arrow.down")
+                        Spacer()
+                        if restoreManager.isLoadingSummary {
+                            ProgressView()
+                        }
+                    }
+                }
+                .disabled(
+                    settings.normalizedBaseURL == nil
+                    || !settings.isSignedIn
+                    || restoreManager.isLoadingSummary
+                )
+
+                if let msg = restoreManager.statusMessage {
+                    HStack(spacing: 8) {
+                        Text(msg)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button {
+                            restoreManager.statusMessage = nil
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        } header: {
+            Text("Restore Originals")
+        } footer: {
+            Text("Downloads full-resolution originals from your server into Apple Photos and marks them protected so automatic proxy cleanup will not re-compress them.")
+        }
+    }
+
     private func refreshAccountAndStorage() async {
         isTesting = true
         connectionStatus = nil
@@ -466,5 +570,41 @@ struct SettingsView: View {
         if fraction >= 0.9 { return .red }
         if fraction >= 0.75 { return .orange }
         return .green
+    }
+}
+
+extension View {
+    func restoreOriginalsConfirmAlert(
+        prompt: Binding<RestoreConfirmPrompt?>,
+        onConfirm: @escaping (_ targets: [ServerPhoto], _ prompt: RestoreConfirmPrompt) -> Void
+    ) -> some View {
+        alert(
+            prompt.wrappedValue?.title ?? "Restore Originals",
+            isPresented: Binding(
+                get: { prompt.wrappedValue != nil },
+                set: { if !$0 { prompt.wrappedValue = nil } }
+            ),
+            presenting: prompt.wrappedValue
+        ) { current in
+            if !current.unrestoredTargets.isEmpty {
+                Button("Restore \(current.unrestoredTargets.count)") {
+                    onConfirm(current.unrestoredTargets, current)
+                }
+                if current.skippedCount > 0 {
+                    Button("Include \(current.skippedCount) Already Restored (\(current.allTargets.count))") {
+                        onConfirm(current.allTargets, current)
+                    }
+                }
+            } else {
+                Button("Re-download All (\(current.allTargets.count))") {
+                    onConfirm(current.allTargets, current)
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                prompt.wrappedValue = nil
+            }
+        } message: { current in
+            Text(current.messageText)
+        }
     }
 }

@@ -26,6 +26,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.photohub.compressor.data.*
+import com.photohub.compressor.media.MediaLibraryService
 import com.photohub.compressor.ui.theme.*
 import com.photohub.compressor.viewmodel.SettingsViewModel
 import kotlin.math.roundToInt
@@ -44,11 +45,36 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
     var showFormatMenu by remember { mutableStateOf(false) }
     var showResMenu by remember { mutableStateOf(false) }
     var showDetailMenu by remember { mutableStateOf(false) }
+    var pendingRestoreIncludeProtected by remember { mutableStateOf<Boolean?>(null) }
 
     val testTrashLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartIntentSenderForResult()
     ) { result ->
         viewModel.onDiagnosticTrashResult(result.resultCode == Activity.RESULT_OK)
+    }
+
+    val restoreGalleryPermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { _ ->
+        val includeProtected = pendingRestoreIncludeProtected
+        pendingRestoreIncludeProtected = null
+        if (includeProtected != null) {
+            if (viewModel.canWriteGallery()) {
+                viewModel.executeRestoreOriginalsConfirm(includeProtected)
+            } else {
+                viewModel.dismissRestoreOriginalsConfirm()
+                viewModel.reportRestoreOriginalsPermissionDenied()
+            }
+        }
+    }
+
+    fun triggerConfirmedRestoreOriginals(includeAlreadyRestored: Boolean) {
+        if (viewModel.canWriteGallery()) {
+            viewModel.executeRestoreOriginalsConfirm(includeAlreadyRestored)
+        } else {
+            pendingRestoreIncludeProtected = includeAlreadyRestored
+            restoreGalleryPermLauncher.launch(MediaLibraryService.galleryReadWritePermissions())
+        }
     }
 
     LaunchedEffect(uiState.pendingTestTrashIntentSender) {
@@ -70,9 +96,20 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
 
     LaunchedEffect(Unit) {
         viewModel.onAppear()
-        if (settingsState.isSignedIn && settingsState.serverStorage == null) {
-            viewModel.refreshAccountAndStorage()
+        if (settingsState.isSignedIn) {
+            if (settingsState.serverStorage == null) {
+                viewModel.refreshAccountAndStorage()
+            }
+            viewModel.refreshRestoreOriginalsSummary(fetchRemote = true)
         }
+    }
+
+    uiState.restoreOriginalsConfirmRequest?.let { req ->
+        BatchRestoreConfirmDialog(
+            request = req,
+            onDismiss = { viewModel.dismissRestoreOriginalsConfirm() },
+            onConfirm = { includeProtected -> triggerConfirmedRestoreOriginals(includeProtected) }
+        )
     }
 
     Scaffold(
@@ -603,6 +640,126 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
                         contentPadding = PaddingValues(0.dp)
                     ) {
                         Text("Clear Local Proxy Cache", color = if (uiState.localProxyCacheBytes > 0L) PhotoHubRed else MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+
+            // 8. Restore Originals Section
+            item {
+                SectionCard(
+                    title = "Restore Originals",
+                    footer = "Downloads full-resolution originals from your server into your phone Gallery and marks them protected so automatic proxy cleanup will not re-compress them."
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Originals Status", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                        when {
+                            uiState.isLoadingRestoreSummary && !uiState.hasLoadedRestoreSummary -> {
+                                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            }
+                            uiState.restoreLibraryTotalCount > 0 && uiState.restoreLibraryUnrestoredCount > 0 -> {
+                                val sizeStr = Formatter.formatFileSize(context, uiState.restoreLibraryUnrestoredBytes)
+                                Text(
+                                    "${uiState.restoreLibraryUnrestoredCount} of ${uiState.restoreLibraryTotalCount} not restored (~$sizeStr)",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            uiState.restoreLibraryTotalCount > 0 -> {
+                                Text(
+                                    "All ${uiState.restoreLibraryTotalCount} protected/restored",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = PhotoHubGreen,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            }
+                            uiState.hasLoadedRestoreSummary -> {
+                                Text(
+                                    "0 items on server",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            else -> {
+                                Text(
+                                    "Tap Restore to check",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+
+                    if (uiState.isBatchRestoringOriginals) {
+                        Column(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    "Restoring originals (${uiState.restoreOriginalsCompleted}/${uiState.restoreOriginalsTotal})…",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = FontWeight.Medium,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                TextButton(onClick = { viewModel.stopRestoreOriginals() }) {
+                                    Text("Stop")
+                                }
+                            }
+                            if (uiState.restoreOriginalsCurrentName.isNotBlank()) {
+                                Text(
+                                    uiState.restoreOriginalsCurrentName,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1
+                                )
+                            }
+                        }
+                    } else {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            TextButton(
+                                onClick = { viewModel.requestRestoreAllOriginals() },
+                                enabled = settingsState.normalizedBaseUrl != null &&
+                                    settingsState.isSignedIn &&
+                                    !uiState.isLoadingRestoreSummary,
+                                contentPadding = PaddingValues(0.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(Icons.Rounded.CloudDownload, null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Restore All Originals to Gallery", modifier = Modifier.weight(1f))
+                            }
+                            if (uiState.isLoadingRestoreSummary) {
+                                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            }
+                        }
+
+                        uiState.restoreOriginalsMessage?.let { msg ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    msg,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                IconButton(
+                                    onClick = { viewModel.dismissRestoreOriginalsMessage() },
+                                    modifier = Modifier.size(24.dp)
+                                ) {
+                                    Icon(Icons.Rounded.Close, null, modifier = Modifier.size(14.dp))
+                                }
+                            }
+                        }
                     }
                 }
             }

@@ -10,6 +10,7 @@ import com.photohub.compressor.media.ShareUtils
 import com.photohub.compressor.network.ContentRangeInfo
 import com.photohub.compressor.network.DownloadRangePlanner
 import com.photohub.compressor.provider.PhotoHubDocumentIdParser
+import com.photohub.compressor.viewmodel.BatchRestoreExecutor
 import com.photohub.compressor.viewmodel.BatchRestorePlanner
 import com.photohub.compressor.viewmodel.ServerGalleryFilter
 import com.photohub.compressor.viewmodel.ServerMediaTypeFilter
@@ -256,5 +257,25 @@ class PhotoHubUnitTest {
         assertEquals(ProxyDetailPreset.COMPACT, ProxyDetailPreset.fromStoredQuality(0.50f))
         assertEquals(ProxyDetailPreset.BALANCED, ProxyDetailPreset.fromStoredQuality(0.72f))
         assertEquals(ProxyDetailPreset.HIGH_DETAIL, ProxyDetailPreset.fromStoredQuality(0.85f))
+    }
+
+    @Test
+    fun `batch restore executor formats summary messages consistently`() {
+        assertEquals(
+            "Stopped after restoring 3 original(s).",
+            BatchRestoreExecutor.formatSummaryMessage(ok = 3, errCount = 1, cancelled = true)
+        )
+        assertEquals(
+            "Restore failed for 4 item(s).",
+            BatchRestoreExecutor.formatSummaryMessage(ok = 0, errCount = 4, cancelled = false)
+        )
+        assertEquals(
+            "Restored 5 original(s) & protected them; 2 failed.",
+            BatchRestoreExecutor.formatSummaryMessage(ok = 5, errCount = 2, cancelled = false)
+        )
+        assertEquals(
+            "Restored 6 original(s) to Gallery & protected them.",
+            BatchRestoreExecutor.formatSummaryMessage(ok = 6, errCount = 0, cancelled = false)
+        )
     }
 }

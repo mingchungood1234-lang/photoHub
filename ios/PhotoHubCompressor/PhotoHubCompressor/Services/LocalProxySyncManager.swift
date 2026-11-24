@@ -360,3 +360,351 @@ final class LocalProxySyncManager: ObservableObject {
         lock.unlock()
     }
 }
+
+enum BatchRestoreOutcome: Sendable {
+    case restored(ServerPhoto?, String)
+    case failed(String)
+
+    var displayName: String {
+        switch self {
+        case .restored(_, let name): return name
+        case .failed(let name): return name
+        }
+    }
+}
+
+struct RestoreConfirmPrompt: Identifiable {
+    let id = UUID()
+    let title: String
+    let allTargets: [ServerPhoto]
+    let unrestoredTargets: [ServerPhoto]
+    let skippedCount: Int
+    let unrestoredBytes: Int64
+    let allBytes: Int64
+    let isRestoreAll: Bool
+
+    var messageText: String {
+        if unrestoredTargets.isEmpty {
+            return "All \(allTargets.count) selected item(s) are already restored & protected on this device."
+        }
+        let sizeStr = ByteCountFormatter.string(fromByteCount: max(0, unrestoredBytes), countStyle: .file)
+        let skipNote = skippedCount > 0
+            ? "\n\n\(skippedCount) already protected/restored item(s) will be skipped."
+            : ""
+        return "Download \(unrestoredTargets.count) full-resolution original(s) (~\(sizeStr)) to Photos and protect them from auto re-compression.\(skipNote)"
+    }
+
+    static func build(
+        title: String,
+        targets: [ServerPhoto],
+        locallyProtectedHashes: Set<String>,
+        isRestoreAll: Bool
+    ) -> RestoreConfirmPrompt {
+        let normProtected = Set(
+            locallyProtectedHashes.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        )
+        let unrestored = targets.filter { photo in
+            let norm = photo.hash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return !photo.isProtectedOriginal && !normProtected.contains(norm)
+        }
+        return RestoreConfirmPrompt(
+            title: title,
+            allTargets: targets,
+            unrestoredTargets: unrestored,
+            skippedCount: max(0, targets.count - unrestored.count),
+            unrestoredBytes: unrestored.reduce(into: Int64(0)) { $0 += max(0, $1.size) },
+            allBytes: targets.reduce(into: Int64(0)) { $0 += max(0, $1.size) },
+            isRestoreAll: isRestoreAll
+        )
+    }
+}
+
+enum BatchRestoreRunner {
+    struct Summary {
+        let succeeded: Int
+        let failed: Int
+        let cancelled: Bool
+        let message: String
+    }
+
+    static func run(
+        targets: [ServerPhoto],
+        client: PhotoHubAPIClient,
+        onProgress: @MainActor @escaping (
+            _ completed: Int,
+            _ total: Int,
+            _ displayName: String,
+            _ updatedPhoto: ServerPhoto?
+        ) -> Void
+    ) async -> Summary {
+        let queue = AsyncWorkQueue(targets)
+        let photosWriteSemaphore = AsyncSemaphore(value: 1)
+        let workerCount = min(3, targets.count)
+
+        var succeeded = 0
+        var failed = 0
+        var completed = 0
+
+        await withTaskGroup(of: BatchRestoreOutcome?.self) { group in
+            for _ in 0..<workerCount {
+                group.addTask {
+                    await processNextItem(
+                        queue: queue,
+                        client: client,
+                        photoWriteSemaphore: photosWriteSemaphore
+                    )
+                }
+            }
+
+            for await outcome in group {
+                guard let outcome else { continue }
+                var updatedPhoto: ServerPhoto?
+                switch outcome {
+                case .restored(let updated, _):
+                    updatedPhoto = updated
+                    succeeded += 1
+                case .failed:
+                    failed += 1
+                }
+                completed += 1
+                await onProgress(completed, targets.count, outcome.displayName, updatedPhoto)
+
+                if !Task.isCancelled {
+                    group.addTask {
+                        await processNextItem(
+                            queue: queue,
+                            client: client,
+                            photoWriteSemaphore: photosWriteSemaphore
+                        )
+                    }
+                }
+            }
+        }
+
+        let cancelled = Task.isCancelled
+        let message: String
+        if cancelled {
+            message = "Stopped after restoring \(succeeded) original(s)."
+        } else if failed > 0 && succeeded == 0 {
+            message = "Restore failed for \(failed) item(s)."
+        } else if failed > 0 {
+            message = "Restored \(succeeded) original(s) & protected them; \(failed) failed."
+        } else {
+            message = "Restored \(succeeded) original(s) to Photos & protected them."
+        }
+        return Summary(succeeded: succeeded, failed: failed, cancelled: cancelled, message: message)
+    }
+
+    private static func processNextItem(
+        queue: AsyncWorkQueue<ServerPhoto>,
+        client: PhotoHubAPIClient,
+        photoWriteSemaphore: AsyncSemaphore
+    ) async -> BatchRestoreOutcome? {
+        guard !Task.isCancelled, let item = await queue.next() else {
+            return nil
+        }
+        do {
+            let (updated, _) = try await PhotoLibraryService.restoreMasterToPhotos(
+                photo: item,
+                client: client,
+                photoWriteSemaphore: photoWriteSemaphore
+            )
+            return .restored(updated, item.originalName)
+        } catch {
+            return .failed(item.originalName)
+        }
+    }
+}
+
+/// Manages bulk "Restore All Originals to Photos" from Settings so restore jobs
+/// survive navigation across tabs and reflect live counts from server & local state.
+@MainActor
+final class OriginalRestoreManager: ObservableObject {
+    static let shared = OriginalRestoreManager()
+
+    @Published private(set) var isLoadingSummary: Bool = false
+    @Published private(set) var hasLoadedSummary: Bool = false
+    @Published private(set) var totalCount: Int = 0
+    @Published private(set) var unrestoredCount: Int = 0
+    @Published private(set) var unrestoredBytes: Int64 = 0
+
+    @Published private(set) var isRestoring: Bool = false
+    @Published private(set) var completedCount: Int = 0
+    @Published private(set) var batchTotalCount: Int = 0
+    @Published private(set) var currentItemName: String = ""
+    @Published var statusMessage: String?
+    @Published var confirmPrompt: RestoreConfirmPrompt?
+
+    private var cachedPhotos: [ServerPhoto] = []
+    private var restoreTask: Task<Void, Never>?
+
+    private init() {}
+
+    func loadCachedSummary(settings: AppSettings) {
+        let cached = LocalProxyStore.shared.cachedPhotos(
+            baseURL: settings.normalizedBaseURL,
+            apiKey: settings.apiKey
+        )
+        applySummary(photos: cached, markLoaded: !cached.isEmpty)
+    }
+
+    func refreshFromServer(settings: AppSettings) async {
+        loadCachedSummary(settings: settings)
+        guard settings.isSignedIn, let baseURL = settings.normalizedBaseURL else {
+            return
+        }
+        if isLoadingSummary { return }
+        isLoadingSummary = true
+        defer { isLoadingSummary = false }
+
+        do {
+            let fetched = try await PhotoHubAPIClient(settings: settings).fetchAllServerPhotos(sync: true)
+            LocalProxyStore.shared.savePhotos(fetched, baseURL: baseURL, apiKey: settings.apiKey)
+            applySummary(photos: fetched, markLoaded: true)
+        } catch {
+            // Keep cached counts if offline
+        }
+    }
+
+    func requestRestoreAll(settings: AppSettings) {
+        guard !isRestoring, !isLoadingSummary,
+              settings.isSignedIn,
+              let baseURL = settings.normalizedBaseURL else {
+            return
+        }
+        statusMessage = nil
+        isLoadingSummary = true
+
+        Task {
+            defer { isLoadingSummary = false }
+            var targets: [ServerPhoto] = []
+            var fetchError: Error?
+
+            do {
+                let fetched = try await PhotoHubAPIClient(settings: settings).fetchAllServerPhotos(sync: true)
+                LocalProxyStore.shared.savePhotos(fetched, baseURL: baseURL, apiKey: settings.apiKey)
+                applySummary(photos: fetched, markLoaded: true)
+                targets = fetched
+            } catch {
+                fetchError = error
+                loadCachedSummary(settings: settings)
+                targets = cachedPhotos
+            }
+
+            if targets.isEmpty {
+                if let fetchError {
+                    statusMessage = "Could not load server library: \(fetchError.localizedDescription)"
+                } else {
+                    statusMessage = "No photos or videos found on server yet."
+                }
+                return
+            }
+
+            confirmPrompt = RestoreConfirmPrompt.build(
+                title: "Restore All Originals",
+                targets: targets,
+                locallyProtectedHashes: protectedHashes(for: targets),
+                isRestoreAll: true
+            )
+        }
+    }
+
+    func startRestore(targets: [ServerPhoto], settings: AppSettings) {
+        guard !isRestoring, !targets.isEmpty else { return }
+        confirmPrompt = nil
+        statusMessage = nil
+        completedCount = 0
+        batchTotalCount = targets.count
+        currentItemName = "Preparing..."
+        isRestoring = true
+
+        let baseURL = settings.normalizedBaseURL
+        let apiKey = settings.apiKey
+
+        restoreTask?.cancel()
+        restoreTask = Task {
+            let authorized = await PhotoLibraryService.requestWriteAuthorizationAsync()
+            guard authorized else {
+                isRestoring = false
+                currentItemName = ""
+                restoreTask = nil
+                statusMessage = "Allow Photos permission in iOS Settings to save originals."
+                return
+            }
+
+            let client = PhotoHubAPIClient(settings: settings)
+            let summary = await BatchRestoreRunner.run(
+                targets: targets,
+                client: client
+            ) { [weak self] completed, total, displayName, updatedPhoto in
+                guard let self else { return }
+                self.completedCount = completed
+                self.batchTotalCount = total
+                self.currentItemName = displayName
+                if let updatedPhoto {
+                    LocalProxyStore.shared.updatePhoto(
+                        updatedPhoto,
+                        baseURL: baseURL,
+                        apiKey: apiKey,
+                        notify: false
+                    )
+                    if let idx = self.cachedPhotos.firstIndex(where: {
+                        $0.hash.caseInsensitiveCompare(updatedPhoto.hash) == .orderedSame
+                    }) {
+                        self.cachedPhotos[idx] = updatedPhoto
+                    }
+                }
+            }
+
+            isRestoring = false
+            currentItemName = ""
+            restoreTask = nil
+            applySummary(photos: cachedPhotos, markLoaded: hasLoadedSummary || !cachedPhotos.isEmpty)
+            NotificationCenter.default.post(name: .localProxyStoreDidChange, object: nil)
+            statusMessage = summary.message
+        }
+    }
+
+    func stopRestore() {
+        restoreTask?.cancel()
+    }
+
+    func reset() {
+        restoreTask?.cancel()
+        restoreTask = nil
+        cachedPhotos = []
+        isLoadingSummary = false
+        hasLoadedSummary = false
+        totalCount = 0
+        unrestoredCount = 0
+        unrestoredBytes = 0
+        isRestoring = false
+        completedCount = 0
+        batchTotalCount = 0
+        currentItemName = ""
+        statusMessage = nil
+        confirmPrompt = nil
+    }
+
+    private func protectedHashes(for photos: [ServerPhoto]) -> Set<String> {
+        Set(
+            photos
+                .map { $0.hash.lowercased() }
+                .filter { LocalProxyTracker.shared.isRestoredMasterHash($0) }
+        )
+    }
+
+    private func applySummary(photos: [ServerPhoto], markLoaded: Bool) {
+        cachedPhotos = photos
+        let prompt = RestoreConfirmPrompt.build(
+            title: "Restore All Originals",
+            targets: photos,
+            locallyProtectedHashes: protectedHashes(for: photos),
+            isRestoreAll: true
+        )
+        totalCount = photos.count
+        unrestoredCount = prompt.unrestoredTargets.count
+        unrestoredBytes = prompt.unrestoredBytes
+        hasLoadedSummary = markLoaded
+    }
+}

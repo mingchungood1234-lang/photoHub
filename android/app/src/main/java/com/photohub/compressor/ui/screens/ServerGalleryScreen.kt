@@ -1,9 +1,7 @@
 package com.photohub.compressor.ui.screens
 
-import android.Manifest
 import android.content.ComponentName
 import android.content.Intent
-import android.os.Build
 import android.text.format.Formatter
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
@@ -41,6 +39,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.photohub.compressor.ShareOriginalActivity
 import com.photohub.compressor.data.ServerPhoto
+import com.photohub.compressor.media.MediaLibraryService
 import com.photohub.compressor.media.ShareUtils
 import com.photohub.compressor.sync.LocalProxySyncManager
 import com.photohub.compressor.ui.theme.PhotoHubGreen
@@ -93,25 +92,7 @@ fun ServerGalleryScreen(
             viewModel.executeRestoreConfirm(includeAlreadyRestored)
         } else {
             pendingRestoreIncludeProtected = includeAlreadyRestored
-            val perms = when {
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE -> arrayOf(
-                    Manifest.permission.READ_MEDIA_IMAGES,
-                    Manifest.permission.READ_MEDIA_VIDEO,
-                    Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED
-                )
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> arrayOf(
-                    Manifest.permission.READ_MEDIA_IMAGES,
-                    Manifest.permission.READ_MEDIA_VIDEO
-                )
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> arrayOf(
-                    Manifest.permission.READ_EXTERNAL_STORAGE
-                )
-                else -> arrayOf(
-                    Manifest.permission.READ_EXTERNAL_STORAGE,
-                    Manifest.permission.WRITE_EXTERNAL_STORAGE
-                )
-            }
-            galleryPermLauncher.launch(perms)
+            galleryPermLauncher.launch(MediaLibraryService.galleryReadWritePermissions())
         }
     }
 
@@ -137,52 +118,10 @@ fun ServerGalleryScreen(
     }
 
     uiState.restoreConfirmRequest?.let { req ->
-        AlertDialog(
-            onDismissRequest = { viewModel.dismissRestoreConfirm() },
-            title = { Text(req.title) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (req.unrestoredTargets.isEmpty()) {
-                        Text(
-                            "All ${req.allTargets.size} selected item(s) are already restored & protected on this device."
-                        )
-                    } else {
-                        val sizeStr = Formatter.formatFileSize(context, req.unrestoredBytes)
-                        Text(
-                            "Download ${req.unrestoredTargets.size} full-resolution original(s) (~$sizeStr) to your Gallery and protect them from auto re-compression."
-                        )
-                        if (req.skippedCount > 0) {
-                            Text(
-                                "${req.skippedCount} already protected/restored item(s) will be skipped.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            TextButton(
-                                onClick = { triggerConfirmedRestore(includeAlreadyRestored = true) },
-                                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp)
-                            ) {
-                                Text("Include ${req.skippedCount} already restored (${req.allTargets.size} total)")
-                            }
-                        }
-                    }
-                }
-            },
-            confirmButton = {
-                if (req.unrestoredTargets.isEmpty()) {
-                    Button(onClick = { triggerConfirmedRestore(includeAlreadyRestored = true) }) {
-                        Text("Re-download All (${req.allTargets.size})")
-                    }
-                } else {
-                    Button(onClick = { triggerConfirmedRestore(includeAlreadyRestored = false) }) {
-                        Text("Restore ${req.unrestoredTargets.size}")
-                    }
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { viewModel.dismissRestoreConfirm() }) {
-                    Text("Cancel")
-                }
-            }
+        BatchRestoreConfirmDialog(
+            request = req,
+            onDismiss = { viewModel.dismissRestoreConfirm() },
+            onConfirm = { includeProtected -> triggerConfirmedRestore(includeProtected) }
         )
     }
 
@@ -306,15 +245,6 @@ fun ServerGalleryScreen(
                             }
                             DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
                                 if (uiState.photos.isNotEmpty()) {
-                                    DropdownMenuItem(
-                                        text = { Text("Restore All Originals (${uiState.photos.size})") },
-                                        leadingIcon = { Icon(Icons.Rounded.CloudDownload, null) },
-                                        enabled = !uiState.isBatchRestoring && !uiState.isBatchProxying && !uiState.isBatchDeleting,
-                                        onClick = {
-                                            showMenu = false
-                                            viewModel.requestRestoreAll()
-                                        }
-                                    )
                                     DropdownMenuItem(
                                         text = { Text("Select Photos to Restore or Delete") },
                                         leadingIcon = { Icon(Icons.Rounded.CheckBox, null) },
@@ -512,7 +442,7 @@ fun ServerGalleryScreen(
                                     }
                                 }
 
-                                if (uiState.isBatchRestoring || uiState.restoreBannerMessage != null || (!uiState.isSelectionMode && uiState.photos.isNotEmpty())) {
+                                if (uiState.isBatchRestoring || uiState.restoreBannerMessage != null) {
                                     item(span = { GridItemSpan(maxLineSpan) }) {
                                         RestoreOriginalsBanner(uiState = uiState, viewModel = viewModel)
                                     }
@@ -770,6 +700,62 @@ private fun UnproxiedBanner(
 }
 
 @Composable
+fun BatchRestoreConfirmDialog(
+    request: com.photohub.compressor.viewmodel.BatchRestoreConfirmRequest,
+    onDismiss: () -> Unit,
+    onConfirm: (includeAlreadyRestored: Boolean) -> Unit
+) {
+    val context = LocalContext.current
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(request.title) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (request.unrestoredTargets.isEmpty()) {
+                    Text(
+                        "All ${request.allTargets.size} selected item(s) are already restored & protected on this device."
+                    )
+                } else {
+                    val sizeStr = Formatter.formatFileSize(context, request.unrestoredBytes)
+                    Text(
+                        "Download ${request.unrestoredTargets.size} full-resolution original(s) (~$sizeStr) to your Gallery and protect them from auto re-compression."
+                    )
+                    if (request.skippedCount > 0) {
+                        Text(
+                            "${request.skippedCount} already protected/restored item(s) will be skipped.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        TextButton(
+                            onClick = { onConfirm(true) },
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp)
+                        ) {
+                            Text("Include ${request.skippedCount} already restored (${request.allTargets.size} total)")
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            if (request.unrestoredTargets.isEmpty()) {
+                Button(onClick = { onConfirm(true) }) {
+                    Text("Re-download All (${request.allTargets.size})")
+                }
+            } else {
+                Button(onClick = { onConfirm(false) }) {
+                    Text("Restore ${request.unrestoredTargets.size}")
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
+}
+
+@Composable
 private fun RestoreOriginalsBanner(
     uiState: ServerGalleryUiState,
     viewModel: ServerGalleryViewModel
@@ -785,61 +771,30 @@ private fun RestoreOriginalsBanner(
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            when {
-                uiState.isBatchRestoring -> {
-                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        "Restoring originals ${uiState.restoreCompleted}/${uiState.restoreTotal}",
-                        style = MaterialTheme.typography.bodySmall,
-                        fontWeight = FontWeight.Medium,
-                        modifier = Modifier.weight(1f)
-                    )
-                    TextButton(onClick = { viewModel.stopBatchRestore() }) {
-                        Text("Stop", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
-                    }
+            if (uiState.isBatchRestoring) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    "Restoring originals ${uiState.restoreCompleted}/${uiState.restoreTotal}",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(onClick = { viewModel.stopBatchRestore() }) {
+                    Text("Stop", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
                 }
-                uiState.restoreBannerMessage != null -> {
-                    Icon(Icons.Rounded.CheckCircle, null, tint = PhotoHubGreen, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        uiState.restoreBannerMessage.orEmpty(),
-                        style = MaterialTheme.typography.bodySmall,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f)
-                    )
-                    IconButton(onClick = { viewModel.dismissRestoreBanner() }, modifier = Modifier.size(24.dp)) {
-                        Icon(Icons.Rounded.Close, null, modifier = Modifier.size(14.dp))
-                    }
-                }
-                else -> {
-                    val pending = uiState.unrestoredCount
-                    Icon(
-                        Icons.Rounded.CloudDownload,
-                        null,
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = if (pending > 0) {
-                            "$pending of ${uiState.photos.size} original(s) not restored"
-                        } else {
-                            "All ${uiState.photos.size} original(s) protected/restored"
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        fontWeight = FontWeight.Medium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f)
-                    )
-                    TextButton(
-                        onClick = { viewModel.requestRestoreAll() },
-                        enabled = !uiState.isBatchProxying && !uiState.isBatchDeleting && uiState.photos.isNotEmpty()
-                    ) {
-                        Text("Restore All", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
-                    }
+            } else if (uiState.restoreBannerMessage != null) {
+                Icon(Icons.Rounded.CheckCircle, null, tint = PhotoHubGreen, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    uiState.restoreBannerMessage.orEmpty(),
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                IconButton(onClick = { viewModel.dismissRestoreBanner() }, modifier = Modifier.size(24.dp)) {
+                    Icon(Icons.Rounded.Close, null, modifier = Modifier.size(14.dp))
                 }
             }
         }
