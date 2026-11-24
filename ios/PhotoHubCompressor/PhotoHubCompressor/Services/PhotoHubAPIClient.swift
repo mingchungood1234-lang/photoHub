@@ -515,7 +515,31 @@ final class PhotoHubAPIClient {
         return collected
     }
 
-    private func fetchServerPhotosPage(limit: Int, offset: Int, sync: Bool) async throws -> ServerPhotosResponse {
+    func lookupPhotoByHashPrefix(_ rawPrefix: String) async throws -> ServerPhoto? {
+        let cleanPrefix = rawPrefix
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .filter { $0.isHexDigit }
+        guard cleanPrefix.count >= 8 else { return nil }
+
+        let page = try await fetchServerPhotosPage(limit: 50, offset: 0, sync: false, prefix: cleanPrefix)
+        if let direct = page.photos.first(where: { $0.hash.lowercased().hasPrefix(cleanPrefix) }) {
+            return direct
+        }
+        let serverHasMore = page.hasMore ?? (page.photos.count < page.total)
+        guard serverHasMore else { return nil }
+
+        // Fallback for older server instances that ignore ?prefix=.
+        let all = try await fetchAllServerPhotos(sync: true)
+        return all.first(where: { $0.hash.lowercased().hasPrefix(cleanPrefix) })
+    }
+
+    private func fetchServerPhotosPage(
+        limit: Int,
+        offset: Int,
+        sync: Bool,
+        prefix: String? = nil
+    ) async throws -> ServerPhotosResponse {
         var components = URLComponents(url: try makeURL("/api/photos"), resolvingAgainstBaseURL: false)
         var queryItems = [
             URLQueryItem(name: "limit", value: String(limit)),
@@ -523,6 +547,9 @@ final class PhotoHubAPIClient {
         ]
         if sync {
             queryItems.append(URLQueryItem(name: "sync", value: "1"))
+        }
+        if let prefix, !prefix.isEmpty {
+            queryItems.append(URLQueryItem(name: "prefix", value: prefix))
         }
         components?.queryItems = queryItems
         guard let url = components?.url else {

@@ -4,6 +4,7 @@ struct ContentView: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject private var authService: GoogleAuthService
     @ObservedObject private var bgManager: BackgroundBackupManager
+    @ObservedObject private var incomingShare: IncomingShareCoordinator
     @StateObject private var viewModel: CompressorViewModel
     @State private var selectedTab: Int = 0
 
@@ -11,6 +12,7 @@ struct ContentView: View {
         self.settings = settings
         self._authService = ObservedObject(wrappedValue: GoogleAuthService.shared)
         self._bgManager = ObservedObject(wrappedValue: BackgroundBackupManager.shared)
+        self._incomingShare = ObservedObject(wrappedValue: IncomingShareCoordinator.shared)
         _viewModel = StateObject(wrappedValue: CompressorViewModel(settings: settings))
     }
 
@@ -55,9 +57,29 @@ struct ContentView: View {
                         openDeletePromptFromNotification()
                     }
                 }
+                .sheet(isPresented: $incomingShare.showingInAppPicker) {
+                    MultiPhotoPickerSheet(selectionLimit: 25) { picked in
+                        incomingShare.showingInAppPicker = false
+                        incomingShare.enqueuePickedResults(picked)
+                    } onCancel: {
+                        incomingShare.showingInAppPicker = false
+                    }
+                }
             } else {
                 GoogleSignInGateView(settings: settings, authService: authService)
             }
+        }
+        .onOpenURL { url in
+            incomingShare.handleIncomingURL(url)
+        }
+        .sheet(item: $incomingShare.activeSession, onDismiss: {
+            incomingShare.dismiss()
+        }) { session in
+            ShareOriginalOverlaySheet(
+                session: session,
+                settings: settings,
+                coordinator: incomingShare
+            )
         }
     }
 

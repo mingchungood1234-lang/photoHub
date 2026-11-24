@@ -202,6 +202,46 @@ enum ProxyGenerator {
                 return parsed
             }
         }
+        return findProxyMarkerInMP4File(fileURL)
+    }
+
+    static func findProxyMarkerInMP4Bytes(_ data: Data) -> String? {
+        guard !data.isEmpty,
+              let markerData = proxyMarkerPrefix.data(using: .utf8),
+              let range = data.range(of: markerData) else {
+            return nil
+        }
+        let start = range.upperBound
+        let end = min(data.endIndex, start + 128)
+        guard start < end,
+              let tail = String(data: data[start..<end], encoding: .utf8)
+                ?? String(data: data[start..<end], encoding: .isoLatin1) else {
+            return nil
+        }
+        let hex = extractLowercaseHexPrefix(from: tail, maxLength: 64)
+        return hex.count >= 8 ? hex : nil
+    }
+
+    private static func findProxyMarkerInMP4File(_ fileURL: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: fileURL) else { return nil }
+        defer { try? handle.close() }
+
+        let probeSize = 256 * 1024
+        let head = handle.readData(ofLength: probeSize)
+        if let hit = findProxyMarkerInMP4Bytes(head) {
+            return hit
+        }
+
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+           let totalSize = (attrs[.size] as? NSNumber)?.int64Value,
+           totalSize > Int64(probeSize) {
+            let tailOffset = UInt64(max(0, totalSize - Int64(probeSize)))
+            try? handle.seek(toOffset: tailOffset)
+            let tail = handle.readData(ofLength: probeSize)
+            if let hit = findProxyMarkerInMP4Bytes(tail) {
+                return hit
+            }
+        }
         return nil
     }
 

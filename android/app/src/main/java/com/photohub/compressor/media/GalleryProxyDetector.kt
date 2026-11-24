@@ -382,7 +382,7 @@ object GalleryProxyDetector {
         }
     }
 
-    private fun extractVideoMarkerFromUri(context: Context, uri: Uri): String? {
+    internal fun extractVideoMarkerFromUri(context: Context, uri: Uri): String? {
         val tmp = File(context.cacheDir, "probe_vid_${System.nanoTime()}.mp4")
         return try {
             context.contentResolver.openInputStream(uri)?.use { input ->

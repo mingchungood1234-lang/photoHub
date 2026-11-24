@@ -278,4 +278,18 @@ class PhotoHubUnitTest {
             BatchRestoreExecutor.formatSummaryMessage(ok = 6, errCount = 0, cancelled = false)
         )
     }
+
+    @Test
+    fun `share utils infer image, video, and mixed mime types cleanly`() {
+        assertEquals("image/heic", ShareUtils.inferMimeType(java.io.File("IMG_001.HEIC")))
+        assertEquals("video/*", ShareUtils.inferMimeType(java.io.File("VID_002.MP4")))
+        assertEquals(
+            "image/*",
+            ShareUtils.computeCombinedShareMimeType(listOf("image/jpeg", "image/heic"))
+        )
+        assertEquals(
+            "*/*",
+            ShareUtils.computeCombinedShareMimeType(listOf("image/jpeg", "video/*"))
+        )
+    }
 }

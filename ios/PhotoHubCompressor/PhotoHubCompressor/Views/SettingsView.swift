@@ -23,6 +23,7 @@ struct SettingsView: View {
     @State private var isTestingDelete: Bool = false
     @State private var photosAuthText: String = PhotoLibraryService.currentReadWriteAuthLabel()
     @State private var localProxyCacheBytes: Int64 = LocalProxyStore.shared.totalStorageBytes()
+    @State private var copiedShortcutURLNotice: Bool = false
 
     private var currentResolutionPreset: ProxyResolutionPreset {
         ProxyResolutionPreset.fromStoredPixels(settings.proxyMaxPixelSize)
@@ -53,6 +54,7 @@ struct SettingsView: View {
                 diagnosticsSection
                 localCacheSection
                 restoreOriginalsSection
+                applePhotosShareSection
             }
             .onAppear {
                 photosAuthText = PhotoLibraryService.currentReadWriteAuthLabel()
@@ -530,6 +532,58 @@ struct SettingsView: View {
             Text("Restore Originals")
         } footer: {
             Text("Downloads full-resolution originals from your server into Apple Photos and marks them protected so automatic proxy cleanup will not re-compress them.")
+        }
+    }
+
+    @ViewBuilder
+    private var applePhotosShareSection: some View {
+        Section {
+            Button {
+                IncomingShareCoordinator.shared.presentInAppPhotoPicker()
+            } label: {
+                Label("Pick Photos to Share Original Now", systemImage: "square.and.arrow.up.on.square")
+            }
+            .disabled(!settings.isSignedIn || settings.normalizedBaseURL == nil)
+
+            Button {
+                if let url = URL(string: "shortcuts://") {
+                    UIApplication.shared.open(url)
+                }
+            } label: {
+                Label("Open Apple Shortcuts App", systemImage: "command")
+            }
+
+            Button {
+                UIPasteboard.general.string = "photohub://share-original?from=clipboard"
+                copiedShortcutURLNotice = true
+            } label: {
+                Label("Copy iOS 15 Shortcut URL Scheme", systemImage: "doc.on.doc")
+            }
+
+            if copiedShortcutURLNotice {
+                Text("Copied: photohub://share-original?from=clipboard")
+                    .font(.caption)
+                    .foregroundColor(.green)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("1-Tap Setup from Apple Photos Share Sheet:")
+                    .font(.caption.weight(.semibold))
+                Text("1. Open Shortcuts -> tap + -> tap (i) Details -> enable Show in Share Sheet (Images & Media).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("2. Add action: photoHub -> Fetch & Share Original (pass Shortcut Input).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("3. On iOS 15: add Copy to Clipboard, then Open URLs (photohub://share-original?from=clipboard).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 2)
+        } header: {
+            Text("Share Original from Apple Photos")
+        } footer: {
+            Text("Uses Apple Shortcuts inside the main app (1 App ID, zero App Groups/extensions) so it works reliably on Free Apple Accounts & sideloaded installs.")
         }
     }
 

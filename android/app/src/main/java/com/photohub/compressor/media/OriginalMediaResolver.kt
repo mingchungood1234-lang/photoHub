@@ -276,32 +276,34 @@ class OriginalMediaResolver(
             )
         }
 
-        // 2. EXIF PhotoHubProxy:<masterHash> marker (0 extra RTTs when full 64-char SHA-256 is embedded).
+        // 2. Embedded EXIF (images) or QuickTime/MP4 container marker (videos): PhotoHubProxy:<masterHash>
         var shortPrefix = displayName?.let { ProxyGenerator.extractMasterHashPrefix(it) }
         val isLikelyVideo = mimeHint.startsWith("video/") ||
             (displayName?.substringAfterLast('.', "")?.lowercase(Locale.ROOT)
                 in setOf("mp4", "mov", "m4v", "mkv", "webm", "3gp", "avi"))
 
-        if (!isLikelyVideo) {
-            val exifMarker = runCatching {
+        val embeddedMarker = if (!isLikelyVideo) {
+            runCatching {
                 context.contentResolver.openInputStream(uri)?.use { stream ->
                     ProxyGenerator.extractEmbeddedProxyMasterHashFromStream(stream)
                 }
             }.getOrNull()
+        } else {
+            GalleryProxyDetector.extractVideoMarkerFromUri(context, uri)
+        }
 
-            if (exifMarker != null) {
-                if (ProxyGenerator.isFullSha256Hex(exifMarker)) {
-                    val norm = exifMarker.lowercase(Locale.ROOT)
-                    val cached = cachedPhotos.firstOrNull { it.hash.equals(norm, ignoreCase = true) }
-                    return@withContext ResolvedMasterMedia(
-                        masterHash = cached?.hash ?: norm,
-                        originalName = cached?.originalName,
-                        expectedSizeBytes = cached?.size,
-                        sourceDisplayName = displayName
-                    )
-                } else if (shortPrefix == null) {
-                    shortPrefix = exifMarker
-                }
+        if (embeddedMarker != null) {
+            if (ProxyGenerator.isFullSha256Hex(embeddedMarker)) {
+                val norm = embeddedMarker.lowercase(Locale.ROOT)
+                val cached = cachedPhotos.firstOrNull { it.hash.equals(norm, ignoreCase = true) }
+                return@withContext ResolvedMasterMedia(
+                    masterHash = cached?.hash ?: norm,
+                    originalName = cached?.originalName,
+                    expectedSizeBytes = cached?.size,
+                    sourceDisplayName = displayName
+                )
+            } else if (shortPrefix == null) {
+                shortPrefix = embeddedMarker
             }
         }
 

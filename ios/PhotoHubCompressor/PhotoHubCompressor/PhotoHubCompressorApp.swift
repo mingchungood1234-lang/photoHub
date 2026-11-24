@@ -1,5 +1,9 @@
+#if canImport(AppIntents)
+import AppIntents
+#endif
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 @MainActor
 final class PhotoHubAppDelegate: NSObject, UIApplicationDelegate {
@@ -14,6 +18,69 @@ final class PhotoHubAppDelegate: NSObject, UIApplicationDelegate {
         )
     }
 }
+
+#if canImport(AppIntents)
+@available(iOS 16.0, *)
+struct FetchAndShareOriginalIntent: AppIntent {
+    static var title: LocalizedStringResource = "Fetch & Share Original"
+    static var description = IntentDescription(
+        "Matches compressed photoHub proxies from Apple Photos or Shortcuts and opens the iOS Share Sheet with full-resolution originals."
+    )
+    static var openAppWhenRun: Bool = true
+
+    @Parameter(title: "Photos or Videos", default: [])
+    var media: [IntentFile]
+
+    @MainActor
+    func perform() async throws -> some IntentResult {
+        if media.isEmpty {
+            IncomingShareCoordinator.shared.presentInAppPhotoPicker()
+            return .result()
+        }
+
+        let fm = FileManager.default
+        let batchDir = fm.temporaryDirectory
+            .appendingPathComponent("photohub_incoming_\(UUID().uuidString.prefix(8))", isDirectory: true)
+        try? fm.createDirectory(at: batchDir, withIntermediateDirectories: true)
+
+        var inputs: [OriginalShareInput] = []
+        for (idx, file) in media.enumerated() {
+            let rawName = file.filename.trimmingCharacters(in: .whitespacesAndNewlines)
+            let baseName = URL(fileURLWithPath: rawName.isEmpty ? "media_\(idx + 1)" : rawName).lastPathComponent
+            let destURL = batchDir.appendingPathComponent("\(idx + 1)_\(baseName)")
+            var saved = false
+            if let srcURL = file.fileURL {
+                try? fm.removeItem(at: destURL)
+                saved = (try? fm.copyItem(at: srcURL, to: destURL)) != nil
+            }
+            if !saved {
+                saved = (try? file.data.write(to: destURL, options: .atomic)) != nil
+            }
+            guard saved else { continue }
+            let ext = destURL.pathExtension.lowercased()
+            let utType = file.type ?? UTType(filenameExtension: ext)
+            let isVideo = utType?.conforms(to: .movie) == true
+                || ["mp4", "mov", "m4v", "3gp", "avi", "mkv", "webm"].contains(ext)
+            inputs.append(
+                OriginalShareInput(
+                    assetId: nil,
+                    fileURL: destURL,
+                    filenameHint: baseName,
+                    masterHashHint: nil,
+                    isVideo: isVideo
+                )
+            )
+        }
+
+        if inputs.isEmpty {
+            IncomingShareCoordinator.shared.presentInAppPhotoPicker()
+        } else {
+            IncomingShareCoordinator.shared.enqueueInputs(inputs, cleanupDirs: [batchDir])
+        }
+        return .result()
+    }
+}
+#endif
 
 @main
 struct PhotoHubCompressorApp: App {

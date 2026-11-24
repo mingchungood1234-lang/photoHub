@@ -650,10 +650,20 @@ final class PhotoLibraryService {
         photo: ServerPhoto,
         fileURL: URL
     ) async throws -> String {
-        let isVideo = photo.isVideo
-        let targetFilename = photo.originalName
-        let targetDate = photo.parsedCreationDate
+        try await saveRestoredOriginalToPhotosAsync(
+            isVideo: photo.isVideo,
+            originalFilename: photo.originalName,
+            creationDate: photo.parsedCreationDate,
+            fileURL: fileURL
+        )
+    }
 
+    static func saveRestoredOriginalToPhotosAsync(
+        isVideo: Bool,
+        originalFilename: String,
+        creationDate: Date?,
+        fileURL: URL
+    ) async throws -> String {
         return try await withCheckedThrowingContinuation { continuation in
             var placeholderId: String?
             PHPhotoLibrary.shared().performChanges({
@@ -663,11 +673,11 @@ final class PhotoLibraryService {
                 } else {
                     let creationReq = PHAssetCreationRequest.forAsset()
                     let options = PHAssetResourceCreationOptions()
-                    options.originalFilename = targetFilename
+                    options.originalFilename = originalFilename
                     creationReq.addResource(with: .photo, fileURL: fileURL, options: options)
                     request = creationReq
                 }
-                request?.creationDate = targetDate
+                request?.creationDate = creationDate
                 placeholderId = request?.placeholderForCreatedAsset?.localIdentifier
             }) { success, error in
                 if success {
@@ -772,5 +782,277 @@ final class PhotoLibraryService {
         resources.first(where: { $0.type == .photo || $0.type == .video })
             ?? resources.first(where: { $0.type == .fullSizePhoto || $0.type == .fullSizeVideo })
             ?? resources.first
+    }
+}
+
+struct OriginalShareInput: Sendable {
+    let assetId: String?
+    let fileURL: URL?
+    let filenameHint: String?
+    let masterHashHint: String?
+    let isVideo: Bool
+
+    var displayName: String {
+        if let hint = filenameHint?.trimmingCharacters(in: .whitespacesAndNewlines), !hint.isEmpty {
+            return URL(fileURLWithPath: hint).lastPathComponent
+        }
+        if let urlName = fileURL?.lastPathComponent, !urlName.isEmpty {
+            return urlName
+        }
+        if let hash = masterHashHint, !hash.isEmpty {
+            return "original_\(String(hash.prefix(8)))"
+        }
+        return isVideo ? "Video" : "Photo"
+    }
+}
+
+struct ResolvedOriginalDownload: Identifiable, Sendable {
+    let id = UUID()
+    let masterHash: String
+    let fileURL: URL
+    let originalName: String
+    let sizeBytes: Int64
+    let isVideo: Bool
+}
+
+private enum BatchOriginalFetchItemOutcome: Sendable {
+    case resolved(index: Int, download: ResolvedOriginalDownload)
+    case unresolved(index: Int, input: OriginalShareInput, errorMessage: String?)
+    case authExpired
+}
+
+enum OriginalMediaResolver {
+    static func resolveMaster(
+        input: OriginalShareInput,
+        cachedPhotos: [ServerPhoto],
+        client: PhotoHubAPIClient
+    ) async throws -> (masterHash: String, originalName: String?)? {
+        // 1. Explicit masterHash / prefix query parameter
+        if let hint = input.masterHashHint?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .filter({ $0.isHexDigit }),
+           hint.count >= 8 {
+            if hint.count == 64 {
+                let name = cachedPhotos.first(where: { $0.hash.lowercased() == hint })?.originalName
+                return (hint, name ?? input.filenameHint)
+            }
+            if let match = try await matchPrefix(hint, cachedPhotos: cachedPhotos, client: client) {
+                return (match.hash, match.originalName)
+            }
+        }
+
+        // 2. Local tracker lookup + Photos PHAssetResource metadata (zero iCloud download)
+        if let assetId = input.assetId, !assetId.isEmpty {
+            if let tracked = LocalProxyTracker.shared.masterLookup(forAssetId: assetId) {
+                let fallbackName = cachedPhotos.first(where: {
+                    $0.hash.caseInsensitiveCompare(tracked.masterHash) == .orderedSame
+                })?.originalName
+                return (tracked.masterHash, tracked.originalName ?? fallbackName)
+            }
+
+            let rwAuth = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+            if rwAuth == .authorized || rwAuth == .limited,
+               let asset = PHAsset.fetchAssets(withLocalIdentifiers: [assetId], options: nil).firstObject,
+               let proxyMatch = PhotoLibraryService.proxyHashPrefixFromAssetResources(asset) {
+                if let match = try await matchPrefix(proxyMatch.prefix, cachedPhotos: cachedPhotos, client: client) {
+                    return (match.hash, match.originalName)
+                }
+            }
+        }
+
+        // 3. Filename prefix PHOTOHUB_PROXY_<prefix16>
+        let nameCandidates = [input.filenameHint, input.fileURL?.lastPathComponent].compactMap { $0 }
+        for rawName in nameCandidates {
+            if let prefix = ProxyGenerator.extractMasterHashPrefix(fromProxyFilename: rawName),
+               let match = try await matchPrefix(prefix, cachedPhotos: cachedPhotos, client: client) {
+                return (match.hash, match.originalName)
+            }
+        }
+
+        // 4. Embedded EXIF UserComment / TIFF ImageDescription / MP4 QuickTime udta PhotoHubProxy:<hash>
+        if let fileURL = input.fileURL {
+            if let embedded = await ProxyGenerator.extractEmbeddedProxyMasterHash(
+                fromFileURL: fileURL,
+                isVideo: input.isVideo
+            ) {
+                let norm = embedded.lowercased()
+                if norm.count == 64 {
+                    let match = cachedPhotos.first(where: { $0.hash.lowercased() == norm })
+                    return (match?.hash ?? norm, match?.originalName ?? input.filenameHint)
+                } else if let match = try await matchPrefix(norm, cachedPhotos: cachedPhotos, client: client) {
+                    return (match.hash, match.originalName)
+                }
+            }
+
+            // 5. Stream SHA-256 -> LocalProxyTracker proxy map / cached server index / GET /api/check/:sha
+            let sha = try ProxyGenerator.computeFileSHA256(url: fileURL).lowercased()
+            if let knownMaster = LocalProxyTracker.shared.masterHash(forProxySha256: sha) {
+                let match = cachedPhotos.first(where: { $0.hash.lowercased() == knownMaster.lowercased() })
+                return (knownMaster, match?.originalName ?? input.filenameHint)
+            }
+            if let cachedByHash = cachedPhotos.first(where: {
+                $0.hash.lowercased() == sha || ($0.proxyHash?.lowercased() == sha)
+            }) {
+                return (cachedByHash.hash, cachedByHash.originalName)
+            }
+
+            let check = try await client.checkHash(sha)
+            if check.exists {
+                let resolved = check.masterHash ?? sha
+                let match = cachedPhotos.first(where: { $0.hash.lowercased() == resolved.lowercased() })
+                return (resolved, match?.originalName ?? input.filenameHint)
+            }
+        }
+
+        return nil
+    }
+
+    static func resolveAndFetchBatch(
+        inputs: [OriginalShareInput],
+        settings: AppSettings,
+        onProgress: @MainActor @escaping (_ completed: Int, _ total: Int, _ stage: String) -> Void
+    ) async -> (
+        resolved: [ResolvedOriginalDownload],
+        unresolved: [OriginalShareInput],
+        errorMessage: String?,
+        authExpired: Bool
+    ) {
+        let client = PhotoHubAPIClient(settings: settings)
+        let cachedPhotos = LocalProxyStore.shared.cachedPhotos(
+            baseURL: settings.normalizedBaseURL,
+            apiKey: settings.apiKey
+        )
+        let indexed = inputs.enumerated().map { (index: $0.offset, input: $0.element) }
+        let queue = AsyncWorkQueue(indexed)
+        let workerCount = min(3, max(1, indexed.count))
+
+        var outcomes: [BatchOriginalFetchItemOutcome] = []
+        var completed = 0
+        var sawAuthExpired = false
+
+        await withTaskGroup(of: BatchOriginalFetchItemOutcome?.self) { group in
+            for _ in 0..<workerCount {
+                group.addTask {
+                    await fetchNextItem(queue: queue, cachedPhotos: cachedPhotos, client: client)
+                }
+            }
+
+            for await outcome in group {
+                guard let outcome else { continue }
+                outcomes.append(outcome)
+                completed += 1
+                if case .authExpired = outcome {
+                    sawAuthExpired = true
+                }
+                let stageLabel = indexed.count > 1
+                    ? "Prepared \(completed) of \(indexed.count) item(s)..."
+                    : "Downloading original from server..."
+                await onProgress(completed, indexed.count, stageLabel)
+
+                if !Task.isCancelled && !sawAuthExpired {
+                    group.addTask {
+                        await fetchNextItem(queue: queue, cachedPhotos: cachedPhotos, client: client)
+                    }
+                }
+            }
+        }
+
+        if sawAuthExpired {
+            return ([], inputs, "Session expired. Please sign in again.", true)
+        }
+
+        var resolvedPairs: [(Int, ResolvedOriginalDownload)] = []
+        var unresolvedPairs: [(Int, OriginalShareInput)] = []
+        var firstError: String?
+
+        for item in outcomes {
+            switch item {
+            case .resolved(let idx, let download):
+                resolvedPairs.append((idx, download))
+            case .unresolved(let idx, let input, let err):
+                unresolvedPairs.append((idx, input))
+                if firstError == nil, let err, !err.isEmpty {
+                    firstError = err
+                }
+            case .authExpired:
+                break
+            }
+        }
+
+        resolvedPairs.sort { $0.0 < $1.0 }
+        unresolvedPairs.sort { $0.0 < $1.0 }
+        return (
+            resolvedPairs.map(\.1),
+            unresolvedPairs.map(\.1),
+            firstError,
+            false
+        )
+    }
+
+    private static func matchPrefix(
+        _ prefix: String,
+        cachedPhotos: [ServerPhoto],
+        client: PhotoHubAPIClient
+    ) async throws -> ServerPhoto? {
+        if let localMatch = cachedPhotos.first(where: { $0.hash.lowercased().hasPrefix(prefix.lowercased()) }) {
+            return localMatch
+        }
+        return try? await client.lookupPhotoByHashPrefix(prefix)
+    }
+
+    private static func fetchNextItem(
+        queue: AsyncWorkQueue<(index: Int, input: OriginalShareInput)>,
+        cachedPhotos: [ServerPhoto],
+        client: PhotoHubAPIClient
+    ) async -> BatchOriginalFetchItemOutcome? {
+        guard !Task.isCancelled, let work = await queue.next() else {
+            return nil
+        }
+        let input = work.input
+        do {
+            guard let resolved = try await resolveMaster(
+                input: input,
+                cachedPhotos: cachedPhotos,
+                client: client
+            ) else {
+                return .unresolved(
+                    index: work.index,
+                    input: input,
+                    errorMessage: "Not linked to an uploaded PhotoHub original on the server."
+                )
+            }
+
+            let tempMasterURL = try await client.downloadMasterToTempFile(
+                hash: resolved.masterHash,
+                preferredFilename: resolved.originalName
+            )
+            let attrs = try? FileManager.default.attributesOfItem(atPath: tempMasterURL.path)
+            let bytes = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+            let trimmedPreferred = resolved.originalName?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let finalName = trimmedPreferred.isEmpty ? tempMasterURL.lastPathComponent : trimmedPreferred
+            let ext = tempMasterURL.pathExtension.lowercased()
+            let isVid = input.isVideo || ["mp4", "mov", "m4v", "3gp", "avi"].contains(ext)
+
+            return .resolved(
+                index: work.index,
+                download: ResolvedOriginalDownload(
+                    masterHash: resolved.masterHash,
+                    fileURL: tempMasterURL,
+                    originalName: finalName,
+                    sizeBytes: bytes,
+                    isVideo: isVid
+                )
+            )
+        } catch APIClientError.httpError(401, _) {
+            return .authExpired
+        } catch {
+            return .unresolved(
+                index: work.index,
+                input: input,
+                errorMessage: error.localizedDescription
+            )
+        }
     }
 }

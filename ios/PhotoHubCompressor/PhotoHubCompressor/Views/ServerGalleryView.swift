@@ -90,12 +90,6 @@ struct ServerGalleryView: View {
     @State private var deleteBannerMessage: String?
     @State private var deleteConfirmPrompt: DeleteConfirmPrompt?
 
-    @State private var showingPhotoPicker: Bool = false
-    @State private var isResolvingPick: Bool = false
-    @State private var pickStatusText: String = "Preparing original..."
-    @State private var pickerErrorMessage: String?
-    @State private var shareSheetItem: ShareSheetItem?
-
     private let columns = [
         GridItem(.adaptive(minimum: 100, maximum: 140), spacing: 2)
     ]
@@ -298,21 +292,6 @@ struct ServerGalleryView: View {
                     selectionRestoreBottomBar
                 }
             }
-            .overlay {
-                if isResolvingPick {
-                    ZStack {
-                        Color.black.opacity(0.45).ignoresSafeArea()
-                        VStack(spacing: 12) {
-                            ProgressView()
-                                .scaleEffect(1.2)
-                            Text(pickStatusText)
-                                .font(.subheadline.weight(.medium))
-                        }
-                        .padding(24)
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
-                    }
-                }
-            }
             .navigationTitle(isSelectionMode ? "\(selectedPhotoHashes.count) Selected" : "Server")
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
@@ -328,11 +307,10 @@ struct ServerGalleryView: View {
                         }
                     } else {
                         Button {
-                            showingPhotoPicker = true
+                            IncomingShareCoordinator.shared.presentInAppPhotoPicker()
                         } label: {
                             Label("From Photos", systemImage: "square.and.arrow.up.on.square")
                         }
-                        .disabled(isResolvingPick)
                     }
                 }
 
@@ -430,31 +408,6 @@ struct ServerGalleryView: View {
                         deleteBannerMessage = "Deleted \(deletedName) from server."
                     }
                 )
-            }
-            .sheet(isPresented: $showingPhotoPicker) {
-                PhotoPickerSheet(
-                    onPick: { picked in
-                        showingPhotoPicker = false
-                        Task { await handlePickedMedia(picked) }
-                    },
-                    onCancel: {
-                        showingPhotoPicker = false
-                    }
-                )
-            }
-            .sheet(item: $shareSheetItem) { item in
-                ShareSheet(activityItems: [item.fileURL]) {
-                    cleanupTempShareURL(item.fileURL)
-                    shareSheetItem = nil
-                }
-            }
-            .alert("Cannot Resolve Original", isPresented: Binding(
-                get: { pickerErrorMessage != nil },
-                set: { if !$0 { pickerErrorMessage = nil } }
-            )) {
-                Button("OK", role: .cancel) { pickerErrorMessage = nil }
-            } message: {
-                Text(pickerErrorMessage ?? "")
             }
             .restoreOriginalsConfirmAlert(prompt: $restoreConfirmPrompt) { targets, prompt in
                 startBatchRestore(targets: targets, exitSelectionAfter: !prompt.isRestoreAll)
@@ -1190,67 +1143,6 @@ struct ServerGalleryView: View {
             failedPreviewHashes.remove(photo.hash)
         } else {
             failedPreviewHashes.insert(photo.hash)
-        }
-    }
-
-    private func handlePickedMedia(_ picked: PickedMediaResult) async {
-        isResolvingPick = true
-        pickStatusText = "Matching selected item..."
-        defer {
-            if let tempURL = picked.copiedFileURL {
-                try? FileManager.default.removeItem(at: tempURL)
-            }
-            isResolvingPick = false
-        }
-
-        let tracker = LocalProxyTracker.shared
-        let client = PhotoHubAPIClient(settings: settings)
-
-        var resolvedMasterHash: String?
-        var resolvedFilename: String?
-
-        if let assetId = picked.assetId,
-           let match = tracker.masterLookup(forAssetId: assetId) {
-            resolvedMasterHash = match.masterHash
-            resolvedFilename = match.originalName
-        }
-
-        if resolvedMasterHash == nil, let fileURL = picked.copiedFileURL {
-            do {
-                let sha = try ProxyGenerator.computeFileSHA256(url: fileURL)
-                if let knownMaster = tracker.masterHash(forProxySha256: sha) {
-                    resolvedMasterHash = knownMaster
-                } else {
-                    let check = try await client.checkHash(sha)
-                    if check.exists {
-                        resolvedMasterHash = check.masterHash ?? sha
-                    }
-                }
-            } catch {
-                pickerErrorMessage = error.localizedDescription
-                return
-            }
-        }
-
-        guard let masterHash = resolvedMasterHash else {
-            pickerErrorMessage = "This item is not linked to an uploaded PhotoHub master on the server. Back it up on the Compress tab or pick it from the Server gallery."
-            return
-        }
-
-        if resolvedFilename == nil,
-           let matchingPhoto = photos.first(where: { $0.hash.lowercased() == masterHash.lowercased() }) {
-            resolvedFilename = matchingPhoto.originalName
-        }
-
-        do {
-            pickStatusText = "Downloading original..."
-            let tempMasterURL = try await client.downloadMasterToTempFile(
-                hash: masterHash,
-                preferredFilename: resolvedFilename
-            )
-            shareSheetItem = ShareSheetItem(fileURL: tempMasterURL)
-        } catch {
-            pickerErrorMessage = "Download failed: \(error.localizedDescription)"
         }
     }
 }
