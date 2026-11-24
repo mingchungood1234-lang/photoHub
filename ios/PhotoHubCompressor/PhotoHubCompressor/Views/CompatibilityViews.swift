@@ -139,13 +139,21 @@ func pruneStaleTempShareDirs(maxAge: TimeInterval = 3600) {
     }
 }
 
-/// Native iOS Share Sheet wrapper with delayed temp-file cleanup for large videos.
+/// Native iOS Share Sheet wrapper with delayed temp-file cleanup and iPad popover safety for large videos.
 struct ShareSheet: UIViewControllerRepresentable {
     let activityItems: [Any]
     let onComplete: () -> Void
 
     func makeUIViewController(context: Context) -> UIActivityViewController {
         let controller = UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+        if let pop = controller.popoverPresentationController {
+            pop.permittedArrowDirections = []
+            if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+               let rootView = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController?.view {
+                pop.sourceView = rootView
+                pop.sourceRect = CGRect(x: rootView.bounds.midX, y: rootView.bounds.midY, width: 1, height: 1)
+            }
+        }
         let finishShare = onComplete
         controller.completionWithItemsHandler = { _, _, _, _ in
             DispatchQueue.main.async {
@@ -679,25 +687,62 @@ final class IncomingShareCoordinator: ObservableObject {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let nameParam = comps?.queryItems?.first(where: { $0.name == "name" })?.value?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        let namesParam = comps?.queryItems?.first(where: { $0.name == "names" })?.value?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let dateParam = comps?.queryItems?.first(where: { $0.name == "date" })?.value?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         let fromParam = comps?.queryItems?.first(where: { $0.name == "from" })?.value?.lowercased()
+        let parsedDate = Self.parseDateHint(dateParam)
 
-        if (hashParam != nil && !hashParam!.isEmpty) || (nameParam != nil && !nameParam!.isEmpty) {
-            let ext = URL(fileURLWithPath: nameParam ?? "").pathExtension.lowercased()
-            let isVideo = ["mp4", "mov", "m4v", "3gp", "avi"].contains(ext)
+        let rawMultiNames = [namesParam, nameParam]
+            .compactMap { $0 }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+
+        if (hashParam != nil && !hashParam!.isEmpty) || !rawMultiNames.isEmpty {
+            let lines = rawMultiNames
+                .components(separatedBy: CharacterSet.newlines)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+
+            if lines.count > 1 && (hashParam == nil || hashParam!.isEmpty) {
+                let batchInputs = lines.map { line -> OriginalShareInput in
+                    let base = URL(fileURLWithPath: line).lastPathComponent
+                    let prefix = ProxyGenerator.extractMasterHashPrefix(fromProxyFilename: base)
+                    let ext = URL(fileURLWithPath: base).pathExtension.lowercased()
+                    let isVideo = ["mp4", "mov", "m4v", "3gp", "avi", "mkv", "webm"].contains(ext)
+                    return OriginalShareInput(
+                        assetId: nil,
+                        fileURL: nil,
+                        filenameHint: base,
+                        masterHashHint: prefix,
+                        isVideo: isVideo,
+                        creationDateHint: parsedDate
+                    )
+                }
+                enqueueInputs(batchInputs)
+                return
+            }
+
+            let singleName = lines.first ?? nameParam
+            let prefix = singleName.flatMap { ProxyGenerator.extractMasterHashPrefix(fromProxyFilename: $0) }
+            let ext = URL(fileURLWithPath: singleName ?? "").pathExtension.lowercased()
+            let isVideo = ["mp4", "mov", "m4v", "3gp", "avi", "mkv", "webm"].contains(ext)
             enqueueInputs([
                 OriginalShareInput(
                     assetId: nil,
                     fileURL: nil,
-                    filenameHint: nameParam,
-                    masterHashHint: hashParam,
-                    isVideo: isVideo
+                    filenameHint: singleName,
+                    masterHashHint: (hashParam?.isEmpty == false ? hashParam : nil) ?? prefix,
+                    isVideo: isVideo,
+                    creationDateHint: parsedDate
                 )
             ])
             return
         }
 
         let pb = UIPasteboard.general
-        if fromParam == "clipboard" || !pb.itemProviders.isEmpty || pb.hasImages || pb.hasURLs {
+        if fromParam == "clipboard" || !pb.itemProviders.isEmpty || pb.hasStrings || pb.hasImages || pb.hasURLs {
             loadInputsFromPasteboard(openPickerIfEmpty: fromParam != "clipboard")
         } else {
             presentInAppPhotoPicker()
@@ -705,6 +750,25 @@ final class IncomingShareCoordinator: ObservableObject {
     }
 
     private func handleIncomingFileURL(_ url: URL) {
+        let baseName = url.lastPathComponent.isEmpty ? "media" : url.lastPathComponent
+        let ext = url.pathExtension.lowercased()
+        let isVideo = UTType(filenameExtension: ext)?.conforms(to: .movie) == true
+            || ["mp4", "mov", "m4v", "3gp", "avi", "mkv", "webm"].contains(ext)
+
+        // Zero-copy fast path for large proxy files opened from Files / Share Sheet
+        if let prefix = ProxyGenerator.extractMasterHashPrefix(fromProxyFilename: baseName) {
+            enqueueInputs([
+                OriginalShareInput(
+                    assetId: nil,
+                    fileURL: nil,
+                    filenameHint: baseName,
+                    masterHashHint: prefix,
+                    isVideo: isVideo
+                )
+            ])
+            return
+        }
+
         let accessed = url.startAccessingSecurityScopedResource()
         defer {
             if accessed {
@@ -716,17 +780,22 @@ final class IncomingShareCoordinator: ObservableObject {
         let batchDir = fm.temporaryDirectory
             .appendingPathComponent("photohub_incoming_\(UUID().uuidString.prefix(8))", isDirectory: true)
         try? fm.createDirectory(at: batchDir, withIntermediateDirectories: true)
-        let baseName = url.lastPathComponent.isEmpty ? "media" : url.lastPathComponent
         let destURL = batchDir.appendingPathComponent(baseName)
         try? fm.removeItem(at: destURL)
         guard (try? fm.copyItem(at: url, to: destURL)) != nil else {
             try? fm.removeItem(at: batchDir)
+            enqueueInputs([
+                OriginalShareInput(
+                    assetId: nil,
+                    fileURL: nil,
+                    filenameHint: baseName,
+                    masterHashHint: nil,
+                    isVideo: isVideo
+                )
+            ])
             return
         }
 
-        let ext = destURL.pathExtension.lowercased()
-        let isVideo = UTType(filenameExtension: ext)?.conforms(to: .movie) == true
-            || ["mp4", "mov", "m4v", "3gp", "avi", "mkv", "webm"].contains(ext)
         enqueueInputs([
             OriginalShareInput(
                 assetId: nil,
@@ -739,7 +808,19 @@ final class IncomingShareCoordinator: ObservableObject {
     }
 
     private func loadInputsFromPasteboard(openPickerIfEmpty: Bool) {
-        let providers = UIPasteboard.general.itemProviders
+        // Check zero-copy text names/hashes FIRST before itemProviders (iOS exposes plain text
+        // inside itemProviders too, which otherwise copied text as a bogus .jpg file).
+        if let textInputs = Self.parseTextShareInputs(from: UIPasteboard.general.string),
+           !textInputs.isEmpty {
+            enqueueInputs(textInputs)
+            return
+        }
+
+        let providers = UIPasteboard.general.itemProviders.filter { provider in
+            PhotoPickerItemLoader.detectIsVideo(provider)
+                || provider.hasItemConformingToTypeIdentifier(UTType.image.identifier)
+                || provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+        }
         if !providers.isEmpty {
             let collector = PickedBatchCollector(count: providers.count)
             let group = DispatchGroup()
@@ -767,6 +848,94 @@ final class IncomingShareCoordinator: ObservableObject {
         }
 
         finishPasteboardFallback(openPickerIfEmpty: openPickerIfEmpty)
+    }
+
+    private static func parseTextShareInputs(from raw: String?) -> [OriginalShareInput]? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return nil
+        }
+        let lines = trimmed
+            .components(separatedBy: CharacterSet.newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !lines.isEmpty else { return nil }
+
+        let mediaExts: Set<String> = [
+            "mp4", "mov", "m4v", "3gp", "avi", "mkv", "webm",
+            "jpg", "jpeg", "heic", "heif", "png", "webp", "dng", "gif"
+        ]
+        var inputs: [OriginalShareInput] = []
+        for line in lines {
+            if line.lowercased().hasPrefix("http://") || line.lowercased().hasPrefix("https://") {
+                continue
+            }
+            if let prefix = ProxyGenerator.extractMasterHashPrefix(fromProxyFilename: line) {
+                let ext = URL(fileURLWithPath: line).pathExtension.lowercased()
+                inputs.append(
+                    OriginalShareInput(
+                        assetId: nil,
+                        fileURL: nil,
+                        filenameHint: URL(fileURLWithPath: line).lastPathComponent,
+                        masterHashHint: prefix,
+                        isVideo: ["mp4", "mov", "m4v", "3gp", "avi", "mkv", "webm"].contains(ext)
+                    )
+                )
+                continue
+            }
+            let hexOnly = line.lowercased().filter { $0.isHexDigit }
+            if hexOnly.count >= 8 && hexOnly.count == line.count {
+                inputs.append(
+                    OriginalShareInput(
+                        assetId: nil,
+                        fileURL: nil,
+                        filenameHint: nil,
+                        masterHashHint: hexOnly,
+                        isVideo: false
+                    )
+                )
+                continue
+            }
+            let base = URL(fileURLWithPath: line).lastPathComponent
+            let ext = URL(fileURLWithPath: base).pathExtension.lowercased()
+            let upper = base.uppercased()
+            let looksLikeMediaName = mediaExts.contains(ext)
+                || (!base.contains(" ") && (
+                    upper.hasPrefix("IMG_")
+                    || upper.hasPrefix("VID_")
+                    || upper.hasPrefix("PXL_")
+                    || upper.hasPrefix("DSC")
+                    || upper.hasPrefix("MVI_")
+                    || upper.hasPrefix("RPREPLAY")
+                ))
+            if looksLikeMediaName {
+                inputs.append(
+                    OriginalShareInput(
+                        assetId: nil,
+                        fileURL: nil,
+                        filenameHint: base,
+                        masterHashHint: nil,
+                        isVideo: ["mp4", "mov", "m4v", "3gp", "avi", "mkv", "webm"].contains(ext)
+                    )
+                )
+            }
+        }
+        return inputs.isEmpty ? nil : inputs
+    }
+
+    private static func parseDateHint(_ raw: String?) -> Date? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        if let epoch = Double(trimmed), epoch > 946_684_800 {
+            return Date(timeIntervalSince1970: epoch)
+        }
+        let isoFrac = ISO8601DateFormatter()
+        isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = isoFrac.date(from: trimmed) { return d }
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+        return iso.date(from: trimmed)
     }
 
     private func finishPasteboardFallback(openPickerIfEmpty: Bool) {

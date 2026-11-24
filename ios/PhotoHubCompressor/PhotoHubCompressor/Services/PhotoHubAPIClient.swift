@@ -960,6 +960,16 @@ final class PhotoHubAPIClient {
             }
         }
 
+        func urlSession(
+            _ session: URLSession,
+            dataTask: URLSessionDataTask,
+            willCacheResponse proposedResponse: CachedURLResponse,
+            completionHandler: @escaping (CachedURLResponse?) -> Void
+        ) {
+            // Never buffer multi-hundred-MB immutable videos inside URLCache RAM.
+            completionHandler(nil)
+        }
+
         func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
             closeHandle()
 
@@ -1080,6 +1090,8 @@ final class PhotoHubAPIClient {
         expectedStatus206Only: Bool = false,
         onProgress: (@Sendable (Int64, Int64?) -> Void)? = nil
     ) async throws -> URLResponse {
+        var streamReq = request
+        streamReq.cachePolicy = .reloadIgnoringLocalCacheData
         let delegate = StreamingDownloadDelegate(
             partURL: partURL,
             appendOffset: appendOffset,
@@ -1087,7 +1099,7 @@ final class PhotoHubAPIClient {
             expectedStatus206Only: expectedStatus206Only,
             onProgress: onProgress
         )
-        let task = pooledSession.dataTask(with: request)
+        let task = pooledSession.dataTask(with: streamReq)
         task.delegate = delegate
 
         return try await withTaskCancellationHandler {
@@ -1111,6 +1123,7 @@ final class PhotoHubAPIClient {
         let url = try makeURL(path)
         var initialReq = URLRequest(url: url)
         initialReq.httpMethod = "GET"
+        initialReq.cachePolicy = .reloadIgnoringLocalCacheData
         applyAuth(to: &initialReq)
         initialReq.setValue("bytes=0-\(Self.initialRangeBytes - 1)", forHTTPHeaderField: "Range")
 

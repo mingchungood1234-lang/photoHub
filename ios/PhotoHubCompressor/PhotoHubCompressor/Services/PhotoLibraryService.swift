@@ -914,6 +914,23 @@ struct OriginalShareInput: Sendable {
     let filenameHint: String?
     let masterHashHint: String?
     let isVideo: Bool
+    let creationDateHint: Date?
+
+    init(
+        assetId: String?,
+        fileURL: URL?,
+        filenameHint: String?,
+        masterHashHint: String?,
+        isVideo: Bool,
+        creationDateHint: Date? = nil
+    ) {
+        self.assetId = assetId
+        self.fileURL = fileURL
+        self.filenameHint = filenameHint
+        self.masterHashHint = masterHashHint
+        self.isVideo = isVideo
+        self.creationDateHint = creationDateHint
+    }
 
     var displayName: String {
         if let hint = filenameHint?.trimmingCharacters(in: .whitespacesAndNewlines), !hint.isEmpty {
@@ -1437,7 +1454,169 @@ enum OriginalMediaResolver {
             }
         }
 
+        // 6. Zero-copy filename + creation date metadata matching (handles Shortcuts "Get Name" and large
+        // videos where iOS Shortcuts could not export bytes or transcoded/stripped metadata).
+        if let rawHint = input.filenameHint?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !rawHint.isEmpty {
+            if let matchedByMeta = await matchByFilenameMetadata(
+                rawHint,
+                creationDateHint: input.creationDateHint,
+                preferVideo: input.isVideo,
+                cachedPhotos: cachedPhotos,
+                client: client
+            ) {
+                return matchedByMeta
+            }
+        }
+
         return nil
+    }
+
+    private static func matchByFilenameMetadata(
+        _ rawHint: String,
+        creationDateHint: Date?,
+        preferVideo: Bool,
+        cachedPhotos: [ServerPhoto],
+        client: PhotoHubAPIClient
+    ) async -> (masterHash: String, originalName: String?, expectedSizeBytes: Int64?)? {
+        let hintName = URL(fileURLWithPath: rawHint).lastPathComponent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !hintName.isEmpty else { return nil }
+        let hintStem = URL(fileURLWithPath: hintName).deletingPathExtension().lastPathComponent.lowercased()
+        let hintHasExt = !URL(fileURLWithPath: hintName).pathExtension.isEmpty
+
+        let ignoredStems: Set<String> = ["media", "video", "photo", "image", "movie", "untitled"]
+        if ignoredStems.contains(hintStem)
+            || hintStem.hasPrefix("media_")
+            || hintStem.hasPrefix("clipboard_")
+            || hintStem.hasPrefix("photohub_pick_") {
+            return nil
+        }
+
+        // 6a. Fast match in cached server catalog
+        if let hit = pickBestServerPhotoMatch(
+            from: cachedPhotos,
+            hintName: hintName,
+            hintStem: hintStem,
+            hintHasExt: hintHasExt,
+            creationDateHint: creationDateHint,
+            preferVideo: preferVideo
+        ) {
+            return (hit.hash, hit.originalName, hit.size)
+        }
+
+        // 6b. Check live server index if local cache missed (e.g. newly uploaded item or fresh install)
+        if let freshPhotos = try? await client.fetchAllServerPhotos(sync: false),
+           let hit = pickBestServerPhotoMatch(
+               from: freshPhotos,
+               hintName: hintName,
+               hintStem: hintStem,
+               hintHasExt: hintHasExt,
+               creationDateHint: creationDateHint,
+               preferVideo: preferVideo
+           ) {
+            return (hit.hash, hit.originalName, hit.size)
+        }
+
+        // 6c. Zero-copy Apple Photos PHAsset metadata lookup (handles renamed/localized proxy assets)
+        let rwAuth = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        if rwAuth == .authorized || rwAuth == .limited {
+            let fetchOptions = PHFetchOptions()
+            if let creationDateHint {
+                let start = creationDateHint.addingTimeInterval(-30) as NSDate
+                let end = creationDateHint.addingTimeInterval(30) as NSDate
+                fetchOptions.predicate = NSPredicate(
+                    format: "(mediaType == %d OR mediaType == %d) AND creationDate >= %@ AND creationDate <= %@",
+                    PHAssetMediaType.image.rawValue,
+                    PHAssetMediaType.video.rawValue,
+                    start,
+                    end
+                )
+            } else {
+                fetchOptions.predicate = NSPredicate(
+                    format: "mediaType == %d OR mediaType == %d",
+                    PHAssetMediaType.image.rawValue,
+                    PHAssetMediaType.video.rawValue
+                )
+                fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+                fetchOptions.fetchLimit = 2000
+            }
+
+            let assets = PHAsset.fetchAssets(with: fetchOptions)
+            var matchedMaster: (String, String?, Int64?)?
+            var matchedPrefix: String?
+            for i in 0..<assets.count {
+                if matchedMaster != nil || matchedPrefix != nil { break }
+                autoreleasepool {
+                    let asset = assets.object(at: i)
+                    let info = PhotoLibraryService.inspectAssetResources(for: asset)
+                    guard let resName = info.originalFilename?.lowercased(), !resName.isEmpty else { return }
+                    let resStem = URL(fileURLWithPath: resName).deletingPathExtension().lastPathComponent.lowercased()
+                    let nameMatches = hintHasExt ? (resName == hintName) : (resStem == hintStem)
+                    guard nameMatches else { return }
+
+                    if let tracked = LocalProxyTracker.shared.anyMasterLookup(forAssetId: asset.localIdentifier) {
+                        let cachedMatch = cachedPhotos.first(where: {
+                            $0.hash.caseInsensitiveCompare(tracked.masterHash) == .orderedSame
+                        })
+                        matchedMaster = (tracked.masterHash, tracked.originalName ?? cachedMatch?.originalName ?? info.originalFilename, cachedMatch?.size)
+                    } else if let proxyMatch = info.proxyMatch {
+                        matchedPrefix = proxyMatch.prefix
+                    }
+                }
+            }
+
+            if let matchedMaster {
+                return matchedMaster
+            }
+            if let matchedPrefix,
+               let match = try? await matchPrefix(matchedPrefix, cachedPhotos: cachedPhotos, client: client) {
+                return (match.hash, match.originalName, match.size)
+            }
+        }
+
+        return nil
+    }
+
+    private static func pickBestServerPhotoMatch(
+        from photos: [ServerPhoto],
+        hintName: String,
+        hintStem: String,
+        hintHasExt: Bool,
+        creationDateHint: Date?,
+        preferVideo: Bool
+    ) -> ServerPhoto? {
+        var matches = photos.filter { photo in
+            let candidate = URL(fileURLWithPath: photo.originalName).lastPathComponent.lowercased()
+            if candidate == hintName { return true }
+            if !hintHasExt {
+                let stem = URL(fileURLWithPath: candidate).deletingPathExtension().lastPathComponent.lowercased()
+                return stem == hintStem
+            }
+            return false
+        }
+        guard !matches.isEmpty else { return nil }
+        if matches.count == 1 { return matches[0] }
+
+        if let creationDateHint {
+            let nearDate = matches.compactMap { photo -> (ServerPhoto, TimeInterval)? in
+                guard let d = photo.parsedCreationDate else { return nil }
+                let diff = abs(d.timeIntervalSince(creationDateHint))
+                return diff <= 120 ? (photo, diff) : nil
+            }
+            if let closest = nearDate.min(by: { $0.1 < $1.1 }) {
+                return closest.0
+            }
+        }
+
+        if preferVideo {
+            let videoMatches = matches.filter { $0.isVideo }
+            if !videoMatches.isEmpty {
+                matches = videoMatches
+            }
+        }
+        return matches.first
     }
 
     static func resolveAndFetchBatch(
@@ -1572,12 +1751,15 @@ enum OriginalMediaResolver {
             let trimmedName = resolved.originalName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let displayLabel = trimmedName.isEmpty ? input.displayName : trimmedName
             let expectedBytes = resolved.expectedSizeBytes
+            let resolvedExt = URL(fileURLWithPath: displayLabel).pathExtension.lowercased()
+            let resolvedIsVideo = input.isVideo
+                || ["mp4", "mov", "m4v", "3gp", "avi", "mkv", "webm"].contains(resolvedExt)
 
             let tempMasterURL = try await OriginalDownloadCache.shared.getOrFetchShareCopy(
                 hash: resolved.masterHash,
                 preferredFilename: resolved.originalName,
                 expectedSizeBytes: expectedBytes,
-                isVideo: input.isVideo,
+                isVideo: resolvedIsVideo,
                 client: client,
                 onProgress: { down, total in
                     let effectiveTotal = total ?? expectedBytes

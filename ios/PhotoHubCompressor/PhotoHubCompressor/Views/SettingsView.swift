@@ -577,15 +577,18 @@ struct SettingsView: View {
             }
 
             VStack(alignment: .leading, spacing: 6) {
-                Text("1-Tap Setup from Apple Photos Share Sheet:")
+                Text("1-Tap Setup from Apple Photos Share Sheet (Works for Large Videos):")
                     .font(.caption.weight(.semibold))
                 Text("1. Open Shortcuts -> tap + -> tap (i) Details -> enable Show in Share Sheet (Images & Media).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text("2. Add action: photoHub -> Fetch & Share Original (pass Shortcut Input).")
+                Text("2. Add action: Get Details of Photos -> choose Name (of Shortcut Input).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text("3. On iOS 15: add Copy to Clipboard, then Open URLs (photohub://share-original?from=clipboard).")
+                Text("3. Add action: photoHub -> Fetch & Share Original (Large Video) and pass Name (zero video copy!).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("4. On iOS 15: Copy Name to Clipboard, then Open URLs (photohub://share-original?from=clipboard).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -593,7 +596,7 @@ struct SettingsView: View {
         } header: {
             Text("Share Original from Apple Photos")
         } footer: {
-            Text("Uses Apple Shortcuts inside the main app (1 App ID, zero App Groups/extensions) so it works reliably on Free Apple Accounts & sideloaded installs.")
+            Text("Passing only the Name avoids Apple Shortcuts exporting huge videos into memory (1 App ID, zero App Groups/extensions — works on Free Apple Accounts).")
         }
     }
 

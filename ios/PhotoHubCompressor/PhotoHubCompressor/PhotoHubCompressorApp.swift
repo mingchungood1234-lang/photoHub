@@ -21,6 +21,57 @@ final class PhotoHubAppDelegate: NSObject, UIApplicationDelegate {
 
 #if canImport(AppIntents)
 @available(iOS 16.0, *)
+struct FetchAndShareByNameIntent: AppIntent {
+    static var title: LocalizedStringResource = "Fetch & Share Original (Large Video)"
+    static var description = IntentDescription(
+        "Zero-copy original fetch using only Photo/Video Name from Apple Shortcuts. Works reliably for large videos without exporting video bytes."
+    )
+    static var openAppWhenRun: Bool = true
+
+    @Parameter(title: "Photo or Video Names", default: [])
+    var names: [String]
+
+    @Parameter(title: "Creation Dates", default: [])
+    var creationDates: [Date]
+
+    @MainActor
+    func perform() async throws -> some IntentResult {
+        var expandedNames: [String] = []
+        for raw in names {
+            let parts = raw
+                .components(separatedBy: CharacterSet.newlines)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            expandedNames.append(contentsOf: parts)
+        }
+
+        guard !expandedNames.isEmpty else {
+            IncomingShareCoordinator.shared.presentInAppPhotoPicker()
+            return .result()
+        }
+
+        let inputs: [OriginalShareInput] = expandedNames.enumerated().map { idx, name in
+            let baseName = URL(fileURLWithPath: name).lastPathComponent
+            let prefix = ProxyGenerator.extractMasterHashPrefix(fromProxyFilename: baseName)
+            let ext = URL(fileURLWithPath: baseName).pathExtension.lowercased()
+            let isVideo = ["mp4", "mov", "m4v", "3gp", "avi", "mkv", "webm"].contains(ext)
+            let dateHint = idx < creationDates.count ? creationDates[idx] : nil
+            return OriginalShareInput(
+                assetId: nil,
+                fileURL: nil,
+                filenameHint: baseName,
+                masterHashHint: prefix,
+                isVideo: isVideo,
+                creationDateHint: dateHint
+            )
+        }
+
+        IncomingShareCoordinator.shared.enqueueInputs(inputs)
+        return .result()
+    }
+}
+
+@available(iOS 16.0, *)
 struct FetchAndShareOriginalIntent: AppIntent {
     static var title: LocalizedStringResource = "Fetch & Share Original"
     static var description = IntentDescription(
@@ -41,13 +92,38 @@ struct FetchAndShareOriginalIntent: AppIntent {
         let fm = FileManager.default
         let batchDir = fm.temporaryDirectory
             .appendingPathComponent("photohub_incoming_\(UUID().uuidString.prefix(8))", isDirectory: true)
-        try? fm.createDirectory(at: batchDir, withIntermediateDirectories: true)
+        var createdBatchDir = false
 
         var inputs: [OriginalShareInput] = []
         for (idx, file) in media.enumerated() {
             autoreleasepool {
                 let rawName = file.filename.trimmingCharacters(in: .whitespacesAndNewlines)
                 let baseName = URL(fileURLWithPath: rawName.isEmpty ? "media_\(idx + 1)" : rawName).lastPathComponent
+                let ext = URL(fileURLWithPath: baseName).pathExtension.lowercased()
+                let utType = file.type ?? UTType(filenameExtension: ext)
+                let isVideo = utType?.conforms(to: .movie) == true
+                    || ["mp4", "mov", "m4v", "3gp", "avi", "mkv", "webm"].contains(ext)
+
+                // Zero-copy fast path: if filename already carries PHOTOHUB_PROXY_<prefix16>,
+                // never copy fileURL or load file.data into RAM (works instantly for huge videos).
+                if let prefix = ProxyGenerator.extractMasterHashPrefix(fromProxyFilename: baseName) {
+                    inputs.append(
+                        OriginalShareInput(
+                            assetId: nil,
+                            fileURL: nil,
+                            filenameHint: baseName,
+                            masterHashHint: prefix,
+                            isVideo: isVideo
+                        )
+                    )
+                    return
+                }
+
+                if !createdBatchDir {
+                    try? fm.createDirectory(at: batchDir, withIntermediateDirectories: true)
+                    createdBatchDir = true
+                }
+
                 let destURL = batchDir.appendingPathComponent("\(idx + 1)_\(baseName)")
                 var saved = false
                 if let srcURL = file.fileURL {
@@ -60,39 +136,53 @@ struct FetchAndShareOriginalIntent: AppIntent {
                     }
                     saved = (try? fm.copyItem(at: srcURL, to: destURL)) != nil
                 }
-                if !saved && file.fileURL == nil {
-                    // Only materialize in-memory IntentFile.data when no backing fileURL was provided,
-                    // avoiding Jetsam OOM crashes on huge videos.
+                if !saved && file.fileURL == nil && !isVideo {
+                    // Never materialize an unknown video into RAM via IntentFile.data (causes Jetsam OOM).
                     saved = (try? file.data.write(to: destURL, options: .atomic)) != nil
                 }
-                guard saved else { return }
-                let ext = destURL.pathExtension.lowercased()
-                let utType = file.type ?? UTType(filenameExtension: ext)
-                let isVideo = utType?.conforms(to: .movie) == true
-                    || ["mp4", "mov", "m4v", "3gp", "avi", "mkv", "webm"].contains(ext)
-                inputs.append(
-                    OriginalShareInput(
-                        assetId: nil,
-                        fileURL: destURL,
-                        filenameHint: baseName,
-                        masterHashHint: nil,
-                        isVideo: isVideo
+
+                if saved {
+                    inputs.append(
+                        OriginalShareInput(
+                            assetId: nil,
+                            fileURL: destURL,
+                            filenameHint: baseName,
+                            masterHashHint: nil,
+                            isVideo: isVideo
+                        )
                     )
-                )
+                } else if !rawName.isEmpty {
+                    // Even if Shortcuts could not pass file bytes for a huge video, preserve the
+                    // filename so zero-copy server/Photos metadata matching can still resolve it.
+                    inputs.append(
+                        OriginalShareInput(
+                            assetId: nil,
+                            fileURL: nil,
+                            filenameHint: baseName,
+                            masterHashHint: nil,
+                            isVideo: isVideo
+                        )
+                    )
+                }
             }
         }
 
         if inputs.isEmpty {
-            try? fm.removeItem(at: batchDir)
+            if createdBatchDir {
+                try? fm.removeItem(at: batchDir)
+            }
             if !media.isEmpty {
                 IncomingShareCoordinator.shared.reportIncomingLoadFailure(
-                    "Could not read the selected photo/video from Apple Shortcuts (iOS memory or security-scope limit for huge files). Open photoHub -> Pick Photos or Videos to Share Original instead."
+                    "Apple Shortcuts hit its memory limit exporting this large video. Update your Shortcut to pass Name (Get Details of Photos -> Name) into \"Fetch & Share Original (Large Video)\", or use photoHub -> Pick Photos or Videos to Share Original."
                 )
             } else {
                 IncomingShareCoordinator.shared.presentInAppPhotoPicker()
             }
         } else {
-            IncomingShareCoordinator.shared.enqueueInputs(inputs, cleanupDirs: [batchDir])
+            IncomingShareCoordinator.shared.enqueueInputs(
+                inputs,
+                cleanupDirs: createdBatchDir ? [batchDir] : []
+            )
         }
         return .result()
     }
