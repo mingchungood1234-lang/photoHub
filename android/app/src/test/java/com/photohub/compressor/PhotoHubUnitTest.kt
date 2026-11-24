@@ -151,7 +151,9 @@ class PhotoHubUnitTest {
             title = "Restore All Originals",
             targets = listOf(p1, p2, p3),
             locallyProtectedHashes = setOf("hashtwo"),
-            isRestoreAll = true
+            isRestoreAll = true,
+            leftoverProxyHashes = setOf("hashone", "hashtwo"),
+            leftoverProxyCount = 2
         )
 
         assertEquals(3, req.allTargets.size)
@@ -159,6 +161,18 @@ class PhotoHubUnitTest {
         assertEquals(2, req.skippedCount)
         assertEquals(5000L, req.unrestoredBytes)
         assertEquals(8500L, req.allBytes)
+        assertEquals(2, req.leftoverProxyCount)
+        assertEquals(setOf("hashone", "hashtwo"), req.leftoverProxyHashes)
+
+        assertEquals(
+            "Restored 5 original(s) to Gallery & protected them and deleted 5 compressed copy(s).",
+            BatchRestoreExecutor.formatSummaryMessage(
+                ok = 5,
+                errCount = 0,
+                cancelled = false,
+                deletedProxyCount = 5
+            )
+        )
 
         assertEquals(
             listOf("HashThree"),

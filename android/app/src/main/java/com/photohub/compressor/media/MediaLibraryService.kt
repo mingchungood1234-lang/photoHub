@@ -103,7 +103,8 @@ class MediaLibraryService(private val context: Context) {
         MediaAccessLevel.DENIED -> "Denied"
     }
 
-    fun scanExistingProxyPrefixesInGallery(): Map<String, String> {
+    fun scanExistingProxyPrefixesInGalleryAll(): Map<String, List<String>> {
+        if (currentAccessLevel() == MediaAccessLevel.DENIED) return emptyMap()
         val resolver = context.contentResolver
         val collection = MediaStore.Files.getContentUri("external")
         val projection = arrayOf(
@@ -111,14 +112,19 @@ class MediaLibraryService(private val context: Context) {
             MediaStore.Files.FileColumns.MEDIA_TYPE,
             MediaStore.MediaColumns.DISPLAY_NAME
         )
-        val selection = "${MediaStore.Files.FileColumns.MEDIA_TYPE} IN (?, ?) AND ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?"
+        val trashClause = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            " AND COALESCE(${MediaStore.MediaColumns.IS_TRASHED}, 0) = 0"
+        } else {
+            ""
+        }
+        val selection = "${MediaStore.Files.FileColumns.MEDIA_TYPE} IN (?, ?) AND ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?$trashClause"
         val args = arrayOf(
             MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE.toString(),
             MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString(),
             "${ProxyGenerator.PROXY_FILENAME_PREFIX}%"
         )
 
-        val result = mutableMapOf<String, String>()
+        val result = linkedMapOf<String, MutableList<String>>()
         runCatching {
             resolver.query(collection, projection, selection, args, null)?.use { cursor ->
                 val idCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID)
@@ -137,12 +143,17 @@ class MediaLibraryService(private val context: Context) {
                         },
                         id
                     )
-                    result[prefix] = contentUri.toString()
+                    result.getOrPut(prefix) { mutableListOf() }.add(contentUri.toString())
                 }
             }
         }
         return result
     }
+
+    fun scanExistingProxyPrefixesInGallery(): Map<String, String> =
+        scanExistingProxyPrefixesInGalleryAll()
+            .mapNotNull { (prefix, ids) -> ids.firstOrNull()?.let { prefix to it } }
+            .toMap()
 
     fun scanCandidates(
         tracker: LocalProxyTracker,
@@ -552,6 +563,141 @@ class MediaLibraryService(private val context: Context) {
     }
 
     /**
+     * Finds live compressed proxy URIs in Gallery matching `masterHashes`,
+     * strictly excluding any restored full-resolution original URIs.
+     */
+    suspend fun findCompressedProxyAssetIds(
+        tracker: LocalProxyTracker,
+        masterHashes: Set<String>
+    ): List<String> = withContext(Dispatchers.IO) {
+        if (currentAccessLevel() == MediaAccessLevel.DENIED) return@withContext emptyList()
+        val normHashes = masterHashes
+            .map { it.trim().lowercase() }
+            .filter { it.isNotEmpty() }
+            .toSet()
+        if (normHashes.isEmpty()) return@withContext emptyList()
+
+        val candidates = linkedSetOf<String>()
+        candidates.addAll(tracker.trackedProxyAssetIds(normHashes))
+
+        val targetPrefixes = normHashes
+            .map { ProxyGenerator.proxyPrefixTag(it) }
+            .filter { it.length >= 8 }
+            .toSet()
+        if (targetPrefixes.isNotEmpty()) {
+            val prefixMap = scanExistingProxyPrefixesInGalleryAll()
+            for (prefix in targetPrefixes) {
+                prefixMap[prefix]?.let { candidates.addAll(it) }
+            }
+        }
+
+        val filtered = candidates.filterNot { tracker.isRestoredOriginal(it) }
+        if (filtered.isEmpty()) return@withContext emptyList()
+
+        val verified = mutableListOf<String>()
+        for (uri in fetchLiveAssetIds(filtered)) {
+            val uriStr = uri.toString()
+            if (tracker.isRestoredOriginal(uriStr)) continue
+            val (displayName, diskPath) = queryMediaFileInfo(uri)
+            val candidateName = displayName ?: diskPath?.let { File(it).name }
+            val isProxyByName = candidateName?.let { ProxyGenerator.extractMasterHashPrefix(it) != null } == true
+            if (tracker.isKnownProxy(uriStr) || isProxyByName) {
+                verified.add(uriStr)
+            }
+        }
+        verified
+    }
+
+    /**
+     * Deletes verified compressed proxy copies from Gallery after originals have been restored.
+     * App-owned proxies (and devices with All Files Access) are removed silently; any remaining
+     * system-protected URIs are batched into a single MediaStore delete confirmation request on API 30+.
+     */
+    suspend fun deleteCompressedProxiesAfterRestore(
+        tracker: LocalProxyTracker,
+        assetIds: List<String>
+    ): CompressedProxyDeleteResult = withContext(Dispatchers.IO) {
+        val liveUris = fetchLiveAssetIds(assetIds.distinct())
+        if (liveUris.isEmpty()) {
+            return@withContext CompressedProxyDeleteResult.Deleted(emptyList())
+        }
+
+        val resolver = context.contentResolver
+        val deletedIds = mutableListOf<String>()
+        val batchPromptUris = mutableListOf<Uri>()
+        val recoverableItems = mutableListOf<Pair<String, IntentSender>>()
+
+        for (uri in liveUris) {
+            val uriStr = uri.toString()
+            if (tracker.isRestoredOriginal(uriStr)) continue
+            val (displayName, diskPath) = queryMediaFileInfo(uri)
+            val candidateName = displayName ?: diskPath?.let { File(it).name }
+            val isProxyByName = candidateName?.let { ProxyGenerator.extractMasterHashPrefix(it) != null } == true
+            if (!tracker.isKnownProxy(uriStr) && !isProxyByName) continue
+
+            var deleted = false
+            var recoverableSender: IntentSender? = null
+
+            try {
+                val count = resolver.delete(uri, null, null)
+                if (count > 0 || fetchLiveAssetIds(listOf(uriStr)).isEmpty()) {
+                    deleted = true
+                }
+            } catch (sec: SecurityException) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                    Build.VERSION.SDK_INT < Build.VERSION_CODES.R &&
+                    sec is RecoverableSecurityException
+                ) {
+                    recoverableSender = sec.userAction.actionIntent.intentSender
+                }
+            }
+
+            if (!deleted && diskPath != null && hasAllFilesAccess()) {
+                val file = File(diskPath)
+                val removedFile = !file.exists() || runCatching { file.delete() }.getOrDefault(false) || !file.exists()
+                if (removedFile) {
+                    runCatching { resolver.delete(uri, null, null) }
+                    MediaScannerConnection.scanFile(context, arrayOf(diskPath), null, null)
+                    deleted = !File(diskPath).exists()
+                }
+            }
+
+            if (deleted) {
+                deletedIds.add(uriStr)
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                batchPromptUris.add(uri)
+            } else if (recoverableSender != null) {
+                recoverableItems.add(uriStr to recoverableSender)
+            }
+        }
+
+        if (deletedIds.isNotEmpty()) {
+            tracker.clearProxyMappings(deletedIds)
+        }
+
+        if (batchPromptUris.isNotEmpty() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val pi: PendingIntent = MediaStore.createDeleteRequest(resolver, batchPromptUris)
+            return@withContext CompressedProxyDeleteResult.NeedsSystemConfirmation(
+                intentSender = pi.intentSender,
+                targetIds = batchPromptUris.map { it.toString() },
+                alreadyDeletedIds = deletedIds,
+                remainingIds = emptyList()
+            )
+        }
+
+        if (recoverableItems.isNotEmpty()) {
+            return@withContext CompressedProxyDeleteResult.NeedsSystemConfirmation(
+                intentSender = recoverableItems.first().second,
+                targetIds = listOf(recoverableItems.first().first),
+                alreadyDeletedIds = deletedIds,
+                remainingIds = recoverableItems.drop(1).map { it.first }
+            )
+        }
+
+        CompressedProxyDeleteResult.Deleted(deletedIds)
+    }
+
+    /**
      * Silently deletes a verified original without a system confirmation dialog when
      * All Files Access (`MANAGE_EXTERNAL_STORAGE` on Android 11+, or legacy storage write on <= 9) is active.
      * Refuses to delete any PhotoHub compressed proxy filename or restored-protected asset.
@@ -639,4 +785,14 @@ class MediaLibraryService(private val context: Context) {
             )
         }
     }
+}
+
+sealed class CompressedProxyDeleteResult {
+    data class Deleted(val deletedIds: List<String>) : CompressedProxyDeleteResult()
+    data class NeedsSystemConfirmation(
+        val intentSender: IntentSender,
+        val targetIds: List<String>,
+        val alreadyDeletedIds: List<String>,
+        val remainingIds: List<String>
+    ) : CompressedProxyDeleteResult()
 }

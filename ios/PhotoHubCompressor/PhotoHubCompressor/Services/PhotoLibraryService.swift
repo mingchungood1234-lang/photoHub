@@ -73,9 +73,20 @@ final class PhotoLibraryService {
         inspectAssetResources(for: asset).proxyMatch
     }
 
-    /// Scans local Photos metadata (zero iCloud download) for any synced or locally created
-    /// `PHOTOHUB_PROXY_<prefix>` assets, returning `prefix16 -> PHAsset.localIdentifier`.
-    static func scanExistingProxyPrefixesInPhotos() -> [String: String] {
+    enum CompressedProxyDeleteResult: Sendable {
+        case deleted(Int)
+        case cancelledByUser
+        case noPermission
+        case failed(String)
+    }
+
+    /// Scans local Photos metadata (zero iCloud download) for all synced or locally created
+    /// `PHOTOHUB_PROXY_<prefix>` assets, returning `prefix16 -> [PHAsset.localIdentifier]`.
+    static func scanAllProxyPrefixesInPhotos() -> [String: [String]] {
+        let auth = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard auth == .authorized || auth == .limited else {
+            return [:]
+        }
         let fetchOptions = PHFetchOptions()
         fetchOptions.predicate = NSPredicate(
             format: "mediaType == %d OR mediaType == %d",
@@ -83,16 +94,102 @@ final class PhotoLibraryService {
             PHAssetMediaType.video.rawValue
         )
         let assets = PHAsset.fetchAssets(with: fetchOptions)
-        var map: [String: String] = [:]
+        var map: [String: [String]] = [:]
         for i in 0..<assets.count {
             autoreleasepool {
                 let asset = assets.object(at: i)
                 if let match = proxyHashPrefixFromAssetResources(asset) {
-                    map[match.prefix] = asset.localIdentifier
+                    map[match.prefix, default: []].append(asset.localIdentifier)
                 }
             }
         }
         return map
+    }
+
+    /// Scans local Photos metadata (zero iCloud download) for any synced or locally created
+    /// `PHOTOHUB_PROXY_<prefix>` assets, returning `prefix16 -> PHAsset.localIdentifier`.
+    static func scanExistingProxyPrefixesInPhotos() -> [String: String] {
+        scanAllProxyPrefixesInPhotos().compactMapValues { $0.first }
+    }
+
+    /// Finds live compressed proxy `PHAsset`s in Apple Photos matching the provided master hashes,
+    /// strictly excluding any restored full-resolution original assets.
+    static func findCompressedProxyAssets(forMasterHashes hashes: Set<String>) -> [PHAsset] {
+        let auth = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard auth == .authorized || auth == .limited else {
+            return []
+        }
+
+        let normHashes = Set(
+            hashes.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter { !$0.isEmpty }
+        )
+        guard !normHashes.isEmpty else { return [] }
+
+        let tracker = LocalProxyTracker.shared
+        var candidateIds = Set(tracker.trackedProxyAssetIds(forMasterHashes: normHashes))
+
+        let targetPrefixes = Set(
+            normHashes.map { ProxyGenerator.proxyPrefixTag(forMasterHash: $0) }
+                .filter { $0.count >= 8 }
+        )
+        if !targetPrefixes.isEmpty {
+            let prefixMap = scanAllProxyPrefixesInPhotos()
+            for prefix in targetPrefixes {
+                if let ids = prefixMap[prefix] {
+                    candidateIds.formUnion(ids)
+                }
+            }
+        }
+
+        let filteredIds = candidateIds.filter { !tracker.isRestoredOriginal(assetId: $0) }
+        guard !filteredIds.isEmpty else { return [] }
+
+        let fetch = PHAsset.fetchAssets(withLocalIdentifiers: Array(filteredIds), options: nil)
+        var verified: [PHAsset] = []
+        verified.reserveCapacity(fetch.count)
+        for i in 0..<fetch.count {
+            let asset = fetch.object(at: i)
+            let localId = asset.localIdentifier
+            guard !tracker.isRestoredOriginal(assetId: localId) else { continue }
+            if tracker.isKnownProxy(assetId: localId) || proxyHashPrefixFromAssetResources(asset) != nil {
+                verified.append(asset)
+            }
+        }
+        return verified
+    }
+
+    /// Presents one native iOS Photos confirmation dialog to delete all verified compressed proxies
+    /// corresponding to successfully restored originals, and clears their proxy tracker entries.
+    static func deleteCompressedProxyAssets(forMasterHashes hashes: Set<String>) async -> CompressedProxyDeleteResult {
+        let auth = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard auth == .authorized || auth == .limited else {
+            return .noPermission
+        }
+
+        let assets = await Task.detached(priority: .userInitiated) {
+            findCompressedProxyAssets(forMasterHashes: hashes)
+        }.value
+
+        guard !assets.isEmpty else {
+            return .deleted(0)
+        }
+
+        return await withCheckedContinuation { continuation in
+            PhotoLibraryService().deleteOriginalAssets(assets) { result in
+                switch result {
+                case .success(.deleted(let deletedIds)):
+                    LocalProxyTracker.shared.clearProxyMappings(assetIds: deletedIds)
+                    continuation.resume(returning: .deleted(deletedIds.count))
+                case .success(.cancelledByUser):
+                    continuation.resume(returning: .cancelledByUser)
+                case .failure(PhotoLibraryError.permissionDenied):
+                    continuation.resume(returning: .noPermission)
+                case .failure(let error):
+                    continuation.resume(returning: .failed(error.localizedDescription))
+                }
+            }
+        }
     }
 
     static func readLocalImageDataIfCached(for asset: PHAsset, maxBytes: Int64 = 4_000_000) -> Data? {
@@ -574,6 +671,18 @@ final class PhotoLibraryService {
         }
     }
 
+    static func requestReadWriteAuthorizationAsync() async -> Bool {
+        let current = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        if current == .authorized || current == .limited {
+            return true
+        }
+        return await withCheckedContinuation { continuation in
+            PHPhotoLibrary.requestAuthorization(for: .readWrite) { status in
+                continuation.resume(returning: status == .authorized || status == .limited)
+            }
+        }
+    }
+
     /// Saves a server-backed compressed proxy (JPEG/HEIC image or MP4 video) into Apple Photos,
     /// preserving original creation date and registering its asset ID in `LocalProxyTracker.shared`
     /// so it is never re-uploaded and can always be resolved back to its server master for Share Original.
@@ -850,6 +959,7 @@ final class OriginalDownloadCache: @unchecked Sendable {
 
     private let lock = NSLock()
     private var inFlight: [String: InFlightEntry] = [:]
+    private var entryCallbacks: [UUID: [UUID: @Sendable (Int64, Int64?) -> Void]] = [:]
 
     private init() {}
 
@@ -932,7 +1042,8 @@ final class OriginalDownloadCache: @unchecked Sendable {
         preferredFilename: String? = nil,
         expectedSizeBytes: Int64? = nil,
         isVideo: Bool = false,
-        client: PhotoHubAPIClient
+        client: PhotoHubAPIClient,
+        onProgress: (@Sendable (Int64, Int64?) -> Void)? = nil
     ) async throws -> URL {
         let normHash = Self.normalizeHash(hash)
         guard !normHash.isEmpty else {
@@ -940,6 +1051,11 @@ final class OriginalDownloadCache: @unchecked Sendable {
         }
 
         if let cached = getCachedOriginal(hash: normHash, expectedSizeBytes: expectedSizeBytes) {
+            let attrs = try? FileManager.default.attributesOfItem(atPath: cached.path)
+            let sz = (attrs?[.size] as? NSNumber)?.int64Value ?? expectedSizeBytes ?? 0
+            if sz > 0 {
+                onProgress?(sz, sz)
+            }
             return cached
         }
 
@@ -951,7 +1067,8 @@ final class OriginalDownloadCache: @unchecked Sendable {
             preferredFilename: preferredFilename,
             expectedSizeBytes: expectedSizeBytes,
             isVideo: isVideo,
-            clientBox: clientBox
+            clientBox: clientBox,
+            onProgress: onProgress
         )
 
         return try await withTaskCancellationHandler {
@@ -968,14 +1085,16 @@ final class OriginalDownloadCache: @unchecked Sendable {
         preferredFilename: String? = nil,
         expectedSizeBytes: Int64? = nil,
         isVideo: Bool = false,
-        client: PhotoHubAPIClient
+        client: PhotoHubAPIClient,
+        onProgress: (@Sendable (Int64, Int64?) -> Void)? = nil
     ) async throws -> URL {
         let cachedURL = try await getOrFetchOriginal(
             hash: hash,
             preferredFilename: preferredFilename,
             expectedSizeBytes: expectedSizeBytes,
             isVideo: isVideo,
-            client: client
+            client: client,
+            onProgress: onProgress
         )
 
         let fm = FileManager.default
@@ -993,32 +1112,50 @@ final class OriginalDownloadCache: @unchecked Sendable {
         return targetURL
     }
 
+    private func emitProgress(entryID: UUID, downloaded: Int64, total: Int64?) {
+        lock.lock()
+        let callbacks = Array(entryCallbacks[entryID]?.values ?? [])
+        lock.unlock()
+        for cb in callbacks {
+            cb(downloaded, total)
+        }
+    }
+
     private func acquireEntry(
         normHash: String,
         waiterID: UUID,
         preferredFilename: String?,
         expectedSizeBytes: Int64?,
         isVideo: Bool,
-        clientBox: SendableClientBox
+        clientBox: SendableClientBox,
+        onProgress: (@Sendable (Int64, Int64?) -> Void)?
     ) -> InFlightEntry {
         lock.lock()
         defer { lock.unlock() }
 
         if let existing = inFlight[normHash], !existing.task.isCancelled {
             existing.waiterIDs.insert(waiterID)
+            if let onProgress {
+                entryCallbacks[existing.id, default: [:]][waiterID] = onProgress
+            }
             return existing
         }
 
         let entryID = UUID()
+        if let onProgress {
+            entryCallbacks[entryID] = [waiterID: onProgress]
+        }
         let task = Task<URL, Error> { [self] in
             defer {
                 self.lock.lock()
                 if self.inFlight[normHash]?.id == entryID {
                     self.inFlight.removeValue(forKey: normHash)
                 }
+                self.entryCallbacks.removeValue(forKey: entryID)
                 self.lock.unlock()
             }
             return try await self.downloadIntoCache(
+                entryID: entryID,
                 normHash: normHash,
                 preferredFilename: preferredFilename,
                 expectedSizeBytes: expectedSizeBytes,
@@ -1039,11 +1176,13 @@ final class OriginalDownloadCache: @unchecked Sendable {
     ) {
         var taskToCancel: Task<URL, Error>?
         lock.lock()
+        entryCallbacks[entry.id]?.removeValue(forKey: waiterID)
         let removed = entry.waiterIDs.remove(waiterID) != nil
         if removed && cancelIfUnused && entry.waiterIDs.isEmpty {
             if inFlight[normHash]?.id == entry.id {
                 inFlight.removeValue(forKey: normHash)
             }
+            entryCallbacks.removeValue(forKey: entry.id)
             taskToCancel = entry.task
         }
         lock.unlock()
@@ -1051,6 +1190,7 @@ final class OriginalDownloadCache: @unchecked Sendable {
     }
 
     private func downloadIntoCache(
+        entryID: UUID,
         normHash: String,
         preferredFilename: String?,
         expectedSizeBytes: Int64?,
@@ -1074,7 +1214,10 @@ final class OriginalDownloadCache: @unchecked Sendable {
             destinationDir: stageDir,
             preferredFilename: preferredFilename,
             expectedSizeBytes: expectedSizeBytes,
-            isVideo: isVideo
+            isVideo: isVideo,
+            onProgress: { [self] down, total in
+                self.emitProgress(entryID: entryID, downloaded: down, total: total)
+            }
         )
         try Task.checkCancellation()
 
@@ -1162,6 +1305,32 @@ final class OriginalDownloadCache: @unchecked Sendable {
     }
 }
 
+private actor BatchShareStatusTracker {
+    private var completedCount: Int = 0
+    private let totalCount: Int
+    private let onProgress: @MainActor (_ completed: Int, _ total: Int, _ stage: String) -> Void
+
+    init(
+        totalCount: Int,
+        onProgress: @MainActor @escaping (_ completed: Int, _ total: Int, _ stage: String) -> Void
+    ) {
+        self.totalCount = totalCount
+        self.onProgress = onProgress
+    }
+
+    func emitByteProgress(_ stage: String) async {
+        await onProgress(completedCount, totalCount, stage)
+    }
+
+    func recordItemCompleted() async {
+        completedCount += 1
+        let stage = totalCount > 1
+            ? "Prepared \(completedCount) of \(totalCount) item(s)..."
+            : "Finishing original..."
+        await onProgress(completedCount, totalCount, stage)
+    }
+}
+
 enum OriginalMediaResolver {
     static func resolveMaster(
         input: OriginalShareInput,
@@ -1185,7 +1354,7 @@ enum OriginalMediaResolver {
 
         // 2. Local tracker lookup + Photos PHAssetResource metadata (zero iCloud download)
         if let assetId = input.assetId, !assetId.isEmpty {
-            if let tracked = LocalProxyTracker.shared.masterLookup(forAssetId: assetId) {
+            if let tracked = LocalProxyTracker.shared.anyMasterLookup(forAssetId: assetId) {
                 let match = cachedPhotos.first(where: {
                     $0.hash.caseInsensitiveCompare(tracked.masterHash) == .orderedSame
                 })
@@ -1284,34 +1453,41 @@ enum OriginalMediaResolver {
         )
         let indexed = inputs.enumerated().map { (index: $0.offset, input: $0.element) }
         let queue = AsyncWorkQueue(indexed)
-        let workerCount = min(3, max(1, indexed.count))
+        let hasVideo = inputs.contains { $0.isVideo }
+        let workerCount = hasVideo ? 1 : min(3, max(1, indexed.count))
+        let statusTracker = BatchShareStatusTracker(totalCount: indexed.count, onProgress: onProgress)
 
         var outcomes: [BatchOriginalFetchItemOutcome] = []
-        var completed = 0
         var sawAuthExpired = false
 
         await withTaskGroup(of: BatchOriginalFetchItemOutcome?.self) { group in
             for _ in 0..<workerCount {
                 group.addTask {
-                    await fetchNextItem(queue: queue, cachedPhotos: cachedPhotos, client: client)
+                    await fetchNextItem(
+                        queue: queue,
+                        cachedPhotos: cachedPhotos,
+                        client: client,
+                        statusTracker: statusTracker
+                    )
                 }
             }
 
             for await outcome in group {
                 guard let outcome else { continue }
                 outcomes.append(outcome)
-                completed += 1
                 if case .authExpired = outcome {
                     sawAuthExpired = true
                 }
-                let stageLabel = indexed.count > 1
-                    ? "Prepared \(completed) of \(indexed.count) item(s)..."
-                    : "Downloading original from server..."
-                await onProgress(completed, indexed.count, stageLabel)
+                await statusTracker.recordItemCompleted()
 
                 if !Task.isCancelled && !sawAuthExpired {
                     group.addTask {
-                        await fetchNextItem(queue: queue, cachedPhotos: cachedPhotos, client: client)
+                        await fetchNextItem(
+                            queue: queue,
+                            cachedPhotos: cachedPhotos,
+                            client: client,
+                            statusTracker: statusTracker
+                        )
                     }
                 }
             }
@@ -1363,7 +1539,8 @@ enum OriginalMediaResolver {
     private static func fetchNextItem(
         queue: AsyncWorkQueue<(index: Int, input: OriginalShareInput)>,
         cachedPhotos: [ServerPhoto],
-        client: PhotoHubAPIClient
+        client: PhotoHubAPIClient,
+        statusTracker: BatchShareStatusTracker
     ) async -> BatchOriginalFetchItemOutcome? {
         guard !Task.isCancelled, let work = await queue.next() else {
             return nil
@@ -1382,12 +1559,30 @@ enum OriginalMediaResolver {
                 )
             }
 
+            let trimmedName = resolved.originalName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let displayLabel = trimmedName.isEmpty ? input.displayName : trimmedName
+            let expectedBytes = resolved.expectedSizeBytes
+
             let tempMasterURL = try await OriginalDownloadCache.shared.getOrFetchShareCopy(
                 hash: resolved.masterHash,
                 preferredFilename: resolved.originalName,
-                expectedSizeBytes: resolved.expectedSizeBytes,
+                expectedSizeBytes: expectedBytes,
                 isVideo: input.isVideo,
-                client: client
+                client: client,
+                onProgress: { down, total in
+                    let effectiveTotal = total ?? expectedBytes
+                    let downStr = ByteCountFormatter.string(fromByteCount: down, countStyle: .file)
+                    let msg: String
+                    if let effectiveTotal, effectiveTotal > 0 {
+                        let totStr = ByteCountFormatter.string(fromByteCount: effectiveTotal, countStyle: .file)
+                        msg = "Downloading \(displayLabel) (\(downStr) / \(totStr))..."
+                    } else {
+                        msg = "Downloading \(displayLabel) (\(downStr))..."
+                    }
+                    Task {
+                        await statusTracker.emitByteProgress(msg)
+                    }
+                }
             )
             let attrs = try? FileManager.default.attributesOfItem(atPath: tempMasterURL.path)
             let bytes = (attrs?[.size] as? NSNumber)?.int64Value ?? 0

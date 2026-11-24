@@ -362,12 +362,12 @@ final class LocalProxySyncManager: ObservableObject {
 }
 
 enum BatchRestoreOutcome: Sendable {
-    case restored(ServerPhoto?, String)
+    case restored(ServerPhoto?, String, String)
     case failed(String)
 
     var displayName: String {
         switch self {
-        case .restored(_, let name): return name
+        case .restored(_, _, let name): return name
         case .failed(let name): return name
         }
     }
@@ -382,15 +382,23 @@ struct RestoreConfirmPrompt: Identifiable {
     let unrestoredBytes: Int64
     let allBytes: Int64
     let isRestoreAll: Bool
+    let leftoverProxyHashes: Set<String>
+    let leftoverProxyCount: Int
 
     var messageText: String {
         if unrestoredTargets.isEmpty {
+            if isRestoreAll && leftoverProxyCount > 0 {
+                return "All \(allTargets.count) item(s) are already restored & protected on this device, and \(leftoverProxyCount) compressed copy/copies still remain in Photos."
+            }
             return "All \(allTargets.count) selected item(s) are already restored & protected on this device."
         }
         let sizeStr = ByteCountFormatter.string(fromByteCount: max(0, unrestoredBytes), countStyle: .file)
         let skipNote = skippedCount > 0
             ? "\n\n\(skippedCount) already protected/restored item(s) will be skipped."
             : ""
+        if isRestoreAll {
+            return "Download \(unrestoredTargets.count) full-resolution original(s) (~\(sizeStr)) to Photos, protect them from auto re-compression, and delete matching compressed copies from Photos.\(skipNote)"
+        }
         return "Download \(unrestoredTargets.count) full-resolution original(s) (~\(sizeStr)) to Photos and protect them from auto re-compression.\(skipNote)"
     }
 
@@ -398,7 +406,9 @@ struct RestoreConfirmPrompt: Identifiable {
         title: String,
         targets: [ServerPhoto],
         locallyProtectedHashes: Set<String>,
-        isRestoreAll: Bool
+        isRestoreAll: Bool,
+        leftoverProxyHashes: Set<String> = [],
+        leftoverProxyCount: Int = 0
     ) -> RestoreConfirmPrompt {
         let normProtected = Set(
             locallyProtectedHashes.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
@@ -414,7 +424,9 @@ struct RestoreConfirmPrompt: Identifiable {
             skippedCount: max(0, targets.count - unrestored.count),
             unrestoredBytes: unrestored.reduce(into: Int64(0)) { $0 += max(0, $1.size) },
             allBytes: targets.reduce(into: Int64(0)) { $0 += max(0, $1.size) },
-            isRestoreAll: isRestoreAll
+            isRestoreAll: isRestoreAll,
+            leftoverProxyHashes: leftoverProxyHashes,
+            leftoverProxyCount: max(0, leftoverProxyCount)
         )
     }
 }
@@ -424,12 +436,16 @@ enum BatchRestoreRunner {
         let succeeded: Int
         let failed: Int
         let cancelled: Bool
+        let deletedProxyCount: Int
         let message: String
     }
 
     static func run(
         targets: [ServerPhoto],
         client: PhotoHubAPIClient,
+        deleteCompressedProxies: Bool = false,
+        additionalProxyCleanupHashes: Set<String> = [],
+        onPhaseChange: (@MainActor (_ stageText: String) -> Void)? = nil,
         onProgress: @MainActor @escaping (
             _ completed: Int,
             _ total: Int,
@@ -444,6 +460,7 @@ enum BatchRestoreRunner {
         var succeeded = 0
         var failed = 0
         var completed = 0
+        var succeededMasterHashes: [String] = []
 
         await withTaskGroup(of: BatchRestoreOutcome?.self) { group in
             for _ in 0..<workerCount {
@@ -460,9 +477,10 @@ enum BatchRestoreRunner {
                 guard let outcome else { continue }
                 var updatedPhoto: ServerPhoto?
                 switch outcome {
-                case .restored(let updated, _):
+                case .restored(let updated, let masterHash, _):
                     updatedPhoto = updated
                     succeeded += 1
+                    succeededMasterHashes.append(masterHash)
                 case .failed:
                     failed += 1
                 }
@@ -482,17 +500,50 @@ enum BatchRestoreRunner {
         }
 
         let cancelled = Task.isCancelled
+        var deletedProxyCount = 0
+        var proxyNote = ""
+
+        if deleteCompressedProxies {
+            var cleanupHashes = Set(succeededMasterHashes.map { $0.lowercased() })
+            if !cancelled {
+                cleanupHashes.formUnion(additionalProxyCleanupHashes.map { $0.lowercased() })
+            }
+            if !cleanupHashes.isEmpty {
+                await onPhaseChange?("Deleting compressed copies from Photos...")
+                let deleteResult = await PhotoLibraryService.deleteCompressedProxyAssets(forMasterHashes: cleanupHashes)
+                switch deleteResult {
+                case .deleted(let count):
+                    deletedProxyCount = count
+                    if count > 0 {
+                        proxyNote = " and deleted \(count) compressed copy(s)"
+                    }
+                case .cancelledByUser:
+                    proxyNote = "; kept compressed copies in Photos (delete cancelled)"
+                case .noPermission:
+                    proxyNote = "; grant Full Access in iOS Settings -> photoHub -> Photos to delete compressed copies"
+                case .failed:
+                    proxyNote = "; could not delete some compressed copies (check Full Photos access)"
+                }
+            }
+        }
+
         let message: String
         if cancelled {
-            message = "Stopped after restoring \(succeeded) original(s)."
+            message = "Stopped after restoring \(succeeded) original(s)\(proxyNote)."
         } else if failed > 0 && succeeded == 0 {
             message = "Restore failed for \(failed) item(s)."
         } else if failed > 0 {
-            message = "Restored \(succeeded) original(s) & protected them; \(failed) failed."
+            message = "Restored \(succeeded) original(s) & protected them\(proxyNote); \(failed) failed."
         } else {
-            message = "Restored \(succeeded) original(s) to Photos & protected them."
+            message = "Restored \(succeeded) original(s) to Photos & protected them\(proxyNote)."
         }
-        return Summary(succeeded: succeeded, failed: failed, cancelled: cancelled, message: message)
+        return Summary(
+            succeeded: succeeded,
+            failed: failed,
+            cancelled: cancelled,
+            deletedProxyCount: deletedProxyCount,
+            message: message
+        )
     }
 
     private static func processNextItem(
@@ -509,7 +560,7 @@ enum BatchRestoreRunner {
                 client: client,
                 photoWriteSemaphore: photoWriteSemaphore
             )
-            return .restored(updated, item.originalName)
+            return .restored(updated, item.hash, item.originalName)
         } catch {
             return .failed(item.originalName)
         }
@@ -600,16 +651,34 @@ final class OriginalRestoreManager: ObservableObject {
                 return
             }
 
+            let allHashes = targets.map { $0.hash.lowercased() }
+            let (leftoverHashes, leftoverCount) = await Task.detached(priority: .userInitiated) {
+                let verifiedLocal = Set(
+                    allHashes.filter { LocalProxyTracker.shared.liveRestoredAssetId(forMasterHash: $0) != nil }
+                )
+                guard !verifiedLocal.isEmpty else {
+                    return (Set<String>(), 0)
+                }
+                let count = PhotoLibraryService.findCompressedProxyAssets(forMasterHashes: verifiedLocal).count
+                return (verifiedLocal, count)
+            }.value
+
             confirmPrompt = RestoreConfirmPrompt.build(
                 title: "Restore All Originals",
                 targets: targets,
                 locallyProtectedHashes: protectedHashes(for: targets),
-                isRestoreAll: true
+                isRestoreAll: true,
+                leftoverProxyHashes: leftoverHashes,
+                leftoverProxyCount: leftoverCount
             )
         }
     }
 
-    func startRestore(targets: [ServerPhoto], settings: AppSettings) {
+    func startRestore(
+        targets: [ServerPhoto],
+        settings: AppSettings,
+        additionalProxyCleanupHashes: Set<String> = []
+    ) {
         guard !isRestoring, !targets.isEmpty else { return }
         confirmPrompt = nil
         statusMessage = nil
@@ -623,8 +692,9 @@ final class OriginalRestoreManager: ObservableObject {
 
         restoreTask?.cancel()
         restoreTask = Task {
-            let authorized = await PhotoLibraryService.requestWriteAuthorizationAsync()
-            guard authorized else {
+            let readWriteGranted = await PhotoLibraryService.requestReadWriteAuthorizationAsync()
+            let canWrite = readWriteGranted || PhotoLibraryService.canWriteToPhotosLibrary()
+            guard canWrite else {
                 isRestoring = false
                 currentItemName = ""
                 restoreTask = nil
@@ -635,7 +705,12 @@ final class OriginalRestoreManager: ObservableObject {
             let client = PhotoHubAPIClient(settings: settings)
             let summary = await BatchRestoreRunner.run(
                 targets: targets,
-                client: client
+                client: client,
+                deleteCompressedProxies: true,
+                additionalProxyCleanupHashes: additionalProxyCleanupHashes,
+                onPhaseChange: { [weak self] stage in
+                    self?.currentItemName = stage
+                }
             ) { [weak self] completed, total, displayName, updatedPhoto in
                 guard let self else { return }
                 self.completedCount = completed
@@ -662,6 +737,39 @@ final class OriginalRestoreManager: ObservableObject {
             applySummary(photos: cachedPhotos, markLoaded: hasLoadedSummary || !cachedPhotos.isEmpty)
             NotificationCenter.default.post(name: .localProxyStoreDidChange, object: nil)
             statusMessage = summary.message
+        }
+    }
+
+    func deleteLeftoverCompressedProxies(hashes: Set<String>, settings: AppSettings) {
+        guard !isRestoring, !hashes.isEmpty else { return }
+        confirmPrompt = nil
+        statusMessage = nil
+        completedCount = 0
+        batchTotalCount = 1
+        currentItemName = "Deleting compressed copies from Photos..."
+        isRestoring = true
+
+        restoreTask?.cancel()
+        restoreTask = Task {
+            _ = await PhotoLibraryService.requestReadWriteAuthorizationAsync()
+            let deleteResult = await PhotoLibraryService.deleteCompressedProxyAssets(forMasterHashes: hashes)
+            isRestoring = false
+            currentItemName = ""
+            restoreTask = nil
+            NotificationCenter.default.post(name: .localProxyStoreDidChange, object: nil)
+
+            switch deleteResult {
+            case .deleted(let count):
+                statusMessage = count > 0
+                    ? "Deleted \(count) compressed copy(s) from Photos."
+                    : "No compressed copies found in Photos."
+            case .cancelledByUser:
+                statusMessage = "Kept compressed copies in Photos (delete cancelled)."
+            case .noPermission:
+                statusMessage = "Grant Full Access in iOS Settings -> photoHub -> Photos to delete compressed copies."
+            case .failed(let detail):
+                statusMessage = "Could not delete compressed copies: \(detail)"
+            }
         }
     }
 

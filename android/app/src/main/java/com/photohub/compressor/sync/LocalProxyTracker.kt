@@ -123,12 +123,80 @@ class LocalProxyTracker private constructor(context: Context) {
         }
     }
 
+    fun trackedProxyAssetIds(masterHashes: Set<String>): List<String> {
+        val normHashes = masterHashes
+            .map { it.trim().lowercase() }
+            .filter { it.isNotEmpty() }
+            .toSet()
+        if (normHashes.isEmpty()) return emptyList()
+        return synchronized(lock) {
+            val result = linkedSetOf<String>()
+            for (h in normHashes) {
+                val direct = masterToAssetId[h]
+                if (!direct.isNullOrBlank() && !restoredAssetIds.contains(direct)) {
+                    result.add(direct)
+                }
+            }
+            for ((assetId, mappedMaster) in assetToMaster) {
+                if (mappedMaster.trim().lowercase() in normHashes && !restoredAssetIds.contains(assetId)) {
+                    result.add(assetId)
+                }
+            }
+            result.toList()
+        }
+    }
+
+    fun clearProxyMappings(deletedAssetIds: Collection<String>) {
+        val idSet = deletedAssetIds.filter { it.isNotBlank() }.toSet()
+        if (idSet.isEmpty()) return
+        synchronized(lock) {
+            for (id in idSet) {
+                assetIds.remove(id)
+                assetToMaster.remove(id)
+                assetToFilename.remove(id)
+            }
+            val mastersToRemove = masterToAssetId
+                .filterValues { it in idSet }
+                .keys
+                .toList()
+            for (master in mastersToRemove) {
+                masterToAssetId.remove(master)
+            }
+            saveSet(KEY_ASSET_IDS, assetIds)
+            saveMap(KEY_ASSET_TO_MASTER, assetToMaster)
+            saveMap(KEY_ASSET_TO_FILENAME, assetToFilename)
+            saveMap(KEY_MASTER_TO_ASSET, masterToAssetId)
+        }
+    }
+
     fun isRestoredOriginal(assetId: String): Boolean = synchronized(lock) {
         restoredAssetIds.contains(assetId)
     }
 
     fun isRestoredMasterHash(masterHash: String): Boolean = synchronized(lock) {
         restoredMasterHashes.contains(masterHash.lowercase())
+    }
+
+    fun liveRestoredAssetId(masterHash: String): String? {
+        val normMaster = masterHash.trim().lowercase()
+        if (normMaster.isEmpty()) return null
+        val candidateIds = synchronized(lock) {
+            restoredAssetToMaster.filterValues { it == normMaster }.keys.toList()
+        }
+        if (candidateIds.isEmpty()) return null
+        for (raw in candidateIds) {
+            val exists = runCatching {
+                appContext.contentResolver.query(
+                    Uri.parse(raw),
+                    arrayOf(MediaStore.MediaColumns._ID),
+                    null,
+                    null,
+                    null
+                )?.use { it.moveToFirst() } ?: false
+            }.getOrDefault(false)
+            if (exists) return raw
+        }
+        return null
     }
 
     fun markRestoredOriginal(assetId: String?, masterHash: String) {

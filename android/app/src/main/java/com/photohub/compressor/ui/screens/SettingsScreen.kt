@@ -53,6 +53,12 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
         viewModel.onDiagnosticTrashResult(result.resultCode == Activity.RESULT_OK)
     }
 
+    val proxyDeleteLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        viewModel.onProxyDeleteConfirmationResult(result.resultCode == Activity.RESULT_OK)
+    }
+
     val restoreGalleryPermLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { _ ->
@@ -83,6 +89,12 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
         testTrashLauncher.launch(IntentSenderRequest.Builder(sender).build())
     }
 
+    LaunchedEffect(uiState.pendingProxyDeleteIntentSender) {
+        val sender = uiState.pendingProxyDeleteIntentSender ?: return@LaunchedEffect
+        viewModel.clearPendingProxyDeleteIntent()
+        proxyDeleteLauncher.launch(IntentSenderRequest.Builder(sender).build())
+    }
+
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
@@ -108,6 +120,7 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
         BatchRestoreConfirmDialog(
             request = req,
             onDismiss = { viewModel.dismissRestoreOriginalsConfirm() },
+            onDeleteLeftoverProxies = { viewModel.executeDeleteLeftoverCompressedProxies() },
             onConfirm = { includeProtected -> triggerConfirmedRestoreOriginals(includeProtected) }
         )
     }
@@ -648,7 +661,7 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
             item {
                 SectionCard(
                     title = "Restore Originals",
-                    footer = "Downloads full-resolution originals from your server into your phone Gallery and marks them protected so automatic proxy cleanup will not re-compress them."
+                    footer = "Downloads full-resolution originals from your server into your phone Gallery, deletes matching compressed proxy copies from Gallery, and marks originals protected so automatic proxy cleanup will not re-compress them."
                 ) {
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),

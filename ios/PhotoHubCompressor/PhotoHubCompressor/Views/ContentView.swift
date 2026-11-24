@@ -58,12 +58,21 @@ struct ContentView: View {
                     }
                 }
                 .sheet(isPresented: $incomingShare.showingInAppPicker) {
-                    MultiPhotoPickerSheet(selectionLimit: 25, skipCopyIfTracked: true) { picked in
-                        incomingShare.showingInAppPicker = false
-                        incomingShare.enqueuePickedResults(picked)
-                    } onCancel: {
-                        incomingShare.showingInAppPicker = false
-                    }
+                    MultiPhotoPickerSheet(
+                        selectionLimit: 25,
+                        skipCopyIfTracked: true,
+                        onPickPending: { pending in
+                            incomingShare.showingInAppPicker = false
+                            incomingShare.enqueuePickerSelections(pending)
+                        },
+                        onPickBatch: { picked in
+                            incomingShare.showingInAppPicker = false
+                            incomingShare.enqueuePickedResults(picked)
+                        },
+                        onCancel: {
+                            incomingShare.showingInAppPicker = false
+                        }
+                    )
                 }
             } else {
                 GoogleSignInGateView(settings: settings, authService: authService)

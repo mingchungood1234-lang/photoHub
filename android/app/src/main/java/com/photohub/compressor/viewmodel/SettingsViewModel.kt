@@ -42,7 +42,14 @@ data class SettingsUiState(
     val restoreOriginalsTotal: Int = 0,
     val restoreOriginalsCurrentName: String = "",
     val restoreOriginalsMessage: String? = null,
-    val restoreOriginalsConfirmRequest: BatchRestoreConfirmRequest? = null
+    val restoreOriginalsConfirmRequest: BatchRestoreConfirmRequest? = null,
+    val pendingProxyDeleteIntentSender: IntentSender? = null,
+    val pendingProxyDeleteTargetIds: List<String> = emptyList(),
+    val pendingProxyDeleteRemainingIds: List<String> = emptyList(),
+    val pendingProxyDeleteBaseRestoredCount: Int = 0,
+    val pendingProxyDeleteBaseFailedCount: Int = 0,
+    val pendingProxyDeleteAlreadyDeletedCount: Int = 0,
+    val pendingProxyDeleteFromRestoreRun: Boolean = false
 )
 
 class SettingsViewModel(application: Application) : AndroidViewModel(application) {
@@ -217,7 +224,14 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 restoreOriginalsTotal = 0,
                 restoreOriginalsCurrentName = "",
                 restoreOriginalsMessage = null,
-                restoreOriginalsConfirmRequest = null
+                restoreOriginalsConfirmRequest = null,
+                pendingProxyDeleteIntentSender = null,
+                pendingProxyDeleteTargetIds = emptyList(),
+                pendingProxyDeleteRemainingIds = emptyList(),
+                pendingProxyDeleteBaseRestoredCount = 0,
+                pendingProxyDeleteBaseFailedCount = 0,
+                pendingProxyDeleteAlreadyDeletedCount = 0,
+                pendingProxyDeleteFromRestoreRun = false
             )
         }
         settings.signOut()
@@ -296,11 +310,23 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             }
 
             val req = withContext(Dispatchers.IO) {
+                val verifiedLocalHashes = targets
+                    .asSequence()
+                    .map { it.hash.trim().lowercase(Locale.ROOT) }
+                    .filter { it.isNotEmpty() && tracker.liveRestoredAssetId(it) != null }
+                    .toSet()
+                val leftoverProxyCount = if (verifiedLocalHashes.isNotEmpty()) {
+                    mediaService.findCompressedProxyAssetIds(tracker, verifiedLocalHashes).size
+                } else {
+                    0
+                }
                 BatchRestorePlanner.buildConfirmRequest(
                     title = "Restore All Originals",
                     targets = targets,
                     locallyProtectedHashes = computeLocallyProtectedHashes(targets),
-                    isRestoreAll = true
+                    isRestoreAll = true,
+                    leftoverProxyHashes = verifiedLocalHashes,
+                    leftoverProxyCount = leftoverProxyCount
                 )
             }
             _uiState.update { it.copy(restoreOriginalsConfirmRequest = req) }
@@ -323,6 +349,169 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     fun stopRestoreOriginals() {
         restoreOriginalsJob?.cancel()
+    }
+
+    fun clearPendingProxyDeleteIntent() {
+        _uiState.update { it.copy(pendingProxyDeleteIntentSender = null) }
+    }
+
+    fun onProxyDeleteConfirmationResult(confirmed: Boolean) {
+        val state = _uiState.value
+        val targetIds = state.pendingProxyDeleteTargetIds
+        val remainingIds = state.pendingProxyDeleteRemainingIds
+        val baseRestored = state.pendingProxyDeleteBaseRestoredCount
+        val baseFailed = state.pendingProxyDeleteBaseFailedCount
+        val alreadyDeleted = state.pendingProxyDeleteAlreadyDeletedCount
+        val fromRestore = state.pendingProxyDeleteFromRestoreRun
+
+        viewModelScope.launch {
+            if (confirmed) {
+                if (targetIds.isNotEmpty()) {
+                    withContext(Dispatchers.IO) { tracker.clearProxyMappings(targetIds) }
+                }
+                val nextDeleted = alreadyDeleted + targetIds.size
+                if (remainingIds.isNotEmpty()) {
+                    when (val nextRes = mediaService.deleteCompressedProxiesAfterRestore(tracker, remainingIds)) {
+                        is com.photohub.compressor.media.CompressedProxyDeleteResult.Deleted -> {
+                            val totalDeleted = nextDeleted + nextRes.deletedIds.size
+                            val msg = if (fromRestore) {
+                                BatchRestoreExecutor.formatSummaryMessage(
+                                    ok = baseRestored,
+                                    errCount = baseFailed,
+                                    cancelled = false,
+                                    deletedProxyCount = totalDeleted
+                                )
+                            } else {
+                                "Deleted $totalDeleted compressed copy(s) from Gallery."
+                            }
+                            _uiState.update {
+                                it.copy(
+                                    pendingProxyDeleteIntentSender = null,
+                                    pendingProxyDeleteTargetIds = emptyList(),
+                                    pendingProxyDeleteRemainingIds = emptyList(),
+                                    restoreOriginalsMessage = msg
+                                )
+                            }
+                        }
+                        is com.photohub.compressor.media.CompressedProxyDeleteResult.NeedsSystemConfirmation -> {
+                            _uiState.update {
+                                it.copy(
+                                    pendingProxyDeleteIntentSender = nextRes.intentSender,
+                                    pendingProxyDeleteTargetIds = nextRes.targetIds,
+                                    pendingProxyDeleteRemainingIds = nextRes.remainingIds,
+                                    pendingProxyDeleteAlreadyDeletedCount = nextDeleted + nextRes.alreadyDeletedIds.size
+                                )
+                            }
+                        }
+                    }
+                    return@launch
+                }
+
+                val msg = if (fromRestore) {
+                    BatchRestoreExecutor.formatSummaryMessage(
+                        ok = baseRestored,
+                        errCount = baseFailed,
+                        cancelled = false,
+                        deletedProxyCount = nextDeleted
+                    )
+                } else {
+                    "Deleted $nextDeleted compressed copy(s) from Gallery."
+                }
+                _uiState.update {
+                    it.copy(
+                        pendingProxyDeleteIntentSender = null,
+                        pendingProxyDeleteTargetIds = emptyList(),
+                        pendingProxyDeleteRemainingIds = emptyList(),
+                        restoreOriginalsMessage = msg
+                    )
+                }
+            } else {
+                val msg = if (fromRestore) {
+                    if (alreadyDeleted > 0) {
+                        "Restored $baseRestored original(s) & deleted $alreadyDeleted compressed copy(s); remaining copies kept (delete cancelled)."
+                    } else {
+                        "Restored $baseRestored original(s) to Gallery, but kept compressed copies (delete cancelled)."
+                    }
+                } else {
+                    if (alreadyDeleted > 0) {
+                        "Deleted $alreadyDeleted compressed copy(s); remaining copies kept (delete cancelled)."
+                    } else {
+                        "Kept compressed copies in Gallery (delete cancelled)."
+                    }
+                }
+                _uiState.update {
+                    it.copy(
+                        pendingProxyDeleteIntentSender = null,
+                        pendingProxyDeleteTargetIds = emptyList(),
+                        pendingProxyDeleteRemainingIds = emptyList(),
+                        restoreOriginalsMessage = msg
+                    )
+                }
+            }
+        }
+    }
+
+    fun executeDeleteLeftoverCompressedProxies() {
+        val req = _uiState.value.restoreOriginalsConfirmRequest ?: return
+        _uiState.update { it.copy(restoreOriginalsConfirmRequest = null) }
+        val hashes = req.leftoverProxyHashes
+        if (_uiState.value.isBatchRestoringOriginals || hashes.isEmpty()) return
+
+        restoreOriginalsJob?.cancel()
+        _uiState.update {
+            it.copy(
+                isBatchRestoringOriginals = true,
+                restoreOriginalsMessage = null,
+                restoreOriginalsCompleted = 0,
+                restoreOriginalsTotal = 1,
+                restoreOriginalsCurrentName = "Deleting compressed copies from Gallery…"
+            )
+        }
+
+        restoreOriginalsJob = viewModelScope.launch {
+            val proxyIds = mediaService.findCompressedProxyAssetIds(tracker, hashes)
+            if (proxyIds.isEmpty()) {
+                _uiState.update {
+                    it.copy(
+                        isBatchRestoringOriginals = false,
+                        restoreOriginalsCurrentName = "",
+                        restoreOriginalsMessage = "No compressed copies found in Gallery."
+                    )
+                }
+                return@launch
+            }
+            when (val res = mediaService.deleteCompressedProxiesAfterRestore(tracker, proxyIds)) {
+                is com.photohub.compressor.media.CompressedProxyDeleteResult.Deleted -> {
+                    val count = res.deletedIds.size
+                    _uiState.update {
+                        it.copy(
+                            isBatchRestoringOriginals = false,
+                            restoreOriginalsCurrentName = "",
+                            restoreOriginalsMessage = if (count > 0) {
+                                "Deleted $count compressed copy(s) from Gallery."
+                            } else {
+                                "No compressed copies found in Gallery."
+                            }
+                        )
+                    }
+                }
+                is com.photohub.compressor.media.CompressedProxyDeleteResult.NeedsSystemConfirmation -> {
+                    _uiState.update {
+                        it.copy(
+                            isBatchRestoringOriginals = false,
+                            restoreOriginalsCurrentName = "",
+                            pendingProxyDeleteIntentSender = res.intentSender,
+                            pendingProxyDeleteTargetIds = res.targetIds,
+                            pendingProxyDeleteRemainingIds = res.remainingIds,
+                            pendingProxyDeleteBaseRestoredCount = 0,
+                            pendingProxyDeleteBaseFailedCount = 0,
+                            pendingProxyDeleteAlreadyDeletedCount = res.alreadyDeletedIds.size,
+                            pendingProxyDeleteFromRestoreRun = false
+                        )
+                    }
+                }
+            }
+        }
     }
 
     fun executeRestoreOriginalsConfirm(includeAlreadyRestored: Boolean = false) {
@@ -355,6 +544,11 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 mediaService = mediaService,
                 tracker = tracker,
                 targets = targets,
+                deleteCompressedProxies = true,
+                additionalProxyCleanupHashes = req.leftoverProxyHashes,
+                onPhaseChange = { stage ->
+                    _uiState.update { it.copy(restoreOriginalsCurrentName = stage) }
+                },
                 onItemComplete = { progress ->
                     val updated = progress.updatedPhoto
                     if (updated != null) {
@@ -378,11 +572,19 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                         )
                     }
                     store.notifyChanged()
+                    val pending = result.proxyDeletePending
                     _uiState.update {
                         it.copy(
                             isBatchRestoringOriginals = false,
                             restoreOriginalsCurrentName = "",
-                            restoreOriginalsMessage = result.summaryMessage
+                            restoreOriginalsMessage = result.summaryMessage,
+                            pendingProxyDeleteIntentSender = pending?.intentSender,
+                            pendingProxyDeleteTargetIds = pending?.targetIds ?: emptyList(),
+                            pendingProxyDeleteRemainingIds = pending?.remainingIds ?: emptyList(),
+                            pendingProxyDeleteBaseRestoredCount = result.succeeded,
+                            pendingProxyDeleteBaseFailedCount = result.failed,
+                            pendingProxyDeleteAlreadyDeletedCount = result.deletedProxyCount,
+                            pendingProxyDeleteFromRestoreRun = pending != null
                         )
                     }
                 }

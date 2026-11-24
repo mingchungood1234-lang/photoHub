@@ -45,35 +45,52 @@ struct FetchAndShareOriginalIntent: AppIntent {
 
         var inputs: [OriginalShareInput] = []
         for (idx, file) in media.enumerated() {
-            let rawName = file.filename.trimmingCharacters(in: .whitespacesAndNewlines)
-            let baseName = URL(fileURLWithPath: rawName.isEmpty ? "media_\(idx + 1)" : rawName).lastPathComponent
-            let destURL = batchDir.appendingPathComponent("\(idx + 1)_\(baseName)")
-            var saved = false
-            if let srcURL = file.fileURL {
-                try? fm.removeItem(at: destURL)
-                saved = (try? fm.copyItem(at: srcURL, to: destURL)) != nil
-            }
-            if !saved {
-                saved = (try? file.data.write(to: destURL, options: .atomic)) != nil
-            }
-            guard saved else { continue }
-            let ext = destURL.pathExtension.lowercased()
-            let utType = file.type ?? UTType(filenameExtension: ext)
-            let isVideo = utType?.conforms(to: .movie) == true
-                || ["mp4", "mov", "m4v", "3gp", "avi", "mkv", "webm"].contains(ext)
-            inputs.append(
-                OriginalShareInput(
-                    assetId: nil,
-                    fileURL: destURL,
-                    filenameHint: baseName,
-                    masterHashHint: nil,
-                    isVideo: isVideo
+            autoreleasepool {
+                let rawName = file.filename.trimmingCharacters(in: .whitespacesAndNewlines)
+                let baseName = URL(fileURLWithPath: rawName.isEmpty ? "media_\(idx + 1)" : rawName).lastPathComponent
+                let destURL = batchDir.appendingPathComponent("\(idx + 1)_\(baseName)")
+                var saved = false
+                if let srcURL = file.fileURL {
+                    try? fm.removeItem(at: destURL)
+                    let accessed = srcURL.startAccessingSecurityScopedResource()
+                    defer {
+                        if accessed {
+                            srcURL.stopAccessingSecurityScopedResource()
+                        }
+                    }
+                    saved = (try? fm.copyItem(at: srcURL, to: destURL)) != nil
+                }
+                if !saved && file.fileURL == nil {
+                    // Only materialize in-memory IntentFile.data when no backing fileURL was provided,
+                    // avoiding Jetsam OOM crashes on huge videos.
+                    saved = (try? file.data.write(to: destURL, options: .atomic)) != nil
+                }
+                guard saved else { return }
+                let ext = destURL.pathExtension.lowercased()
+                let utType = file.type ?? UTType(filenameExtension: ext)
+                let isVideo = utType?.conforms(to: .movie) == true
+                    || ["mp4", "mov", "m4v", "3gp", "avi", "mkv", "webm"].contains(ext)
+                inputs.append(
+                    OriginalShareInput(
+                        assetId: nil,
+                        fileURL: destURL,
+                        filenameHint: baseName,
+                        masterHashHint: nil,
+                        isVideo: isVideo
+                    )
                 )
-            )
+            }
         }
 
         if inputs.isEmpty {
-            IncomingShareCoordinator.shared.presentInAppPhotoPicker()
+            try? fm.removeItem(at: batchDir)
+            if !media.isEmpty {
+                IncomingShareCoordinator.shared.reportIncomingLoadFailure(
+                    "Could not read the selected photo/video from Apple Shortcuts (iOS memory or security-scope limit for huge files). Open photoHub -> Pick Photos or Videos to Share Original instead."
+                )
+            } else {
+                IncomingShareCoordinator.shared.presentInAppPhotoPicker()
+            }
         } else {
             IncomingShareCoordinator.shared.enqueueInputs(inputs, cleanupDirs: [batchDir])
         }

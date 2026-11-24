@@ -113,7 +113,7 @@ func cleanupTempShareURLs(_ urls: [URL]) {
 
 /// Delays cleanup after UIActivityViewController finishes so async share extensions
 /// (Save Video, AirDrop, WhatsApp) can finish reading large original video files first.
-func scheduleTempShareCleanup(_ urls: [URL], delay: TimeInterval = 180) {
+func scheduleTempShareCleanup(_ urls: [URL], delay: TimeInterval = 900) {
     guard !urls.isEmpty else { return }
     DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) {
         cleanupTempShareURLs(urls)
@@ -162,18 +162,39 @@ struct PickedMediaResult: Sendable {
     let assetId: String?
     let copiedFileURL: URL?
     let isVideo: Bool
+    let errorMessage: String?
+
+    init(
+        assetId: String?,
+        copiedFileURL: URL?,
+        isVideo: Bool,
+        errorMessage: String? = nil
+    ) {
+        self.assetId = assetId
+        self.copiedFileURL = copiedFileURL
+        self.isVideo = isVideo
+        self.errorMessage = errorMessage
+    }
 }
 
-/// Multi-select iOS 15+ PHPicker wrapper returning `[PickedMediaResult]` for checking gallery proxy/original status.
+struct PendingPickedMedia: @unchecked Sendable {
+    let assetId: String?
+    let provider: NSItemProvider
+    let isVideo: Bool
+}
+
+/// Multi-select iOS 15+ PHPicker wrapper returning `[PickedMediaResult]` (or `[PendingPickedMedia]` immediately).
 struct MultiPhotoPickerSheet: UIViewControllerRepresentable {
     var selectionLimit: Int = 25
     var skipCopyIfTracked: Bool = false
+    var onPickPending: (([PendingPickedMedia]) -> Void)? = nil
     let onPickBatch: ([PickedMediaResult]) -> Void
     let onCancel: () -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
             skipCopyIfTracked: skipCopyIfTracked,
+            onPickPending: onPickPending,
             onPickBatch: onPickBatch,
             onCancel: onCancel
         )
@@ -194,15 +215,18 @@ struct MultiPhotoPickerSheet: UIViewControllerRepresentable {
     @MainActor
     final class Coordinator: NSObject, PHPickerViewControllerDelegate {
         private let skipCopyIfTracked: Bool
+        private let onPickPending: (([PendingPickedMedia]) -> Void)?
         private let onPickBatch: ([PickedMediaResult]) -> Void
         private let onCancel: () -> Void
 
         init(
             skipCopyIfTracked: Bool,
+            onPickPending: (([PendingPickedMedia]) -> Void)?,
             onPickBatch: @escaping ([PickedMediaResult]) -> Void,
             onCancel: @escaping () -> Void
         ) {
             self.skipCopyIfTracked = skipCopyIfTracked
+            self.onPickPending = onPickPending
             self.onPickBatch = onPickBatch
             self.onCancel = onCancel
         }
@@ -213,16 +237,34 @@ struct MultiPhotoPickerSheet: UIViewControllerRepresentable {
                 return
             }
 
+            if let onPickPending {
+                let pending = results.map { item in
+                    PendingPickedMedia(
+                        assetId: item.assetIdentifier,
+                        provider: item.itemProvider,
+                        isVideo: PhotoPickerItemLoader.detectIsVideo(item.itemProvider)
+                    )
+                }
+                onPickPending(pending)
+                return
+            }
+
             let finishBatch = onPickBatch
             let skipCopy = skipCopyIfTracked
             let collector = PickedBatchCollector(count: results.count)
             let group = DispatchGroup()
+            let throttle = DispatchSemaphore(value: 2)
+            let workQueue = DispatchQueue(label: "photohub.picker.export", qos: .userInitiated, attributes: .concurrent)
 
             for (idx, item) in results.enumerated() {
                 group.enter()
-                PhotoPickerItemLoader.loadPickedResult(from: item, skipCopyIfTracked: skipCopy) { picked in
-                    collector.store(picked, at: idx)
-                    group.leave()
+                workQueue.async {
+                    throttle.wait()
+                    PhotoPickerItemLoader.loadPickedResult(from: item, skipCopyIfTracked: skipCopy) { picked in
+                        collector.store(picked, at: idx)
+                        throttle.signal()
+                        group.leave()
+                    }
                 }
             }
 
@@ -258,6 +300,22 @@ private final class PickedBatchCollector: @unchecked Sendable {
 }
 
 enum PhotoPickerItemLoader {
+    static func detectIsVideo(_ provider: NSItemProvider) -> Bool {
+        let videoTypeIds = [
+            UTType.quickTimeMovie.identifier,
+            UTType.mpeg4Movie.identifier,
+            UTType.movie.identifier,
+            UTType.video.identifier,
+        ]
+        if provider.registeredTypeIdentifiers.contains(where: { tid in
+            guard let ut = UTType(tid) else { return false }
+            return ut.conforms(to: .movie) || ut.conforms(to: .video)
+        }) {
+            return true
+        }
+        return videoTypeIds.contains { provider.hasItemConformingToTypeIdentifier($0) }
+    }
+
     static func loadPickedResult(
         from result: PHPickerResult,
         skipCopyIfTracked: Bool,
@@ -269,6 +327,22 @@ enum PhotoPickerItemLoader {
             skipCopyIfTracked: skipCopyIfTracked,
             completion: completion
         )
+    }
+
+    static func loadItemProviderAsync(
+        _ provider: NSItemProvider,
+        assetId: String?,
+        skipCopyIfTracked: Bool
+    ) async -> PickedMediaResult {
+        await withCheckedContinuation { continuation in
+            loadItemProvider(
+                provider,
+                assetId: assetId,
+                skipCopyIfTracked: skipCopyIfTracked
+            ) { result in
+                continuation.resume(returning: result)
+            }
+        }
     }
 
     static func loadItemProvider(
@@ -294,7 +368,7 @@ enum PhotoPickerItemLoader {
         }
 
         if skipCopyIfTracked, let assetId {
-            if LocalProxyTracker.shared.masterLookup(forAssetId: assetId) != nil {
+            if LocalProxyTracker.shared.anyMasterLookup(forAssetId: assetId) != nil {
                 completion(PickedMediaResult(assetId: assetId, copiedFileURL: nil, isVideo: isVideo))
                 return
             }
@@ -320,8 +394,14 @@ enum PhotoPickerItemLoader {
             typeId = provider.registeredTypeIdentifiers.first ?? UTType.data.identifier
         }
 
-        func finishWithURL(_ sourceURL: URL?, rawData: Data? = nil, suggestedExt: String? = nil) {
+        func finishWithURL(
+            _ sourceURL: URL?,
+            rawData: Data? = nil,
+            suggestedExt: String? = nil,
+            loadError: Error? = nil
+        ) {
             var copiedURL: URL?
+            var failureMessage: String? = loadError?.localizedDescription
             let fallbackExt = suggestedExt ?? (isVideo ? "mp4" : "jpg")
             let batchDir = FileManager.default.temporaryDirectory
                 .appendingPathComponent("photohub_incoming_\(UUID().uuidString.prefix(8))", isDirectory: true)
@@ -335,37 +415,57 @@ enum PhotoPickerItemLoader {
                 } else {
                     baseName = rawName
                 }
-                try? FileManager.default.createDirectory(at: batchDir, withIntermediateDirectories: true)
-                let dest = batchDir.appendingPathComponent(baseName)
-                try? FileManager.default.removeItem(at: dest)
-                let accessed = sourceURL.startAccessingSecurityScopedResource()
-                if (try? FileManager.default.copyItem(at: sourceURL, to: dest)) != nil {
+                do {
+                    try FileManager.default.createDirectory(at: batchDir, withIntermediateDirectories: true)
+                    let dest = batchDir.appendingPathComponent(baseName)
+                    try? FileManager.default.removeItem(at: dest)
+                    let accessed = sourceURL.startAccessingSecurityScopedResource()
+                    defer {
+                        if accessed {
+                            sourceURL.stopAccessingSecurityScopedResource()
+                        }
+                    }
+                    try FileManager.default.copyItem(at: sourceURL, to: dest)
                     copiedURL = dest
-                }
-                if accessed {
-                    sourceURL.stopAccessingSecurityScopedResource()
+                    failureMessage = nil
+                } catch {
+                    failureMessage = error.localizedDescription
                 }
             } else if let rawData, !rawData.isEmpty {
                 let rawHint = provider.suggestedName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 let baseName = rawHint.isEmpty
                     ? "photohub_pick_\(UUID().uuidString.prefix(8)).\(fallbackExt)"
                     : (URL(fileURLWithPath: rawHint).pathExtension.isEmpty ? "\(rawHint).\(fallbackExt)" : rawHint)
-                try? FileManager.default.createDirectory(at: batchDir, withIntermediateDirectories: true)
-                let dest = batchDir.appendingPathComponent(baseName)
-                if (try? rawData.write(to: dest, options: .atomic)) != nil {
+                do {
+                    try FileManager.default.createDirectory(at: batchDir, withIntermediateDirectories: true)
+                    let dest = batchDir.appendingPathComponent(baseName)
+                    try rawData.write(to: dest, options: .atomic)
                     copiedURL = dest
+                    failureMessage = nil
+                } catch {
+                    failureMessage = error.localizedDescription
                 }
             }
             if copiedURL == nil {
                 try? FileManager.default.removeItem(at: batchDir)
+                if failureMessage == nil {
+                    failureMessage = isVideo
+                        ? "Could not export video from Apple Photos (iCloud download or Photos export failed)."
+                        : "Could not export photo from Apple Photos."
+                }
             }
-            let out = PickedMediaResult(assetId: assetId, copiedFileURL: copiedURL, isVideo: isVideo)
+            let out = PickedMediaResult(
+                assetId: assetId,
+                copiedFileURL: copiedURL,
+                isVideo: isVideo,
+                errorMessage: failureMessage
+            )
             DispatchQueue.main.async {
                 completion(out)
             }
         }
 
-        provider.loadFileRepresentation(forTypeIdentifier: typeId) { url, _ in
+        provider.loadFileRepresentation(forTypeIdentifier: typeId) { url, fileErr in
             if let url {
                 let ext = url.pathExtension.isEmpty
                     ? UTType(typeId)?.preferredFilenameExtension
@@ -375,17 +475,18 @@ enum PhotoPickerItemLoader {
             }
 
             // Fallback when NSItemProvider exposes URL/Data (e.g. Shortcuts / Pasteboard videos)
-            provider.loadItem(forTypeIdentifier: typeId, options: nil) { item, _ in
+            provider.loadItem(forTypeIdentifier: typeId, options: nil) { item, itemErr in
+                let combinedErr = itemErr ?? fileErr
                 if let itemURL = item as? URL {
-                    finishWithURL(itemURL, suggestedExt: UTType(typeId)?.preferredFilenameExtension)
+                    finishWithURL(itemURL, suggestedExt: UTType(typeId)?.preferredFilenameExtension, loadError: combinedErr)
                 } else if let data = item as? Data {
-                    finishWithURL(nil, rawData: data, suggestedExt: UTType(typeId)?.preferredFilenameExtension)
+                    finishWithURL(nil, rawData: data, suggestedExt: UTType(typeId)?.preferredFilenameExtension, loadError: combinedErr)
                 } else if provider.canLoadObject(ofClass: URL.self) {
-                    _ = provider.loadObject(ofClass: URL.self) { objURL, _ in
-                        finishWithURL(objURL, suggestedExt: UTType(typeId)?.preferredFilenameExtension)
+                    _ = provider.loadObject(ofClass: URL.self) { objURL, objErr in
+                        finishWithURL(objURL, suggestedExt: UTType(typeId)?.preferredFilenameExtension, loadError: objErr ?? combinedErr)
                     }
                 } else {
-                    finishWithURL(nil)
+                    finishWithURL(nil, loadError: combinedErr)
                 }
             }
         }
@@ -451,8 +552,9 @@ enum IncomingShareState {
 
 struct IncomingShareSession: Identifiable {
     let id = UUID()
-    let inputs: [OriginalShareInput]
-    let cleanupDirs: [URL]
+    var pendingSelections: [PendingPickedMedia] = []
+    var inputs: [OriginalShareInput]
+    var cleanupDirs: [URL]
     var state: IncomingShareState
     var didAutoPresentShareSheet: Bool = false
 }
@@ -468,11 +570,57 @@ final class IncomingShareCoordinator: ObservableObject {
     @Published var shareSheetItem: ShareSheetItem?
 
     private var activeTask: Task<Void, Never>?
+    private var processingSessionId: UUID?
 
     private init() {}
 
     func presentInAppPhotoPicker() {
-        showingInAppPicker = true
+        let auth = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        if auth == .notDetermined {
+            Task { @MainActor [weak self] in
+                _ = await PhotoLibraryService.requestReadWriteAuthorizationAsync()
+                self?.showingInAppPicker = true
+            }
+        } else {
+            showingInAppPicker = true
+        }
+    }
+
+    func reportIncomingLoadFailure(_ message: String) {
+        cleanupActiveResources()
+        activeTask?.cancel()
+        activeTask = nil
+        processingSessionId = nil
+        shareSheetItem = nil
+        activeSession = IncomingShareSession(
+            pendingSelections: [],
+            inputs: [],
+            cleanupDirs: [],
+            state: .failed(message: message, unresolved: [])
+        )
+    }
+
+    func enqueuePickerSelections(_ selections: [PendingPickedMedia]) {
+        cleanupActiveResources()
+        activeTask?.cancel()
+        activeTask = nil
+        processingSessionId = nil
+        shareSheetItem = nil
+
+        guard !selections.isEmpty else { return }
+
+        activeSession = IncomingShareSession(
+            pendingSelections: selections,
+            inputs: [],
+            cleanupDirs: [],
+            state: .fetching(
+                completed: 0,
+                total: selections.count,
+                statusText: selections.count > 1
+                    ? "Reading \(selections.count) items from Apple Photos..."
+                    : "Reading item from Apple Photos..."
+            )
+        )
     }
 
     func enqueuePickedResults(_ results: [PickedMediaResult]) {
@@ -493,6 +641,7 @@ final class IncomingShareCoordinator: ObservableObject {
         cleanupActiveResources()
         activeTask?.cancel()
         activeTask = nil
+        processingSessionId = nil
         shareSheetItem = nil
 
         guard !inputs.isEmpty else {
@@ -501,6 +650,7 @@ final class IncomingShareCoordinator: ObservableObject {
         }
 
         activeSession = IncomingShareSession(
+            pendingSelections: [],
             inputs: inputs,
             cleanupDirs: cleanupDirs,
             state: .fetching(
@@ -731,6 +881,9 @@ final class IncomingShareCoordinator: ObservableObject {
 
     func processIfNeeded(sessionId: UUID, settings: AppSettings) {
         guard var current = activeSession, current.id == sessionId else { return }
+        if processingSessionId == sessionId && activeTask != nil {
+            return
+        }
         if !settings.isSignedIn || settings.normalizedBaseURL == nil {
             current.state = .needsSignIn
             activeSession = current
@@ -738,11 +891,101 @@ final class IncomingShareCoordinator: ObservableObject {
         }
         guard case .fetching = current.state else { return }
 
-        let inputs = current.inputs
+        processingSessionId = sessionId
         activeTask?.cancel()
         activeTask = Task { [weak self] in
+            guard let self else { return }
+
+            var resolvedInputs = current.inputs
+            var collectedDirs = current.cleanupDirs
+            var exportErrors: [String] = []
+
+            if resolvedInputs.isEmpty && !current.pendingSelections.isEmpty {
+                let selections = current.pendingSelections
+                let totalSel = selections.count
+                var built: [OriginalShareInput] = []
+
+                for (idx, sel) in selections.enumerated() {
+                    if Task.isCancelled { return }
+                    await MainActor.run {
+                        guard var s = self.activeSession, s.id == sessionId else { return }
+                        let label = totalSel > 1
+                            ? "Reading \(idx + 1) of \(totalSel) from Apple Photos..."
+                            : (sel.isVideo ? "Preparing video from Apple Photos..." : "Reading photo from Apple Photos...")
+                        s.state = .fetching(completed: idx, total: totalSel, statusText: label)
+                        self.activeSession = s
+                    }
+
+                    let picked = await PhotoPickerItemLoader.loadItemProviderAsync(
+                        sel.provider,
+                        assetId: sel.assetId,
+                        skipCopyIfTracked: true
+                    )
+                    if Task.isCancelled {
+                        if let url = picked.copiedFileURL {
+                            cleanupTempShareURL(url)
+                        }
+                        return
+                    }
+                    if let dir = picked.copiedFileURL?.deletingLastPathComponent() {
+                        collectedDirs.append(dir)
+                        await MainActor.run {
+                            if var s = self.activeSession, s.id == sessionId {
+                                s.cleanupDirs.append(dir)
+                                self.activeSession = s
+                            }
+                        }
+                    }
+                    if picked.assetId != nil || picked.copiedFileURL != nil {
+                        built.append(
+                            OriginalShareInput(
+                                assetId: picked.assetId,
+                                fileURL: picked.copiedFileURL,
+                                filenameHint: picked.copiedFileURL?.lastPathComponent,
+                                masterHashHint: nil,
+                                isVideo: picked.isVideo
+                            )
+                        )
+                    } else if let errMsg = picked.errorMessage, !errMsg.isEmpty {
+                        exportErrors.append(errMsg)
+                    }
+                }
+
+                guard !Task.isCancelled else { return }
+                resolvedInputs = built
+                await MainActor.run {
+                    guard var s = self.activeSession, s.id == sessionId else { return }
+                    s.inputs = built
+                    s.pendingSelections = []
+                    self.activeSession = s
+                }
+
+                if resolvedInputs.isEmpty {
+                    await MainActor.run {
+                        guard var latest = self.activeSession, latest.id == sessionId else { return }
+                        latest.state = .failed(
+                            message: exportErrors.first ?? "Could not read selected item(s) from Apple Photos.",
+                            unresolved: []
+                        )
+                        self.activeSession = latest
+                        self.processingSessionId = nil
+                        self.activeTask = nil
+                    }
+                    return
+                }
+            }
+
+            let initialMatchText = resolvedInputs.count > 1
+                ? "Matching \(resolvedInputs.count) compressed items..."
+                : "Matching compressed item..."
+            await MainActor.run {
+                guard var s = self.activeSession, s.id == sessionId else { return }
+                s.state = .fetching(completed: 0, total: resolvedInputs.count, statusText: initialMatchText)
+                self.activeSession = s
+            }
+
             let outcome = await OriginalMediaResolver.resolveAndFetchBatch(
-                inputs: inputs,
+                inputs: resolvedInputs,
                 settings: settings
             ) { [weak self] completed, total, stage in
                 guard let self, var s = self.activeSession, s.id == sessionId else { return }
@@ -750,9 +993,11 @@ final class IncomingShareCoordinator: ObservableObject {
                 self.activeSession = s
             }
 
-            guard let self, var latest = self.activeSession, latest.id == sessionId, !Task.isCancelled else {
+            guard var latest = self.activeSession, latest.id == sessionId, !Task.isCancelled else {
                 return
             }
+            self.processingSessionId = nil
+            self.activeTask = nil
 
             if outcome.authExpired {
                 LocalProxySyncManager.shared.cancel()
@@ -764,6 +1009,7 @@ final class IncomingShareCoordinator: ObservableObject {
 
             if outcome.resolved.isEmpty {
                 let errMsg = outcome.errorMessage
+                    ?? exportErrors.first
                     ?? "None of the selected items are linked to a backed-up PhotoHub original."
                 latest.state = .failed(message: errMsg, unresolved: outcome.unresolved)
                 self.activeSession = latest
@@ -788,7 +1034,8 @@ final class IncomingShareCoordinator: ObservableObject {
 
     func retry(settings: AppSettings) {
         guard var current = activeSession else { return }
-        let total = current.inputs.count
+        processingSessionId = nil
+        let total = max(current.inputs.count, current.pendingSelections.count)
         current.state = .fetching(
             completed: 0,
             total: total,
@@ -893,6 +1140,7 @@ final class IncomingShareCoordinator: ObservableObject {
     func dismiss() {
         activeTask?.cancel()
         activeTask = nil
+        processingSessionId = nil
         shareSheetItem = nil
         cleanupActiveResources()
         activeSession = nil

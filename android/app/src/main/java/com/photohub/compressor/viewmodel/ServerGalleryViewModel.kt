@@ -245,7 +245,9 @@ data class BatchRestoreConfirmRequest(
     val skippedCount: Int,
     val unrestoredBytes: Long,
     val allBytes: Long,
-    val isRestoreAll: Boolean
+    val isRestoreAll: Boolean,
+    val leftoverProxyHashes: Set<String> = emptySet(),
+    val leftoverProxyCount: Int = 0
 )
 
 object BatchRestorePlanner {
@@ -253,7 +255,9 @@ object BatchRestorePlanner {
         title: String,
         targets: List<ServerPhoto>,
         locallyProtectedHashes: Set<String>,
-        isRestoreAll: Boolean
+        isRestoreAll: Boolean,
+        leftoverProxyHashes: Set<String> = emptySet(),
+        leftoverProxyCount: Int = 0
     ): BatchRestoreConfirmRequest {
         val normProtected = locallyProtectedHashes.map { it.trim().lowercase(Locale.ROOT) }.toSet()
         val unrestored = targets.filter { photo ->
@@ -266,7 +270,9 @@ object BatchRestorePlanner {
             skippedCount = (targets.size - unrestored.size).coerceAtLeast(0),
             unrestoredBytes = unrestored.sumOf { maxOf(0L, it.size) },
             allBytes = targets.sumOf { maxOf(0L, it.size) },
-            isRestoreAll = isRestoreAll
+            isRestoreAll = isRestoreAll,
+            leftoverProxyHashes = leftoverProxyHashes,
+            leftoverProxyCount = leftoverProxyCount.coerceAtLeast(0)
         )
     }
 
@@ -292,6 +298,8 @@ data class BatchRestoreResult(
     val succeeded: Int,
     val failed: Int,
     val cancelled: Boolean,
+    val deletedProxyCount: Int = 0,
+    val proxyDeletePending: com.photohub.compressor.media.CompressedProxyDeleteResult.NeedsSystemConfirmation? = null,
     val summaryMessage: String
 )
 
@@ -330,6 +338,9 @@ object BatchRestoreExecutor {
         mediaService: MediaLibraryService,
         tracker: LocalProxyTracker,
         targets: List<ServerPhoto>,
+        deleteCompressedProxies: Boolean = false,
+        additionalProxyCleanupHashes: Set<String> = emptySet(),
+        onPhaseChange: ((String) -> Unit)? = null,
         onItemComplete: (BatchRestoreProgress) -> Unit,
         onFinished: suspend (BatchRestoreResult) -> Unit
     ) {
@@ -340,6 +351,7 @@ object BatchRestoreExecutor {
         val succeeded = AtomicInteger(0)
         val failed = AtomicInteger(0)
         val completed = AtomicInteger(0)
+        val succeededHashes = java.util.Collections.synchronizedList(mutableListOf<String>())
         var cancelled = false
 
         try {
@@ -359,6 +371,7 @@ object BatchRestoreExecutor {
                                     photo = item
                                 ).first
                                 succeeded.incrementAndGet()
+                                succeededHashes.add(item.hash)
                             } catch (c: CancellationException) {
                                 throw c
                             } catch (_: Exception) {
@@ -384,13 +397,54 @@ object BatchRestoreExecutor {
         } finally {
             val ok = succeeded.get()
             val errCount = failed.get()
-            val msg = formatSummaryMessage(ok = ok, errCount = errCount, cancelled = cancelled)
+            var deletedProxyCount = 0
+            var pendingPrompt: com.photohub.compressor.media.CompressedProxyDeleteResult.NeedsSystemConfirmation? = null
+
             withContext(NonCancellable) {
+                if (deleteCompressedProxies) {
+                    val cleanupHashes = succeededHashes
+                        .map { it.trim().lowercase(Locale.ROOT) }
+                        .filter { it.isNotEmpty() }
+                        .toMutableSet()
+                    if (!cancelled) {
+                        additionalProxyCleanupHashes
+                            .map { it.trim().lowercase(Locale.ROOT) }
+                            .filter { it.isNotEmpty() }
+                            .let { cleanupHashes.addAll(it) }
+                    }
+                    if (cleanupHashes.isNotEmpty()) {
+                        onPhaseChange?.invoke("Deleting compressed copies from Gallery…")
+                        val proxyIds = mediaService.findCompressedProxyAssetIds(tracker, cleanupHashes)
+                        if (proxyIds.isNotEmpty()) {
+                            when (val delRes = mediaService.deleteCompressedProxiesAfterRestore(tracker, proxyIds)) {
+                                is com.photohub.compressor.media.CompressedProxyDeleteResult.Deleted -> {
+                                    deletedProxyCount = delRes.deletedIds.size
+                                }
+                                is com.photohub.compressor.media.CompressedProxyDeleteResult.NeedsSystemConfirmation -> {
+                                    deletedProxyCount = delRes.alreadyDeletedIds.size
+                                    if (!cancelled) {
+                                        pendingPrompt = delRes
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                val msg = formatSummaryMessage(
+                    ok = ok,
+                    errCount = errCount,
+                    cancelled = cancelled,
+                    deletedProxyCount = deletedProxyCount,
+                    awaitingDeleteConfirm = pendingPrompt != null
+                )
                 onFinished(
                     BatchRestoreResult(
                         succeeded = ok,
                         failed = errCount,
                         cancelled = cancelled,
+                        deletedProxyCount = deletedProxyCount,
+                        proxyDeletePending = pendingPrompt,
                         summaryMessage = msg
                     )
                 )
@@ -398,11 +452,28 @@ object BatchRestoreExecutor {
         }
     }
 
-    fun formatSummaryMessage(ok: Int, errCount: Int, cancelled: Boolean): String = when {
-        cancelled -> "Stopped after restoring $ok original(s)."
-        errCount > 0 && ok == 0 -> "Restore failed for $errCount item(s)."
-        errCount > 0 -> "Restored $ok original(s) & protected them; $errCount failed."
-        else -> "Restored $ok original(s) to Gallery & protected them."
+    fun formatSummaryMessage(
+        ok: Int,
+        errCount: Int,
+        cancelled: Boolean,
+        deletedProxyCount: Int = 0,
+        awaitingDeleteConfirm: Boolean = false
+    ): String {
+        val proxyNote = when {
+            awaitingDeleteConfirm && deletedProxyCount > 0 ->
+                ", deleted $deletedProxyCount compressed copy(s), awaiting system confirm for remaining"
+            awaitingDeleteConfirm ->
+                "; confirm system prompt to delete compressed copies"
+            deletedProxyCount > 0 ->
+                " and deleted $deletedProxyCount compressed copy(s)"
+            else -> ""
+        }
+        return when {
+            cancelled -> "Stopped after restoring $ok original(s)$proxyNote."
+            errCount > 0 && ok == 0 -> "Restore failed for $errCount item(s)."
+            errCount > 0 -> "Restored $ok original(s) & protected them$proxyNote; $errCount failed."
+            else -> "Restored $ok original(s) to Gallery & protected them$proxyNote."
+        }
     }
 }
 

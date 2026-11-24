@@ -88,9 +88,19 @@ struct SettingsView: View {
                 localProxyCacheBytes = LocalProxyStore.shared.totalStorageBytes()
                 restoreManager.loadCachedSummary(settings: settings)
             }
-            .restoreOriginalsConfirmAlert(prompt: $restoreManager.confirmPrompt) { targets, _ in
-                restoreManager.startRestore(targets: targets, settings: settings)
-            }
+            .restoreOriginalsConfirmAlert(
+                prompt: $restoreManager.confirmPrompt,
+                onDeleteLeftoverProxies: { hashes in
+                    restoreManager.deleteLeftoverCompressedProxies(hashes: hashes, settings: settings)
+                },
+                onConfirm: { targets, prompt in
+                    restoreManager.startRestore(
+                        targets: targets,
+                        settings: settings,
+                        additionalProxyCleanupHashes: prompt.leftoverProxyHashes
+                    )
+                }
+            )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
@@ -531,7 +541,7 @@ struct SettingsView: View {
         } header: {
             Text("Restore Originals")
         } footer: {
-            Text("Downloads full-resolution originals from your server into Apple Photos and marks them protected so automatic proxy cleanup will not re-compress them.")
+            Text("Downloads full-resolution originals from your server into Apple Photos, deletes matching compressed proxy copies from Photos, and marks originals protected so automatic proxy cleanup will not re-compress them.")
         }
     }
 
@@ -630,6 +640,7 @@ struct SettingsView: View {
 extension View {
     func restoreOriginalsConfirmAlert(
         prompt: Binding<RestoreConfirmPrompt?>,
+        onDeleteLeftoverProxies: ((_ hashes: Set<String>) -> Void)? = nil,
         onConfirm: @escaping (_ targets: [ServerPhoto], _ prompt: RestoreConfirmPrompt) -> Void
     ) -> some View {
         alert(
@@ -650,6 +661,14 @@ extension View {
                     }
                 }
             } else {
+                if current.isRestoreAll, current.leftoverProxyCount > 0, let onDeleteLeftoverProxies {
+                    Button(
+                        "Delete \(current.leftoverProxyCount) Compressed Copy\(current.leftoverProxyCount == 1 ? "" : "s")",
+                        role: .destructive
+                    ) {
+                        onDeleteLeftoverProxies(current.leftoverProxyHashes)
+                    }
+                }
                 Button("Re-download All (\(current.allTargets.count))") {
                     onConfirm(current.allTargets, current)
                 }

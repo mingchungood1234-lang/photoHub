@@ -703,6 +703,7 @@ private fun UnproxiedBanner(
 fun BatchRestoreConfirmDialog(
     request: com.photohub.compressor.viewmodel.BatchRestoreConfirmRequest,
     onDismiss: () -> Unit,
+    onDeleteLeftoverProxies: (() -> Unit)? = null,
     onConfirm: (includeAlreadyRestored: Boolean) -> Unit
 ) {
     val context = LocalContext.current
@@ -712,14 +713,29 @@ fun BatchRestoreConfirmDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (request.unrestoredTargets.isEmpty()) {
-                    Text(
-                        "All ${request.allTargets.size} selected item(s) are already restored & protected on this device."
-                    )
+                    if (request.isRestoreAll && request.leftoverProxyCount > 0 && onDeleteLeftoverProxies != null) {
+                        Text(
+                            "All ${request.allTargets.size} item(s) are already restored & protected on this device, and ${request.leftoverProxyCount} compressed copy(s) still remain in Gallery."
+                        )
+                        TextButton(
+                            onClick = { onConfirm(true) },
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp)
+                        ) {
+                            Text("Re-download All (${request.allTargets.size})")
+                        }
+                    } else {
+                        Text(
+                            "All ${request.allTargets.size} selected item(s) are already restored & protected on this device."
+                        )
+                    }
                 } else {
                     val sizeStr = Formatter.formatFileSize(context, request.unrestoredBytes)
-                    Text(
+                    val baseMsg = if (request.isRestoreAll) {
+                        "Download ${request.unrestoredTargets.size} full-resolution original(s) (~$sizeStr) to your Gallery, protect them from auto re-compression, and delete matching compressed copies from Gallery."
+                    } else {
                         "Download ${request.unrestoredTargets.size} full-resolution original(s) (~$sizeStr) to your Gallery and protect them from auto re-compression."
-                    )
+                    }
+                    Text(baseMsg)
                     if (request.skippedCount > 0) {
                         Text(
                             "${request.skippedCount} already protected/restored item(s) will be skipped.",
@@ -738,8 +754,20 @@ fun BatchRestoreConfirmDialog(
         },
         confirmButton = {
             if (request.unrestoredTargets.isEmpty()) {
-                Button(onClick = { onConfirm(true) }) {
-                    Text("Re-download All (${request.allTargets.size})")
+                if (request.isRestoreAll && request.leftoverProxyCount > 0 && onDeleteLeftoverProxies != null) {
+                    Button(
+                        onClick = onDeleteLeftoverProxies,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.error,
+                            contentColor = MaterialTheme.colorScheme.onError
+                        )
+                    ) {
+                        Text("Delete ${request.leftoverProxyCount} Compressed")
+                    }
+                } else {
+                    Button(onClick = { onConfirm(true) }) {
+                        Text("Re-download All (${request.allTargets.size})")
+                    }
                 }
             } else {
                 Button(onClick = { onConfirm(false) }) {

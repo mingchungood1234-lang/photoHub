@@ -64,6 +64,27 @@ final class LocalProxyTracker {
         return (master, assetToFilename[assetId])
     }
 
+    func restoredMasterHash(forAssetId assetId: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let master = restoredAssetToMaster[assetId], !master.isEmpty else {
+            return nil
+        }
+        return master
+    }
+
+    func anyMasterLookup(forAssetId assetId: String) -> (masterHash: String, originalName: String?)? {
+        lock.lock()
+        defer { lock.unlock() }
+        if let master = assetToMaster[assetId], !master.isEmpty {
+            return (master, assetToFilename[assetId])
+        }
+        if let restored = restoredAssetToMaster[assetId], !restored.isEmpty {
+            return (restored, nil)
+        }
+        return nil
+    }
+
     func masterHash(forProxySha256 sha256: String) -> String? {
         lock.lock()
         defer { lock.unlock() }
@@ -133,6 +154,55 @@ final class LocalProxyTracker {
         }
     }
 
+    /// Returns all tracked local compressed proxy `PHAsset.localIdentifier`s for the given master hashes,
+    /// excluding any asset ID recorded as a restored full-resolution original.
+    func trackedProxyAssetIds(forMasterHashes hashes: Set<String>) -> [String] {
+        let normHashes = Set(
+            hashes.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter { !$0.isEmpty }
+        )
+        guard !normHashes.isEmpty else { return [] }
+        lock.lock()
+        var result = Set<String>()
+        for h in normHashes {
+            if let direct = masterToAssetId[h], !direct.isEmpty, !restoredAssetIds.contains(direct) {
+                result.insert(direct)
+            }
+        }
+        for (assetId, mappedMaster) in assetToMaster {
+            if normMastersContains(normHashes, master: mappedMaster), !restoredAssetIds.contains(assetId) {
+                result.insert(assetId)
+            }
+        }
+        lock.unlock()
+        return Array(result)
+    }
+
+    private func normMastersContains(_ normHashes: Set<String>, master: String) -> Bool {
+        normHashes.contains(master.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }
+
+    /// Removes deleted compressed proxy asset IDs from proxy tracking while preserving restored-original protection.
+    func clearProxyMappings(assetIds deletedIds: [String]) {
+        let idSet = Set(deletedIds.filter { !$0.isEmpty })
+        guard !idSet.isEmpty else { return }
+
+        lock.lock()
+        for id in idSet {
+            assetIds.remove(id)
+            assetToMaster.removeValue(forKey: id)
+            assetToFilename.removeValue(forKey: id)
+        }
+        for (master, mappedId) in Array(masterToAssetId) where idSet.contains(mappedId) {
+            masterToAssetId.removeValue(forKey: master)
+        }
+        defaults.set(Array(assetIds), forKey: assetIdsKey)
+        defaults.set(assetToMaster, forKey: assetToMasterKey)
+        defaults.set(assetToFilename, forKey: assetToFilenameKey)
+        defaults.set(masterToAssetId, forKey: masterToAssetKey)
+        lock.unlock()
+    }
+
     func isRestoredOriginal(assetId: String) -> Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -143,6 +213,20 @@ final class LocalProxyTracker {
         lock.lock()
         defer { lock.unlock() }
         return restoredMasterHashes.contains(masterHash.lowercased())
+    }
+
+    /// Returns a live `PHAsset.localIdentifier` of a locally restored original if it still exists in Photos.
+    func liveRestoredAssetId(forMasterHash masterHash: String) -> String? {
+        let normMaster = masterHash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normMaster.isEmpty else { return nil }
+        lock.lock()
+        let candidateIds = restoredAssetToMaster
+            .filter { $0.value == normMaster }
+            .map(\.key)
+        lock.unlock()
+        guard !candidateIds.isEmpty else { return nil }
+        let fetched = PHAsset.fetchAssets(withLocalIdentifiers: candidateIds, options: nil)
+        return fetched.firstObject?.localIdentifier
     }
 
     func markRestoredOriginal(assetId: String?, masterHash: String) {
