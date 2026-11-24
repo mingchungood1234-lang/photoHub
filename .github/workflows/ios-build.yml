@@ -78,6 +78,9 @@ jobs:
               ERRORS=$(tail -n 100 build.log)
             fi
             echo "$ERRORS"
+            grep -E "error:|fatal error:|xcodebuild: error:" build.log | head -n 15 | while IFS= read -r LINE; do
+              echo "::error::${LINE}"
+            done || true
             {
               echo "### xcodebuild Failed (exit code $BUILD_RC)"
               echo '```'

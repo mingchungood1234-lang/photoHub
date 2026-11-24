@@ -41,7 +41,10 @@ jobs:
           fi
           if [ -n "$SDKMANAGER" ] && [ -x "$SDKMANAGER" ]; then
             yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
-            "$SDKMANAGER" --install "platforms;android-37" "build-tools;36.0.0"
+            PLATFORM_PKG=$("$SDKMANAGER" --list 2>/dev/null | grep -oE 'platforms;android-37(\.[0-9]+)?' | sort -V | tail -n 1 || true)
+            PLATFORM_PKG="${PLATFORM_PKG:-platforms;android-37.0}"
+            echo "Installing Android SDK packages: $PLATFORM_PKG build-tools;36.0.0"
+            yes | "$SDKMANAGER" --install "$PLATFORM_PKG" "build-tools;36.0.0" || true
           fi
 
       - name: Set up Gradle
@@ -68,6 +71,9 @@ jobs:
             if [ -z "$ERRORS" ]; then
               ERRORS=$(tail -n 100 gradle-build.log)
             fi
+            grep -E "e: |FAILURE:|What went wrong:|Compilation error" gradle-build.log | head -n 15 | while IFS= read -r LINE; do
+              echo "::error::${LINE}"
+            done || true
             {
               echo "### Android Gradle Build Failed (exit code $BUILD_RC)"
               echo '```'

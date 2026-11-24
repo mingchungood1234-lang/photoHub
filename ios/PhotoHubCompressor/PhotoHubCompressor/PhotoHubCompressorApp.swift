@@ -1,6 +1,7 @@
 #if canImport(AppIntents)
 import AppIntents
 #endif
+import Foundation
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
@@ -28,41 +29,37 @@ struct FetchAndShareByNameIntent: AppIntent {
     )
     static var openAppWhenRun: Bool = true
 
-    @Parameter(title: "Photo or Video Names", default: [])
-    var names: [String]
+    @Parameter(title: "Photo or Video Names")
+    var names: String?
 
-    @Parameter(title: "Creation Dates", default: [])
-    var creationDates: [Date]
+    @Parameter(title: "Creation Date")
+    var creationDate: Date?
 
     @MainActor
     func perform() async throws -> some IntentResult {
-        var expandedNames: [String] = []
-        for raw in names {
-            let parts = raw
-                .components(separatedBy: CharacterSet.newlines)
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-            expandedNames.append(contentsOf: parts)
-        }
+        let expandedNames: [String] = (names ?? "")
+            .components(separatedBy: CharacterSet.newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
 
         guard !expandedNames.isEmpty else {
             IncomingShareCoordinator.shared.presentInAppPhotoPicker()
             return .result()
         }
 
-        let inputs: [OriginalShareInput] = expandedNames.enumerated().map { idx, name in
+        let singleDateHint = expandedNames.count == 1 ? creationDate : nil
+        let inputs: [OriginalShareInput] = expandedNames.map { name in
             let baseName = URL(fileURLWithPath: name).lastPathComponent
             let prefix = ProxyGenerator.extractMasterHashPrefix(fromProxyFilename: baseName)
             let ext = URL(fileURLWithPath: baseName).pathExtension.lowercased()
             let isVideo = ["mp4", "mov", "m4v", "3gp", "avi", "mkv", "webm"].contains(ext)
-            let dateHint = idx < creationDates.count ? creationDates[idx] : nil
             return OriginalShareInput(
                 assetId: nil,
                 fileURL: nil,
                 filenameHint: baseName,
                 masterHashHint: prefix,
                 isVideo: isVideo,
-                creationDateHint: dateHint
+                creationDateHint: singleDateHint
             )
         }
 

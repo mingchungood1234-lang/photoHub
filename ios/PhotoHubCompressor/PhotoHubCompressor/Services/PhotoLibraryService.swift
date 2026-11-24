@@ -1503,7 +1503,7 @@ enum OriginalMediaResolver {
             creationDateHint: creationDateHint,
             preferVideo: preferVideo
         ) {
-            return (hit.hash, hit.originalName, hit.size)
+            return (masterHash: hit.hash, originalName: hit.originalName, expectedSizeBytes: hit.size)
         }
 
         // 6b. Check live server index if local cache missed (e.g. newly uploaded item or fresh install)
@@ -1516,7 +1516,7 @@ enum OriginalMediaResolver {
                creationDateHint: creationDateHint,
                preferVideo: preferVideo
            ) {
-            return (hit.hash, hit.originalName, hit.size)
+            return (masterHash: hit.hash, originalName: hit.originalName, expectedSizeBytes: hit.size)
         }
 
         // 6c. Zero-copy Apple Photos PHAsset metadata lookup (handles renamed/localized proxy assets)
@@ -1544,7 +1544,7 @@ enum OriginalMediaResolver {
             }
 
             let assets = PHAsset.fetchAssets(with: fetchOptions)
-            var matchedMaster: (String, String?, Int64?)?
+            var matchedMaster: (masterHash: String, originalName: String?, expectedSizeBytes: Int64?)?
             var matchedPrefix: String?
             for i in 0..<assets.count {
                 if matchedMaster != nil || matchedPrefix != nil { break }
@@ -1560,7 +1560,11 @@ enum OriginalMediaResolver {
                         let cachedMatch = cachedPhotos.first(where: {
                             $0.hash.caseInsensitiveCompare(tracked.masterHash) == .orderedSame
                         })
-                        matchedMaster = (tracked.masterHash, tracked.originalName ?? cachedMatch?.originalName ?? info.originalFilename, cachedMatch?.size)
+                        matchedMaster = (
+                            masterHash: tracked.masterHash,
+                            originalName: tracked.originalName ?? cachedMatch?.originalName ?? info.originalFilename,
+                            expectedSizeBytes: cachedMatch?.size
+                        )
                     } else if let proxyMatch = info.proxyMatch {
                         matchedPrefix = proxyMatch.prefix
                     }
@@ -1572,7 +1576,7 @@ enum OriginalMediaResolver {
             }
             if let matchedPrefix,
                let match = try? await matchPrefix(matchedPrefix, cachedPhotos: cachedPhotos, client: client) {
-                return (match.hash, match.originalName, match.size)
+                return (masterHash: match.hash, originalName: match.originalName, expectedSizeBytes: match.size)
             }
         }
 
