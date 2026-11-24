@@ -29,6 +29,74 @@ enum ProxyFormat: String, CaseIterable, Identifiable {
     }
 }
 
+enum ProxyResolutionPreset: Int, CaseIterable, Identifiable {
+    case autoSmart = 0
+    case p480 = 854
+    case p720 = 1280
+    case p1080 = 1920
+    case p1440 = 2560
+
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .autoSmart: return "Auto (Smart 720p)"
+        case .p480: return "480p SD (Smallest)"
+        case .p720: return "720p HD (Balanced)"
+        case .p1080: return "1080p Full HD (Sharper)"
+        case .p1440: return "1440p 2K (Largest)"
+        }
+    }
+
+    var resolutionHint: String {
+        switch self {
+        case .autoSmart: return "Videos: 720p HD · Photos: 1024–1920 px (smart savings)"
+        case .p480: return "Videos: 480p (480×854) · Photos: up to 854 px (~0.5 MP)"
+        case .p720: return "Videos: 720p HD (720×1280) · Photos: up to 1280 px (~1 MP)"
+        case .p1080: return "Videos: 1080p Full HD · Photos: up to 1920 px (~2 MP)"
+        case .p1440: return "Videos: up to 1080p Full HD · Photos: up to 2560 px (~4 MP)"
+        }
+    }
+
+    static func fromStoredPixels(_ px: Int) -> ProxyResolutionPreset {
+        if px <= 0 { return .autoSmart }
+        if px <= 960 { return .p480 }
+        if px <= 1440 { return .p720 }
+        if px <= 2100 { return .p1080 }
+        return .p1440
+    }
+}
+
+enum ProxyDetailPreset: String, CaseIterable, Identifiable {
+    case compact = "compact"
+    case balanced = "balanced"
+    case highDetail = "high"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .compact: return "Smallest File"
+        case .balanced: return "Balanced (Recommended)"
+        case .highDetail: return "High Detail (Larger)"
+        }
+    }
+
+    var qualityValue: Double {
+        switch self {
+        case .compact: return 0.50
+        case .balanced: return 0.68
+        case .highDetail: return 0.85
+        }
+    }
+
+    static func fromStoredQuality(_ q: Double) -> ProxyDetailPreset {
+        if q < 0.59 { return .compact }
+        if q <= 0.77 { return .balanced }
+        return .highDetail
+    }
+}
+
 struct ServerStorageInfo: Codable, Equatable, Sendable {
     let usedBytes: Int64
     let mastersBytes: Int64?

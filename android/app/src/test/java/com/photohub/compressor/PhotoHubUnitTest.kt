@@ -243,4 +243,18 @@ class PhotoHubUnitTest {
             AppSettingsState.normalizeUrl("photohub.mingchun.us.ci", defaultScheme = "https")
         )
     }
+
+    @Test
+    fun `proxy resolution and detail presets map legacy pixel sizes and quality cleanly`() {
+        assertEquals(ProxyResolutionPreset.AUTO_SMART, ProxyResolutionPreset.fromStoredPixels(0))
+        assertEquals(ProxyResolutionPreset.P480, ProxyResolutionPreset.fromStoredPixels(854))
+        assertEquals(ProxyResolutionPreset.P720, ProxyResolutionPreset.fromStoredPixels(1280))
+        assertEquals(ProxyResolutionPreset.P1080, ProxyResolutionPreset.fromStoredPixels(1920))
+        assertEquals(ProxyResolutionPreset.P1080, ProxyResolutionPreset.fromStoredPixels(2048))
+        assertEquals(ProxyResolutionPreset.P1440, ProxyResolutionPreset.fromStoredPixels(2560))
+
+        assertEquals(ProxyDetailPreset.COMPACT, ProxyDetailPreset.fromStoredQuality(0.50f))
+        assertEquals(ProxyDetailPreset.BALANCED, ProxyDetailPreset.fromStoredQuality(0.72f))
+        assertEquals(ProxyDetailPreset.HIGH_DETAIL, ProxyDetailPreset.fromStoredQuality(0.85f))
+    }
 }

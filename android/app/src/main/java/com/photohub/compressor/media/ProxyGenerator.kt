@@ -309,55 +309,86 @@ object ProxyGenerator {
     suspend fun createVideoProxy(
         context: Context,
         masterFile: File,
-        masterHash: String? = null
+        masterHash: String? = null,
+        maxPixelSize: Int = 0,
+        quality: Float = 0.72f
     ): GeneratedProxy {
-        val proxyFile = makeTaggedProxyTempFile(context, masterHash, "mp4", "video_proxy")
-        if (proxyFile.exists()) proxyFile.delete()
-
-        val mainHandler = Handler(Looper.getMainLooper())
-        try {
-            suspendCancellableCoroutine<Unit> { cont ->
-                mainHandler.post {
-                    if (!cont.isActive) return@post
-                    val mediaItem = MediaItem.fromUri(Uri.fromFile(masterFile))
-                    val effects = Effects(
-                        emptyList(),
-                        listOf(Presentation.createForHeight(720))
-                    )
-                    val editedMediaItem = EditedMediaItem.Builder(mediaItem)
-                        .setEffects(effects)
-                        .build()
-
-                    val transformer = Transformer.Builder(context)
-                        .addListener(object : Transformer.Listener {
-                            override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                                if (cont.isActive) cont.resume(Unit)
-                            }
-
-                            override fun onError(
-                                composition: Composition,
-                                exportResult: ExportResult,
-                                exportException: ExportException
-                            ) {
-                                if (cont.isActive) cont.resumeWithException(exportException)
-                            }
-                        })
-                        .build()
-
-                    transformer.start(editedMediaItem, proxyFile.absolutePath)
-                    cont.invokeOnCancellation {
-                        mainHandler.post { runCatching { transformer.cancel() } }
-                    }
-                }
-            }
-        } catch (err: Exception) {
-            cleanupTempFile(proxyFile)
-            throw err
+        val masterSize = masterFile.length().takeIf { it > 0L } ?: Long.MAX_VALUE
+        val targetShortSide = when {
+            maxPixelSize in 1..960 -> 480
+            maxPixelSize <= 0 -> if (quality < 0.59f) 540 else 720
+            maxPixelSize <= 1440 -> 720
+            maxPixelSize <= 2100 -> 1080
+            else -> 1440
         }
 
-        if (!proxyFile.exists() || proxyFile.length() == 0L) {
-            cleanupTempFile(proxyFile)
-            throw IOException("Video proxy export produced an empty file.")
+        // Compute display height corresponding to target short side so portrait videos stay sharp at chosen tier (720x1280 vs 405x720) and never upscale
+        val targetDisplayHeight = withContext(Dispatchers.IO) {
+            resolveTargetVideoHeight(masterFile, targetShortSide)
+        }
+
+        suspend fun runTransform(heightPx: Int): File {
+            val outFile = makeTaggedProxyTempFile(context, masterHash, "mp4", "video_proxy")
+            if (outFile.exists()) outFile.delete()
+            val mainHandler = Handler(Looper.getMainLooper())
+            try {
+                suspendCancellableCoroutine<Unit> { cont ->
+                    mainHandler.post {
+                        if (!cont.isActive) return@post
+                        val mediaItem = MediaItem.fromUri(Uri.fromFile(masterFile))
+                        val effects = Effects(
+                            emptyList(),
+                            listOf(Presentation.createForHeight(heightPx))
+                        )
+                        val editedMediaItem = EditedMediaItem.Builder(mediaItem)
+                            .setEffects(effects)
+                            .build()
+
+                        val transformer = Transformer.Builder(context)
+                            .addListener(object : Transformer.Listener {
+                                override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                                    if (cont.isActive) cont.resume(Unit)
+                                }
+
+                                override fun onError(
+                                    composition: Composition,
+                                    exportResult: ExportResult,
+                                    exportException: ExportException
+                                ) {
+                                    if (cont.isActive) cont.resumeWithException(exportException)
+                                }
+                            })
+                            .build()
+
+                        transformer.start(editedMediaItem, outFile.absolutePath)
+                        cont.invokeOnCancellation {
+                            mainHandler.post { runCatching { transformer.cancel() } }
+                        }
+                    }
+                }
+            } catch (err: Exception) {
+                cleanupTempFile(outFile)
+                throw err
+            }
+            if (!outFile.exists() || outFile.length() == 0L) {
+                cleanupTempFile(outFile)
+                throw IOException("Video proxy export produced an empty file.")
+            }
+            return outFile
+        }
+
+        var proxyFile = runTransform(targetDisplayHeight)
+        if (proxyFile.length() >= masterSize && targetShortSide > 480) {
+            val smallerHeight = withContext(Dispatchers.IO) { resolveTargetVideoHeight(masterFile, 480) }
+            if (smallerHeight < targetDisplayHeight) {
+                val smallerFile = runCatching { runTransform(smallerHeight) }.getOrNull()
+                if (smallerFile != null && smallerFile.length() < proxyFile.length()) {
+                    cleanupTempFile(proxyFile)
+                    proxyFile = smallerFile
+                } else {
+                    cleanupTempFile(smallerFile)
+                }
+            }
         }
 
         var posterFile: File? = null
@@ -403,6 +434,28 @@ object ProxyGenerator {
             sizeBytes = proxyFile.length(),
             posterFile = posterFile
         )
+    }
+
+    private fun resolveTargetVideoHeight(masterFile: File, desiredShortSide: Int): Int {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(masterFile.absolutePath)
+            val rawW = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+            val rawH = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+            val rot = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+            if (rawW <= 0 || rawH <= 0) return desiredShortSide
+
+            val dispW = if (rot == 90 || rot == 270) rawH else rawW
+            val dispH = if (rot == 90 || rot == 270) rawW else rawH
+            val shortSide = minOf(dispW, dispH).coerceAtLeast(1)
+            val scale = minOf(1.0f, desiredShortSide.toFloat() / shortSide.toFloat())
+            val evenHeight = (((dispH * scale).toInt() + 1) / 2) * 2
+            evenHeight.coerceAtLeast(240)
+        } catch (_: Exception) {
+            desiredShortSide
+        } finally {
+            runCatching { retriever.release() }
+        }
     }
 
     fun computeFileSha256(file: File): String =

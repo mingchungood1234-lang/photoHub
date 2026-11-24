@@ -85,7 +85,8 @@ async function createApp(configOverrides = {}) {
   });
 
   app.use(express.json({ limit: '50mb' })); // Parses `application/json` payloads into `req.body`
-  app.use('/api/upload', uploadMiddleware.rawUploadParser); // Parses raw binary photo uploads on `/api/upload`
+  // Raw binary `/api/upload` bodies stream directly to storage inside `uploadController.uploadDirect`
+  // after `authMiddleware` resolves `req.userContext.storageDir` (avoids 100MB+ RAM buffering).
 
   // Controllers: thin HTTP handlers injected with config/services (Dependency Injection)
   const controllers = {

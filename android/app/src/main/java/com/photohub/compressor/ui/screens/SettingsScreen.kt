@@ -39,11 +39,11 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
     val bgState by viewModel.bgManager.state.collectAsStateWithLifecycle()
     val syncState by viewModel.syncManager.state.collectAsStateWithLifecycle()
 
-    val resolutions = remember { listOf(0, 2560, 2048, 1600, 1280, 1024) }
     var showHourMenu by remember { mutableStateOf(false) }
     var showUploadModeMenu by remember { mutableStateOf(false) }
     var showFormatMenu by remember { mutableStateOf(false) }
     var showResMenu by remember { mutableStateOf(false) }
+    var showDetailMenu by remember { mutableStateOf(false) }
 
     val testTrashLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartIntentSenderForResult()
@@ -385,7 +385,7 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
             item {
                 SectionCard(
                     title = "Lightweight Proxy Settings",
-                    footer = "When 'Keep Compressed Proxy in Gallery' is ON, photoHub saves a small compressed proxy and prompts you to trash the huge original photo. Turn it OFF to trash the original completely while keeping it in the Server tab."
+                    footer = "Full-resolution originals always upload first untouched. Lower resolution (e.g. 480p or 720p) keeps local proxies and preview transfers super lightweight while freeing maximum space."
                 ) {
                     SwitchRow("Auto Scan & Upload on App Open", settingsState.autoCompressOnOpen) {
                         viewModel.settings.setAutoCompressOnOpen(it)
@@ -434,19 +434,22 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
                         }
                     }
 
+                    val resPreset = ProxyResolutionPreset.fromStoredPixels(settingsState.proxyMaxPixelSize)
+                    val detailPreset = ProxyDetailPreset.fromStoredQuality(settingsState.proxyQuality)
+
                     Box {
                         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                            Text("Proxy Target Size", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                            Text("Resolution (Photo & Video)", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
                             TextButton(onClick = { showResMenu = true }) {
-                                Text(if (settingsState.proxyMaxPixelSize == 0) "Auto (All Resolutions)" else "${settingsState.proxyMaxPixelSize} px")
+                                Text(resPreset.title)
                             }
                         }
                         DropdownMenu(expanded = showResMenu, onDismissRequest = { showResMenu = false }) {
-                            resolutions.forEach { px ->
+                            ProxyResolutionPreset.entries.forEach { preset ->
                                 DropdownMenuItem(
-                                    text = { Text(if (px == 0) "Auto (All Resolutions)" else "$px px") },
+                                    text = { Text(preset.title) },
                                     onClick = {
-                                        viewModel.settings.setProxyMaxPixelSize(px)
+                                        viewModel.settings.setProxyMaxPixelSize(preset.maxPixelSize)
                                         showResMenu = false
                                     }
                                 )
@@ -454,12 +457,30 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
                         }
                     }
 
-                    Text("Compression Quality: ${(settingsState.proxyQuality * 100f).roundToInt()}%", style = MaterialTheme.typography.bodyMedium)
-                    Slider(
-                        value = settingsState.proxyQuality,
-                        onValueChange = { viewModel.settings.setProxyQuality(it) },
-                        valueRange = 0.4f..0.95f,
-                        steps = 10
+                    Box {
+                        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text("File Size vs Detail", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                            TextButton(onClick = { showDetailMenu = true }) {
+                                Text(detailPreset.title)
+                            }
+                        }
+                        DropdownMenu(expanded = showDetailMenu, onDismissRequest = { showDetailMenu = false }) {
+                            ProxyDetailPreset.entries.forEach { detail ->
+                                DropdownMenuItem(
+                                    text = { Text(detail.title) },
+                                    onClick = {
+                                        viewModel.settings.setProxyQuality(detail.qualityValue)
+                                        showDetailMenu = false
+                                    }
+                                )
+                            }
+                        }
+                    }
+
+                    Text(
+                        text = resPreset.resolutionHint,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }

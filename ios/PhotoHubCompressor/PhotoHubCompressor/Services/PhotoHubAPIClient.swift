@@ -393,8 +393,8 @@ final class PhotoHubAPIClient {
         let config = URLSessionConfiguration.default
         config.httpMaximumConnectionsPerHost = 6
         config.waitsForConnectivity = true
-        config.timeoutIntervalForRequest = 120
-        config.timeoutIntervalForResource = 600
+        config.timeoutIntervalForRequest = 600
+        config.timeoutIntervalForResource = 3600
         return URLSession(
             configuration: config,
             delegate: SessionTrustDelegate(
@@ -574,7 +574,11 @@ final class PhotoHubAPIClient {
         let videoProxyURL: URL?
 
         if photo.isVideo {
-            proxy = try await ProxyGenerator.createVideoProxy(from: masterURL)
+            proxy = try await ProxyGenerator.createVideoProxy(
+                from: masterURL,
+                maxPixelSize: settings.proxyMaxPixelSize,
+                quality: settings.proxyQuality
+            )
             previewURL = proxy.posterFileURL
             previewFormat = "jpeg"
             videoProxyURL = proxy.fileURL
@@ -936,7 +940,7 @@ final class PhotoHubAPIClient {
         let url = try makeURL("/api/upload")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.timeoutInterval = 300
+        request.timeoutInterval = 900
         applyAuth(to: &request)
 
         request.setValue(mimeType, forHTTPHeaderField: "Content-Type")
@@ -1106,7 +1110,7 @@ final class PhotoHubAPIClient {
         let url = try makeURL("/api/proxy/\(masterHash)/video")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.timeoutInterval = 300
+        request.timeoutInterval = 600
         request.setValue("video/mp4", forHTTPHeaderField: "Content-Type")
         request.setValue(proxyHash, forHTTPHeaderField: "X-Proxy-Hash")
         if !assetId.isEmpty {

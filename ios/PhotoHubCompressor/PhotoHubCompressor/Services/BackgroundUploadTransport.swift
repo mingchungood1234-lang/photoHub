@@ -87,7 +87,7 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
         cfg.sessionSendsLaunchEvents = true
         cfg.allowsExpensiveNetworkAccess = true
         cfg.waitsForConnectivity = true
-        cfg.timeoutIntervalForRequest = 300
+        cfg.timeoutIntervalForRequest = 600
         cfg.timeoutIntervalForResource = 24 * 3600
         return URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
     }()
@@ -398,7 +398,12 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
 
         do {
             if job.isVideo {
-                generatedProxy = try await ProxyGenerator.createVideoProxy(from: stagedURL, masterHash: job.masterSha256)
+                generatedProxy = try await ProxyGenerator.createVideoProxy(
+                    from: stagedURL,
+                    maxPixelSize: job.proxyMaxPixelSize,
+                    quality: job.proxyQuality,
+                    masterHash: job.masterSha256
+                )
             } else {
                 generatedProxy = try ProxyGenerator.createProxy(
                     from: stagedURL,

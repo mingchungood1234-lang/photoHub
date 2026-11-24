@@ -22,7 +22,23 @@ struct SettingsView: View {
     @State private var photosAuthText: String = PhotoLibraryService.currentReadWriteAuthLabel()
     @State private var localProxyCacheBytes: Int64 = LocalProxyStore.shared.totalStorageBytes()
 
-    private let resolutions = [0, 1280, 1920, 2048, 2560]
+    private var currentResolutionPreset: ProxyResolutionPreset {
+        ProxyResolutionPreset.fromStoredPixels(settings.proxyMaxPixelSize)
+    }
+
+    private var detailBinding: Binding<ProxyDetailPreset> {
+        Binding(
+            get: { ProxyDetailPreset.fromStoredQuality(settings.proxyQuality) },
+            set: { settings.proxyQuality = $0.qualityValue }
+        )
+    }
+
+    private var resolutionBinding: Binding<ProxyResolutionPreset> {
+        Binding(
+            get: { ProxyResolutionPreset.fromStoredPixels(settings.proxyMaxPixelSize) },
+            set: { settings.proxyMaxPixelSize = $0.rawValue }
+        )
+    }
 
     var body: some View {
         AdaptiveNavigationStack {
@@ -283,24 +299,25 @@ struct SettingsView: View {
                 }
             }
 
-            Picker("Proxy Target Size", selection: $settings.proxyMaxPixelSize) {
-                ForEach(resolutions, id: \.self) { px in
-                    if px == 0 {
-                        Text("Auto (All Resolutions)").tag(0)
-                    } else {
-                        Text("\(px) px").tag(px)
-                    }
+            Picker("Resolution (Photo & Video)", selection: resolutionBinding) {
+                ForEach(ProxyResolutionPreset.allCases) { preset in
+                    Text(preset.title).tag(preset)
                 }
             }
 
-            VStack(alignment: .leading) {
-                Text("Compression Quality: \(Int(settings.proxyQuality * 100))%")
-                Slider(value: $settings.proxyQuality, in: 0.4...0.95, step: 0.05)
+            Picker("File Size vs Detail", selection: detailBinding) {
+                ForEach(ProxyDetailPreset.allCases) { detail in
+                    Text(detail.title).tag(detail)
+                }
             }
+
+            Text(currentResolutionPreset.resolutionHint)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
         } header: {
             Text("Lightweight Proxy Settings")
         } footer: {
-            Text("When 'Keep Compressed Proxy in iPhone Photos' is ON, photoHub saves a small compressed proxy and prompts you to delete the huge original photo. Turn it OFF to delete the original photo from your iPhone completely while keeping it in the Server tab.")
+            Text("Full-resolution originals always upload first untouched. Lower resolution (e.g. 480p or 720p) keeps local proxies and preview transfers super lightweight while freeing maximum space.")
         }
     }
 

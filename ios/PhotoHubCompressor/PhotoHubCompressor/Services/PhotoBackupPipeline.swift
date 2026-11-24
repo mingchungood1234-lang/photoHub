@@ -194,7 +194,12 @@ enum PhotoBackupPipeline {
         if candidate.mediaType == .video {
             await videoSemaphore.acquire()
             do {
-                proxy = try await ProxyGenerator.createVideoProxy(from: master.fileURL, masterHash: master.sha256)
+                proxy = try await ProxyGenerator.createVideoProxy(
+                    from: master.fileURL,
+                    maxPixelSize: maxPixelSize,
+                    quality: quality,
+                    masterHash: master.sha256
+                )
                 await videoSemaphore.release()
             } catch {
                 await videoSemaphore.release()

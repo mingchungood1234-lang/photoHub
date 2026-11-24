@@ -1890,3 +1890,64 @@ test('Ordered node allocation prefers node1 and spills new users to node2 when n
   assert.equal(overview.nodes[1].id, 'node2');
   assert.equal(overview.nodes[1].isFullForNewUsers, true);
 });
+
+test('Streaming raw upload handles duplicate check, strict checksum rejection, and leaves no stray temp files', async () => {
+  const ctx = await startTestServer();
+  try {
+    const rawVideo = Buffer.alloc(512 * 1024, 0x7a); // 512 KB raw binary video payload
+    const sha = crypto.createHash('sha256').update(rawVideo).digest('hex');
+
+    // 1. Mismatched strict checksum fails with 422 & cleans up staging file
+    const badRes = await ctx.request('/api/upload', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'video/mp4',
+        'X-File-Name': 'STREAM_BAD.MP4',
+        'X-File-Sha256': '0'.repeat(64),
+        'X-Verify-Checksum': 'strict',
+      },
+      body: rawVideo,
+    });
+    assert.equal(badRes.status, 422);
+    const badJson = await badRes.json();
+    assert.equal(badJson.canDelete, false);
+
+    // 2. Valid streaming upload stores & SHA-256 verifies
+    const okRes = await ctx.request('/api/upload', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'video/mp4',
+        'X-File-Name': 'STREAM_OK.MP4',
+        'X-Photo-Date': '2026-11-24',
+        'X-File-Sha256': sha,
+        'X-Verify-Checksum': 'strict',
+      },
+      body: rawVideo,
+    });
+    assert.equal(okRes.status, 200);
+    const okJson = await okRes.json();
+    assert.equal(okJson.status, 'stored_verified');
+    assert.equal(okJson.checksumVerified, true);
+    assert.equal(okJson.canDelete, true);
+
+    // 3. Re-uploading identical binary returns duplicate_verified & leaves no leftover .tmp files in storageDir
+    const dupRes = await ctx.request('/api/upload', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'video/mp4',
+        'X-File-Name': 'STREAM_DUP.MP4',
+        'X-File-Sha256': sha,
+        'X-Verify-Checksum': 'strict',
+      },
+      body: rawVideo,
+    });
+    assert.equal(dupRes.status, 200);
+    const dupJson = await dupRes.json();
+    assert.equal(dupJson.status, 'duplicate_verified');
+
+    const rootEntries = await fsp.readdir(ctx.storageDir);
+    assert.equal(rootEntries.some((n) => n.includes('.tmp')), false);
+  } finally {
+    await ctx.cleanup();
+  }
+});

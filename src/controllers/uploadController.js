@@ -12,6 +12,7 @@
 const path = require('path');
 const {
   storeAndVerifyPhoto,
+  storeAndVerifyStream,
   assertWithinQuota,
   sanitizeFilename,
   parseDateFolder,
@@ -26,6 +27,58 @@ function createUploadController({ config, contextService }) {
   return {
     async uploadDirect(req, res) {
       try {
+        const contentType = String(req.headers['content-type'] || '').toLowerCase();
+        const isMultipart = contentType.startsWith('multipart/form-data');
+
+        // Raw binary uploads stream straight to disk (no 100MB+ RAM Buffer bottleneck).
+        if (!isMultipart && (!Array.isArray(req.files) || req.files.length === 0)) {
+          const originalName = req.headers['x-file-name']
+            ? decodeURIComponent(String(req.headers['x-file-name']))
+            : '';
+          const mimeType = String(req.headers['content-type'] || 'application/octet-stream');
+          const createdAt =
+            req.headers['x-photo-date'] ||
+            req.headers['x-created-at'] ||
+            '';
+          const expectedHash =
+            req.headers['x-file-sha256'] ||
+            req.headers['x-file-hash'] ||
+            '';
+          const strictChecksum =
+            String(req.headers['x-verify-checksum'] ?? req.query.strictChecksum ?? '')
+              .trim()
+              .toLowerCase() === 'strict' ||
+            String(req.query.strictChecksum ?? '').trim().toLowerCase() === 'true';
+
+          const { storageDir, hashIndex, folderName } = req.userContext;
+          const quotaBytes = contextService.getQuotaBytesForContext(req.userContext);
+
+          const result = await storeAndVerifyStream({
+            req,
+            originalName,
+            mimeType,
+            createdAt,
+            expectedHash,
+            strictChecksum,
+            storageDir,
+            hashIndex,
+            quotaBytes,
+            minFreeDiskBytes: config.minFreeDiskBytes,
+            maxFileSizeBytes: config.maxFileSizeBytes,
+          });
+
+          result.userFolder = folderName;
+          const displayPath = folderName
+            ? `${folderName}/${result.savedPath}`
+            : result.savedPath;
+
+          console.log(
+            `[${new Date().toISOString()}] ${result.status.toUpperCase()}${folderName ? ` [${folderName}]` : ''}: ${displayPath} (${result.hash.slice(0, 12)}..., ${result.size} bytes) -> canDelete=${result.canDelete}`
+          );
+
+          return res.status(200).json(result);
+        }
+
         let buffer = null;
         let originalName = '';
         let mimeType = '';
@@ -154,6 +207,9 @@ function createUploadController({ config, contextService }) {
       } catch (err) {
         const status = err.statusCode || 500;
         console.error(`[${new Date().toISOString()}] UPLOAD ERROR:`, err.message);
+        if (res.headersSent || res.writableEnded || res.destroyed) {
+          return;
+        }
         return res.status(status).json({
           success: false,
           canDelete: false,

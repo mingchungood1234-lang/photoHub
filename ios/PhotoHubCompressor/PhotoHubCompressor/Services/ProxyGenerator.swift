@@ -361,43 +361,77 @@ enum ProxyGenerator {
         return GeneratedProxy(fileURL: proxyURL, sha256: sha256, sizeBytes: sizeBytes)
     }
 
-    static func createVideoProxy(from masterURL: URL, masterHash: String? = nil) async throws -> GeneratedProxy {
+    static func createVideoProxy(
+        from masterURL: URL,
+        maxPixelSize: Int = 0,
+        quality: Double = 0.72,
+        masterHash: String? = nil
+    ) async throws -> GeneratedProxy {
         let avAsset = AVURLAsset(url: masterURL)
-        let proxyURL = makeTaggedProxyTempURL(masterHash: masterHash, ext: "mp4", fallbackPrefix: "video_proxy")
+        let compatiblePresets = Set(AVAssetExportSession.exportPresets(compatibleWith: avAsset))
+        let masterAttrs = try? FileManager.default.attributesOfItem(atPath: masterURL.path)
+        let masterSize = (masterAttrs?[.size] as? NSNumber)?.int64Value ?? Int64.max
 
-        guard let exportSession = AVAssetExportSession(
-            asset: avAsset,
-            presetName: AVAssetExportPresetMediumQuality
-        ) else {
-            cleanupTempFile(proxyURL)
-            throw ProxyGeneratorError.failedToOpenSource
+        let preferredLadder: [String]
+        if maxPixelSize > 0 && maxPixelSize <= 960 {
+            preferredLadder = [AVAssetExportPreset640x480, AVAssetExportPreset960x540, AVAssetExportPresetMediumQuality]
+        } else if maxPixelSize == 0 {
+            preferredLadder = quality < 0.59
+                ? [AVAssetExportPreset960x540, AVAssetExportPresetMediumQuality, AVAssetExportPreset640x480]
+                : [AVAssetExportPreset1280x720, AVAssetExportPreset960x540, AVAssetExportPresetMediumQuality]
+        } else if maxPixelSize <= 1440 {
+            preferredLadder = [AVAssetExportPreset1280x720, AVAssetExportPreset960x540, AVAssetExportPresetMediumQuality]
+        } else {
+            preferredLadder = quality < 0.59
+                ? [AVAssetExportPreset1280x720, AVAssetExportPreset960x540, AVAssetExportPresetMediumQuality]
+                : [AVAssetExportPreset1920x1080, AVAssetExportPreset1280x720, AVAssetExportPresetMediumQuality]
         }
 
-        exportSession.outputURL = proxyURL
-        exportSession.outputFileType = .mp4
-        exportSession.shouldOptimizeForNetworkUse = true
-        if let cleanMaster = cleanMasterHashString(masterHash) {
-            let descItem = AVMutableMetadataItem()
-            descItem.identifier = .commonIdentifierDescription
-            descItem.value = "\(proxyMarkerPrefix)\(cleanMaster)" as NSString
-            let swItem = AVMutableMetadataItem()
-            swItem.identifier = .commonIdentifierSoftware
-            swItem.value = "PhotoHub Proxy" as NSString
-            exportSession.metadata = [descItem, swItem]
-        }
+        let selectedPreset = preferredLadder.first(where: { compatiblePresets.contains($0) })
+            ?? AVAssetExportPresetMediumQuality
 
-        let once = OnceFlag()
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            exportSession.exportAsynchronously {
-                guard once.tryTrigger() else { return }
-                continuation.resume()
+        func runExport(preset: String) async throws -> (url: URL, sizeBytes: Int64) {
+            let candidateURL = makeTaggedProxyTempURL(masterHash: masterHash, ext: "mp4", fallbackPrefix: "video_proxy")
+            guard let exportSession = AVAssetExportSession(asset: avAsset, presetName: preset) else {
+                cleanupTempFile(candidateURL)
+                throw ProxyGeneratorError.failedToOpenSource
             }
+            exportSession.outputURL = candidateURL
+            exportSession.outputFileType = .mp4
+            exportSession.shouldOptimizeForNetworkUse = true
+            if let cleanMaster = cleanMasterHashString(masterHash) {
+                let descItem = AVMutableMetadataItem()
+                descItem.identifier = .commonIdentifierDescription
+                descItem.value = "\(proxyMarkerPrefix)\(cleanMaster)" as NSString
+                let swItem = AVMutableMetadataItem()
+                swItem.identifier = .commonIdentifierSoftware
+                swItem.value = "PhotoHub Proxy" as NSString
+                exportSession.metadata = [descItem, swItem]
+            }
+
+            let once = OnceFlag()
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                exportSession.exportAsynchronously {
+                    guard once.tryTrigger() else { return }
+                    continuation.resume()
+                }
+            }
+
+            guard exportSession.status == .completed else {
+                cleanupTempFile(candidateURL)
+                throw exportSession.error ?? ProxyGeneratorError.failedToFinalize
+            }
+            let attrs = try FileManager.default.attributesOfItem(atPath: candidateURL.path)
+            let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+            return (candidateURL, size)
         }
 
-        guard exportSession.status == .completed else {
-            try? FileManager.default.removeItem(at: proxyURL)
-            throw exportSession.error ?? ProxyGeneratorError.failedToFinalize
+        var exported = try await runExport(preset: selectedPreset)
+        if exported.sizeBytes >= masterSize && selectedPreset != AVAssetExportPresetMediumQuality {
+            cleanupTempFile(exported.url)
+            exported = try await runExport(preset: AVAssetExportPresetMediumQuality)
         }
+        let proxyURL = exported.url
 
         // Also generate a small compressed JPEG poster frame so the Server tab can display a preview thumbnail
         var posterURL: URL?
@@ -413,14 +447,12 @@ enum ProxyGenerator {
             }
         }
 
-        let attrs = try FileManager.default.attributesOfItem(atPath: proxyURL.path)
-        let sizeBytes = (attrs[.size] as? NSNumber)?.int64Value ?? 0
         let sha256 = try computeFileSHA256(url: proxyURL)
 
         return GeneratedProxy(
             fileURL: proxyURL,
             sha256: sha256,
-            sizeBytes: sizeBytes,
+            sizeBytes: exported.sizeBytes,
             posterFileURL: posterURL
         )
     }

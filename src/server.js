@@ -44,16 +44,18 @@ if (require.main === module) {
           },
           app
         );
-        // Keep TCP/TLS sockets warm longer (65s vs Node's 5s default) so phones
-        // can reuse connections across rapid bursts of photo fetches.
+        // Keep TCP/TLS sockets warm longer (65s vs Node's 5s default) and allow slow
+        // large-video uploads over Tailscale/WAN without hitting Node 22's 5-min requestTimeout.
         server.keepAliveTimeout = 65_000;
         server.headersTimeout = 66_000;
+        server.requestTimeout = 0;
         server.listen(port, '0.0.0.0', onListening);
       } else {
         const server = http.createServer(app);
-        // Match reverse proxy (Nginx/Caddy) keep-alive windows for faster photo browsing.
+        // Match reverse proxy (Nginx/Caddy) keep-alive windows and allow large video uploads.
         server.keepAliveTimeout = 65_000;
         server.headersTimeout = 66_000;
+        server.requestTimeout = 0;
         server.listen(port, '0.0.0.0', onListening);
       }
     })

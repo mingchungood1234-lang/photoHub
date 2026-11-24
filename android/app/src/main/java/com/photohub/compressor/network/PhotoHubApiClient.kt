@@ -95,8 +95,8 @@ private object SharedHttpClientPool {
         .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
         .retryOnConnectionFailure(true)
         .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(180, TimeUnit.SECONDS)
-        .writeTimeout(600, TimeUnit.SECONDS)
+        .readTimeout(600, TimeUnit.SECONDS)
+        .writeTimeout(1800, TimeUnit.SECONDS)
         .build()
 
     private val pinnedClients = ConcurrentHashMap<String, OkHttpClient>()
@@ -652,7 +652,13 @@ class PhotoHubApiClient(
         var posterFile: File? = null
         try {
             val generated = if (photo.isVideo) {
-                ProxyGenerator.createVideoProxy(context, masterFile, photo.hash)
+                ProxyGenerator.createVideoProxy(
+                    context = context,
+                    masterFile = masterFile,
+                    maxPixelSize = current.proxyMaxPixelSize,
+                    quality = current.proxyQuality,
+                    masterHash = photo.hash
+                )
             } else {
                 ProxyGenerator.createImageProxy(
                     context = context,

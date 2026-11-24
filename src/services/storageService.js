@@ -9,6 +9,7 @@
  *   file back from disk to double-check its SHA-256 hash, and only then returns `canDelete: true`.
  */
 
+const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
@@ -74,9 +75,76 @@ function parseDateFolder(rawDate) {
   };
 }
 
+const TRANSIENT_LOCK_CODES = new Set(['EBUSY', 'EPERM', 'EACCES']);
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function renameWithRetry(srcPath, destPath, maxAttempts = 6) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await fsp.rename(srcPath, destPath);
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (!err || !TRANSIENT_LOCK_CODES.has(err.code) || attempt === maxAttempts) {
+        throw err;
+      }
+      // Retry briefly when Windows Defender / Docker VirtioFS/9p holds a lock on newly written video files
+      await sleep(120 * attempt);
+    }
+  }
+  if (lastErr) throw lastErr;
+}
+
+async function ensureTargetDateDir(storageDir, year, dateFolder) {
+  try {
+    await fsp.mkdir(storageDir, { recursive: true });
+  } catch (err) {
+    if (err.code !== 'EEXIST') {
+      console.warn(`[storage] Warning: could not ensure base storageDir ${storageDir}:`, err.message);
+    }
+  }
+
+  const targetDir = path.join(storageDir, year, dateFolder);
+  try {
+    await fsp.mkdir(targetDir, { recursive: true });
+  } catch {
+    // If recursive mkdir failed (e.g. FUSE/rclone mounts failing on multi-level creation), create each step sequentially
+    const yearDir = path.join(storageDir, year);
+    await fsp.mkdir(yearDir, { recursive: true }).catch(() => {});
+    await fsp.mkdir(targetDir, { recursive: true });
+  }
+  return targetDir;
+}
+
+async function resolveUniqueTargetPath(targetDir, safeName, actualHash) {
+  const ext = path.extname(safeName);
+  const stem = path.basename(safeName, ext);
+  let finalFileName = safeName;
+  let targetPath = path.join(targetDir, finalFileName);
+
+  try {
+    const existingStat = await fsp.stat(targetPath);
+    if (existingStat.isFile()) {
+      const existingDiskHash = await computeFileSha256(targetPath);
+      if (existingDiskHash !== actualHash) {
+        finalFileName = `${stem}_${actualHash.slice(0, 8)}${ext}`;
+        targetPath = path.join(targetDir, finalFileName);
+      }
+    }
+  } catch {
+    // Target path does not exist yet
+  }
+
+  return { finalFileName, targetPath };
+}
+
 /**
  * Writes buffer to targetPath atomically when supported by the filesystem,
- * with graceful fallback for Ubuntu FUSE mounts (e.g. rclone / google-drive-ocamlfuse).
+ * with Windows Defender / WSL2 lock retries and FUSE fallback.
  */
 async function writePhotoFile(targetDir, targetPath, finalFileName, buffer) {
   const tmpPath = path.join(
@@ -88,15 +156,10 @@ async function writePhotoFile(targetDir, targetPath, finalFileName, buffer) {
     const fileHandle = await fsp.open(tmpPath, 'w');
     try {
       await fileHandle.writeFile(buffer);
-      try {
-        await fileHandle.sync();
-      } catch {
-        // Ignore ENOSYS / EINVAL on FUSE mounts (e.g. rclone mount)
-      }
     } finally {
       await fileHandle.close();
     }
-    await fsp.rename(tmpPath, targetPath);
+    await renameWithRetry(tmpPath, targetPath);
   } catch (err) {
     await fsp.unlink(tmpPath).catch(() => {});
     // Fallback to direct write if FUSE mount does not support atomic rename
@@ -238,44 +301,8 @@ async function storeAndVerifyPhoto({
   // 2. Determine date folder (YYYY/YYYY-MM-DD) and target filename
   const { year, dateFolder, dateObj, takenAt } = parseDateFolder(createdAt);
   const safeName = sanitizeFilename(originalName, mimeType, actualHash);
-
-  // Ensure base storage directory exists before creating subdirectories (especially important on remote / FUSE mounts)
-  try {
-    await fsp.mkdir(storageDir, { recursive: true });
-  } catch (err) {
-    if (err.code !== 'EEXIST') {
-      console.warn(`[storage] Warning: could not ensure base storageDir ${storageDir}:`, err.message);
-    }
-  }
-
-  const targetDir = path.join(storageDir, year, dateFolder);
-  try {
-    await fsp.mkdir(targetDir, { recursive: true });
-  } catch (err) {
-    // If recursive mkdir failed (e.g. FUSE/rclone mounts failing on multi-level creation), create each step sequentially
-    const yearDir = path.join(storageDir, year);
-    await fsp.mkdir(yearDir, { recursive: true }).catch(() => {});
-    await fsp.mkdir(targetDir, { recursive: true });
-  }
-
-  // Avoid overwriting a different file that happens to share the same filename on the same date
-  const ext = path.extname(safeName);
-  const stem = path.basename(safeName, ext);
-  let finalFileName = safeName;
-  let targetPath = path.join(targetDir, finalFileName);
-
-  try {
-    const existingStat = await fsp.stat(targetPath);
-    if (existingStat.isFile()) {
-      const existingDiskHash = await computeFileSha256(targetPath);
-      if (existingDiskHash !== actualHash) {
-        finalFileName = `${stem}_${actualHash.slice(0, 8)}${ext}`;
-        targetPath = path.join(targetDir, finalFileName);
-      }
-    }
-  } catch {
-    // Target path does not exist yet
-  }
+  const targetDir = await ensureTargetDateDir(storageDir, year, dateFolder);
+  const { finalFileName, targetPath } = await resolveUniqueTargetPath(targetDir, safeName, actualHash);
 
   // 3. Write to storage (supports both local Linux/Windows disks and Ubuntu gdrive FUSE mounts)
   await writePhotoFile(targetDir, targetPath, finalFileName, buffer);
@@ -341,8 +368,242 @@ async function storeAndVerifyPhoto({
   };
 }
 
+/**
+ * Streams a raw binary upload directly into a temporary file inside `storageDir` while
+ * computing SHA-256 on the fly — preventing 100MB+–multi-GB video RAM spikes and post-100% HDD stalls.
+ */
+async function storeAndVerifyStream({
+  req,
+  originalName,
+  mimeType,
+  createdAt,
+  expectedHash,
+  strictChecksum = false,
+  storageDir,
+  hashIndex,
+  quotaBytes = 0,
+  minFreeDiskBytes = 0,
+  maxFileSizeBytes = 0,
+}) {
+  if (req && req.socket && typeof req.socket.setTimeout === 'function') {
+    req.socket.setTimeout(0);
+  }
+  await fsp.mkdir(storageDir, { recursive: true });
+
+  const declaredLen = Number(req.headers && req.headers['content-length']);
+  if (maxFileSizeBytes > 0 && Number.isFinite(declaredLen) && declaredLen > maxFileSizeBytes) {
+    const err = new Error('Uploaded file exceeds maximum upload size');
+    err.statusCode = 413;
+    throw err;
+  }
+
+  const stagingPath = path.join(
+    storageDir,
+    `.upload_${process.pid}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.tmp`
+  );
+
+  let totalBytes = 0;
+  let streamCompleted = false;
+  const hasher = crypto.createHash('sha256');
+
+  try {
+    await new Promise((resolve, reject) => {
+      const ws = fs.createWriteStream(stagingPath, { highWaterMark: 256 * 1024 });
+      let settled = false;
+      const fail = (err) => {
+        if (settled) return;
+        settled = true;
+        req.unpipe(ws);
+        ws.destroy();
+        reject(err);
+      };
+
+      const onAborted = () => {
+        const abortErr = new Error('request aborted');
+        abortErr.statusCode = 400;
+        fail(abortErr);
+      };
+
+      ws.on('error', fail);
+      req.on('aborted', onAborted);
+      req.on('error', fail);
+      req.on('close', () => {
+        if (!settled && !req.complete) {
+          onAborted();
+        }
+      });
+      req.on('data', (chunk) => {
+        totalBytes += chunk.length;
+        if (maxFileSizeBytes > 0 && totalBytes > maxFileSizeBytes) {
+          const err = new Error('Uploaded file exceeds maximum upload size');
+          err.statusCode = 413;
+          fail(err);
+          return;
+        }
+        hasher.update(chunk);
+      });
+      ws.on('finish', () => {
+        if (settled) return;
+        settled = true;
+        streamCompleted = true;
+        resolve();
+      });
+      req.pipe(ws);
+    });
+
+    if (!streamCompleted || totalBytes === 0) {
+      const err = new Error(
+        'No photo file received. In Apple Shortcuts, use "Form" with a File field named "photo" or "File" request body.'
+      );
+      err.statusCode = 400;
+      throw err;
+    }
+
+    const actualHash = hasher.digest('hex');
+    const cleanClientHash =
+      expectedHash && typeof expectedHash === 'string'
+        ? expectedHash.trim().toLowerCase()
+        : '';
+
+    if (strictChecksum && cleanClientHash && actualHash !== cleanClientHash) {
+      const err = new Error(
+        `Checksum mismatch: expected ${cleanClientHash}, got ${actualHash}`
+      );
+      err.statusCode = 422;
+      throw err;
+    }
+
+    const proxyCheck = await hashIndex.lookup(actualHash, { allowStatFastPath: true });
+    if (proxyCheck.status === 'proxy' && proxyCheck.record) {
+      await fsp.unlink(stagingPath).catch(() => {});
+      return {
+        success: true,
+        backedUp: true,
+        canDelete: false,
+        canReplaceWithProxy: false,
+        checksumVerified: false,
+        isDuplicate: true,
+        isProxy: true,
+        status: 'existing_proxy',
+        message: 'Uploaded bytes match an existing compressed proxy; master is already stored.',
+        hash: actualHash,
+        masterHash: proxyCheck.masterHash,
+        serverSha256: proxyCheck.masterHash,
+        savedPath: proxyCheck.record.relativePath,
+        originalName: proxyCheck.record.originalName,
+        size: proxyCheck.record.size,
+      };
+    }
+
+    const existingRecord =
+      (await hashIndex.verifyExisting(actualHash)) ||
+      (!strictChecksum && cleanClientHash
+        ? await hashIndex.verifyExisting(cleanClientHash)
+        : null);
+
+    if (existingRecord) {
+      await fsp.unlink(stagingPath).catch(() => {});
+      if (cleanClientHash && cleanClientHash !== existingRecord.hash) {
+        await hashIndex.set(cleanClientHash, existingRecord);
+      }
+      const isProtectedOriginal = Boolean(existingRecord.keepOriginalOnDevice);
+      return {
+        success: true,
+        backedUp: true,
+        canDelete: !isProtectedOriginal,
+        canReplaceWithProxy: !isProtectedOriginal,
+        isProtectedOriginal,
+        keepOriginalOnDevice: isProtectedOriginal,
+        checksumVerified: true,
+        isDuplicate: true,
+        status: 'duplicate_verified',
+        message: 'Photo already exists on server and passed disk verification.',
+        hash: actualHash,
+        serverSha256: actualHash,
+        savedPath: existingRecord.relativePath,
+        originalName: existingRecord.originalName,
+        size: existingRecord.size,
+        photoDate: existingRecord.photoDate,
+      };
+    }
+
+    assertWithinQuota(hashIndex, quotaBytes, totalBytes);
+    await assertMinimumFreeDisk(storageDir, minFreeDiskBytes, totalBytes);
+
+    const { year, dateFolder, dateObj, takenAt } = parseDateFolder(createdAt);
+    const safeName = sanitizeFilename(originalName, mimeType, actualHash);
+    const targetDir = await ensureTargetDateDir(storageDir, year, dateFolder);
+    const { finalFileName, targetPath } = await resolveUniqueTargetPath(targetDir, safeName, actualHash);
+
+    try {
+      await renameWithRetry(stagingPath, targetPath);
+    } catch {
+      await fsp.copyFile(stagingPath, targetPath);
+      await fsp.unlink(stagingPath).catch(() => {});
+    }
+
+    try {
+      await fsp.utimes(targetPath, dateObj, dateObj);
+    } catch {
+      // Ignore timestamp errors on FUSE mounts
+    }
+
+    const writtenStat = await fsp.stat(targetPath);
+    const diskHash = await computeFileSha256(targetPath);
+    if (writtenStat.size !== totalBytes || diskHash !== actualHash) {
+      await fsp.unlink(targetPath).catch(() => {});
+      const err = new Error('Disk verification failed after writing file');
+      err.statusCode = 500;
+      throw err;
+    }
+
+    const relativePath = path
+      .relative(storageDir, targetPath)
+      .split(path.sep)
+      .join('/');
+
+    const entryData = {
+      hash: actualHash,
+      diskHash: actualHash,
+      relativePath,
+      originalName: finalFileName,
+      size: writtenStat.size,
+      mtimeMs: writtenStat.mtimeMs,
+      photoDate: dateFolder,
+      takenAt: takenAt || null,
+      uploadedAt: new Date().toISOString(),
+    };
+
+    const record = await hashIndex.set(actualHash, entryData);
+    if (cleanClientHash && cleanClientHash !== actualHash) {
+      await hashIndex.set(cleanClientHash, entryData);
+    }
+
+    return {
+      success: true,
+      backedUp: true,
+      canDelete: true,
+      canReplaceWithProxy: true,
+      checksumVerified: true,
+      isDuplicate: false,
+      status: 'stored_verified',
+      message: 'Photo backed up and verified on disk.',
+      hash: actualHash,
+      serverSha256: actualHash,
+      savedPath: record.relativePath,
+      originalName: record.originalName,
+      size: record.size,
+      photoDate: record.photoDate,
+    };
+  } catch (err) {
+    await fsp.unlink(stagingPath).catch(() => {});
+    throw err;
+  }
+}
+
 module.exports = {
   storeAndVerifyPhoto,
+  storeAndVerifyStream,
   assertWithinQuota,
   sanitizeFilename,
   parseDateFolder,

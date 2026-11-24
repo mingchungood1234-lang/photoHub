@@ -187,7 +187,13 @@ object PhotoBackupPipeline {
 
                 if (candidate.isVideo) {
                     proxy = videoSemaphore.withPermit {
-                        ProxyGenerator.createVideoProxy(context, master.file, master.sha256)
+                        ProxyGenerator.createVideoProxy(
+                            context = context,
+                            masterFile = master.file,
+                            maxPixelSize = maxPixelSize,
+                            quality = quality,
+                            masterHash = master.sha256
+                        )
                     }
                     previewFileForServer = proxy.posterFile
                     previewFmtForServer = "jpeg"

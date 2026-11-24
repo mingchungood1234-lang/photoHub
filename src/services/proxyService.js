@@ -167,15 +167,24 @@ async function generateServerSideProxy({
         ], 30000).catch(() => {});
       }
 
-      // Encode lightweight compressed H.264 + AAC proxy MP4
+      // Encode lightweight compressed H.264 + AAC proxy MP4 honoring user's resolution/detail preference
+      const targetHeight =
+        maxPx >= 2400 ? 1440 :
+        maxPx >= 1800 ? 1080 :
+        maxPx >= 1100 ? 720 :
+        maxPx > 0 ? 480 :
+        qualityNum < 0.59 ? 540 : 720;
+      const crfVal = qualityNum >= 0.78 ? '24' : qualityNum < 0.59 ? '31' : '28';
+      const videoScaleFilter = `scale='if(gte(iw,ih),-2,min(${targetHeight},iw))':'if(gte(iw,ih),min(${targetHeight},ih),-2)'`;
+
       await runFfmpeg([
         '-y',
         '-i', sourcePath,
         '-c:v', 'libx264',
         '-preset', 'veryfast',
-        '-crf', '28',
+        '-crf', crfVal,
         '-pix_fmt', 'yuv420p',
-        '-vf', "scale='min(960,iw)':-2",
+        '-vf', videoScaleFilter,
         '-c:a', 'aac',
         '-b:a', '96k',
         '-movflags', '+faststart',
