@@ -891,17 +891,19 @@ final class IncomingShareCoordinator: ObservableObject {
         }
         guard case .fetching = current.state else { return }
 
+        let initialInputs = current.inputs
+        let initialPending = current.pendingSelections
+
         processingSessionId = sessionId
         activeTask?.cancel()
         activeTask = Task { [weak self] in
             guard let self else { return }
 
-            var resolvedInputs = current.inputs
-            var collectedDirs = current.cleanupDirs
+            var resolvedInputs = initialInputs
             var exportErrors: [String] = []
 
-            if resolvedInputs.isEmpty && !current.pendingSelections.isEmpty {
-                let selections = current.pendingSelections
+            if resolvedInputs.isEmpty && !initialPending.isEmpty {
+                let selections = initialPending
                 let totalSel = selections.count
                 var built: [OriginalShareInput] = []
 
@@ -928,7 +930,6 @@ final class IncomingShareCoordinator: ObservableObject {
                         return
                     }
                     if let dir = picked.copiedFileURL?.deletingLastPathComponent() {
-                        collectedDirs.append(dir)
                         await MainActor.run {
                             if var s = self.activeSession, s.id == sessionId {
                                 s.cleanupDirs.append(dir)

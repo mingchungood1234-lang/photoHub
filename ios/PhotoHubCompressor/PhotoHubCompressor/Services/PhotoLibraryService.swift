@@ -167,10 +167,20 @@ final class PhotoLibraryService {
             return .noPermission
         }
 
-        let assets = await Task.detached(priority: .userInitiated) {
-            findCompressedProxyAssets(forMasterHashes: hashes)
+        let assetIds = await Task.detached(priority: .userInitiated) {
+            PhotoLibraryService.findCompressedProxyAssets(forMasterHashes: hashes).map(\.localIdentifier)
         }.value
 
+        guard !assetIds.isEmpty else {
+            return .deleted(0)
+        }
+
+        let fetched = PHAsset.fetchAssets(withLocalIdentifiers: assetIds, options: nil)
+        var assets: [PHAsset] = []
+        assets.reserveCapacity(fetched.count)
+        for i in 0..<fetched.count {
+            assets.append(fetched.object(at: i))
+        }
         guard !assets.isEmpty else {
             return .deleted(0)
         }
@@ -1114,7 +1124,7 @@ final class OriginalDownloadCache: @unchecked Sendable {
 
     private func emitProgress(entryID: UUID, downloaded: Int64, total: Int64?) {
         lock.lock()
-        let callbacks = Array(entryCallbacks[entryID]?.values ?? [])
+        let callbacks = entryCallbacks[entryID].map { Array($0.values) } ?? []
         lock.unlock()
         for cb in callbacks {
             cb(downloaded, total)

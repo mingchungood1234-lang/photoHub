@@ -800,6 +800,7 @@ final class PhotoHubAPIClient {
         private let onProgress: (@Sendable (Int64, Int64?) -> Void)?
 
         private var continuation: CheckedContinuation<URLResponse, Error>?
+        private var pendingResult: Result<URLResponse, Error>?
         private var fileHandle: FileHandle?
         private var httpResponse: HTTPURLResponse?
         private var errorBuffer = Data()
@@ -826,6 +827,12 @@ final class PhotoHubAPIClient {
 
         func attachContinuation(_ cont: CheckedContinuation<URLResponse, Error>) {
             lock.lock()
+            if let ready = pendingResult {
+                pendingResult = nil
+                lock.unlock()
+                cont.resume(with: ready)
+                return
+            }
             self.continuation = cont
             lock.unlock()
         }
@@ -845,10 +852,16 @@ final class PhotoHubAPIClient {
 
         private func resumeOnce(_ result: Result<URLResponse, Error>) {
             lock.lock()
-            let cont = continuation
-            continuation = nil
+            if let cont = continuation {
+                continuation = nil
+                lock.unlock()
+                cont.resume(with: result)
+                return
+            }
+            if pendingResult == nil {
+                pendingResult = result
+            }
             lock.unlock()
-            cont?.resume(with: result)
         }
 
         func urlSession(

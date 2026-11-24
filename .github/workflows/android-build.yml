@@ -4,12 +4,18 @@ on:
   push:
     paths:
       - 'android/**'
+      - '.gitignore'
       - '.github/workflows/android-build.yml'
   pull_request:
     paths:
       - 'android/**'
+      - '.gitignore'
       - '.github/workflows/android-build.yml'
   workflow_dispatch:
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-android:
@@ -21,10 +27,22 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '21'
+
+      - name: Accept Android SDK licenses and ensure compileSdk 37
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$SDK_ROOT" -name sdkmanager 2>/dev/null | head -n 1 || true)"
+          fi
+          if [ -n "$SDKMANAGER" ] && [ -x "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+            "$SDKMANAGER" --install "platforms;android-37" "build-tools;36.0.0"
+          fi
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -35,11 +53,28 @@ jobs:
           PHOTOHUB_GATEWAY_URL: ${{ vars.PHOTOHUB_GATEWAY_URL }}
           PHOTOHUB_PINNED_CERT_SHA256: ${{ vars.PHOTOHUB_PINNED_CERT_SHA256 }}
         run: |
+          set -o pipefail
+          set +e
           chmod +x gradlew || true
           if [ -x ./gradlew ]; then
-            ./gradlew testDebugUnitTest assembleDebug
+            ./gradlew testDebugUnitTest assembleDebug --no-daemon --stacktrace --console=plain 2>&1 | tee gradle-build.log
           else
-            gradle testDebugUnitTest assembleDebug
+            gradle testDebugUnitTest assembleDebug --no-daemon --stacktrace --console=plain 2>&1 | tee gradle-build.log
+          fi
+          BUILD_RC=${PIPESTATUS[0]}
+          set -e
+          if [ "$BUILD_RC" -ne 0 ]; then
+            ERRORS=$(grep -nE -C 2 "e: |FAILURE:|What went wrong:|Compilation error" gradle-build.log | head -n 120 || true)
+            if [ -z "$ERRORS" ]; then
+              ERRORS=$(tail -n 100 gradle-build.log)
+            fi
+            {
+              echo "### Android Gradle Build Failed (exit code $BUILD_RC)"
+              echo '```'
+              echo "$ERRORS"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$BUILD_RC"
           fi
 
       - name: Upload Debug APK artifact
