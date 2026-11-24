@@ -111,7 +111,35 @@ func cleanupTempShareURLs(_ urls: [URL]) {
     }
 }
 
-/// Native iOS Share Sheet wrapper with automatic completion/cancel callback for temp file cleanup.
+/// Delays cleanup after UIActivityViewController finishes so async share extensions
+/// (Save Video, AirDrop, WhatsApp) can finish reading large original video files first.
+func scheduleTempShareCleanup(_ urls: [URL], delay: TimeInterval = 180) {
+    guard !urls.isEmpty else { return }
+    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) {
+        cleanupTempShareURLs(urls)
+    }
+}
+
+func pruneStaleTempShareDirs(maxAge: TimeInterval = 3600) {
+    let fm = FileManager.default
+    let tmp = fm.temporaryDirectory
+    guard let entries = try? fm.contentsOfDirectory(
+        at: tmp,
+        includingPropertiesForKeys: [.contentModificationDateKey],
+        options: .skipsHiddenFiles
+    ) else { return }
+    let cutoff = Date().addingTimeInterval(-maxAge)
+    for url in entries {
+        let name = url.lastPathComponent
+        guard name.hasPrefix("photohub_share_") || name.hasPrefix("photohub_incoming_") else { continue }
+        let mod = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+        if mod < cutoff {
+            try? fm.removeItem(at: url)
+        }
+    }
+}
+
+/// Native iOS Share Sheet wrapper with delayed temp-file cleanup for large videos.
 struct ShareSheet: UIViewControllerRepresentable {
     let activityItems: [Any]
     let onComplete: () -> Void
@@ -139,17 +167,23 @@ struct PickedMediaResult: Sendable {
 /// Multi-select iOS 15+ PHPicker wrapper returning `[PickedMediaResult]` for checking gallery proxy/original status.
 struct MultiPhotoPickerSheet: UIViewControllerRepresentable {
     var selectionLimit: Int = 25
+    var skipCopyIfTracked: Bool = false
     let onPickBatch: ([PickedMediaResult]) -> Void
     let onCancel: () -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onPickBatch: onPickBatch, onCancel: onCancel)
+        Coordinator(
+            skipCopyIfTracked: skipCopyIfTracked,
+            onPickBatch: onPickBatch,
+            onCancel: onCancel
+        )
     }
 
     func makeUIViewController(context: Context) -> PHPickerViewController {
         var config = PHPickerConfiguration(photoLibrary: .shared())
         config.selectionLimit = selectionLimit
         config.filter = .any(of: [.images, .videos])
+        config.preferredAssetRepresentationMode = .current
         let picker = PHPickerViewController(configuration: config)
         picker.delegate = context.coordinator
         return picker
@@ -159,10 +193,16 @@ struct MultiPhotoPickerSheet: UIViewControllerRepresentable {
 
     @MainActor
     final class Coordinator: NSObject, PHPickerViewControllerDelegate {
+        private let skipCopyIfTracked: Bool
         private let onPickBatch: ([PickedMediaResult]) -> Void
         private let onCancel: () -> Void
 
-        init(onPickBatch: @escaping ([PickedMediaResult]) -> Void, onCancel: @escaping () -> Void) {
+        init(
+            skipCopyIfTracked: Bool,
+            onPickBatch: @escaping ([PickedMediaResult]) -> Void,
+            onCancel: @escaping () -> Void
+        ) {
+            self.skipCopyIfTracked = skipCopyIfTracked
             self.onPickBatch = onPickBatch
             self.onCancel = onCancel
         }
@@ -174,12 +214,13 @@ struct MultiPhotoPickerSheet: UIViewControllerRepresentable {
             }
 
             let finishBatch = onPickBatch
+            let skipCopy = skipCopyIfTracked
             let collector = PickedBatchCollector(count: results.count)
             let group = DispatchGroup()
 
             for (idx, item) in results.enumerated() {
                 group.enter()
-                PhotoPickerItemLoader.loadPickedResult(from: item, skipCopyIfTracked: false) { picked in
+                PhotoPickerItemLoader.loadPickedResult(from: item, skipCopyIfTracked: skipCopy) { picked in
                     collector.store(picked, at: idx)
                     group.leave()
                 }
@@ -236,49 +277,116 @@ enum PhotoPickerItemLoader {
         skipCopyIfTracked: Bool,
         completion: @escaping (PickedMediaResult) -> Void
     ) {
-        let isVideo = provider.hasItemConformingToTypeIdentifier(UTType.movie.identifier)
+        let videoTypeIds = [
+            UTType.quickTimeMovie.identifier,
+            UTType.mpeg4Movie.identifier,
+            UTType.movie.identifier,
+            UTType.video.identifier,
+        ]
+        let registeredVideoId = provider.registeredTypeIdentifiers.first { tid in
+            if let ut = UTType(tid) {
+                return ut.conforms(to: .movie) || ut.conforms(to: .video)
+            }
+            return false
+        }
+        let isVideo = registeredVideoId != nil || videoTypeIds.contains {
+            provider.hasItemConformingToTypeIdentifier($0)
+        }
 
-        if skipCopyIfTracked,
-           let assetId,
-           LocalProxyTracker.shared.masterLookup(forAssetId: assetId) != nil {
-            completion(PickedMediaResult(assetId: assetId, copiedFileURL: nil, isVideo: isVideo))
-            return
+        if skipCopyIfTracked, let assetId {
+            if LocalProxyTracker.shared.masterLookup(forAssetId: assetId) != nil {
+                completion(PickedMediaResult(assetId: assetId, copiedFileURL: nil, isVideo: isVideo))
+                return
+            }
+            let rwAuth = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+            if rwAuth == .authorized || rwAuth == .limited,
+               let asset = PHAsset.fetchAssets(withLocalIdentifiers: [assetId], options: nil).firstObject,
+               PhotoLibraryService.proxyHashPrefixFromAssetResources(asset) != nil {
+                completion(PickedMediaResult(assetId: assetId, copiedFileURL: nil, isVideo: isVideo))
+                return
+            }
         }
 
         let typeId: String
         if isVideo {
-            typeId = UTType.movie.identifier
+            typeId = registeredVideoId
+                ?? videoTypeIds.first { provider.hasItemConformingToTypeIdentifier($0) }
+                ?? UTType.movie.identifier
         } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
-            typeId = UTType.image.identifier
+            typeId = provider.registeredTypeIdentifiers.first { tid in
+                UTType(tid)?.conforms(to: .image) == true
+            } ?? UTType.image.identifier
         } else {
             typeId = provider.registeredTypeIdentifiers.first ?? UTType.data.identifier
         }
 
-        provider.loadFileRepresentation(forTypeIdentifier: typeId) { url, _ in
+        func finishWithURL(_ sourceURL: URL?, rawData: Data? = nil, suggestedExt: String? = nil) {
             var copiedURL: URL?
-            if let url {
-                let rawName = url.lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
-                let fallbackExt = isVideo ? "mp4" : "jpg"
+            let fallbackExt = suggestedExt ?? (isVideo ? "mp4" : "jpg")
+            let batchDir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("photohub_incoming_\(UUID().uuidString.prefix(8))", isDirectory: true)
+            if let sourceURL {
+                let rawName = sourceURL.lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
                 let baseName: String
                 if rawName.isEmpty {
                     baseName = "photohub_pick_\(UUID().uuidString.prefix(8)).\(fallbackExt)"
-                } else if url.pathExtension.isEmpty {
+                } else if sourceURL.pathExtension.isEmpty {
                     baseName = "\(rawName).\(fallbackExt)"
                 } else {
                     baseName = rawName
                 }
-                let batchDir = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("photohub_incoming_\(UUID().uuidString.prefix(8))", isDirectory: true)
                 try? FileManager.default.createDirectory(at: batchDir, withIntermediateDirectories: true)
                 let dest = batchDir.appendingPathComponent(baseName)
                 try? FileManager.default.removeItem(at: dest)
-                if (try? FileManager.default.copyItem(at: url, to: dest)) != nil {
+                let accessed = sourceURL.startAccessingSecurityScopedResource()
+                if (try? FileManager.default.copyItem(at: sourceURL, to: dest)) != nil {
                     copiedURL = dest
                 }
+                if accessed {
+                    sourceURL.stopAccessingSecurityScopedResource()
+                }
+            } else if let rawData, !rawData.isEmpty {
+                let rawHint = provider.suggestedName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let baseName = rawHint.isEmpty
+                    ? "photohub_pick_\(UUID().uuidString.prefix(8)).\(fallbackExt)"
+                    : (URL(fileURLWithPath: rawHint).pathExtension.isEmpty ? "\(rawHint).\(fallbackExt)" : rawHint)
+                try? FileManager.default.createDirectory(at: batchDir, withIntermediateDirectories: true)
+                let dest = batchDir.appendingPathComponent(baseName)
+                if (try? rawData.write(to: dest, options: .atomic)) != nil {
+                    copiedURL = dest
+                }
+            }
+            if copiedURL == nil {
+                try? FileManager.default.removeItem(at: batchDir)
             }
             let out = PickedMediaResult(assetId: assetId, copiedFileURL: copiedURL, isVideo: isVideo)
             DispatchQueue.main.async {
                 completion(out)
+            }
+        }
+
+        provider.loadFileRepresentation(forTypeIdentifier: typeId) { url, _ in
+            if let url {
+                let ext = url.pathExtension.isEmpty
+                    ? UTType(typeId)?.preferredFilenameExtension
+                    : url.pathExtension
+                finishWithURL(url, suggestedExt: ext)
+                return
+            }
+
+            // Fallback when NSItemProvider exposes URL/Data (e.g. Shortcuts / Pasteboard videos)
+            provider.loadItem(forTypeIdentifier: typeId, options: nil) { item, _ in
+                if let itemURL = item as? URL {
+                    finishWithURL(itemURL, suggestedExt: UTType(typeId)?.preferredFilenameExtension)
+                } else if let data = item as? Data {
+                    finishWithURL(nil, rawData: data, suggestedExt: UTType(typeId)?.preferredFilenameExtension)
+                } else if provider.canLoadObject(ofClass: URL.self) {
+                    _ = provider.loadObject(ofClass: URL.self) { objURL, _ in
+                        finishWithURL(objURL, suggestedExt: UTType(typeId)?.preferredFilenameExtension)
+                    }
+                } else {
+                    finishWithURL(nil)
+                }
             }
         }
     }
@@ -297,6 +405,7 @@ struct PhotoPickerSheet: UIViewControllerRepresentable {
         var config = PHPickerConfiguration(photoLibrary: .shared())
         config.selectionLimit = 1
         config.filter = .any(of: [.images, .videos])
+        config.preferredAssetRepresentationMode = .current
         let picker = PHPickerViewController(configuration: config)
         picker.delegate = context.coordinator
         return picker
@@ -541,6 +650,42 @@ final class IncomingShareCoordinator: ObservableObject {
             }
         }
 
+        if let fileURLs = UIPasteboard.general.urls?.filter({ $0.isFileURL }),
+           !fileURLs.isEmpty {
+            let fm = FileManager.default
+            let batchDir = fm.temporaryDirectory
+                .appendingPathComponent("photohub_incoming_\(UUID().uuidString.prefix(8))", isDirectory: true)
+            try? fm.createDirectory(at: batchDir, withIntermediateDirectories: true)
+            var urlInputs: [OriginalShareInput] = []
+            for (idx, srcURL) in fileURLs.enumerated() {
+                let rawName = srcURL.lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
+                let baseName = rawName.isEmpty ? "clipboard_\(idx + 1)" : rawName
+                let dest = batchDir.appendingPathComponent(baseName)
+                try? fm.removeItem(at: dest)
+                let accessed = srcURL.startAccessingSecurityScopedResource()
+                let copied = (try? fm.copyItem(at: srcURL, to: dest)) != nil
+                if accessed { srcURL.stopAccessingSecurityScopedResource() }
+                guard copied else { continue }
+                let ext = dest.pathExtension.lowercased()
+                let isVid = UTType(filenameExtension: ext)?.conforms(to: .movie) == true
+                    || ["mp4", "mov", "m4v", "3gp", "avi", "mkv", "webm"].contains(ext)
+                urlInputs.append(
+                    OriginalShareInput(
+                        assetId: nil,
+                        fileURL: dest,
+                        filenameHint: baseName,
+                        masterHashHint: nil,
+                        isVideo: isVid
+                    )
+                )
+            }
+            if !urlInputs.isEmpty {
+                enqueueInputs(urlInputs, cleanupDirs: [batchDir])
+                return
+            }
+            try? fm.removeItem(at: batchDir)
+        }
+
         let images = UIPasteboard.general.images ?? []
         if !images.isEmpty {
             let fm = FileManager.default
@@ -756,7 +901,7 @@ final class IncomingShareCoordinator: ObservableObject {
     private func cleanupActiveResources() {
         guard let current = activeSession else { return }
         if case .ready(let resolved, _, _, _) = current.state {
-            cleanupTempShareURLs(resolved.map(\.fileURL))
+            scheduleTempShareCleanup(resolved.map(\.fileURL))
         }
         cleanupIncomingDirs(current.cleanupDirs)
     }

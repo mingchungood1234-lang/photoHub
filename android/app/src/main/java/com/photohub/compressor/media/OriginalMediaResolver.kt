@@ -109,6 +109,7 @@ object OriginalDownloadCache {
         masterHash: String,
         preferredFilename: String? = null,
         expectedSizeBytes: Long? = null,
+        isVideo: Boolean = false,
         onProgress: ((downloadedBytes: Long, totalBytes: Long?) -> Unit)? = null
     ): Pair<File, Boolean> {
         pruneStaleCache(context)
@@ -134,6 +135,7 @@ object OriginalDownloadCache {
                         destDir = destDir,
                         preferredFilename = preferredFilename,
                         expectedSizeBytes = expectedSizeBytes,
+                        isVideo = isVideo,
                         onProgress = { down, total ->
                             entry.lastDownloaded.set(down)
                             if (total != null) entry.lastTotal.set(total)
@@ -338,10 +340,13 @@ class OriginalMediaResolver(
         if (check.exists) {
             val resolvedHash = check.masterHash ?: streamSha
             val cached = cachedPhotos.firstOrNull { it.hash.equals(resolvedHash, ignoreCase = true) }
+            val resolvedName = check.originalName
+                ?: cached?.originalName
+                ?: resolveMasterByPrefix(resolvedHash.take(16), cachedPhotos, client)?.originalName
             return@withContext ResolvedMasterMedia(
                 masterHash = resolvedHash,
-                originalName = cached?.originalName,
-                expectedSizeBytes = cached?.size,
+                originalName = resolvedName,
+                expectedSizeBytes = check.size ?: cached?.size,
                 sourceDisplayName = displayName
             )
         }
@@ -360,6 +365,12 @@ class OriginalMediaResolver(
                     "Back it up on the Compress tab or open it in the Server tab."
             )
 
+        val mimeHint = context.contentResolver.getType(uri)?.lowercase(Locale.ROOT).orEmpty()
+        val guessedIsVideo = mimeHint.startsWith("video/") ||
+            ShareUtils.inferMimeType(
+                File(resolved.originalName ?: resolved.sourceDisplayName ?: "file.jpg")
+            ).startsWith("video/")
+
         onStage?.invoke("Auto-fetching original from server…")
         val client = PhotoHubApiClient(context, settings)
         val (file, fromCache) = OriginalDownloadCache.getOrFetchOriginal(
@@ -368,6 +379,7 @@ class OriginalMediaResolver(
             masterHash = resolved.masterHash,
             preferredFilename = resolved.originalName,
             expectedSizeBytes = resolved.expectedSizeBytes,
+            isVideo = guessedIsVideo,
             onProgress = onDownloadProgress
         )
 
@@ -427,7 +439,12 @@ object ShareUtils {
             .substringAfterLast('.', "")
             .lowercase(Locale.ROOT)
         return when (ext) {
-            "mp4", "mov", "m4v", "3gp", "mkv", "webm", "avi" -> "video/*"
+            "mp4", "m4v" -> "video/mp4"
+            "mov" -> "video/quicktime"
+            "3gp" -> "video/3gpp"
+            "mkv" -> "video/x-matroska"
+            "webm" -> "video/webm"
+            "avi" -> "video/x-msvideo"
             "png" -> "image/png"
             "heic", "heif" -> "image/heic"
             "webp" -> "image/webp"

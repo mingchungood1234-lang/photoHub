@@ -347,8 +347,12 @@ test('iOS Proxy-Replacement Workflow: strict checksum, proxy registration, batch
     assert.equal(batchBody.results[proxyHash].isProxy, true);
     assert.equal(batchBody.results[proxyHash].canReplaceWithProxy, false);
     assert.equal(batchBody.results[proxyHash].masterHash, masterHash);
+    assert.equal(batchBody.results[proxyHash].originalName, 'IMG_3001.HEIC');
+    assert.equal(batchBody.results[proxyHash].size, masterBytes.length);
 
     assert.equal(batchBody.results[missingHash].exists, false);
+    assert.equal(batchBody.results[missingHash].originalName, null);
+    assert.equal(batchBody.results[missingHash].size, null);
   });
 
   await t.test('4. List backed-up photos via GET /api/photos, stream video proxy, and check 404 on unknown GET /api/photo/:hash', async () => {

@@ -162,6 +162,50 @@ enum ProxyGenerator {
         }
     }
 
+    /// Creates a temporary video copy tagged with `PHOTOHUB_PROXY_<prefix16>` filename and
+    /// embedded `PhotoHubProxy:<masterHash>` MP4 metadata via lossless passthrough when missing.
+    static func writeTaggedVideoCopyAsync(from videoURL: URL, masterHash: String) async -> URL? {
+        if findProxyMarkerInMP4File(videoURL) != nil {
+            return writeTaggedVideoCopy(from: videoURL, masterHash: masterHash)
+        }
+        guard let cleanMaster = cleanMasterHashString(masterHash) else {
+            return writeTaggedVideoCopy(from: videoURL, masterHash: masterHash)
+        }
+
+        let taggedURL = makeTaggedProxyTempURL(masterHash: masterHash, ext: "mp4", fallbackPrefix: "video_proxy")
+        try? FileManager.default.removeItem(at: taggedURL)
+
+        let avAsset = AVURLAsset(url: videoURL)
+        if let exportSession = AVAssetExportSession(asset: avAsset, presetName: AVAssetExportPresetPassthrough) {
+            exportSession.outputURL = taggedURL
+            exportSession.outputFileType = .mp4
+            exportSession.shouldOptimizeForNetworkUse = true
+            let descItem = AVMutableMetadataItem()
+            descItem.identifier = .commonIdentifierDescription
+            descItem.value = "\(proxyMarkerPrefix)\(cleanMaster)" as NSString
+            let swItem = AVMutableMetadataItem()
+            swItem.identifier = .commonIdentifierSoftware
+            swItem.value = "PhotoHub Proxy" as NSString
+            exportSession.metadata = [descItem, swItem]
+
+            let once = OnceFlag()
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                exportSession.exportAsynchronously {
+                    guard once.tryTrigger() else { return }
+                    continuation.resume()
+                }
+            }
+
+            if exportSession.status == .completed,
+               FileManager.default.fileExists(atPath: taggedURL.path) {
+                return taggedURL
+            }
+            cleanupTempFile(taggedURL)
+        }
+
+        return writeTaggedVideoCopy(from: videoURL, masterHash: masterHash)
+    }
+
     /// Reads embedded PhotoHub EXIF / TIFF marker (`PhotoHubProxy:<masterHash>`) directly from image bytes
     /// without writing temporary files to disk.
     static func extractEmbeddedProxyMasterHash(fromImageData imageData: Data) -> String? {
@@ -185,21 +229,33 @@ enum ProxyGenerator {
         }
 
         let avAsset = AVURLAsset(url: fileURL)
-        let items: [AVMetadataItem]
+        let commonItems: [AVMetadataItem]
+        var allItems: [AVMetadataItem] = []
         if #available(iOS 16.0, *) {
-            items = (try? await avAsset.load(.commonMetadata)) ?? []
-        } else {
-            items = avAsset.commonMetadata
-        }
-        for item in items {
-            if #available(iOS 16.0, *) {
+            commonItems = (try? await avAsset.load(.commonMetadata)) ?? []
+            allItems.append(contentsOf: commonItems)
+            let formats = (try? await avAsset.load(.availableMetadataFormats)) ?? []
+            for fmt in formats {
+                if let items = try? await avAsset.loadMetadata(for: fmt) {
+                    allItems.append(contentsOf: items)
+                }
+            }
+            for item in allItems {
                 if let str = try? await item.load(.stringValue),
                    let parsed = parseMarkerHash(from: str) {
                     return parsed
                 }
-            } else if let str = item.stringValue,
-                      let parsed = parseMarkerHash(from: str) {
-                return parsed
+            }
+        } else {
+            allItems.append(contentsOf: avAsset.commonMetadata)
+            for fmt in avAsset.availableMetadataFormats {
+                allItems.append(contentsOf: avAsset.metadata(forFormat: fmt))
+            }
+            for item in allItems {
+                if let str = item.stringValue,
+                   let parsed = parseMarkerHash(from: str) {
+                    return parsed
+                }
             }
         }
         return findProxyMarkerInMP4File(fileURL)
@@ -226,7 +282,7 @@ enum ProxyGenerator {
         guard let handle = try? FileHandle(forReadingFrom: fileURL) else { return nil }
         defer { try? handle.close() }
 
-        let probeSize = 256 * 1024
+        let probeSize = 512 * 1024
         let head = handle.readData(ofLength: probeSize)
         if let hit = findProxyMarkerInMP4Bytes(head) {
             return hit

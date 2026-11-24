@@ -58,7 +58,7 @@ struct ContentView: View {
                     }
                 }
                 .sheet(isPresented: $incomingShare.showingInAppPicker) {
-                    MultiPhotoPickerSheet(selectionLimit: 25) { picked in
+                    MultiPhotoPickerSheet(selectionLimit: 25, skipCopyIfTracked: true) { picked in
                         incomingShare.showingInAppPicker = false
                         incomingShare.enqueuePickedResults(picked)
                     } onCancel: {

@@ -103,6 +103,7 @@ struct PhotoHubCompressorApp: App {
                 BackgroundBackupManager.shared.scheduleNightlyBackupIfEnabled(settings: settings)
                 BackgroundBackupManager.shared.triggerSilentAutoUpload(settings: settings, isMovingToBackground: true)
             } else if phase == .active {
+                pruneStaleTempShareDirs()
                 BackgroundBackupManager.shared.pruneMissingAssetsFromStaged()
                 BackgroundBackupManager.shared.triggerSilentAutoUpload(settings: settings, isMovingToBackground: false)
             }

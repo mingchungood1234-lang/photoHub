@@ -282,14 +282,19 @@ class PhotoHubUnitTest {
     @Test
     fun `share utils infer image, video, and mixed mime types cleanly`() {
         assertEquals("image/heic", ShareUtils.inferMimeType(java.io.File("IMG_001.HEIC")))
-        assertEquals("video/*", ShareUtils.inferMimeType(java.io.File("VID_002.MP4")))
+        assertEquals("video/mp4", ShareUtils.inferMimeType(java.io.File("VID_002.MP4")))
+        assertEquals("video/quicktime", ShareUtils.inferMimeType(java.io.File("VID_003.MOV")))
         assertEquals(
             "image/*",
             ShareUtils.computeCombinedShareMimeType(listOf("image/jpeg", "image/heic"))
         )
         assertEquals(
+            "video/*",
+            ShareUtils.computeCombinedShareMimeType(listOf("video/mp4", "video/quicktime"))
+        )
+        assertEquals(
             "*/*",
-            ShareUtils.computeCombinedShareMimeType(listOf("image/jpeg", "video/*"))
+            ShareUtils.computeCombinedShareMimeType(listOf("image/jpeg", "video/mp4"))
         )
     }
 }

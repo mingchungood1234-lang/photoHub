@@ -175,6 +175,8 @@ struct CheckResponse: Decodable {
     let canReplaceWithProxy: Bool?
     let masterHash: String?
     let savedPath: String?
+    let originalName: String?
+    let size: Int64?
 }
 
 private struct BatchCheckResponse: Decodable {
@@ -388,10 +390,12 @@ private struct GenerateProxyResponse: Decodable {
 final class PhotoHubAPIClient {
     private static let sharedStandardSession: URLSession = makeSharedSession(allowSelfSigned: false)
     private static let sharedSelfSignedSession: URLSession = makeSharedSession(allowSelfSigned: true)
+    private static let warmLock = NSLock()
+    private static var lastWarmTimestamps: [String: Date] = [:]
 
     private static func makeSharedSession(allowSelfSigned: Bool) -> URLSession {
         let config = URLSessionConfiguration.default
-        config.httpMaximumConnectionsPerHost = 6
+        config.httpMaximumConnectionsPerHost = 10
         config.waitsForConnectivity = true
         config.timeoutIntervalForRequest = 600
         config.timeoutIntervalForResource = 3600
@@ -418,6 +422,27 @@ final class PhotoHubAPIClient {
 
     private var pooledSession: URLSession {
         settings.allowSelfSignedHTTPS ? Self.sharedSelfSignedSession : Self.sharedStandardSession
+    }
+
+    /// Pre-establishes TCP/TLS socket cleanly before original fetches start.
+    func warmConnectionIfNeeded() async {
+        guard let url = try? makeURL("/api/health") else { return }
+        let key = url.absoluteString
+        let now = Date()
+        let shouldWarm: Bool = {
+            Self.warmLock.lock()
+            defer { Self.warmLock.unlock() }
+            if let prev = Self.lastWarmTimestamps[key], now.timeIntervalSince(prev) < 30.0 {
+                return false
+            }
+            Self.lastWarmTimestamps[key] = now
+            return true
+        }()
+        guard shouldWarm else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 8
+        _ = try? await pooledSession.data(for: req)
     }
 
     private func makeURL(_ path: String) throws -> URL {
@@ -724,27 +749,332 @@ final class PhotoHubAPIClient {
         return data
     }
 
+    private enum SegmentedDownloadFallback: Error {
+        case unsupported
+    }
+
+    private static let smallSingleStreamThresholdBytes: Int64 = 1_500_000
+    private static let initialRangeBytes: Int64 = 1_048_576
+    private static let maxExtraParallelSegments: Int = 4
+
     func downloadMasterToTempFile(
         hash: String,
-        preferredFilename: String? = nil
+        preferredFilename: String? = nil,
+        expectedSizeBytes: Int64? = nil,
+        isVideo: Bool = false
     ) async throws -> URL {
-        try await downloadToTempFile(
-            path: "/api/photo/\(hash)",
+        let shareDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("photohub_share_\(UUID().uuidString.prefix(8))", isDirectory: true)
+        return try await downloadMasterToDirectory(
+            hash: hash,
+            destinationDir: shareDir,
             preferredFilename: preferredFilename,
-            fallbackFilename: "photo_\(String(hash.prefix(8))).jpg"
+            expectedSizeBytes: expectedSizeBytes,
+            isVideo: isVideo
         )
     }
 
+    func downloadMasterToDirectory(
+        hash: String,
+        destinationDir: URL,
+        preferredFilename: String? = nil,
+        expectedSizeBytes: Int64? = nil,
+        isVideo: Bool = false
+    ) async throws -> URL {
+        let path = "/api/photo/\(hash)"
+        let inferredFallback = isVideo
+            ? "video_\(String(hash.prefix(8))).mp4"
+            : "photo_\(String(hash.prefix(8))).jpg"
+
+        if let expectedSizeBytes, expectedSizeBytes > 0 && expectedSizeBytes < Self.smallSingleStreamThresholdBytes {
+            return try await downloadToDirectory(
+                path: path,
+                destinationDir: destinationDir,
+                preferredFilename: preferredFilename,
+                fallbackFilename: inferredFallback
+            )
+        }
+
+        do {
+            return try await downloadWithParallelRanges(
+                path: path,
+                destinationDir: destinationDir,
+                preferredFilename: preferredFilename,
+                fallbackFilename: inferredFallback
+            )
+        } catch SegmentedDownloadFallback.unsupported {
+            return try await downloadToDirectory(
+                path: path,
+                destinationDir: destinationDir,
+                preferredFilename: preferredFilename,
+                fallbackFilename: inferredFallback
+            )
+        }
+    }
+
     func downloadVideoProxyToTempFile(hash: String) async throws -> URL {
-        try await downloadToTempFile(
+        let shareDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("photohub_share_\(UUID().uuidString.prefix(8))", isDirectory: true)
+        return try await downloadToDirectory(
             path: "/api/photo/\(hash)/video-proxy",
+            destinationDir: shareDir,
             preferredFilename: "\(String(hash.prefix(16))).mp4",
             fallbackFilename: "\(String(hash.prefix(16))).mp4"
         )
     }
 
-    private func downloadToTempFile(
+    private func downloadWithParallelRanges(
         path: String,
+        destinationDir: URL,
+        preferredFilename: String?,
+        fallbackFilename: String
+    ) async throws -> URL {
+        let url = try makeURL(path)
+        var initialReq = URLRequest(url: url)
+        initialReq.httpMethod = "GET"
+        applyAuth(to: &initialReq)
+        initialReq.setValue("bytes=0-\(Self.initialRangeBytes - 1)", forHTTPHeaderField: "Range")
+
+        let (initialTempURL, response) = try await pooledSession.download(for: initialReq)
+        var cleanupInitial = true
+        defer {
+            if cleanupInitial {
+                try? FileManager.default.removeItem(at: initialTempURL)
+            }
+        }
+
+        if let http = response as? HTTPURLResponse {
+            if http.statusCode == 416 {
+                throw SegmentedDownloadFallback.unsupported
+            }
+            if !(200...299).contains(http.statusCode) {
+                let errData = (try? Data(contentsOf: initialTempURL, options: .mappedIfSafe)) ?? Data()
+                try validateHTTP(response: response, data: errData)
+            }
+        }
+
+        let destFilename = resolveDestinationFilename(
+            response: response,
+            preferredFilename: preferredFilename,
+            fallbackFilename: fallbackFilename
+        )
+        try FileManager.default.createDirectory(at: destinationDir, withIntermediateDirectories: true)
+        let destURL = destinationDir.appendingPathComponent(destFilename)
+
+        guard let http = response as? HTTPURLResponse else {
+            throw APIClientError.invalidResponse
+        }
+
+        let rangeInfo = (http.statusCode == 206)
+            ? parseContentRange(http.value(forHTTPHeaderField: "Content-Range"))
+            : nil
+
+        // If server sent full 200 OK or the whole file fit inside the initial 1 MB segment, move directly.
+        if rangeInfo == nil || rangeInfo!.start != 0 || rangeInfo!.end + 1 >= rangeInfo!.total {
+            if http.statusCode != 200 && rangeInfo == nil {
+                throw SegmentedDownloadFallback.unsupported
+            }
+            try? FileManager.default.removeItem(at: destURL)
+            cleanupInitial = false
+            try FileManager.default.moveItem(at: initialTempURL, to: destURL)
+            return destURL
+        }
+
+        let parsedRange = rangeInfo!
+        let totalSize = parsedRange.total
+        let remainingRanges = Self.buildRemainingRanges(
+            startOffset: parsedRange.end + 1,
+            totalSize: totalSize,
+            maxSegments: Self.maxExtraParallelSegments
+        )
+
+        let partURL = destinationDir.appendingPathComponent(".part_\(UUID().uuidString.prefix(8))")
+        try? FileManager.default.removeItem(at: partURL)
+        defer {
+            try? FileManager.default.removeItem(at: partURL)
+        }
+
+        let fd = open(partURL.path, O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR)
+        guard fd >= 0 else {
+            throw SegmentedDownloadFallback.unsupported
+        }
+        var fdClosed = false
+        defer {
+            if !fdClosed {
+                close(fd)
+            }
+        }
+
+        if ftruncate(fd, off_t(totalSize)) != 0 {
+            throw SegmentedDownloadFallback.unsupported
+        }
+
+        let expectedInitialBytes = parsedRange.end - parsedRange.start + 1
+        let wroteInitial = try Self.streamFile(initialTempURL, toDescriptor: fd, atOffset: 0)
+        if wroteInitial != expectedInitialBytes {
+            throw SegmentedDownloadFallback.unsupported
+        }
+
+        let resolvedURL = http.url ?? url
+        let sameHost = (resolvedURL.host?.lowercased() == url.host?.lowercased())
+        let bearerToken = sameHost ? settings.authToken.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+        let session = pooledSession
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for segRange in remainingRanges {
+                group.addTask {
+                    try await Self.downloadRangeSegment(
+                        session: session,
+                        targetURL: resolvedURL,
+                        bearerToken: bearerToken,
+                        range: segRange,
+                        fd: fd
+                    )
+                }
+            }
+            try await group.waitForAll()
+        }
+
+        close(fd)
+        fdClosed = true
+
+        let finalAttrs = try? FileManager.default.attributesOfItem(atPath: partURL.path)
+        let writtenTotal = (finalAttrs?[.size] as? NSNumber)?.int64Value ?? 0
+        guard writtenTotal == totalSize else {
+            throw SegmentedDownloadFallback.unsupported
+        }
+
+        try? FileManager.default.removeItem(at: destURL)
+        try FileManager.default.moveItem(at: partURL, to: destURL)
+        return destURL
+    }
+
+    private static func downloadRangeSegment(
+        session: URLSession,
+        targetURL: URL,
+        bearerToken: String,
+        range: ClosedRange<Int64>,
+        fd: Int32
+    ) async throws {
+        var req = URLRequest(url: targetURL)
+        req.httpMethod = "GET"
+        req.setValue("bytes=\(range.lowerBound)-\(range.upperBound)", forHTTPHeaderField: "Range")
+        if !bearerToken.isEmpty {
+            req.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
+        }
+
+        let (segTempURL, response) = try await session.download(for: req)
+        defer {
+            try? FileManager.default.removeItem(at: segTempURL)
+        }
+
+        guard let http = response as? HTTPURLResponse else {
+            throw SegmentedDownloadFallback.unsupported
+        }
+        if http.statusCode == 401 {
+            throw APIClientError.httpError(401, "Session expired")
+        }
+        guard http.statusCode == 206 else {
+            throw SegmentedDownloadFallback.unsupported
+        }
+
+        let expectedLen = (range.upperBound - range.lowerBound) + 1
+        let written = try streamFile(segTempURL, toDescriptor: fd, atOffset: range.lowerBound)
+        guard written == expectedLen else {
+            throw SegmentedDownloadFallback.unsupported
+        }
+    }
+
+    private static func streamFile(_ fileURL: URL, toDescriptor fd: Int32, atOffset offset: Int64) throws -> Int64 {
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        defer { try? handle.close() }
+
+        var cursor = offset
+        var totalWritten: Int64 = 0
+        let chunkSize = 256 * 1024
+
+        while true {
+            var shouldBreak = false
+            try autoreleasepool {
+                let chunk = handle.readData(ofLength: chunkSize)
+                if chunk.isEmpty {
+                    shouldBreak = true
+                    return
+                }
+                try chunk.withUnsafeBytes { rawBuf in
+                    guard let base = rawBuf.baseAddress else { return }
+                    var sent = 0
+                    let count = rawBuf.count
+                    while sent < count {
+                        let wrote = pwrite(
+                            fd,
+                            base.advanced(by: sent),
+                            count - sent,
+                            off_t(cursor + Int64(sent))
+                        )
+                        if wrote < 0 {
+                            if errno == EINTR { continue }
+                            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+                        }
+                        sent += wrote
+                    }
+                }
+                let len = Int64(chunk.count)
+                cursor += len
+                totalWritten += len
+            }
+            if shouldBreak { break }
+        }
+        return totalWritten
+    }
+
+    private func parseContentRange(_ header: String?) -> (start: Int64, end: Int64, total: Int64)? {
+        guard let header else { return nil }
+        let trimmed = header.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.lowercased().hasPrefix("bytes ") else { return nil }
+        let rest = trimmed.dropFirst(6)
+        let parts = rest.split(separator: "/", maxSplits: 1)
+        guard parts.count == 2,
+              let total = Int64(parts[1].trimmingCharacters(in: .whitespaces)) else {
+            return nil
+        }
+        let bounds = parts[0].split(separator: "-", maxSplits: 1)
+        guard bounds.count == 2,
+              let start = Int64(bounds[0].trimmingCharacters(in: .whitespaces)),
+              let end = Int64(bounds[1].trimmingCharacters(in: .whitespaces)),
+              start >= 0, end >= start, total > end else {
+            return nil
+        }
+        return (start, end, total)
+    }
+
+    private static func buildRemainingRanges(
+        startOffset: Int64,
+        totalSize: Int64,
+        maxSegments: Int
+    ) -> [ClosedRange<Int64>] {
+        let remaining = totalSize - startOffset
+        guard remaining > 0, maxSegments > 0 else { return [] }
+        let minSegmentBytes: Int64 = 1_048_576
+        let count = min(maxSegments, max(1, Int(remaining / minSegmentBytes)))
+        if count <= 1 {
+            return [startOffset...(totalSize - 1)]
+        }
+        let step = (remaining + Int64(count) - 1) / Int64(count)
+        var ranges: [ClosedRange<Int64>] = []
+        ranges.reserveCapacity(count)
+        var cursor = startOffset
+        while cursor < totalSize {
+            let end = min(totalSize - 1, cursor + step - 1)
+            ranges.append(cursor...end)
+            cursor = end + 1
+        }
+        return ranges
+    }
+
+    private func downloadToDirectory(
+        path: String,
+        destinationDir: URL,
         preferredFilename: String?,
         fallbackFilename: String
     ) async throws -> URL {
@@ -761,6 +1091,23 @@ final class PhotoHubAPIClient {
             try validateHTTP(response: response, data: errData)
         }
 
+        let destFilename = resolveDestinationFilename(
+            response: response,
+            preferredFilename: preferredFilename,
+            fallbackFilename: fallbackFilename
+        )
+        try FileManager.default.createDirectory(at: destinationDir, withIntermediateDirectories: true)
+        let destURL = destinationDir.appendingPathComponent(destFilename)
+        try? FileManager.default.removeItem(at: destURL)
+        try FileManager.default.moveItem(at: tempURL, to: destURL)
+        return destURL
+    }
+
+    private func resolveDestinationFilename(
+        response: URLResponse,
+        preferredFilename: String?,
+        fallbackFilename: String
+    ) -> String {
         let serverSuggestedName = extractFilename(from: response)
         let nonEmptyPreferred: String? = {
             guard let trimmed = preferredFilename?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -769,17 +1116,40 @@ final class PhotoHubAPIClient {
             }
             return trimmed
         }()
-        let rawFilename = nonEmptyPreferred ?? serverSuggestedName ?? fallbackFilename
+        let preferredHasExt = nonEmptyPreferred.map { !URL(fileURLWithPath: $0).pathExtension.isEmpty } ?? false
+        let mimeFallback = inferFilenameFromMime(response, fallback: fallbackFilename)
+        let rawFilename: String
+        if let nonEmptyPreferred, preferredHasExt {
+            rawFilename = nonEmptyPreferred
+        } else if let serverSuggestedName, !URL(fileURLWithPath: serverSuggestedName).pathExtension.isEmpty {
+            rawFilename = serverSuggestedName
+        } else {
+            rawFilename = mimeFallback
+        }
         let safeFilename = URL(fileURLWithPath: rawFilename).lastPathComponent
-        let destFilename = safeFilename.isEmpty ? fallbackFilename : safeFilename
+        return safeFilename.isEmpty ? mimeFallback : safeFilename
+    }
 
-        let shareDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("photohub_share_\(UUID().uuidString.prefix(8))", isDirectory: true)
-        try FileManager.default.createDirectory(at: shareDir, withIntermediateDirectories: true)
-        let destURL = shareDir.appendingPathComponent(destFilename)
-        try? FileManager.default.removeItem(at: destURL)
-        try FileManager.default.moveItem(at: tempURL, to: destURL)
-        return destURL
+    private func inferFilenameFromMime(_ response: URLResponse, fallback: String) -> String {
+        guard let mime = (response as? HTTPURLResponse)?
+            .value(forHTTPHeaderField: "Content-Type")?
+            .split(separator: ";").first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() else {
+            return fallback
+        }
+        let stem = URL(fileURLWithPath: fallback).deletingPathExtension().lastPathComponent
+        switch mime {
+        case "video/mp4": return "\(stem).mp4"
+        case "video/quicktime": return "\(stem).mov"
+        case "video/x-m4v": return "\(stem).m4v"
+        case "video/3gpp": return "\(stem).3gp"
+        case "image/heic": return "\(stem).heic"
+        case "image/png": return "\(stem).png"
+        case "image/webp": return "\(stem).webp"
+        case "image/jpeg": return "\(stem).jpg"
+        default: return fallback
+        }
     }
 
     private func extractFilename(from response: URLResponse) -> String? {
@@ -787,7 +1157,15 @@ final class PhotoHubAPIClient {
               let disposition = http.value(forHTTPHeaderField: "Content-Disposition") else {
             return nil
         }
-        guard let range = disposition.range(of: "filename=") else {
+        if let utf8Range = disposition.range(of: "filename*=UTF-8''", options: .caseInsensitive) {
+            var val = String(disposition[utf8Range.upperBound...])
+            if let semi = val.firstIndex(of: ";") {
+                val = String(val[..<semi])
+            }
+            val = val.trimmingCharacters(in: CharacterSet(charactersIn: " \"'"))
+            return val.removingPercentEncoding ?? val
+        }
+        guard let range = disposition.range(of: "filename=", options: .caseInsensitive) else {
             return nil
         }
         var value = String(disposition[range.upperBound...])
@@ -889,6 +1267,7 @@ final class PhotoHubAPIClient {
             notify: true
         )
         LocalProxyTracker.shared.clearRestoredProtection(masterHash: cleanHash)
+        OriginalDownloadCache.shared.removeCachedOriginals(hashes: [cleanHash])
     }
 
     func deleteServerPhotosBatch(hashes: [String]) async throws -> DeletePhotosResult {
@@ -946,6 +1325,7 @@ final class PhotoHubAPIClient {
             for h in toEvict {
                 LocalProxyTracker.shared.clearRestoredProtection(masterHash: h)
             }
+            OriginalDownloadCache.shared.removeCachedOriginals(hashes: toEvict)
         }
 
         return DeletePhotosResult(

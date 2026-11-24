@@ -863,8 +863,9 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
         }
 
         // Speculatively pre-fetch full-resolution originals for opened photos (<= 40 MB)
-        // so tapping Share Original or Restore completes immediately, just like iCloud Photos.
-        if (!photo.isVideo && photo.size in 1L..SPECULATIVE_PREFETCH_MAX_BYTES) {
+        // and short video clips (<= 15 MB) so Share Original or Restore completes immediately.
+        val prefetchCap = if (photo.isVideo) SPECULATIVE_VIDEO_PREFETCH_MAX_BYTES else SPECULATIVE_PREFETCH_MAX_BYTES
+        if (photo.size in 1L..prefetchCap) {
             speculativePrefetchJob = viewModelScope.launch(Dispatchers.IO) {
                 runCatching {
                     OriginalDownloadCache.getOrFetchOriginal(
@@ -872,7 +873,8 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                         apiClient = PhotoHubApiClient(context, settings),
                         masterHash = photo.hash,
                         preferredFilename = photo.originalName,
-                        expectedSizeBytes = photo.size
+                        expectedSizeBytes = photo.size,
+                        isVideo = photo.isVideo
                     )
                 }
             }
@@ -966,6 +968,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                     masterHash = photo.hash,
                     preferredFilename = photo.originalName,
                     expectedSizeBytes = photo.size,
+                    isVideo = photo.isVideo,
                     onProgress = { down, total ->
                         val label = formatDetailProgressLabel("Fetching original…", down, total)
                         _detailState.update { it?.copy(busyLabel = label) }
@@ -1417,6 +1420,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
     companion object {
         private const val SPECULATIVE_PREFETCH_MAX_BYTES = 40L * 1024L * 1024L
+        private const val SPECULATIVE_VIDEO_PREFETCH_MAX_BYTES = 15L * 1024L * 1024L
     }
 
     fun updateOriginalProtection(protected: Boolean) {

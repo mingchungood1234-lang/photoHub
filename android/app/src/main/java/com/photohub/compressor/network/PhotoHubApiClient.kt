@@ -85,8 +85,8 @@ private class StreamingFileRequestBody(
 private object SharedHttpClientPool {
     private val sharedConnectionPool = ConnectionPool(12, 5, TimeUnit.MINUTES)
     private val sharedDispatcher = Dispatcher().apply {
-        maxRequests = 32
-        maxRequestsPerHost = 8
+        maxRequests = 40
+        maxRequestsPerHost = 12
     }
 
     private val baseClient: OkHttpClient = OkHttpClient.Builder()
@@ -370,7 +370,9 @@ class PhotoHubApiClient(
         keepOriginalOnDevice = json.optBoolean("keepOriginalOnDevice", false),
         canReplaceWithProxy = json.optBoolean("canReplaceWithProxy", false),
         masterHash = json.optString("masterHash").takeIf { it.isNotBlank() && !json.isNull("masterHash") },
-        savedPath = json.optString("savedPath").takeIf { it.isNotBlank() && !json.isNull("savedPath") }
+        savedPath = json.optString("savedPath").takeIf { it.isNotBlank() && !json.isNull("savedPath") },
+        originalName = json.optString("originalName").takeIf { it.isNotBlank() && !json.isNull("originalName") },
+        size = if (json.has("size") && !json.isNull("size")) json.optLong("size") else null
     )
 
     suspend fun checkHash(sha256: String): CheckResponse = withContext(Dispatchers.IO) {
@@ -791,10 +793,11 @@ class PhotoHubApiClient(
         hash: String,
         preferredFilename: String? = null,
         expectedSizeBytes: Long? = null,
+        isVideo: Boolean = false,
         onProgress: ((downloadedBytes: Long, totalBytes: Long?) -> Unit)? = null
     ): File {
         val shareDir = File(context.cacheDir, "photohub_share_${UUID.randomUUID().toString().take(8)}")
-        return downloadMasterToDirectory(hash, shareDir, preferredFilename, expectedSizeBytes, onProgress).file
+        return downloadMasterToDirectory(hash, shareDir, preferredFilename, expectedSizeBytes, isVideo, onProgress).file
     }
 
     suspend fun downloadMasterToDirectory(
@@ -802,10 +805,11 @@ class PhotoHubApiClient(
         destDir: File,
         preferredFilename: String? = null,
         expectedSizeBytes: Long? = null,
+        isVideo: Boolean = false,
         onProgress: ((downloadedBytes: Long, totalBytes: Long?) -> Unit)? = null
     ): DownloadedFileResult {
         val path = "/api/photo/$hash"
-        val fallback = "photo_${hash.take(8)}.jpg"
+        val fallback = if (isVideo) "video_${hash.take(8)}.mp4" else "photo_${hash.take(8)}.jpg"
         // Small files finish faster in a single keep-alive HTTP request; larger or unknown files
         // try 2 MB ranged fetch + up to 3 parallel segments immediately (zero extra HEAD RTT).
         if (expectedSizeBytes != null && expectedSizeBytes in 1L until SMALL_SINGLE_STREAM_THRESHOLD_BYTES) {
@@ -978,7 +982,7 @@ class PhotoHubApiClient(
         onBytes: (Long) -> Unit
     ): Long {
         val coroutineCtx = currentCoroutineContext()
-        val buffer = ByteArray(64 * 1024)
+        val buffer = ByteArray(256 * 1024)
         var pos = startPos
         var total = 0L
         body.byteStream().use { input ->
@@ -1057,7 +1061,7 @@ class PhotoHubApiClient(
         val coroutineCtx = currentCoroutineContext()
         body.byteStream().use { input ->
             partFile.outputStream().use { output ->
-                val buffer = ByteArray(64 * 1024)
+                val buffer = ByteArray(256 * 1024)
                 while (true) {
                     coroutineCtx.ensureActive()
                     val read = input.read(buffer)
@@ -1107,8 +1111,8 @@ class PhotoHubApiClient(
 
     companion object {
         private const val SMALL_SINGLE_STREAM_THRESHOLD_BYTES = 1_500_000L
-        private const val INITIAL_RANGE_BYTES = 2L * 1024L * 1024L
-        private const val MAX_EXTRA_PARALLEL_SEGMENTS = 3
+        private const val INITIAL_RANGE_BYTES = 1L * 1024L * 1024L
+        private const val MAX_EXTRA_PARALLEL_SEGMENTS = 4
         private const val PROGRESS_STEP_BYTES = 64L * 1024L
     }
 

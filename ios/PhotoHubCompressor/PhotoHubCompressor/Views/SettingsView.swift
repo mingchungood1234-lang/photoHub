@@ -541,7 +541,7 @@ struct SettingsView: View {
             Button {
                 IncomingShareCoordinator.shared.presentInAppPhotoPicker()
             } label: {
-                Label("Pick Photos to Share Original Now", systemImage: "square.and.arrow.up.on.square")
+                Label("Pick Photos or Videos to Share Original", systemImage: "square.and.arrow.up.on.square")
             }
             .disabled(!settings.isSignedIn || settings.normalizedBaseURL == nil)
 

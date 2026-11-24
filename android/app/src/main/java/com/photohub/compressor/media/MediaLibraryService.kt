@@ -464,12 +464,11 @@ class MediaLibraryService(private val context: Context) {
         creationDateMs: Long?
     ): String = withContext(Dispatchers.IO) {
         val resolver = context.contentResolver
-        val ext = displayName.substringAfterLast('.', "").lowercase()
-        val mime = when {
-            isVideo -> "video/mp4"
-            ext == "heic" || ext == "heif" -> "image/heic"
-            ext == "png" -> "image/png"
-            else -> "image/jpeg"
+        val inferred = ShareUtils.inferMimeType(file, fallbackName = displayName)
+        val mime = if (isVideo) {
+            if (inferred.startsWith("video/")) inferred else "video/mp4"
+        } else {
+            if (inferred.startsWith("image/")) inferred else "image/jpeg"
         }
         val collection = if (isVideo) {
             MediaStore.Video.Media.EXTERNAL_CONTENT_URI

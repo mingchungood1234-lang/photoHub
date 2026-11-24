@@ -233,6 +233,7 @@ struct LibraryView: View {
                     items: viewModel.galleryInspectionItems ?? [],
                     busyItemId: viewModel.inspectionBusyId,
                     actionMessage: viewModel.inspectorActionMessage,
+                    shareSheetItem: $viewModel.inspectorShareItem,
                     onRestore: { item in
                         viewModel.restoreOriginalFromDetectedProxy(
                             itemId: item.id,
@@ -245,19 +246,14 @@ struct LibraryView: View {
                         viewModel.shareOriginalFromDetectedProxy(
                             itemId: item.id,
                             rawMasterHash: item.masterHash,
-                            originalFilename: item.originalName
+                            originalFilename: item.originalName,
+                            isVideo: item.isVideo
                         )
                     },
                     onClose: {
                         viewModel.dismissGalleryInspection()
                     }
                 )
-            }
-            .sheet(item: $viewModel.inspectorShareItem) { item in
-                ShareSheet(activityItems: [item.fileURL]) {
-                    cleanupTempShareURL(item.fileURL)
-                    viewModel.inspectorShareItem = nil
-                }
             }
             .alert(
                 "Delete Original Photo",
@@ -578,6 +574,7 @@ private struct GalleryProxyInspectionSheet: View {
     let items: [GalleryProxyInspectionItem]
     let busyItemId: String?
     let actionMessage: String?
+    @Binding var shareSheetItem: ShareSheetItem?
     let onRestore: (GalleryProxyInspectionItem) -> Void
     let onShareOriginal: (GalleryProxyInspectionItem) -> Void
     let onClose: () -> Void
@@ -675,6 +672,12 @@ private struct GalleryProxyInspectionSheet: View {
                     Button("Done") { onClose() }
                         .font(.body.weight(.semibold))
                 }
+            }
+        }
+        .sheet(item: $shareSheetItem) { item in
+            ShareSheet(activityItems: item.fileURLs) {
+                scheduleTempShareCleanup(item.fileURLs)
+                shareSheetItem = nil
             }
         }
     }

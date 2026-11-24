@@ -1515,6 +1515,7 @@ private struct ServerPhotoDetailView: View {
     @State private var saveMessage: String?
     @State private var shareSheetItem: ShareSheetItem?
     @State private var showDeleteConfirm: Bool = false
+    @State private var prefetchTask: Task<Void, Never>? = nil
 
     private static let detailDateFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -1765,17 +1766,39 @@ private struct ServerPhotoDetailView: View {
                     }
                 }
 
+                prefetchTask?.cancel()
+                let photoSnapshot = currentPhoto
+                let detailClient = PhotoHubAPIClient(settings: settings)
+                let prefetchLimit: Int64 = photoSnapshot.isVideo ? 15 * 1024 * 1024 : 40 * 1024 * 1024
+                prefetchTask = Task(priority: .utility) {
+                    await detailClient.warmConnectionIfNeeded()
+                    guard !Task.isCancelled,
+                          photoSnapshot.size > 0,
+                          photoSnapshot.size <= prefetchLimit else {
+                        return
+                    }
+                    _ = try? await OriginalDownloadCache.shared.getOrFetchOriginal(
+                        hash: photoSnapshot.hash,
+                        preferredFilename: photoSnapshot.originalName,
+                        expectedSizeBytes: photoSnapshot.size,
+                        isVideo: photoSnapshot.isVideo,
+                        client: detailClient
+                    )
+                }
+
                 if currentPhoto.isVideo && !currentPhoto.needsProxy {
                     await prepareVideoProxyIfNeeded()
                 }
             }
             .onDisappear {
+                prefetchTask?.cancel()
+                prefetchTask = nil
                 player?.pause()
                 player = nil
             }
             .sheet(item: $shareSheetItem) { item in
-                ShareSheet(activityItems: [item.fileURL]) {
-                    cleanupTempShareURL(item.fileURL)
+                ShareSheet(activityItems: item.fileURLs) {
+                    scheduleTempShareCleanup(item.fileURLs)
                     shareSheetItem = nil
                 }
             }
@@ -1867,9 +1890,13 @@ private struct ServerPhotoDetailView: View {
 
         do {
             let client = PhotoHubAPIClient(settings: settings)
-            let tempURL = try await client.downloadMasterToTempFile(
+            await client.warmConnectionIfNeeded()
+            let tempURL = try await OriginalDownloadCache.shared.getOrFetchShareCopy(
                 hash: currentPhoto.hash,
-                preferredFilename: currentPhoto.originalName
+                preferredFilename: currentPhoto.originalName,
+                expectedSizeBytes: currentPhoto.size > 0 ? currentPhoto.size : nil,
+                isVideo: currentPhoto.isVideo,
+                client: client
             )
             shareSheetItem = ShareSheetItem(fileURL: tempURL)
         } catch {

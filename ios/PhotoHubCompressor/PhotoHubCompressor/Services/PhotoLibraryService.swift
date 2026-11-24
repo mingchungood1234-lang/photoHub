@@ -592,7 +592,7 @@ final class PhotoLibraryService {
         let targetCreationDate = photo.parsedCreationDate
         var tempTaggedURL: URL?
         if photo.isVideo, let videoURL {
-            tempTaggedURL = ProxyGenerator.writeTaggedVideoCopy(from: videoURL, masterHash: photo.hash)
+            tempTaggedURL = await ProxyGenerator.writeTaggedVideoCopyAsync(from: videoURL, masterHash: photo.hash)
         } else if let imageData {
             tempTaggedURL = ProxyGenerator.writeTaggedProxyImageData(imageData, masterHash: photo.hash)
         }
@@ -697,9 +697,13 @@ final class PhotoLibraryService {
         client: PhotoHubAPIClient,
         photoWriteSemaphore: AsyncSemaphore? = nil
     ) async throws -> (updatedPhoto: ServerPhoto?, savedBytes: Int64) {
-        let tempURL = try await client.downloadMasterToTempFile(
+        await client.warmConnectionIfNeeded()
+        let tempURL = try await OriginalDownloadCache.shared.getOrFetchShareCopy(
             hash: photo.hash,
-            preferredFilename: photo.originalName
+            preferredFilename: photo.originalName,
+            expectedSizeBytes: photo.size > 0 ? photo.size : nil,
+            isVideo: photo.isVideo,
+            client: client
         )
         defer {
             let parent = tempURL.deletingLastPathComponent()
@@ -821,12 +825,349 @@ private enum BatchOriginalFetchItemOutcome: Sendable {
     case authExpired
 }
 
+private struct SendableClientBox: @unchecked Sendable {
+    let client: PhotoHubAPIClient
+}
+
+/// Persistent LRU disk cache + ref-counted single-flight coalescer for downloaded originals.
+final class OriginalDownloadCache: @unchecked Sendable {
+    static let shared = OriginalDownloadCache()
+
+    private static let maxCacheBytes: Int64 = 400 * 1024 * 1024
+    private static let cacheFolderName = "photohub_originals_cache"
+
+    private final class InFlightEntry: @unchecked Sendable {
+        let id: UUID
+        let task: Task<URL, Error>
+        var waiterIDs = Set<UUID>()
+
+        init(id: UUID, task: Task<URL, Error>, waiterID: UUID) {
+            self.id = id
+            self.task = task
+            self.waiterIDs.insert(waiterID)
+        }
+    }
+
+    private let lock = NSLock()
+    private var inFlight: [String: InFlightEntry] = [:]
+
+    private init() {}
+
+    private var cacheRootDirectory: URL {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return base.appendingPathComponent(Self.cacheFolderName, isDirectory: true)
+    }
+
+    private static func normalizeHash(_ raw: String) -> String {
+        raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .filter { $0.isASCII && ($0.isLetter || $0.isNumber) }
+    }
+
+    private func itemDirectory(forNormalizedHash normHash: String) -> URL {
+        cacheRootDirectory.appendingPathComponent(String(normHash.prefix(24)), isDirectory: true)
+    }
+
+    func getCachedOriginal(hash: String, expectedSizeBytes: Int64? = nil) -> URL? {
+        let normHash = Self.normalizeHash(hash)
+        guard !normHash.isEmpty else { return nil }
+        let dir = itemDirectory(forNormalizedHash: normHash)
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return nil
+        }
+
+        for candidate in entries {
+            let name = candidate.lastPathComponent
+            if name.hasPrefix(".") || name.hasSuffix(".part") {
+                continue
+            }
+            guard let values = try? candidate.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  values.isRegularFile == true,
+                  let byteCount = values.fileSize,
+                  byteCount > 0 else {
+                continue
+            }
+            let actualSize = Int64(byteCount)
+            if let expected = expectedSizeBytes, expected > 0, actualSize != expected {
+                try? fm.removeItem(at: candidate)
+                continue
+            }
+            try? fm.setAttributes([.modificationDate: Date()], ofItemAtPath: candidate.path)
+            return candidate
+        }
+        return nil
+    }
+
+    func removeCachedOriginals(hashes: [String]) {
+        let normHashes = Set(hashes.map(Self.normalizeHash).filter { !$0.isEmpty })
+        guard !normHashes.isEmpty else { return }
+
+        var tasksToCancel: [Task<URL, Error>] = []
+        lock.lock()
+        for h in normHashes {
+            if let entry = inFlight.removeValue(forKey: h) {
+                tasksToCancel.append(entry.task)
+            }
+        }
+        lock.unlock()
+
+        for t in tasksToCancel {
+            t.cancel()
+        }
+
+        let fm = FileManager.default
+        for h in normHashes {
+            try? fm.removeItem(at: itemDirectory(forNormalizedHash: h))
+        }
+    }
+
+    func getOrFetchOriginal(
+        hash: String,
+        preferredFilename: String? = nil,
+        expectedSizeBytes: Int64? = nil,
+        isVideo: Bool = false,
+        client: PhotoHubAPIClient
+    ) async throws -> URL {
+        let normHash = Self.normalizeHash(hash)
+        guard !normHash.isEmpty else {
+            throw APIClientError.invalidResponse
+        }
+
+        if let cached = getCachedOriginal(hash: normHash, expectedSizeBytes: expectedSizeBytes) {
+            return cached
+        }
+
+        let waiterID = UUID()
+        let clientBox = SendableClientBox(client: client)
+        let entry = acquireEntry(
+            normHash: normHash,
+            waiterID: waiterID,
+            preferredFilename: preferredFilename,
+            expectedSizeBytes: expectedSizeBytes,
+            isVideo: isVideo,
+            clientBox: clientBox
+        )
+
+        return try await withTaskCancellationHandler {
+            defer { releaseWaiter(normHash: normHash, entry: entry, waiterID: waiterID, cancelIfUnused: false) }
+            try Task.checkCancellation()
+            return try await entry.task.value
+        } onCancel: {
+            releaseWaiter(normHash: normHash, entry: entry, waiterID: waiterID, cancelIfUnused: true)
+        }
+    }
+
+    func getOrFetchShareCopy(
+        hash: String,
+        preferredFilename: String? = nil,
+        expectedSizeBytes: Int64? = nil,
+        isVideo: Bool = false,
+        client: PhotoHubAPIClient
+    ) async throws -> URL {
+        let cachedURL = try await getOrFetchOriginal(
+            hash: hash,
+            preferredFilename: preferredFilename,
+            expectedSizeBytes: expectedSizeBytes,
+            isVideo: isVideo,
+            client: client
+        )
+
+        let fm = FileManager.default
+        let shareDir = fm.temporaryDirectory.appendingPathComponent(
+            "photohub_share_\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fm.createDirectory(at: shareDir, withIntermediateDirectories: true)
+        let targetURL = shareDir.appendingPathComponent(cachedURL.lastPathComponent)
+        if fm.fileExists(atPath: targetURL.path) {
+            try? fm.removeItem(at: targetURL)
+        }
+        // APFS copyItem clones extents cleanly while giving callers a disposable temp path.
+        try fm.copyItem(at: cachedURL, to: targetURL)
+        return targetURL
+    }
+
+    private func acquireEntry(
+        normHash: String,
+        waiterID: UUID,
+        preferredFilename: String?,
+        expectedSizeBytes: Int64?,
+        isVideo: Bool,
+        clientBox: SendableClientBox
+    ) -> InFlightEntry {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if let existing = inFlight[normHash], !existing.task.isCancelled {
+            existing.waiterIDs.insert(waiterID)
+            return existing
+        }
+
+        let entryID = UUID()
+        let task = Task<URL, Error> { [self] in
+            defer {
+                self.lock.lock()
+                if self.inFlight[normHash]?.id == entryID {
+                    self.inFlight.removeValue(forKey: normHash)
+                }
+                self.lock.unlock()
+            }
+            return try await self.downloadIntoCache(
+                normHash: normHash,
+                preferredFilename: preferredFilename,
+                expectedSizeBytes: expectedSizeBytes,
+                isVideo: isVideo,
+                client: clientBox.client
+            )
+        }
+        let createdEntry = InFlightEntry(id: entryID, task: task, waiterID: waiterID)
+        inFlight[normHash] = createdEntry
+        return createdEntry
+    }
+
+    private func releaseWaiter(
+        normHash: String,
+        entry: InFlightEntry,
+        waiterID: UUID,
+        cancelIfUnused: Bool
+    ) {
+        var taskToCancel: Task<URL, Error>?
+        lock.lock()
+        let removed = entry.waiterIDs.remove(waiterID) != nil
+        if removed && cancelIfUnused && entry.waiterIDs.isEmpty {
+            if inFlight[normHash]?.id == entry.id {
+                inFlight.removeValue(forKey: normHash)
+            }
+            taskToCancel = entry.task
+        }
+        lock.unlock()
+        taskToCancel?.cancel()
+    }
+
+    private func downloadIntoCache(
+        normHash: String,
+        preferredFilename: String?,
+        expectedSizeBytes: Int64?,
+        isVideo: Bool,
+        client: PhotoHubAPIClient
+    ) async throws -> URL {
+        if let cached = getCachedOriginal(hash: normHash, expectedSizeBytes: expectedSizeBytes) {
+            return cached
+        }
+
+        let fm = FileManager.default
+        let destDir = itemDirectory(forNormalizedHash: normHash)
+        try fm.createDirectory(at: destDir, withIntermediateDirectories: true)
+
+        let stageDir = destDir.appendingPathComponent(".stage_\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: stageDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: stageDir) }
+
+        let stagedURL = try await client.downloadMasterToDirectory(
+            hash: normHash,
+            destinationDir: stageDir,
+            preferredFilename: preferredFilename,
+            expectedSizeBytes: expectedSizeBytes,
+            isVideo: isVideo
+        )
+        try Task.checkCancellation()
+
+        let finalURL = destDir.appendingPathComponent(stagedURL.lastPathComponent)
+        if let existingItems = try? fm.contentsOfDirectory(at: destDir, includingPropertiesForKeys: nil) {
+            for existing in existingItems where existing.lastPathComponent != stageDir.lastPathComponent {
+                try? fm.removeItem(at: existing)
+            }
+        }
+        try fm.moveItem(at: stagedURL, to: finalURL)
+        try? fm.setAttributes([.modificationDate: Date()], ofItemAtPath: finalURL.path)
+        pruneAndEnforceBudget(keepingDirName: destDir.lastPathComponent)
+        return finalURL
+    }
+
+    private func pruneAndEnforceBudget(keepingDirName: String) {
+        let fm = FileManager.default
+        let root = cacheRootDirectory
+        guard let itemDirs = try? fm.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return
+        }
+
+        struct CacheEntryMeta {
+            let dir: URL
+            let dirName: String
+            let totalBytes: Int64
+            let lastModified: Date
+        }
+
+        var metas: [CacheEntryMeta] = []
+        var totalBytes: Int64 = 0
+
+        for dir in itemDirs {
+            let dirName = dir.lastPathComponent
+            guard let files = try? fm.contentsOfDirectory(
+                at: dir,
+                includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey],
+                options: []
+            ) else {
+                continue
+            }
+            var entryBytes: Int64 = 0
+            var newestDate = Date.distantPast
+            for file in files {
+                let name = file.lastPathComponent
+                if name.hasPrefix(".") || name.hasSuffix(".part") {
+                    if name.hasPrefix(".stage_") || name.hasSuffix(".part") {
+                        let mod = (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
+                        if Date().timeIntervalSince(mod) > 1800 {
+                            try? fm.removeItem(at: file)
+                        }
+                    }
+                    continue
+                }
+                if let vals = try? file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]),
+                   vals.isRegularFile == true {
+                    entryBytes += Int64(vals.fileSize ?? 0)
+                    if let m = vals.contentModificationDate, m > newestDate {
+                        newestDate = m
+                    }
+                }
+            }
+            if entryBytes == 0 {
+                if dirName != keepingDirName {
+                    try? fm.removeItem(at: dir)
+                }
+                continue
+            }
+            totalBytes += entryBytes
+            metas.append(CacheEntryMeta(dir: dir, dirName: dirName, totalBytes: entryBytes, lastModified: newestDate))
+        }
+
+        guard totalBytes > Self.maxCacheBytes else { return }
+        let sortedOldestFirst = metas.sorted { $0.lastModified < $1.lastModified }
+        for entry in sortedOldestFirst {
+            if totalBytes <= Self.maxCacheBytes { break }
+            if entry.dirName == keepingDirName { continue }
+            try? fm.removeItem(at: entry.dir)
+            totalBytes -= entry.totalBytes
+        }
+    }
+}
+
 enum OriginalMediaResolver {
     static func resolveMaster(
         input: OriginalShareInput,
         cachedPhotos: [ServerPhoto],
         client: PhotoHubAPIClient
-    ) async throws -> (masterHash: String, originalName: String?)? {
+    ) async throws -> (masterHash: String, originalName: String?, expectedSizeBytes: Int64?)? {
         // 1. Explicit masterHash / prefix query parameter
         if let hint = input.masterHashHint?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -834,21 +1175,21 @@ enum OriginalMediaResolver {
             .filter({ $0.isHexDigit }),
            hint.count >= 8 {
             if hint.count == 64 {
-                let name = cachedPhotos.first(where: { $0.hash.lowercased() == hint })?.originalName
-                return (hint, name ?? input.filenameHint)
+                let match = cachedPhotos.first(where: { $0.hash.lowercased() == hint })
+                return (hint, match?.originalName ?? input.filenameHint, match?.size)
             }
             if let match = try await matchPrefix(hint, cachedPhotos: cachedPhotos, client: client) {
-                return (match.hash, match.originalName)
+                return (match.hash, match.originalName, match.size)
             }
         }
 
         // 2. Local tracker lookup + Photos PHAssetResource metadata (zero iCloud download)
         if let assetId = input.assetId, !assetId.isEmpty {
             if let tracked = LocalProxyTracker.shared.masterLookup(forAssetId: assetId) {
-                let fallbackName = cachedPhotos.first(where: {
+                let match = cachedPhotos.first(where: {
                     $0.hash.caseInsensitiveCompare(tracked.masterHash) == .orderedSame
-                })?.originalName
-                return (tracked.masterHash, tracked.originalName ?? fallbackName)
+                })
+                return (tracked.masterHash, tracked.originalName ?? match?.originalName, match?.size)
             }
 
             let rwAuth = PHPhotoLibrary.authorizationStatus(for: .readWrite)
@@ -856,7 +1197,7 @@ enum OriginalMediaResolver {
                let asset = PHAsset.fetchAssets(withLocalIdentifiers: [assetId], options: nil).firstObject,
                let proxyMatch = PhotoLibraryService.proxyHashPrefixFromAssetResources(asset) {
                 if let match = try await matchPrefix(proxyMatch.prefix, cachedPhotos: cachedPhotos, client: client) {
-                    return (match.hash, match.originalName)
+                    return (match.hash, match.originalName, match.size)
                 }
             }
         }
@@ -866,7 +1207,7 @@ enum OriginalMediaResolver {
         for rawName in nameCandidates {
             if let prefix = ProxyGenerator.extractMasterHashPrefix(fromProxyFilename: rawName),
                let match = try await matchPrefix(prefix, cachedPhotos: cachedPhotos, client: client) {
-                return (match.hash, match.originalName)
+                return (match.hash, match.originalName, match.size)
             }
         }
 
@@ -879,9 +1220,9 @@ enum OriginalMediaResolver {
                 let norm = embedded.lowercased()
                 if norm.count == 64 {
                     let match = cachedPhotos.first(where: { $0.hash.lowercased() == norm })
-                    return (match?.hash ?? norm, match?.originalName ?? input.filenameHint)
+                    return (match?.hash ?? norm, match?.originalName ?? input.filenameHint, match?.size)
                 } else if let match = try await matchPrefix(norm, cachedPhotos: cachedPhotos, client: client) {
-                    return (match.hash, match.originalName)
+                    return (match.hash, match.originalName, match.size)
                 }
             }
 
@@ -889,19 +1230,31 @@ enum OriginalMediaResolver {
             let sha = try ProxyGenerator.computeFileSHA256(url: fileURL).lowercased()
             if let knownMaster = LocalProxyTracker.shared.masterHash(forProxySha256: sha) {
                 let match = cachedPhotos.first(where: { $0.hash.lowercased() == knownMaster.lowercased() })
-                return (knownMaster, match?.originalName ?? input.filenameHint)
+                return (knownMaster, match?.originalName ?? input.filenameHint, match?.size)
             }
             if let cachedByHash = cachedPhotos.first(where: {
                 $0.hash.lowercased() == sha || ($0.proxyHash?.lowercased() == sha)
             }) {
-                return (cachedByHash.hash, cachedByHash.originalName)
+                return (cachedByHash.hash, cachedByHash.originalName, cachedByHash.size)
             }
 
             let check = try await client.checkHash(sha)
             if check.exists {
                 let resolved = check.masterHash ?? sha
-                let match = cachedPhotos.first(where: { $0.hash.lowercased() == resolved.lowercased() })
-                return (resolved, match?.originalName ?? input.filenameHint)
+                let cachedMatch = cachedPhotos.first(where: { $0.hash.lowercased() == resolved.lowercased() })
+                var resolvedName = check.originalName ?? cachedMatch?.originalName
+                var resolvedSize = check.size ?? cachedMatch?.size
+                if resolvedName == nil || resolvedName?.isEmpty == true || resolvedSize == nil {
+                    if let prefixMatch = try? await matchPrefix(String(resolved.prefix(16)), cachedPhotos: cachedPhotos, client: client) {
+                        if resolvedName == nil || resolvedName?.isEmpty == true {
+                            resolvedName = prefixMatch.originalName
+                        }
+                        if resolvedSize == nil {
+                            resolvedSize = prefixMatch.size
+                        }
+                    }
+                }
+                return (resolved, resolvedName ?? input.filenameHint, resolvedSize)
             }
         }
 
@@ -919,6 +1272,12 @@ enum OriginalMediaResolver {
         authExpired: Bool
     ) {
         let client = PhotoHubAPIClient(settings: settings)
+        let warmClientBox = SendableClientBox(client: client)
+        let warmTask = Task(priority: .userInitiated) {
+            await warmClientBox.client.warmConnectionIfNeeded()
+        }
+        defer { warmTask.cancel() }
+
         let cachedPhotos = LocalProxyStore.shared.cachedPhotos(
             baseURL: settings.normalizedBaseURL,
             apiKey: settings.apiKey
@@ -1023,9 +1382,12 @@ enum OriginalMediaResolver {
                 )
             }
 
-            let tempMasterURL = try await client.downloadMasterToTempFile(
+            let tempMasterURL = try await OriginalDownloadCache.shared.getOrFetchShareCopy(
                 hash: resolved.masterHash,
-                preferredFilename: resolved.originalName
+                preferredFilename: resolved.originalName,
+                expectedSizeBytes: resolved.expectedSizeBytes,
+                isVideo: input.isVideo,
+                client: client
             )
             let attrs = try? FileManager.default.attributesOfItem(atPath: tempMasterURL.path)
             let bytes = (attrs?[.size] as? NSNumber)?.int64Value ?? 0

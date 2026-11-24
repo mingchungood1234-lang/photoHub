@@ -83,7 +83,8 @@ fun CompressScreen(
                 viewModel.shareOriginalFromDetectedProxy(
                     itemId = item.id,
                     rawMasterHash = item.masterHash,
-                    originalFilename = item.originalName
+                    originalFilename = item.originalName,
+                    isVideo = item.isVideo
                 )
             },
             onDismiss = { viewModel.dismissGalleryInspection() }

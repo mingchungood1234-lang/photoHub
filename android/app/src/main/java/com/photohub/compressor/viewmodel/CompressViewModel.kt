@@ -929,7 +929,8 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
     fun shareOriginalFromDetectedProxy(
         itemId: String,
         rawMasterHash: String?,
-        originalFilename: String?
+        originalFilename: String?,
+        isVideo: Boolean = false
     ) {
         if (rawMasterHash.isNullOrBlank()) {
             _uiState.update { it.copy(statusBanner = "Master hash unavailable for this offline proxy.") }
@@ -942,13 +943,16 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
                 val resolved = resolveFullServerPhotoForHashOrPrefix(client, rawMasterHash)
                 val fullHash = resolved?.hash ?: rawMasterHash.takeIf { ProxyGenerator.isFullSha256Hex(it) }
                     ?: throw IllegalStateException("Could not resolve server master photo.")
-                val preferredName = resolved?.originalName ?: originalFilename ?: "ORIGINAL_$fullHash.jpg"
+                val preferredName = resolved?.originalName
+                    ?: originalFilename
+                    ?: if (isVideo) "ORIGINAL_$fullHash.mp4" else "ORIGINAL_$fullHash.jpg"
                 val (file, _) = OriginalDownloadCache.getOrFetchOriginal(
                     context = context,
                     apiClient = client,
                     masterHash = fullHash,
                     preferredFilename = preferredName,
-                    expectedSizeBytes = resolved?.size
+                    expectedSizeBytes = resolved?.size,
+                    isVideo = resolved?.isVideo ?: isVideo
                 )
                 _uiState.update { it.copy(inspectionBusyId = null, shareFileReady = file) }
             } catch (err: Exception) {

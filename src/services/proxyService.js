@@ -187,6 +187,8 @@ async function generateServerSideProxy({
         '-vf', videoScaleFilter,
         '-c:a', 'aac',
         '-b:a', '96k',
+        '-metadata', `description=PhotoHubProxy:${normMaster}`,
+        '-metadata', `comment=PhotoHubProxy:${normMaster}`,
         '-movflags', '+faststart',
         videoTmp,
       ], 180000);

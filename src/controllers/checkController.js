@@ -31,6 +31,8 @@ function formatCheckPayload(lookupResult, reqHash, folderName) {
     ...(folderName !== undefined ? { userFolder: folderName } : {}),
     ...(reqHash !== undefined ? { hash: reqHash } : {}),
     savedPath: record ? record.relativePath : null,
+    originalName: record ? (record.originalName || null) : null,
+    size: record && Number.isFinite(record.size) ? record.size : null,
   };
 }
 

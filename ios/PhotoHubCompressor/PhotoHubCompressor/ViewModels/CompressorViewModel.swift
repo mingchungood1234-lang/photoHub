@@ -898,7 +898,8 @@ final class CompressorViewModel: ObservableObject {
     func shareOriginalFromDetectedProxy(
         itemId: String,
         rawMasterHash: String?,
-        originalFilename: String?
+        originalFilename: String?,
+        isVideo: Bool = false
     ) {
         guard let rawMasterHash, !rawMasterHash.isEmpty else {
             inspectorActionMessage = "Master hash unavailable while offline."
@@ -913,15 +914,19 @@ final class CompressorViewModel: ObservableObject {
             guard let self else { return }
             do {
                 let client = PhotoHubAPIClient(settings: settings)
+                await client.warmConnectionIfNeeded()
                 let serverPhoto = try await self.resolveServerPhotoForHashOrPrefix(
                     rawMasterHash,
                     fallbackFilename: originalFilename,
-                    isVideo: false,
+                    isVideo: isVideo,
                     client: client
                 )
-                let tempURL = try await client.downloadMasterToTempFile(
+                let tempURL = try await OriginalDownloadCache.shared.getOrFetchShareCopy(
                     hash: serverPhoto.hash,
-                    preferredFilename: serverPhoto.originalName
+                    preferredFilename: serverPhoto.originalName,
+                    expectedSizeBytes: serverPhoto.size > 0 ? serverPhoto.size : nil,
+                    isVideo: isVideo || serverPhoto.isVideo,
+                    client: client
                 )
                 self.inspectionBusyId = nil
                 self.inspectorActionMessage = nil
