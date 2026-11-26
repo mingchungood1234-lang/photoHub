@@ -1338,165 +1338,168 @@ struct ShareOriginalOverlaySheet: View {
     let settings: AppSettings
     @ObservedObject var coordinator: IncomingShareCoordinator
 
+    private var mascotMood: MascotMood {
+        switch session.state {
+        case .fetching: return .uploading
+        case .ready: return .celebrate
+        case .failed, .needsSignIn: return .alert
+        }
+    }
+
     var body: some View {
         AdaptiveNavigationStack {
-            VStack(spacing: 16) {
-                headerBanner
+            ZStack {
+                PhotoHubPalette.canvas.ignoresSafeArea()
 
-                switch session.state {
-                case .needsSignIn:
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("Sign in to your photoHub account before sharing full-resolution originals from Apple Photos.")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                        Button("Close") {
-                            coordinator.dismiss()
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .frame(maxWidth: .infinity)
-                    }
+                VStack(spacing: 18) {
+                    SunnyMascotView(mood: mascotMood, size: 96)
+                        .padding(.top, 8)
 
-                case .fetching(let completed, let total, let statusText):
-                    VStack(spacing: 12) {
-                        ProgressView()
-                            .scaleEffect(1.1)
-                        if total > 1 {
-                            Text("Item \(min(completed + 1, total)) of \(total)")
-                                .font(.caption.weight(.semibold))
-                                .foregroundColor(.accentColor)
-                        }
-                        Text(statusText)
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
-                        Button("Cancel", role: .cancel) {
-                            coordinator.dismiss()
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 16)
-
-                case .ready(let resolved, let unresolved, let savedMessage, let isSavingToPhotos):
-                    let totalBytes = resolved.reduce(into: Int64(0)) { $0 += $1.sizeBytes }
-                    let sizeText = ByteCountFormatter.string(fromByteCount: max(0, totalBytes), countStyle: .file)
-                    let summaryTitle = resolved.count == 1
-                        ? resolved[0].originalName
-                        : "\(resolved.count) full-resolution originals"
-
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack(spacing: 10) {
-                            Image(systemName: "checkmark.seal.fill")
-                                .font(.title3)
-                                .foregroundColor(.green)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(summaryTitle)
-                                    .font(.subheadline.weight(.semibold))
-                                    .lineLimit(1)
-                                Text("\(sizeText) original · Fetched from server")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                        }
-                        .padding(12)
-                        .background(Color.green.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
-
-                        if !unresolved.isEmpty {
-                            HStack(spacing: 8) {
-                                Image(systemName: "exclamationmark.triangle.fill")
-                                    .foregroundColor(.orange)
-                                Text("\(unresolved.count) selected item(s) had no backed-up original on the server.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-
-                        if let savedMessage {
-                            Text(savedMessage)
-                                .font(.caption)
-                                .foregroundColor(.green)
-                        }
-
-                        Button {
-                            coordinator.presentResolvedShareSheet()
-                        } label: {
-                            Label(
-                                resolved.count == 1 ? "Share Original" : "Share \(resolved.count) Originals",
-                                systemImage: "square.and.arrow.up"
-                            )
-                            .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(isSavingToPhotos)
-
-                        HStack(spacing: 10) {
-                            Button {
-                                coordinator.saveResolvedToPhotosAndProtect(settings: settings)
-                            } label: {
-                                HStack(spacing: 6) {
-                                    if isSavingToPhotos {
-                                        ProgressView()
-                                    } else {
-                                        Image(systemName: "arrow.down.circle")
-                                    }
-                                    Text("Save to Photos")
-                                }
-                                .frame(maxWidth: .infinity)
-                            }
-                            .buttonStyle(.bordered)
-                            .disabled(isSavingToPhotos)
-
-                            Button("Done") {
-                                coordinator.dismiss()
-                            }
-                            .buttonStyle(.bordered)
-                        }
-                    }
-
-                case .failed(let message, let unresolved):
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack(alignment: .top, spacing: 8) {
-                            Image(systemName: "exclamationmark.circle.fill")
-                                .foregroundColor(.red)
-                            Text(message)
-                                .font(.caption)
-                                .foregroundColor(.primary)
-                        }
-                        .padding(12)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
-
-                        if unresolved.contains(where: { $0.fileURL != nil }) {
-                            Button {
-                                coordinator.presentFallbackCopyShareSheet()
-                            } label: {
-                                Label("Share Selected Copy Instead", systemImage: "square.and.arrow.up")
-                                    .frame(maxWidth: .infinity)
-                            }
-                            .buttonStyle(.bordered)
-                        }
-
-                        HStack(spacing: 10) {
-                            if !session.inputs.isEmpty {
-                                Button("Retry") {
-                                    coordinator.retry(settings: settings)
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .frame(maxWidth: .infinity)
-                            }
+                    switch session.state {
+                    case .needsSignIn:
+                        VStack(spacing: 12) {
+                            Text("Sign In Required")
+                                .font(.headline.weight(.bold))
+                                .foregroundColor(PhotoHubPalette.ink)
                             Button("Close") {
                                 coordinator.dismiss()
                             }
-                            .buttonStyle(.bordered)
+                            .buttonStyle(PhotoHubPrimaryButtonStyle())
                             .frame(maxWidth: .infinity)
                         }
-                    }
-                }
 
-                Spacer()
+                    case .fetching(let completed, let total, let statusText):
+                        VStack(spacing: 10) {
+                            if total > 1 {
+                                WarmStatPill(icon: "arrow.down.circle", text: "\(min(completed + 1, total)) / \(total)", tint: PhotoHubPalette.orange)
+                            }
+                            Text(statusText)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundColor(PhotoHubPalette.ink)
+                                .multilineTextAlignment(.center)
+                            ProgressView()
+                                .tint(PhotoHubPalette.orange)
+                            Button("Cancel") {
+                                coordinator.dismiss()
+                            }
+                            .buttonStyle(PhotoHubSoftButtonStyle())
+                            .padding(.top, 4)
+                        }
+                        .frame(maxWidth: .infinity)
+
+                    case .ready(let resolved, let unresolved, let savedMessage, let isSavingToPhotos):
+                        let totalBytes = resolved.reduce(into: Int64(0)) { $0 += $1.sizeBytes }
+                        let sizeText = ByteCountFormatter.string(fromByteCount: max(0, totalBytes), countStyle: .file)
+                        let summaryTitle = resolved.count == 1
+                            ? resolved[0].originalName
+                            : "\(resolved.count) Originals"
+
+                        VStack(spacing: 12) {
+                            HStack(spacing: 10) {
+                                Image(systemName: "checkmark.seal.fill")
+                                    .font(.title3)
+                                    .foregroundColor(PhotoHubPalette.mint)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(summaryTitle)
+                                        .font(.subheadline.weight(.bold))
+                                        .foregroundColor(PhotoHubPalette.ink)
+                                        .lineLimit(1)
+                                    Text(sizeText)
+                                        .font(.caption.monospacedDigit())
+                                        .foregroundColor(PhotoHubPalette.muted)
+                                }
+                                Spacer()
+                            }
+                            .padding(14)
+                            .background(PhotoHubPalette.mint.opacity(0.12), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+
+                            if !unresolved.isEmpty {
+                                WarmStatPill(icon: "exclamationmark.triangle.fill", text: "\(unresolved.count) unmatched", tint: PhotoHubPalette.warmAmber)
+                            }
+
+                            if let savedMessage {
+                                Text(savedMessage)
+                                    .font(.caption.weight(.medium))
+                                    .foregroundColor(PhotoHubPalette.mint)
+                            }
+
+                            Button {
+                                coordinator.presentResolvedShareSheet()
+                            } label: {
+                                Label(
+                                    resolved.count == 1 ? "Share Original" : "Share \(resolved.count)",
+                                    systemImage: "square.and.arrow.up"
+                                )
+                                .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PhotoHubPrimaryButtonStyle())
+                            .disabled(isSavingToPhotos)
+
+                            HStack(spacing: 10) {
+                                Button {
+                                    coordinator.saveResolvedToPhotosAndProtect(settings: settings)
+                                } label: {
+                                    HStack(spacing: 6) {
+                                        if isSavingToPhotos {
+                                            ProgressView().tint(PhotoHubPalette.deepOrange)
+                                        } else {
+                                            Image(systemName: "arrow.down.circle")
+                                        }
+                                        Text("Save")
+                                    }
+                                    .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PhotoHubSoftButtonStyle())
+                                .disabled(isSavingToPhotos)
+
+                                Button("Done") {
+                                    coordinator.dismiss()
+                                }
+                                .buttonStyle(PhotoHubSoftButtonStyle())
+                            }
+                        }
+
+                    case .failed(let message, let unresolved):
+                        VStack(spacing: 12) {
+                            Text(message)
+                                .font(.caption.weight(.medium))
+                                .foregroundColor(PhotoHubPalette.ink)
+                                .multilineTextAlignment(.center)
+                                .padding(12)
+                                .frame(maxWidth: .infinity)
+                                .background(PhotoHubPalette.rose.opacity(0.10), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+                            if unresolved.contains(where: { $0.fileURL != nil }) {
+                                Button {
+                                    coordinator.presentFallbackCopyShareSheet()
+                                } label: {
+                                    Label("Share Copy", systemImage: "square.and.arrow.up")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PhotoHubSoftButtonStyle())
+                            }
+
+                            HStack(spacing: 10) {
+                                if !session.inputs.isEmpty {
+                                    Button("Retry") {
+                                        coordinator.retry(settings: settings)
+                                    }
+                                    .buttonStyle(PhotoHubPrimaryButtonStyle())
+                                    .frame(maxWidth: .infinity)
+                                }
+                                Button("Close") {
+                                    coordinator.dismiss()
+                                }
+                                .buttonStyle(PhotoHubSoftButtonStyle())
+                                .frame(maxWidth: .infinity)
+                            }
+                        }
+                    }
+
+                    Spacer()
+                }
+                .padding()
             }
-            .padding()
             .navigationTitle("Share Original")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -1517,26 +1520,6 @@ struct ShareOriginalOverlaySheet: View {
             ShareSheet(activityItems: item.fileURLs) {
                 coordinator.shareSheetItem = nil
             }
-        }
-    }
-
-    private var headerBanner: some View {
-        HStack(spacing: 12) {
-            ZStack {
-                Circle()
-                    .fill(Color.accentColor.opacity(0.14))
-                    .frame(width: 40, height: 40)
-                Image(systemName: "icloud.and.arrow.down")
-                    .foregroundColor(.accentColor)
-            }
-            VStack(alignment: .leading, spacing: 2) {
-                Text("photoHub · Full-Resolution Original")
-                    .font(.subheadline.weight(.semibold))
-                Text("Auto-fetch & share from server")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
         }
     }
 }

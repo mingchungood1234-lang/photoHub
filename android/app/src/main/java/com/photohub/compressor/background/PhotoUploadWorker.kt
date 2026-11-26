@@ -60,10 +60,11 @@ class PhotoUploadWorker(
 
         val stagedIds = bgManager.state.value.stagedItems.map { it.id }.toSet()
         val activeIds = AssetUploadCoordinator.activeAssetIds()
-        val prioritized = PhotoBackupPipeline
+        val allEligible = PhotoBackupPipeline
             .sortCandidates(rawCandidates, CandidateSortMode.LARGEST_VIDEOS_FIRST)
             .filter { it.id !in stagedIds && it.id !in activeIds }
-            .take(maxItems)
+        val hasMoreBatches = allEligible.size > maxItems
+        val prioritized = allEligible.take(maxItems)
 
         val videoSem = Semaphore(1)
         val gallerySem = Semaphore(1)
@@ -145,11 +146,9 @@ class PhotoUploadWorker(
             val totalSilent = silentDeletedCount + prevSilentCleaned
 
             if (quotaHit) {
-                bgManager.updateSummary("Background backup stopped: server storage limit reached.")
+                bgManager.updateSummary("Storage full")
             } else if (stagedCount > 0) {
-                bgManager.updateSummary(
-                    "Silently verified ${newStaged.size} new item(s); $stagedCount original(s) ready to delete (free ~$sizeStr)."
-                )
+                bgManager.updateSummary("$stagedCount ready to delete (~$sizeStr)")
                 if ((newStaged.isNotEmpty() || isOvernight) && cur.notifyWhenBackgroundUploadFinishes) {
                     bgManager.sendDeleteOriginalsNotification(
                         count = stagedCount,
@@ -160,10 +159,14 @@ class PhotoUploadWorker(
                 }
             } else if (totalSilent > 0) {
                 val freedStr = android.text.format.Formatter.formatFileSize(context, silentDeletedBytes)
-                val spaceNote = if (silentDeletedBytes > 0L) " (freed ~$freedStr)" else ""
-                bgManager.updateSummary("Silently uploaded, verified & deleted $totalSilent original(s)$spaceNote.")
+                val spaceNote = if (silentDeletedBytes > 0L) " · ~$freedStr" else ""
+                bgManager.updateSummary("Backed up $totalSilent$spaceNote")
             } else {
-                bgManager.updateSummary("Background check complete: all photos are already backed up.")
+                bgManager.updateSummary("All synced")
+            }
+
+            if (hasMoreBatches && !isStopped && !quotaHit) {
+                bgManager.scheduleBatchContinuationIfEnabled(isOvernight = isOvernight)
             }
 
             return Result.success()

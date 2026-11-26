@@ -1,16 +1,22 @@
 package com.photohub.compressor.ui
 
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Cloud
 import androidx.compose.material.icons.rounded.PhotoLibrary
-import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.photohub.compressor.auth.GoogleAuthManager
@@ -58,25 +64,40 @@ fun PhotoHubApp() {
         }
     }
 
+    val navColors = NavigationBarItemDefaults.colors(
+        selectedIconColor = MaterialTheme.colorScheme.primary,
+        selectedTextColor = MaterialTheme.colorScheme.primary,
+        indicatorColor = MaterialTheme.colorScheme.primaryContainer,
+        unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+
     Scaffold(
+        containerColor = MaterialTheme.colorScheme.background,
         bottomBar = {
-            NavigationBar {
+            NavigationBar(
+                containerColor = MaterialTheme.colorScheme.surface,
+                tonalElevation = 2.dp
+            ) {
                 NavigationBarItem(
                     selected = selectedTab == 0,
                     onClick = { selectedTab = 0 },
-                    icon = { Icon(Icons.Rounded.PhotoLibrary, contentDescription = "Compress") },
-                    label = { Text("Compress") }
+                    colors = navColors,
+                    icon = { Icon(Icons.Rounded.PhotoLibrary, contentDescription = "Backup") },
+                    label = { Text("Backup") }
                 )
                 NavigationBarItem(
                     selected = selectedTab == 1,
                     onClick = { selectedTab = 1 },
-                    icon = { Icon(Icons.Rounded.Cloud, contentDescription = "Server") },
-                    label = { Text("Server") }
+                    colors = navColors,
+                    icon = { Icon(Icons.Rounded.Cloud, contentDescription = "Cloud") },
+                    label = { Text("Cloud") }
                 )
                 NavigationBarItem(
                     selected = selectedTab == 2,
                     onClick = { selectedTab = 2 },
-                    icon = { Icon(Icons.Rounded.Settings, contentDescription = "Settings") },
+                    colors = navColors,
+                    icon = { Icon(Icons.Rounded.Tune, contentDescription = "Settings") },
                     label = { Text("Settings") }
                 )
             }
@@ -87,10 +108,18 @@ fun PhotoHubApp() {
                 .fillMaxSize()
                 .padding(bottom = innerPadding.calculateBottomPadding())
         ) {
-            when (selectedTab) {
-                0 -> CompressScreen(viewModel = compressVm, settings = settings, bgManager = bgManager)
-                1 -> ServerGalleryScreen(viewModel = serverVm, syncManager = syncManager)
-                2 -> SettingsScreen(viewModel = settingsVm)
+            AnimatedContent(
+                targetState = selectedTab,
+                transitionSpec = {
+                    fadeIn(tween(200)) togetherWith fadeOut(tween(150))
+                },
+                label = "tabTransition"
+            ) { tab ->
+                when (tab) {
+                    0 -> CompressScreen(viewModel = compressVm, settings = settings, bgManager = bgManager)
+                    1 -> ServerGalleryScreen(viewModel = serverVm, syncManager = syncManager)
+                    2 -> SettingsScreen(viewModel = settingsVm)
+                }
             }
         }
     }

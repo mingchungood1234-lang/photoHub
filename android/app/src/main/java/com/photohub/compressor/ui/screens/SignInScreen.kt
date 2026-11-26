@@ -1,17 +1,21 @@
 package com.photohub.compressor.ui.screens
 
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AccountCircle
-import androidx.compose.material.icons.rounded.PhotoLibrary
+import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.CloudUpload
+import androidx.compose.material.icons.rounded.Verified
 import androidx.compose.material3.*
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -19,6 +23,13 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.photohub.compressor.auth.GoogleAuthManager
 import com.photohub.compressor.data.AppSettingsState
+import com.photohub.compressor.ui.components.GradientPrimaryButton
+import com.photohub.compressor.ui.components.MascotMood
+import com.photohub.compressor.ui.components.SunnyMascot
+import com.photohub.compressor.ui.components.WarmStatChip
+import com.photohub.compressor.ui.theme.PhotoHubAmber
+import com.photohub.compressor.ui.theme.PhotoHubMint
+import com.photohub.compressor.ui.theme.PhotoHubOrange
 
 @Composable
 fun SignInScreen(
@@ -29,51 +40,57 @@ fun SignInScreen(
     val isAuthenticating by authManager.isAuthenticating.collectAsStateWithLifecycle()
     val errorMessage by authManager.errorMessage.collectAsStateWithLifecycle()
 
-    Surface(
-        modifier = Modifier.fillMaxSize(),
-        color = MaterialTheme.colorScheme.background
+    var entered by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { entered = true }
+    val heroScale by animateFloatAsState(
+        targetValue = if (entered) 1f else 0.85f,
+        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
+        label = "signInHero"
+    )
+
+    val bgBrush = Brush.verticalGradient(
+        colors = listOf(
+            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.85f),
+            MaterialTheme.colorScheme.background
+        )
+    )
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(bgBrush)
+            .systemBarsPadding()
+            .padding(horizontal = 28.dp, vertical = 28.dp)
     ) {
         Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 24.dp, vertical = 32.dp),
+            modifier = Modifier.fillMaxSize(),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.SpaceBetween
         ) {
-            Spacer(modifier = Modifier.height(24.dp))
+            Spacer(modifier = Modifier.height(16.dp))
 
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(14.dp)
+                verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(88.dp)
-                        .clip(RoundedCornerShape(24.dp))
-                        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Rounded.PhotoLibrary,
-                        contentDescription = null,
-                        modifier = Modifier.size(40.dp),
-                        tint = MaterialTheme.colorScheme.primary
-                    )
-                }
+                SunnyMascot(
+                    mood = if (isAuthenticating) MascotMood.UPLOADING else MascotMood.HAPPY,
+                    size = 132.dp,
+                    modifier = Modifier.scale(heroScale)
+                )
 
                 Text(
                     text = "photoHub",
                     style = MaterialTheme.typography.headlineLarge,
-                    fontWeight = FontWeight.Bold
+                    fontWeight = FontWeight.ExtraBold,
+                    color = MaterialTheme.colorScheme.onBackground
                 )
 
-                Text(
-                    text = "Back up full-resolution originals safely and keep lightweight proxies on your Android device.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.padding(horizontal = 12.dp)
-                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    WarmStatChip(text = "Backup", tint = PhotoHubOrange, icon = Icons.Rounded.CloudUpload)
+                    WarmStatChip(text = "Compress", tint = PhotoHubAmber, icon = Icons.Rounded.AutoAwesome)
+                    WarmStatChip(text = "Free", tint = PhotoHubMint, icon = Icons.Rounded.Verified)
+                }
             }
 
             Column(
@@ -81,34 +98,14 @@ fun SignInScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Button(
+                GradientPrimaryButton(
+                    text = if (isAuthenticating) "Signing in…" else "Continue with Google",
+                    icon = Icons.Rounded.AccountCircle,
+                    enabled = settingsState.gatewayUrl != null,
+                    loading = isAuthenticating,
                     onClick = { authManager.startSignIn(context) },
-                    enabled = !isAuthenticating && settingsState.gatewayUrl != null,
-                    shape = RoundedCornerShape(14.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(54.dp)
-                ) {
-                    if (isAuthenticating) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(20.dp),
-                            color = MaterialTheme.colorScheme.onPrimary,
-                            strokeWidth = 2.dp
-                        )
-                    } else {
-                        Icon(
-                            imageVector = Icons.Rounded.AccountCircle,
-                            contentDescription = null,
-                            modifier = Modifier.size(22.dp)
-                        )
-                    }
-                    Spacer(modifier = Modifier.width(10.dp))
-                    Text(
-                        text = if (isAuthenticating) "Signing in…" else "Continue with Google",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                }
+                    modifier = Modifier.fillMaxWidth()
+                )
 
                 if (!errorMessage.isNullOrBlank()) {
                     Text(

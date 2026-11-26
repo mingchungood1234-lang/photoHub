@@ -22,22 +22,23 @@ struct ContentView: View {
                 TabView(selection: $selectedTab) {
                     LibraryView(viewModel: viewModel)
                         .tabItem {
-                            Label("Compress", systemImage: "photo.stack")
+                            Label("Backup", systemImage: "photo.stack.fill")
                         }
                         .tag(0)
 
                     ServerGalleryView(settings: settings)
                         .tabItem {
-                            Label("Server", systemImage: "cloud")
+                            Label("Cloud", systemImage: "cloud.fill")
                         }
                         .tag(1)
 
                     SettingsView(settings: settings)
                         .tabItem {
-                            Label("Settings", systemImage: "gearshape")
+                            Label("Settings", systemImage: "slider.horizontal.3")
                         }
                         .tag(2)
                 }
+                .tint(PhotoHubPalette.orange)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .ignoresSafeArea(.keyboard, edges: .bottom)
                 .onAppear {
@@ -104,78 +105,78 @@ struct ContentView: View {
 private struct GoogleSignInGateView: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject var authService: GoogleAuthService
+    @State private var appeared = false
 
     var body: some View {
-        VStack(spacing: 28) {
-            Spacer()
+        ZStack {
+            PhotoHubPalette.sunriseBackdrop.ignoresSafeArea()
 
-            VStack(spacing: 14) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 24, style: .continuous)
-                        .fill(Color.accentColor.opacity(0.12))
-                        .frame(width: 88, height: 88)
-                    Image(systemName: "photo.on.rectangle.angled")
-                        .font(.system(size: 38, weight: .semibold))
-                        .foregroundColor(.accentColor)
-                }
+            VStack(spacing: 28) {
+                Spacer()
 
-                Text("photoHub")
-                    .font(.largeTitle.weight(.bold))
+                VStack(spacing: 16) {
+                    SunnyMascotView(
+                        mood: authService.isAuthenticating ? .uploading : .happy,
+                        size: 132
+                    )
+                    .scaleEffect(appeared ? 1.0 : 0.85)
+                    .opacity(appeared ? 1.0 : 0.0)
 
-                Text("Back up full-resolution originals safely and keep lightweight proxies in iPhone Photos.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 28)
-            }
+                    Text("photoHub")
+                        .font(.system(size: 36, weight: .heavy, design: .rounded))
+                        .foregroundColor(PhotoHubPalette.ink)
 
-            VStack(spacing: 12) {
-                Button {
-                    Task { await authService.signInWithGoogle(settings: settings) }
-                } label: {
-                    HStack(spacing: 10) {
-                        if authService.isAuthenticating {
-                            ProgressView()
-                                .tint(.white)
-                        } else {
-                            Image(systemName: "g.circle.fill")
-                                .font(.title3)
-                        }
-                        Text(authService.isAuthenticating ? "Signing in..." : "Continue with Google")
-                            .font(.headline)
+                    HStack(spacing: 8) {
+                        WarmStatPill(icon: "icloud.and.arrow.up", text: "Backup", tint: PhotoHubPalette.orange)
+                        WarmStatPill(icon: "sparkles", text: "Compress", tint: PhotoHubPalette.warmAmber)
+                        WarmStatPill(icon: "checkmark.seal.fill", text: "Free", tint: PhotoHubPalette.mint)
                     }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .disabled(authService.isAuthenticating || settings.gatewayURL == nil)
-
-                if let errorMessage = authService.errorMessage, !errorMessage.isEmpty {
-                    Text(errorMessage)
-                        .font(.footnote)
-                        .foregroundColor(.red)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 8)
                 }
 
-                if settings.gatewayURL == nil {
-                    Text("Server gateway URL is not configured in this build.")
-                        .font(.caption)
-                        .foregroundColor(.orange)
+                Spacer()
+
+                VStack(spacing: 12) {
+                    Button {
+                        Task { await authService.signInWithGoogle(settings: settings) }
+                    } label: {
+                        HStack(spacing: 10) {
+                            if authService.isAuthenticating {
+                                ProgressView()
+                                    .tint(.white)
+                            } else {
+                                Image(systemName: "g.circle.fill")
+                                    .font(.title3)
+                            }
+                            Text(authService.isAuthenticating ? "Signing in…" : "Continue with Google")
+                                .font(.headline.weight(.bold))
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(PhotoHubPrimaryButtonStyle())
+                    .disabled(authService.isAuthenticating || settings.gatewayURL == nil)
+
+                    if let errorMessage = authService.errorMessage, !errorMessage.isEmpty {
+                        Text(errorMessage)
+                            .font(.caption)
+                            .foregroundColor(PhotoHubPalette.rose)
+                            .multilineTextAlignment(.center)
+                    }
+
+                    if settings.gatewayURL == nil {
+                        Text("Server URL not configured")
+                            .font(.caption)
+                            .foregroundColor(PhotoHubPalette.orange)
+                    }
                 }
+                .padding(.horizontal, 28)
+                .padding(.bottom, 32)
             }
-            .padding(.horizontal, 28)
-
-            Spacer()
-
-            Text("Connected server routing & storage limits are managed automatically via your Google account.")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 32)
-                .padding(.bottom, 16)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear {
+            withAnimation(.spring(response: 0.55, dampingFraction: 0.72)) {
+                appeared = true
+            }
+        }
     }
 }

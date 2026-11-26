@@ -47,8 +47,9 @@ import java.util.concurrent.TimeUnit
 data class BackgroundBackupUiState(
     val stagedItems: List<StagedCleanupItem> = emptyList(),
     val lastRunSummary: String = "",
-    val notificationPermissionLabel: String = "Not Requested",
-    val pendingOpenCleanupFromNotification: Boolean = false
+    val notificationPermissionLabel: String = "Off",
+    val pendingOpenCleanupFromNotification: Boolean = false,
+    val activeBackgroundCount: Int = 0
 ) {
     val stagedSavedBytes: Long
         get() = stagedItems.sumOf { it.savedBytes.coerceAtLeast(0L) }
@@ -83,6 +84,14 @@ class BackgroundBackupManager private constructor(context: Context) {
         scope.launch {
             LocalProxySyncManager.getInstance(appContext).serverSyncCompleted.collect {
                 scheduleDebouncedSilentCheck(1500L)
+            }
+        }
+        scope.launch {
+            AssetUploadCoordinator.changes.collect {
+                val active = AssetUploadCoordinator.backgroundActiveAssetIds().size
+                if (_state.value.activeBackgroundCount != active) {
+                    _state.value = _state.value.copy(activeBackgroundCount = active)
+                }
             }
         }
     }
@@ -174,10 +183,12 @@ class BackgroundBackupManager private constructor(context: Context) {
         val constraints = Constraints.Builder()
             .setRequiredNetworkType(NetworkType.UNMETERED)
             .setRequiresCharging(cur.nightlyRequiresCharging)
+            .setRequiresBatteryNotLow(true)
             .build()
 
         val periodic = PeriodicWorkRequestBuilder<PhotoUploadWorker>(6, TimeUnit.HOURS)
             .setConstraints(constraints)
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             .setInputData(workDataOf(PhotoUploadWorker.KEY_IS_OVERNIGHT to true))
             .build()
 
@@ -188,8 +199,32 @@ class BackgroundBackupManager private constructor(context: Context) {
         )
         scheduleMediaContentTriggerIfEnabled(replaceExisting = false)
         if (_state.value.lastRunSummary.isEmpty()) {
-            updateSummary("Silent auto-upload active in background.")
+            updateSummary("Auto backup active")
         }
+    }
+
+    /**
+     * Enqueues a short-delay continuation worker when a background batch hits its per-run cap,
+     * so large camera shoots finish backing up seamlessly without reopening the app.
+     */
+    fun scheduleBatchContinuationIfEnabled(isOvernight: Boolean) {
+        val cur = settings.current
+        if (!cur.nightlyAutoBackupEnabled || !cur.isSignedIn) return
+        val constraints = Constraints.Builder()
+            .setRequiredNetworkType(if (isOvernight) NetworkType.UNMETERED else NetworkType.CONNECTED)
+            .setRequiresBatteryNotLow(true)
+            .build()
+        val continuation = OneTimeWorkRequestBuilder<PhotoUploadWorker>()
+            .setConstraints(constraints)
+            .setInitialDelay(5, TimeUnit.SECONDS)
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+            .setInputData(workDataOf(PhotoUploadWorker.KEY_IS_OVERNIGHT to isOvernight))
+            .build()
+        WorkManager.getInstance(appContext).enqueueUniqueWork(
+            UNIQUE_CONTINUATION_BG_WORK,
+            ExistingWorkPolicy.REPLACE,
+            continuation
+        )
     }
 
     /**
@@ -216,6 +251,7 @@ class BackgroundBackupManager private constructor(context: Context) {
 
         val triggerWork = OneTimeWorkRequestBuilder<PhotoUploadWorker>()
             .setConstraints(triggerConstraints)
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             .setInputData(workDataOf(PhotoUploadWorker.KEY_IS_OVERNIGHT to false))
             .build()
 
@@ -256,6 +292,7 @@ class BackgroundBackupManager private constructor(context: Context) {
                 .build()
             val oneTime = OneTimeWorkRequestBuilder<PhotoUploadWorker>()
                 .setConstraints(constraints)
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
                 .setInputData(workDataOf(PhotoUploadWorker.KEY_IS_OVERNIGHT to false))
                 .build()
             WorkManager.getInstance(appContext).enqueueUniqueWork(
@@ -595,6 +632,7 @@ class BackgroundBackupManager private constructor(context: Context) {
         private const val UNIQUE_PERIODIC_WORK = "photohub_periodic_backup"
         private const val UNIQUE_CONTENT_TRIGGER_WORK = "photohub_content_trigger_backup"
         private const val UNIQUE_IMMEDIATE_BG_WORK = "photohub_immediate_bg_backup"
+        private const val UNIQUE_CONTINUATION_BG_WORK = "photohub_continuation_bg_backup"
         private const val KEY_STAGED_ITEMS = "staged_cleanup_items_v1"
         private const val KEY_LAST_SUMMARY = "last_run_summary_v1"
 

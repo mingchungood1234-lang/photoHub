@@ -25,10 +25,6 @@ struct SettingsView: View {
     @State private var localProxyCacheBytes: Int64 = LocalProxyStore.shared.totalStorageBytes()
     @State private var copiedShortcutURLNotice: Bool = false
 
-    private var currentResolutionPreset: ProxyResolutionPreset {
-        ProxyResolutionPreset.fromStoredPixels(settings.proxyMaxPixelSize)
-    }
-
     private var detailBinding: Binding<ProxyDetailPreset> {
         Binding(
             get: { ProxyDetailPreset.fromStoredQuality(settings.proxyQuality) },
@@ -45,16 +41,23 @@ struct SettingsView: View {
 
     var body: some View {
         AdaptiveNavigationStack {
-            Form {
-                accountSection
-                storageLimitSection
-                overnightBackupSection
-                proxySettingsSection
-                safetySection
-                diagnosticsSection
-                localCacheSection
-                restoreOriginalsSection
-                applePhotosShareSection
+            ZStack {
+                PhotoHubPalette.canvas.ignoresSafeArea()
+
+                ScrollView {
+                    VStack(spacing: 14) {
+                        accountCard
+                        storageCard
+                        autoBackupCard
+                        proxyCard
+                        restoreCard
+                        cacheCard
+                        shareOriginalCard
+                        diagnosticsCard
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+                }
             }
             .onAppear {
                 photosAuthText = PhotoLibraryService.currentReadWriteAuthLabel()
@@ -107,414 +110,335 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - Warm Card Helper
+
     @ViewBuilder
-    private var accountSection: some View {
-        Section {
-            HStack(spacing: 12) {
-                Image(systemName: "person.crop.circle.fill")
-                    .font(.title2)
-                    .foregroundColor(.accentColor)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(settings.userName.isEmpty ? "Google Account" : settings.userName)
-                        .font(.subheadline.weight(.semibold))
-                    if !settings.userEmail.isEmpty {
-                        Text(settings.userEmail)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    if let nodeURL = settings.normalizedBaseURL?.absoluteString {
-                        Text(nodeURL)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                }
-
-                Spacer()
-
-                Text(settings.assignedNodeId)
-                    .font(.caption2.weight(.semibold))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Color.green.opacity(0.14), in: Capsule())
-                    .foregroundColor(.green)
+    private func card<Content: View>(title: String, icon: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.caption.weight(.bold))
+                    .foregroundColor(PhotoHubPalette.orange)
+                Text(title)
+                    .font(.caption.weight(.heavy))
+                    .foregroundColor(PhotoHubPalette.muted)
+                    .textCase(.uppercase)
             }
+            .padding(.horizontal, 4)
 
-            Button {
-                Task { await refreshAccountAndStorage() }
-            } label: {
-                HStack {
-                    Text("Refresh Connection & Storage")
-                    Spacer()
-                    if isTesting { ProgressView() }
-                }
+            VStack(alignment: .leading, spacing: 12) {
+                content()
             }
-            .disabled(isTesting)
-
-            if let connectionStatus {
-                Text(connectionStatus)
-                    .font(.footnote)
-                    .foregroundStyle(connectionStatus.hasPrefix("Connected") ? .green : .red)
-            }
-
-            Button(role: .destructive) {
-                LocalProxySyncManager.shared.cancel()
-                restoreManager.reset()
-                settings.signOut()
-            } label: {
-                Text("Sign Out")
-            }
-        } header: {
-            Text("Account")
-        } footer: {
-            Text("Automatically connected to your assigned PhotoHub server instance via Google Login.")
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(PhotoHubPalette.card, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .stroke(PhotoHubPalette.cardBorder, lineWidth: 1)
+            )
         }
     }
 
-    @ViewBuilder
-    private var storageLimitSection: some View {
-        Section {
-            if let storage = settings.serverStorage {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(alignment: .firstTextBaseline) {
-                        Text(formatBytes(storage.usedBytes))
-                            .font(.headline.monospacedDigit())
-                        if let limit = storage.effectiveLimitBytes {
-                            Text("of \(formatBytes(limit))")
-                                .font(.subheadline.monospacedDigit())
-                                .foregroundStyle(.secondary)
-                        } else {
-                            Text("used")
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        if storage.effectiveLimitBytes != nil {
-                            Text("\(Int((storage.usageFraction * 100).rounded()))%")
-                                .font(.caption.weight(.semibold).monospacedDigit())
-                                .foregroundStyle(storageTintColor(storage.usageFraction))
-                        }
-                    }
+    // MARK: - Sections
 
-                    if storage.effectiveLimitBytes != nil {
-                        ProgressView(value: storage.usageFraction)
-                            .tint(storageTintColor(storage.usageFraction))
-                    }
+    private var accountCard: some View {
+        VStack(spacing: 12) {
+            HStack(spacing: 12) {
+                SunnyMascotView(
+                    mood: bgManager.activeBackgroundUploadCount > 0 ? .uploading : .happy,
+                    size: 56
+                )
 
-                    HStack {
-                        if let remaining = storage.remainingBytes {
-                            Text(
-                                storage.isFixedQuota
-                                ? "\(formatBytes(remaining)) remaining"
-                                : "\(formatBytes(remaining)) free on server"
-                            )
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(settings.userName.isEmpty ? "Account" : settings.userName)
+                        .font(.headline.weight(.bold))
+                        .foregroundColor(PhotoHubPalette.ink)
+                        .lineLimit(1)
+                    if !settings.userEmail.isEmpty {
+                        Text(settings.userEmail)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        if let count = storage.itemCount {
-                            Text("\(count) item\(count == 1 ? "" : "s")")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            .foregroundColor(PhotoHubPalette.muted)
+                            .lineLimit(1)
+                    }
+                    HStack(spacing: 6) {
+                        WarmStatPill(icon: "server.rack", text: settings.assignedNodeId, tint: PhotoHubPalette.mint)
+                        if let status = connectionStatus {
+                            Text(status.hasPrefix("Connected") ? "Online" : "Offline")
+                                .font(.caption2.weight(.bold))
+                                .foregroundColor(status.hasPrefix("Connected") ? PhotoHubPalette.mint : PhotoHubPalette.rose)
                         }
                     }
                 }
-                .padding(.vertical, 4)
+                Spacer()
+            }
+
+            HStack(spacing: 10) {
+                Button {
+                    Task { await refreshAccountAndStorage() }
+                } label: {
+                    HStack(spacing: 6) {
+                        if isTesting {
+                            ProgressView()
+                                .tint(PhotoHubPalette.deepOrange)
+                        } else {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        Text("Refresh")
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(PhotoHubSoftButtonStyle())
+                .disabled(isTesting)
+
+                Button {
+                    LocalProxySyncManager.shared.cancel()
+                    restoreManager.reset()
+                    settings.signOut()
+                } label: {
+                    Text("Sign Out")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundColor(PhotoHubPalette.rose)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 12)
+                        .background(PhotoHubPalette.rose.opacity(0.11), in: Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(14)
+        .background(PhotoHubPalette.card, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .stroke(PhotoHubPalette.cardBorder, lineWidth: 1)
+        )
+    }
+
+    private var storageCard: some View {
+        card(title: "Storage", icon: "externaldrive.fill") {
+            if let storage = settings.serverStorage {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(formatBytes(storage.usedBytes))
+                        .font(.title3.weight(.heavy).monospacedDigit())
+                        .foregroundColor(PhotoHubPalette.ink)
+                    if let limit = storage.effectiveLimitBytes {
+                        Text("/ \(formatBytes(limit))")
+                            .font(.subheadline.monospacedDigit())
+                            .foregroundColor(PhotoHubPalette.muted)
+                    }
+                    Spacer()
+                    if storage.effectiveLimitBytes != nil {
+                        Text("\(Int((storage.usageFraction * 100).rounded()))%")
+                            .font(.caption.weight(.heavy).monospacedDigit())
+                            .foregroundColor(storageTintColor(storage.usageFraction))
+                    }
+                }
+
+                if storage.effectiveLimitBytes != nil {
+                    ProgressView(value: storage.usageFraction)
+                        .tint(storageTintColor(storage.usageFraction))
+                }
+
+                HStack {
+                    if let remaining = storage.remainingBytes {
+                        WarmStatPill(icon: "checkmark.circle.fill", text: "\(formatBytes(remaining)) free", tint: PhotoHubPalette.mint)
+                    }
+                    Spacer()
+                    if let count = storage.itemCount {
+                        Text("\(count) items")
+                            .font(.caption.weight(.semibold).monospacedDigit())
+                            .foregroundColor(PhotoHubPalette.muted)
+                    }
+                }
 
                 if let masters = storage.mastersBytes, let proxies = storage.proxiesBytes {
                     HStack {
                         Text("Originals · Proxies")
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundColor(PhotoHubPalette.muted)
                         Spacer()
                         Text("\(formatBytes(masters)) · \(formatBytes(proxies))")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
+                            .font(.caption.monospacedDigit().weight(.medium))
+                            .foregroundColor(PhotoHubPalette.ink)
                     }
                 }
             } else {
                 HStack(spacing: 8) {
                     if isTesting {
-                        ProgressView()
-                        Text("Checking server storage...")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    } else {
-                        Text("Tap Refresh Connection & Storage to load your quota.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        ProgressView().tint(PhotoHubPalette.orange)
                     }
+                    Text(isTesting ? "Loading…" : "Tap Refresh")
+                        .font(.caption)
+                        .foregroundColor(PhotoHubPalette.muted)
                 }
-            }
-        } header: {
-            Text("Server Storage Limit")
-        } footer: {
-            if let storage = settings.serverStorage, storage.isFixedQuota {
-                Text("Uploads stop automatically when your assigned storage quota is reached so data integrity is always protected.")
-            } else {
-                Text("Shows your used backup storage and available capacity on your assigned server node.")
             }
         }
     }
 
-    @ViewBuilder
-    private var overnightBackupSection: some View {
-        Section {
-            Toggle("Silent Auto Background Upload", isOn: $settings.nightlyAutoBackupEnabled)
-
-            Toggle("Notify When Ready to Delete Originals", isOn: $settings.notifyWhenBackgroundUploadFinishes)
-
-            Toggle("Require Charger for Large Batches", isOn: $settings.nightlyRequiresCharging)
+    private var autoBackupCard: some View {
+        card(title: "Auto Backup", icon: "icloud.and.arrow.up.fill") {
+            Toggle("Background Upload", isOn: $settings.nightlyAutoBackupEnabled)
+                .tint(PhotoHubPalette.orange)
+            Toggle("Delete Alerts", isOn: $settings.notifyWhenBackgroundUploadFinishes)
+                .tint(PhotoHubPalette.orange)
+            Toggle("Charger Only", isOn: $settings.nightlyRequiresCharging)
+                .tint(PhotoHubPalette.orange)
                 .disabled(!settings.nightlyAutoBackupEnabled)
 
-            Picker("Overnight Reminder Time", selection: $settings.morningReminderHour) {
-                ForEach(6...11, id: \.self) { hr in
-                    Text("\(hr):00 AM").tag(hr)
+            HStack {
+                Text("Reminder")
+                    .font(.subheadline)
+                    .foregroundColor(PhotoHubPalette.ink)
+                Spacer()
+                Picker("Reminder", selection: $settings.morningReminderHour) {
+                    ForEach(6...11, id: \.self) { hr in
+                        Text("\(hr):00 AM").tag(hr)
+                    }
                 }
+                .labelsHidden()
+                .tint(PhotoHubPalette.orange)
+                .disabled(!settings.nightlyAutoBackupEnabled)
             }
-            .disabled(!settings.nightlyAutoBackupEnabled)
 
             HStack {
-                Text("Notification Permission")
+                Text("Alerts")
+                    .font(.subheadline)
+                    .foregroundColor(PhotoHubPalette.ink)
                 Spacer()
-                Text(bgManager.notificationPermissionLabel)
-                    .foregroundStyle(bgManager.notificationPermissionLabel == "Allowed" ? .green : .secondary)
+                let allowed = bgManager.notificationPermissionLabel == "Allowed"
+                WarmStatPill(
+                    icon: allowed ? "bell.fill" : "bell.slash",
+                    text: allowed ? "Allowed" : "Off",
+                    tint: allowed ? PhotoHubPalette.mint : PhotoHubPalette.warmAmber
+                )
             }
 
             if !bgManager.stagedItems.isEmpty {
                 let bytesStr = formatBytes(bgManager.stagedSavedBytes)
-                Text("Ready to Delete on iPhone: \(bgManager.stagedItems.count) original\(bgManager.stagedItems.count == 1 ? "" : "s") (free ~\(bytesStr))")
-                    .font(.caption.weight(.medium))
-                    .foregroundColor(.indigo)
+                WarmStatPill(
+                    icon: "trash",
+                    text: "\(bgManager.stagedItems.count) ready · ~\(bytesStr)",
+                    tint: PhotoHubPalette.orange
+                )
             }
 
             if !bgManager.lastRunSummary.isEmpty {
                 Text(bgManager.lastRunSummary)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Button("Send Test 'Delete Originals' Alert (5s)") {
-                bgManager.sendTestMorningAlert(settings: settings)
-            }
-        } header: {
-            Text("Silent Background Upload & Delete Alerts")
-        } footer: {
-            Text("Just like Google Photos, new photos & videos upload quietly in the background without progress banners or interruptions. Once backups are SHA-256 verified and ready to remove, photoHub sends a notification so you can tap once to delete original photos from your iPhone.")
-        }
-    }
-
-    @ViewBuilder
-    private var proxySettingsSection: some View {
-        Section {
-            Toggle("Auto Scan & Upload on App Open", isOn: $settings.autoCompressOnOpen)
-            Toggle("Keep Compressed Proxy in iPhone Photos", isOn: $settings.keepLocalProxyInPhotos)
-
-            Picker("Upload Mode", selection: $settings.uploadModeRaw) {
-                ForEach(UploadMode.allCases) { mode in
-                    Text(mode.displayName).tag(mode.rawValue)
-                }
-            }
-
-            Picker("Format", selection: $settings.proxyFormatRaw) {
-                ForEach(ProxyFormat.allCases) { fmt in
-                    Text(fmt.displayName).tag(fmt.rawValue)
-                }
-            }
-
-            Picker("Resolution (Photo & Video)", selection: resolutionBinding) {
-                ForEach(ProxyResolutionPreset.allCases) { preset in
-                    Text(preset.title).tag(preset)
-                }
-            }
-
-            Picker("File Size vs Detail", selection: detailBinding) {
-                ForEach(ProxyDetailPreset.allCases) { detail in
-                    Text(detail.title).tag(detail)
-                }
-            }
-
-            Text(currentResolutionPreset.resolutionHint)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-        } header: {
-            Text("Lightweight Proxy Settings")
-        } footer: {
-            Text("Full-resolution originals always upload first untouched. Lower resolution (e.g. 480p or 720p) keeps local proxies and preview transfers super lightweight while freeing maximum space.")
-        }
-    }
-
-    @ViewBuilder
-    private var safetySection: some View {
-        Section("How Safety & Original Deletion Works") {
-            Text("1. Your iPhone computes the SHA-256 checksum of the full-resolution original.\n2. The original uploads to your server in the foreground or background (iOS 26+ continued tasks & scheduled Wi-Fi runs).\n3. Only after your server verifies the exact SHA-256 checksum on disk does photoHub save the proxy and ask you to delete the original photo from your iPhone.\n4. Apple moves deleted originals to Photos → Recently Deleted for 30 days (tap Delete All there to free space right away), while full-resolution originals remain restorable anytime.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    @ViewBuilder
-    private var diagnosticsSection: some View {
-        Section("iOS Photos Diagnostics") {
-            HStack {
-                Text("Photos Permission")
-                Spacer()
-                Text(photosAuthText)
-                    .foregroundStyle(photosAuthText == "Full Access" ? .green : .orange)
+                    .foregroundColor(PhotoHubPalette.muted)
             }
 
             Button {
-                runDeleteDiagnostic()
+                bgManager.sendTestMorningAlert(settings: settings)
             } label: {
-                HStack {
-                    Text("Test Native Delete Alert (Latest Photo)")
-                    Spacer()
-                    if isTestingDelete { ProgressView() }
-                }
+                Label("Test Alert (5s)", systemImage: "bell.badge")
+                    .frame(maxWidth: .infinity)
             }
-            .disabled(isTestingDelete)
-
-            Button("Open iOS Settings for photoHub") {
-                if let url = URL(string: UIApplication.openSettingsURLString) {
-                    UIApplication.shared.open(url)
-                }
-            }
-
-            if let deleteDiagResult {
-                Text(deleteDiagResult)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            .buttonStyle(PhotoHubSoftButtonStyle())
         }
     }
 
-    @ViewBuilder
-    private var localCacheSection: some View {
-        Section {
-            Toggle("Auto-Save Proxies to iPhone Photos", isOn: $settings.autoSaveProxiesToPhotosApp)
+    private var proxyCard: some View {
+        card(title: "Proxy", icon: "sparkles") {
+            Toggle("Auto Scan", isOn: $settings.autoCompressOnOpen)
+                .tint(PhotoHubPalette.orange)
+            Toggle("Keep Proxy", isOn: $settings.keepLocalProxyInPhotos)
+                .tint(PhotoHubPalette.orange)
 
-            if syncManager.isSyncing {
-                HStack(spacing: 8) {
-                    ProgressView()
-                    Text(
-                        syncManager.statusText.isEmpty
-                        ? "Downloading (\(syncManager.completedCount)/\(syncManager.totalCount))..."
-                        : syncManager.statusText
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Stop") {
-                        syncManager.cancel()
+            pickerRow("Upload") {
+                Picker("Upload", selection: $settings.uploadModeRaw) {
+                    ForEach(UploadMode.allCases) { mode in
+                        Text(mode.displayName).tag(mode.rawValue)
                     }
-                    .font(.caption)
                 }
-            } else {
-                Button {
-                    LocalProxySyncManager.shared.downloadAllMissingToPhotos(settings: settings)
-                } label: {
-                    Label("Download All Proxies to iPhone Photos", systemImage: "square.and.arrow.down.on.square")
-                }
-                .disabled(settings.normalizedBaseURL == nil)
-
-                if !syncManager.statusText.isEmpty {
-                    Text(syncManager.statusText)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                .labelsHidden()
             }
 
-            HStack {
-                Text("Cached Proxies in App")
-                Spacer()
-                Text(formatBytes(localProxyCacheBytes))
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(.secondary)
+            pickerRow("Format") {
+                Picker("Format", selection: $settings.proxyFormatRaw) {
+                    ForEach(ProxyFormat.allCases) { fmt in
+                        Text(fmt.displayName).tag(fmt.rawValue)
+                    }
+                }
+                .labelsHidden()
             }
 
-            Toggle("Auto-Cache Proxies in App", isOn: $settings.autoDownloadLocalProxies)
-
-            Toggle("Auto-Download Compressed Videos (.mp4)", isOn: $settings.autoDownloadLocalVideos)
-                .disabled(!settings.autoDownloadLocalProxies && !settings.autoSaveProxiesToPhotosApp)
-
-            Button(role: .destructive) {
-                LocalProxySyncManager.shared.cancel()
-                LocalProxyStore.shared.clearAll()
-                localProxyCacheBytes = LocalProxyStore.shared.totalStorageBytes()
-            } label: {
-                Text("Clear Local Proxy Cache")
+            pickerRow("Size") {
+                Picker("Size", selection: resolutionBinding) {
+                    ForEach(ProxyResolutionPreset.allCases) { preset in
+                        Text(preset.title).tag(preset)
+                    }
+                }
+                .labelsHidden()
             }
-            .disabled(localProxyCacheBytes == 0)
-        } header: {
-            Text("Local Proxy Storage")
-        } footer: {
-            Text("Compressed image previews and MP4 video proxies are saved into your iPhone Photos app automatically without re-uploading them or creating duplicates, and cached locally inside the app for instant browsing.")
+
+            pickerRow("Quality") {
+                Picker("Quality", selection: detailBinding) {
+                    ForEach(ProxyDetailPreset.allCases) { detail in
+                        Text(detail.title).tag(detail)
+                    }
+                }
+                .labelsHidden()
+            }
         }
     }
 
-    @ViewBuilder
-    private var restoreOriginalsSection: some View {
-        Section {
+    private var restoreCard: some View {
+        card(title: "Restore Originals", icon: "icloud.and.arrow.down.fill") {
             HStack {
-                Text("Originals Status")
+                Text("Status")
+                    .font(.subheadline)
+                    .foregroundColor(PhotoHubPalette.ink)
                 Spacer()
                 if restoreManager.isLoadingSummary && !restoreManager.hasLoadedSummary {
-                    ProgressView()
+                    ProgressView().tint(PhotoHubPalette.orange)
                 } else if restoreManager.totalCount > 0 {
                     if restoreManager.unrestoredCount > 0 {
                         let sizeStr = formatBytes(restoreManager.unrestoredBytes)
-                        Text("\(restoreManager.unrestoredCount) of \(restoreManager.totalCount) not restored (~\(sizeStr))")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
+                        WarmStatPill(icon: "arrow.down.circle", text: "\(restoreManager.unrestoredCount) · ~\(sizeStr)", tint: PhotoHubPalette.orange)
                     } else {
-                        Text("All \(restoreManager.totalCount) protected/restored")
-                            .font(.subheadline)
-                            .foregroundColor(.green)
+                        WarmStatPill(icon: "checkmark.seal.fill", text: "All \(restoreManager.totalCount)", tint: PhotoHubPalette.mint)
                     }
-                } else if restoreManager.hasLoadedSummary {
-                    Text("0 items on server")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
                 } else {
-                    Text("Tap Restore to check")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                    Text("0 items")
+                        .font(.caption)
+                        .foregroundColor(PhotoHubPalette.muted)
                 }
             }
 
             if restoreManager.isRestoring {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 8) {
-                        ProgressView()
-                        Text("Restoring originals (\(restoreManager.completedCount)/\(restoreManager.batchTotalCount))…")
-                            .font(.subheadline.weight(.medium))
-                        Spacer()
-                        Button("Stop") {
-                            restoreManager.stopRestore()
+                HStack(spacing: 10) {
+                    SunnyMascotView(mood: .uploading, size: 42)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("\(restoreManager.completedCount)/\(restoreManager.batchTotalCount)")
+                            .font(.subheadline.weight(.bold).monospacedDigit())
+                            .foregroundColor(PhotoHubPalette.orange)
+                        if !restoreManager.currentItemName.isEmpty {
+                            Text(restoreManager.currentItemName)
+                                .font(.caption2)
+                                .foregroundColor(PhotoHubPalette.muted)
+                                .lineLimit(1)
                         }
-                        .font(.subheadline.weight(.semibold))
                     }
-                    if !restoreManager.currentItemName.isEmpty {
-                        Text(restoreManager.currentItemName)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
+                    Spacer()
+                    Button("Stop") { restoreManager.stopRestore() }
+                        .font(.caption.weight(.bold))
+                        .foregroundColor(PhotoHubPalette.rose)
                 }
-                .padding(.vertical, 2)
             } else {
                 Button {
                     restoreManager.requestRestoreAll(settings: settings)
                 } label: {
                     HStack {
-                        Label("Restore All Originals to Photos", systemImage: "icloud.and.arrow.down")
-                        Spacer()
                         if restoreManager.isLoadingSummary {
-                            ProgressView()
+                            ProgressView().tint(.white)
+                        } else {
+                            Image(systemName: "icloud.and.arrow.down.fill")
                         }
+                        Text("Restore All to Photos")
                     }
+                    .frame(maxWidth: .infinity)
                 }
+                .buttonStyle(PhotoHubPrimaryButtonStyle())
                 .disabled(
                     settings.normalizedBaseURL == nil
                     || !settings.isSignedIn
@@ -525,78 +449,193 @@ struct SettingsView: View {
                     HStack(spacing: 8) {
                         Text(msg)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundColor(PhotoHubPalette.muted)
                         Spacer()
                         Button {
                             restoreManager.statusMessage = nil
                         } label: {
                             Image(systemName: "xmark")
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.secondary)
+                                .font(.caption2.weight(.bold))
+                                .foregroundColor(PhotoHubPalette.muted)
                         }
                         .buttonStyle(.plain)
                     }
                 }
             }
-        } header: {
-            Text("Restore Originals")
-        } footer: {
-            Text("Downloads full-resolution originals from your server into Apple Photos, deletes matching compressed proxy copies from Photos, and marks originals protected so automatic proxy cleanup will not re-compress them.")
+        }
+    }
+
+    private var cacheCard: some View {
+        card(title: "Local Cache", icon: "internaldrive.fill") {
+            Toggle("Save to Photos", isOn: $settings.autoSaveProxiesToPhotosApp)
+                .tint(PhotoHubPalette.orange)
+            Toggle("App Cache", isOn: $settings.autoDownloadLocalProxies)
+                .tint(PhotoHubPalette.orange)
+            Toggle("Cache Videos", isOn: $settings.autoDownloadLocalVideos)
+                .tint(PhotoHubPalette.orange)
+                .disabled(!settings.autoDownloadLocalProxies && !settings.autoSaveProxiesToPhotosApp)
+
+            HStack {
+                Text("Cache Size")
+                    .font(.subheadline)
+                    .foregroundColor(PhotoHubPalette.ink)
+                Spacer()
+                Text(formatBytes(localProxyCacheBytes))
+                    .font(.subheadline.weight(.bold).monospacedDigit())
+                    .foregroundColor(PhotoHubPalette.orange)
+            }
+
+            if syncManager.isSyncing {
+                HStack(spacing: 8) {
+                    ProgressView().tint(PhotoHubPalette.orange)
+                    Text("\(syncManager.completedCount)/\(syncManager.totalCount)")
+                        .font(.caption.weight(.semibold).monospacedDigit())
+                        .foregroundColor(PhotoHubPalette.muted)
+                    Spacer()
+                    Button("Stop") { syncManager.cancel() }
+                        .font(.caption.weight(.bold))
+                        .foregroundColor(PhotoHubPalette.rose)
+                }
+            } else {
+                HStack(spacing: 10) {
+                    Button {
+                        LocalProxySyncManager.shared.downloadAllMissingToPhotos(settings: settings)
+                    } label: {
+                        Label("Sync Proxies", systemImage: "arrow.down.to.line")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(PhotoHubSoftButtonStyle())
+                    .disabled(settings.normalizedBaseURL == nil)
+
+                    Button {
+                        LocalProxySyncManager.shared.cancel()
+                        LocalProxyStore.shared.clearAll()
+                        localProxyCacheBytes = LocalProxyStore.shared.totalStorageBytes()
+                    } label: {
+                        Text("Clear")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundColor(localProxyCacheBytes > 0 ? PhotoHubPalette.rose : PhotoHubPalette.muted)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 12)
+                            .background(PhotoHubPalette.rose.opacity(localProxyCacheBytes > 0 ? 0.11 : 0.05), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(localProxyCacheBytes == 0)
+                }
+            }
+        }
+    }
+
+    private var shareOriginalCard: some View {
+        card(title: "Share Original", icon: "square.and.arrow.up.fill") {
+            Button {
+                IncomingShareCoordinator.shared.presentInAppPhotoPicker()
+            } label: {
+                Label("Pick & Share Original", systemImage: "square.and.arrow.up")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(PhotoHubPrimaryButtonStyle())
+            .disabled(!settings.isSignedIn || settings.normalizedBaseURL == nil)
+
+            HStack(spacing: 10) {
+                Button {
+                    if let url = URL(string: "shortcuts://") {
+                        UIApplication.shared.open(url)
+                    }
+                } label: {
+                    Label("Shortcuts", systemImage: "command")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(PhotoHubSoftButtonStyle())
+
+                Button {
+                    UIPasteboard.general.string = "photohub://share-original?from=clipboard"
+                    copiedShortcutURLNotice = true
+                } label: {
+                    Label(copiedShortcutURLNotice ? "Copied" : "Copy URL", systemImage: "doc.on.doc")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(PhotoHubSoftButtonStyle())
+            }
+
+            VStack(alignment: .leading, spacing: 5) {
+                stepChip("1", "Shortcuts → Share Sheet")
+                stepChip("2", "Get Details of Photos → Name")
+                stepChip("3", "photoHub → Large Video")
+            }
+            .padding(.top, 2)
+        }
+    }
+
+    private var diagnosticsCard: some View {
+        card(title: "Photos Access", icon: "photo.fill") {
+            HStack {
+                Text("Permission")
+                    .font(.subheadline)
+                    .foregroundColor(PhotoHubPalette.ink)
+                Spacer()
+                WarmStatPill(
+                    icon: photosAuthText == "Full Access" ? "checkmark.circle.fill" : "exclamationmark.triangle.fill",
+                    text: photosAuthText,
+                    tint: photosAuthText == "Full Access" ? PhotoHubPalette.mint : PhotoHubPalette.warmAmber
+                )
+            }
+
+            HStack(spacing: 10) {
+                Button {
+                    runDeleteDiagnostic()
+                } label: {
+                    HStack(spacing: 6) {
+                        if isTestingDelete { ProgressView().tint(PhotoHubPalette.deepOrange) }
+                        Text("Test Delete")
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(PhotoHubSoftButtonStyle())
+                .disabled(isTestingDelete)
+
+                Button {
+                    if let url = URL(string: UIApplication.openSettingsURLString) {
+                        UIApplication.shared.open(url)
+                    }
+                } label: {
+                    Text("iOS Settings")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(PhotoHubSoftButtonStyle())
+            }
+
+            if let deleteDiagResult {
+                Text(deleteDiagResult)
+                    .font(.caption)
+                    .foregroundColor(PhotoHubPalette.muted)
+            }
         }
     }
 
     @ViewBuilder
-    private var applePhotosShareSection: some View {
-        Section {
-            Button {
-                IncomingShareCoordinator.shared.presentInAppPhotoPicker()
-            } label: {
-                Label("Pick Photos or Videos to Share Original", systemImage: "square.and.arrow.up.on.square")
-            }
-            .disabled(!settings.isSignedIn || settings.normalizedBaseURL == nil)
+    private func pickerRow<Content: View>(_ label: String, @ViewBuilder picker: () -> Content) -> some View {
+        HStack {
+            Text(label)
+                .font(.subheadline)
+                .foregroundColor(PhotoHubPalette.ink)
+            Spacer()
+            picker()
+                .tint(PhotoHubPalette.orange)
+        }
+    }
 
-            Button {
-                if let url = URL(string: "shortcuts://") {
-                    UIApplication.shared.open(url)
-                }
-            } label: {
-                Label("Open Apple Shortcuts App", systemImage: "command")
-            }
-
-            Button {
-                UIPasteboard.general.string = "photohub://share-original?from=clipboard"
-                copiedShortcutURLNotice = true
-            } label: {
-                Label("Copy iOS 15 Shortcut URL Scheme", systemImage: "doc.on.doc")
-            }
-
-            if copiedShortcutURLNotice {
-                Text("Copied: photohub://share-original?from=clipboard")
-                    .font(.caption)
-                    .foregroundColor(.green)
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("1-Tap Setup from Apple Photos Share Sheet (Works for Large Videos):")
-                    .font(.caption.weight(.semibold))
-                Text("1. Open Shortcuts -> tap + -> tap (i) Details -> enable Show in Share Sheet (Images & Media).")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text("2. Add action: Get Details of Photos -> choose Name (of Shortcut Input).")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text("3. Add action: photoHub -> Fetch & Share Original (Large Video) and pass Name (zero video copy!).")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text("4. On iOS 15: Copy Name to Clipboard, then Open URLs (photohub://share-original?from=clipboard).")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.vertical, 2)
-        } header: {
-            Text("Share Original from Apple Photos")
-        } footer: {
-            Text("Passing only the Name avoids Apple Shortcuts exporting huge videos into memory (1 App ID, zero App Groups/extensions — works on Free Apple Accounts).")
+    @ViewBuilder
+    private func stepChip(_ num: String, _ text: String) -> some View {
+        HStack(spacing: 8) {
+            Text(num)
+                .font(.caption2.weight(.heavy))
+                .foregroundColor(.white)
+                .frame(width: 18, height: 18)
+                .background(PhotoHubPalette.orange, in: Circle())
+            Text(text)
+                .font(.caption.weight(.medium))
+                .foregroundColor(PhotoHubPalette.muted)
         }
     }
 
@@ -611,17 +650,15 @@ struct SettingsView: View {
         do {
             let info = try await PhotoHubAPIClient(settings: settings).whoami()
             settings.serverStorage = info.storage
-            let folderNote = info.userFolder.map { "/\($0)" } ?? "/ (root)"
-            let s3Note = (info.s3Enabled == true) ? "S3" : "Direct"
-            connectionStatus = "Connected · Folder: \(folderNote) · \(info.indexedPhotos) items (\(s3Note))"
+            connectionStatus = "Connected · \(info.indexedPhotos) items"
         } catch {
-            connectionStatus = "Offline: \(error.localizedDescription)"
+            connectionStatus = "Offline"
         }
     }
 
     private func runDeleteDiagnostic() {
         isTestingDelete = true
-        deleteDiagResult = "Requesting native iOS delete alert for newest photo (tap Don't Allow if you want to keep it)…"
+        deleteDiagResult = "Testing…"
         PhotoLibraryService().testDeletePromptOnLatestAsset { message in
             isTestingDelete = false
             photosAuthText = PhotoLibraryService.currentReadWriteAuthLabel()
@@ -634,9 +671,9 @@ struct SettingsView: View {
     }
 
     private func storageTintColor(_ fraction: Double) -> Color {
-        if fraction >= 0.9 { return .red }
-        if fraction >= 0.75 { return .orange }
-        return .green
+        if fraction >= 0.9 { return PhotoHubPalette.rose }
+        if fraction >= 0.75 { return PhotoHubPalette.orange }
+        return PhotoHubPalette.mint
     }
 }
 
@@ -659,20 +696,20 @@ extension View {
                     onConfirm(current.unrestoredTargets, current)
                 }
                 if current.skippedCount > 0 {
-                    Button("Include \(current.skippedCount) Already Restored (\(current.allTargets.count))") {
+                    Button("All (\(current.allTargets.count))") {
                         onConfirm(current.allTargets, current)
                     }
                 }
             } else {
                 if current.isRestoreAll, current.leftoverProxyCount > 0, let onDeleteLeftoverProxies {
                     Button(
-                        "Delete \(current.leftoverProxyCount) Compressed Copy\(current.leftoverProxyCount == 1 ? "" : "s")",
+                        "Delete \(current.leftoverProxyCount) Proxies",
                         role: .destructive
                     ) {
                         onDeleteLeftoverProxies(current.leftoverProxyHashes)
                     }
                 }
-                Button("Re-download All (\(current.allTargets.count))") {
+                Button("Re-download (\(current.allTargets.count))") {
                     onConfirm(current.allTargets, current)
                 }
             }

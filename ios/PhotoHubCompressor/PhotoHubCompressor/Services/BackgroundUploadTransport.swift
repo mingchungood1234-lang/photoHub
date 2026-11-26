@@ -79,6 +79,10 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
 
     private var jobsByTaskId: [Int: PendingBackgroundUploadJob] = [:]
     private var responseDataByTaskId: [Int: Data] = [:]
+    private var progressByTaskId: [Int: (sent: Int64, expected: Int64)] = [:]
+    private var lastProgressEmitTime: CFAbsoluteTime = 0
+    private var pendingFinalizationCount: Int = 0
+    private var didReceiveFinishEvents: Bool = false
     private var sessionCompletionHandler: (() -> Void)?
 
     private lazy var backgroundSession: URLSession = {
@@ -86,6 +90,7 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
         cfg.isDiscretionary = false
         cfg.sessionSendsLaunchEvents = true
         cfg.allowsExpensiveNetworkAccess = true
+        cfg.allowsConstrainedNetworkAccess = true
         cfg.waitsForConnectivity = true
         cfg.timeoutIntervalForRequest = 600
         cfg.timeoutIntervalForResource = 24 * 3600
@@ -98,6 +103,38 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
         let restoredIds = Set(jobsByTaskId.values.map { $0.assetId })
         AssetUploadCoordinator.shared.syncPersistedBackgroundAssetIds(restoredIds)
         _ = backgroundSession
+        reconcileOrphanedTasks()
+    }
+
+    /// Prunes any persisted jobs whose URLSessionTask is no longer alive (e.g. OS purged or app reinstalled)
+    /// so assets never remain stuck in `AssetUploadCoordinator`.
+    func reconcileOrphanedTasks() {
+        backgroundSession.getAllTasks { [weak self] tasks in
+            guard let self else { return }
+            let liveTaskIds = Set(tasks.map { $0.taskIdentifier })
+            var orphanedJobs: [PendingBackgroundUploadJob] = []
+
+            self.lock.lock()
+            let staleKeys = self.jobsByTaskId.keys.filter { !liveTaskIds.contains($0) }
+            for key in staleKeys {
+                if let removed = self.jobsByTaskId.removeValue(forKey: key) {
+                    orphanedJobs.append(removed)
+                }
+                self.responseDataByTaskId.removeValue(forKey: key)
+                self.progressByTaskId.removeValue(forKey: key)
+            }
+            if !staleKeys.isEmpty {
+                self.saveJobsLocked()
+            }
+            let remainingCount = self.jobsByTaskId.count
+            self.lock.unlock()
+
+            for job in orphanedJobs {
+                try? FileManager.default.removeItem(at: URL(fileURLWithPath: job.stagedFilePath))
+                AssetUploadCoordinator.shared.releaseAsset(job.assetId, owner: .background)
+            }
+            self.emitProgressSnapshot(force: true, overrideCount: remainingCount)
+        }
     }
 
     func activeAssetIds() -> Set<String> {
@@ -116,6 +153,7 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
         }
         lock.lock()
         sessionCompletionHandler = completionHandler
+        didReceiveFinishEvents = false
         lock.unlock()
         _ = backgroundSession
     }
@@ -281,10 +319,12 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
 
             lock.lock()
             jobsByTaskId[task.taskIdentifier] = persistedJob
+            progressByTaskId[task.taskIdentifier] = (0, max(1, persistedJob.masterBytes))
             saveJobsLocked()
             lock.unlock()
 
             task.resume()
+            emitProgressSnapshot(force: true)
             return .queuedBackgroundUpload
         } catch {
             return .failed
@@ -314,14 +354,32 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
         lock.unlock()
     }
 
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didSendBodyData bytesSent: Int64,
+        totalBytesSent: Int64,
+        totalBytesExpectedToSend: Int64
+    ) {
+        lock.lock()
+        let fallbackExpected = jobsByTaskId[task.taskIdentifier]?.masterBytes ?? totalBytesSent
+        let expected = totalBytesExpectedToSend > 0 ? totalBytesExpectedToSend : max(1, fallbackExpected)
+        progressByTaskId[task.taskIdentifier] = (max(0, totalBytesSent), max(1, expected))
+        lock.unlock()
+        emitProgressSnapshot(force: false)
+    }
+
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         lock.lock()
         let job = jobsByTaskId.removeValue(forKey: task.taskIdentifier)
         let responseData = responseDataByTaskId.removeValue(forKey: task.taskIdentifier)
+        progressByTaskId.removeValue(forKey: task.taskIdentifier)
         if job != nil {
             saveJobsLocked()
         }
         lock.unlock()
+
+        emitProgressSnapshot(force: true)
 
         guard let job else { return }
         let stagedURL = URL(fileURLWithPath: job.stagedFilePath)
@@ -344,7 +402,15 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
             return
         }
 
+        // Hold background session completion handler until proxy creation & notification finish.
+        lock.lock()
+        pendingFinalizationCount += 1
+        lock.unlock()
+
         Task {
+            defer {
+                self.finishOnePendingFinalization()
+            }
             await finalizeCompletedBackgroundUpload(
                 job: job,
                 stagedURL: stagedURL,
@@ -356,14 +422,65 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
         lock.lock()
-        let handler = sessionCompletionHandler
-        sessionCompletionHandler = nil
+        didReceiveFinishEvents = true
+        let handler = (pendingFinalizationCount == 0) ? sessionCompletionHandler : nil
+        if handler != nil {
+            sessionCompletionHandler = nil
+            didReceiveFinishEvents = false
+        }
         lock.unlock()
 
         if let handler {
             DispatchQueue.main.async {
                 handler()
             }
+        }
+    }
+
+    private func finishOnePendingFinalization() {
+        lock.lock()
+        pendingFinalizationCount = max(0, pendingFinalizationCount - 1)
+        let handler = (pendingFinalizationCount == 0 && didReceiveFinishEvents) ? sessionCompletionHandler : nil
+        if handler != nil {
+            sessionCompletionHandler = nil
+            didReceiveFinishEvents = false
+        }
+        lock.unlock()
+
+        if let handler {
+            DispatchQueue.main.async {
+                handler()
+            }
+        }
+    }
+
+    private func emitProgressSnapshot(force: Bool, overrideCount: Int? = nil) {
+        let now = CFAbsoluteTimeGetCurrent()
+        lock.lock()
+        if !force && (now - lastProgressEmitTime) < 0.35 {
+            lock.unlock()
+            return
+        }
+        lastProgressEmitTime = now
+        let count = overrideCount ?? jobsByTaskId.count
+        var sentSum: Int64 = 0
+        var expectedSum: Int64 = 0
+        for item in progressByTaskId.values {
+            sentSum += item.sent
+            expectedSum += item.expected
+        }
+        lock.unlock()
+
+        let fraction: Double
+        if count == 0 {
+            fraction = 0
+        } else if expectedSum > 0 {
+            fraction = min(1.0, max(0.0, Double(sentSum) / Double(expectedSum)))
+        } else {
+            fraction = 0
+        }
+        Task { @MainActor in
+            BackgroundBackupManager.shared.updateLiveBackgroundTransport(activeCount: count, progress: fraction)
         }
     }
 

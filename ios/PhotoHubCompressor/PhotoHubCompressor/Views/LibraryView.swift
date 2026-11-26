@@ -13,150 +13,138 @@ struct LibraryView: View {
         self._bgManager = ObservedObject(wrappedValue: BackgroundBackupManager.shared)
     }
 
+    private var activeBgCount: Int {
+        max(viewModel.backgroundActiveCount, bgManager.activeBackgroundUploadCount)
+    }
+
+    private var heroMood: MascotMood {
+        if viewModel.permissionStatus == .denied || viewModel.permissionStatus == .restricted {
+            return .alert
+        }
+        if viewModel.isScanning || viewModel.isProcessing || activeBgCount > 0 {
+            return .uploading
+        }
+        if !bgManager.stagedItems.isEmpty || viewModel.totalSavedBytes > 0 {
+            return .celebrate
+        }
+        return .happy
+    }
+
     var body: some View {
         AdaptiveNavigationStack {
-            VStack(spacing: 0) {
-                if viewModel.permissionStatus == .limited {
-                    HStack(spacing: 8) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.orange)
-                        Text("Limited Photos Access: Switch to Full Access in iOS Settings to scan and delete all originals.")
-                            .font(.caption)
-                        Spacer()
-                        Button("Full Access") {
-                            if let url = URL(string: UIApplication.openSettingsURLString) {
-                                UIApplication.shared.open(url)
+            ZStack {
+                PhotoHubPalette.canvas.ignoresSafeArea()
+
+                VStack(spacing: 0) {
+                    VStack(spacing: 8) {
+                        if viewModel.permissionStatus == .limited {
+                            compactBanner(tint: PhotoHubPalette.warmAmber) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundColor(PhotoHubPalette.warmAmber)
+                                Text("Limited Access")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundColor(PhotoHubPalette.ink)
+                                Spacer()
+                                Button("Allow All") {
+                                    if let url = URL(string: UIApplication.openSettingsURLString) {
+                                        UIApplication.shared.open(url)
+                                    }
+                                }
+                                .font(.caption.weight(.bold))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(PhotoHubPalette.orange, in: Capsule())
+                                .foregroundColor(.white)
                             }
                         }
-                        .font(.caption.bold())
-                        .buttonStyle(.borderedProminent)
-                        .tint(.orange)
-                    }
-                    .padding(10)
-                    .background(Color.orange.opacity(0.15))
-                }
 
-                if !bgManager.stagedItems.isEmpty && !viewModel.isProcessing && !viewModel.isAwaitingDeleteConfirmation {
-                    overnightReadyBanner
-                }
+                        if !bgManager.stagedItems.isEmpty && !viewModel.isProcessing && !viewModel.isAwaitingDeleteConfirmation {
+                            overnightReadyBanner
+                        }
 
-                if viewModel.backgroundActiveCount > 0 {
-                    HStack(spacing: 8) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("Background upload running for \(viewModel.backgroundActiveCount) item\(viewModel.backgroundActiveCount == 1 ? "" : "s") — automatically skipped from manual upload to prevent duplicates.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(Color.blue.opacity(0.08))
-                }
-
-                if viewModel.recentlyDeletedNoticeCount > 0 {
-                    recentlyDeletedWarningBanner
-                }
-
-                if let banner = viewModel.statusBanner {
-                    HStack(spacing: 8) {
-                        Image(systemName: "info.circle.fill")
-                            .foregroundStyle(.blue)
-                        Text(banner)
-                            .font(.footnote)
-                        Spacer()
-                    }
-                    .padding(12)
-                    .background(Color.blue.opacity(0.1))
-                }
-
-                if viewModel.isProcessing {
-                    VStack(alignment: .leading, spacing: 6) {
-                        ProgressView(value: viewModel.overallProgressFraction, total: 1.0)
-                        let pct = Int((viewModel.overallProgressFraction * 100).rounded())
-                        Text("Uploading & Compressing \(pct)% (\(viewModel.completedCount)/\(viewModel.totalToProcess))…")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding()
-                    .background(Color(.secondarySystemBackground))
-                }
-
-                if viewModel.candidates.isEmpty {
-                    CompatibleEmptyStateView(
-                        title: "Ready to Back Up & Free Space",
-                        systemImage: "photo.on.rectangle.angled",
-                        description: (viewModel.permissionStatus == .denied || viewModel.permissionStatus == .restricted)
-                            ? "Photos permission is required. Open iOS Settings to allow access."
-                            : "New photos & videos upload silently in the background, and photoHub notifies you when originals are ready to delete — or tap below to scan and free space now."
-                    ) {
-                        if viewModel.permissionStatus == .denied || viewModel.permissionStatus == .restricted {
-                            Button("Open iOS Settings") {
-                                if let url = URL(string: UIApplication.openSettingsURLString) {
-                                    UIApplication.shared.open(url)
+                        if activeBgCount > 0 {
+                            compactBanner(tint: PhotoHubPalette.orange) {
+                                AnimatedPulseDot(color: PhotoHubPalette.orange)
+                                let pct = Int((bgManager.liveBackgroundProgress * 100).rounded())
+                                Text(pct > 0 ? "Uploading \(activeBgCount) · \(pct)%" : "Uploading \(activeBgCount)")
+                                    .font(.caption.weight(.semibold).monospacedDigit())
+                                    .foregroundColor(PhotoHubPalette.ink)
+                                Spacer()
+                                if bgManager.liveBackgroundProgress > 0 {
+                                    ProgressView(value: bgManager.liveBackgroundProgress)
+                                        .tint(PhotoHubPalette.orange)
+                                        .frame(width: 72)
                                 }
-                            }
-                            .buttonStyle(.borderedProminent)
-                        } else {
-                            VStack(spacing: 10) {
-                                Button("Auto-Upload New Photos & Videos") {
-                                    viewModel.scanAndAutoCompressIfEnabled(forceNow: true)
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .disabled(viewModel.isScanning || viewModel.isProcessing)
-
-                                Button("Scan & Choose Manually") {
-                                    viewModel.scanLibrary()
-                                }
-                                .buttonStyle(.bordered)
-                                .disabled(viewModel.isScanning || viewModel.isProcessing)
-
-                                Button {
-                                    showingProxyDetectorPicker = true
-                                } label: {
-                                    Label("Detect Proxy in Photos", systemImage: "magnifyingglass")
-                                }
-                                .buttonStyle(.bordered)
-                                .disabled(viewModel.isInspectingGalleryPicks || viewModel.isProcessing)
                             }
                         }
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    summaryHeader
-                    List {
-                        ForEach(viewModel.candidates) { item in
-                            PhotoCandidateRow(
-                                item: item,
-                                onToggleSelect: {
-                                    viewModel.toggleSelection(for: item.id)
-                                }
-                            )
-                            .onAppear {
-                                viewModel.loadThumbnailIfNeeded(for: item.id)
+
+                        if viewModel.recentlyDeletedNoticeCount > 0 {
+                            recentlyDeletedWarningBanner
+                        }
+
+                        if let banner = viewModel.statusBanner, !banner.isEmpty {
+                            compactBanner(tint: PhotoHubPalette.orange) {
+                                Image(systemName: "sparkles")
+                                    .font(.caption.weight(.bold))
+                                    .foregroundColor(PhotoHubPalette.orange)
+                                Text(banner)
+                                    .font(.caption.weight(.medium))
+                                    .foregroundColor(PhotoHubPalette.ink)
+                                    .lineLimit(2)
+                                Spacer()
                             }
                         }
+
+                        if viewModel.isProcessing {
+                            activeProcessingCard
+                        }
                     }
-                    .listStyle(.plain)
+                    .padding(.horizontal, 14)
+                    .padding(.top, 8)
+                    .animation(.spring(response: 0.35, dampingFraction: 0.8), value: viewModel.isProcessing)
+                    .animation(.spring(response: 0.35, dampingFraction: 0.8), value: bgManager.stagedItems.count)
+
+                    if viewModel.candidates.isEmpty {
+                        emptyHeroView
+                    } else {
+                        summaryHeader
+                            .padding(.top, 8)
+                        List {
+                            ForEach(viewModel.candidates) { item in
+                                PhotoCandidateRow(
+                                    item: item,
+                                    onToggleSelect: {
+                                        viewModel.toggleSelection(for: item.id)
+                                    }
+                                )
+                                .listRowBackground(PhotoHubPalette.card)
+                                .onAppear {
+                                    viewModel.loadThumbnailIfNeeded(for: item.id)
+                                }
+                            }
+                        }
+                        .listStyle(.plain)
+                    }
                 }
             }
             .overlay {
                 if viewModel.isInspectingGalleryPicks {
                     ZStack {
-                        Color.black.opacity(0.45).ignoresSafeArea()
+                        Color.black.opacity(0.40).ignoresSafeArea()
                         VStack(spacing: 12) {
-                            ProgressView()
-                                .scaleEffect(1.2)
-                            Text("Detecting Proxy vs Original status…")
-                                .font(.subheadline.weight(.medium))
+                            SunnyMascotView(mood: .uploading, size: 74)
+                            Text("Checking…")
+                                .font(.subheadline.weight(.bold))
+                                .foregroundColor(PhotoHubPalette.ink)
                         }
                         .padding(24)
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                        .background(PhotoHubPalette.card, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                        .shadow(color: PhotoHubPalette.orange.opacity(0.22), radius: 18, y: 8)
                     }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .navigationTitle("Compress")
+            .navigationTitle("Backup")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
@@ -165,8 +153,9 @@ struct LibraryView: View {
                     } label: {
                         if viewModel.isScanning {
                             ProgressView()
+                                .tint(PhotoHubPalette.orange)
                         } else {
-                            Label("Scan", systemImage: "arrow.clockwise")
+                            Image(systemName: "arrow.clockwise")
                         }
                     }
                     .disabled(viewModel.isScanning || viewModel.isProcessing)
@@ -176,13 +165,13 @@ struct LibraryView: View {
                     Button {
                         showingProxyDetectorPicker = true
                     } label: {
-                        Label("Detect Proxy", systemImage: "magnifyingglass")
+                        Image(systemName: "magnifyingglass")
                     }
                     .disabled(viewModel.isInspectingGalleryPicks || viewModel.isProcessing)
 
                     if !viewModel.candidates.isEmpty {
                         Menu {
-                            Picker("Sort Order", selection: Binding(
+                            Picker("Sort", selection: Binding(
                                 get: { viewModel.sortMode },
                                 set: { viewModel.setSortMode($0) }
                             )) {
@@ -195,12 +184,12 @@ struct LibraryView: View {
                                 Button {
                                     viewModel.selectTopVideos()
                                 } label: {
-                                    Label("Select Largest Videos", systemImage: "video.fill")
+                                    Label("Top Videos", systemImage: "video.fill")
                                 }
                             }
 
                             Button("Select All") { viewModel.selectAllEligible(true) }
-                            Button("Deselect All") { viewModel.selectAllEligible(false) }
+                            Button("Clear") { viewModel.selectAllEligible(false) }
                         } label: {
                             Image(systemName: "line.3.horizontal.decrease.circle")
                         }
@@ -256,7 +245,7 @@ struct LibraryView: View {
                 )
             }
             .alert(
-                "Delete Original Photo",
+                "Delete Original",
                 isPresented: Binding(
                     get: { viewModel.deleteErrorAlertMessage != nil },
                     set: { if !$0 { viewModel.deleteErrorAlertMessage = nil } }
@@ -270,7 +259,7 @@ struct LibraryView: View {
                         }
                     }
                 }
-                Button("Open Settings") {
+                Button("Settings") {
                     viewModel.dismissPendingDeleteAfterError()
                     if let url = URL(string: UIApplication.openSettingsURLString) {
                         UIApplication.shared.open(url)
@@ -298,164 +287,255 @@ struct LibraryView: View {
         }
     }
 
+    @ViewBuilder
+    private func compactBanner<Content: View>(
+        tint: Color,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        HStack(spacing: 10) {
+            content()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(tint.opacity(0.24), lineWidth: 1)
+        )
+    }
+
+    private var emptyHeroView: some View {
+        VStack(spacing: 18) {
+            Spacer()
+
+            SunnyMascotView(mood: heroMood, size: 130)
+
+            Text(
+                (viewModel.permissionStatus == .denied || viewModel.permissionStatus == .restricted)
+                ? "Photos Access"
+                : (viewModel.isScanning ? "Scanning…" : (activeBgCount > 0 ? "Syncing…" : "Ready"))
+            )
+            .font(.system(size: 26, weight: .heavy, design: .rounded))
+            .foregroundColor(PhotoHubPalette.ink)
+
+            if viewModel.totalSavedBytes > 0 {
+                WarmStatPill(
+                    icon: "sparkles",
+                    text: "Saved \(ByteCountFormatter.string(fromByteCount: viewModel.totalSavedBytes, countStyle: .file))",
+                    tint: PhotoHubPalette.mint
+                )
+            }
+
+            if viewModel.permissionStatus == .denied || viewModel.permissionStatus == .restricted {
+                Button("Allow Photos") {
+                    if let url = URL(string: UIApplication.openSettingsURLString) {
+                        UIApplication.shared.open(url)
+                    }
+                }
+                .buttonStyle(PhotoHubPrimaryButtonStyle())
+            } else {
+                VStack(spacing: 10) {
+                    Button {
+                        viewModel.scanAndAutoCompressIfEnabled(forceNow: true)
+                    } label: {
+                        Label("Auto Backup", systemImage: "bolt.fill")
+                            .frame(minWidth: 210)
+                    }
+                    .buttonStyle(PhotoHubPrimaryButtonStyle())
+                    .disabled(viewModel.isScanning || viewModel.isProcessing)
+
+                    HStack(spacing: 10) {
+                        Button {
+                            viewModel.scanLibrary()
+                        } label: {
+                            Label("Pick", systemImage: "checklist")
+                        }
+                        .buttonStyle(PhotoHubSoftButtonStyle())
+                        .disabled(viewModel.isScanning || viewModel.isProcessing)
+
+                        Button {
+                            showingProxyDetectorPicker = true
+                        } label: {
+                            Label("Check Proxy", systemImage: "magnifyingglass")
+                        }
+                        .buttonStyle(PhotoHubSoftButtonStyle())
+                        .disabled(viewModel.isInspectingGalleryPicks || viewModel.isProcessing)
+                    }
+                }
+            }
+
+            Spacer()
+        }
+        .padding(.horizontal, 24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var activeProcessingCard: some View {
+        let pct = Int((viewModel.overallProgressFraction * 100).rounded())
+        return HStack(spacing: 12) {
+            SunnyMascotView(mood: .uploading, size: 52)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("\(pct)%")
+                        .font(.subheadline.weight(.heavy).monospacedDigit())
+                        .foregroundColor(PhotoHubPalette.orange)
+                    Text("· \(viewModel.completedCount)/\(viewModel.totalToProcess)")
+                        .font(.caption.weight(.semibold).monospacedDigit())
+                        .foregroundColor(PhotoHubPalette.muted)
+                    Spacer()
+                }
+                ProgressView(value: viewModel.overallProgressFraction, total: 1.0)
+                    .tint(PhotoHubPalette.orange)
+            }
+        }
+        .padding(12)
+        .background(PhotoHubPalette.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(PhotoHubPalette.cardBorder, lineWidth: 1)
+        )
+    }
+
     private var overnightReadyBanner: some View {
         let sizeStr = ByteCountFormatter.string(fromByteCount: bgManager.stagedSavedBytes, countStyle: .file)
-        return HStack(spacing: 10) {
+        return compactBanner(tint: PhotoHubPalette.mint) {
             Image(systemName: "checkmark.seal.fill")
-                .foregroundColor(.indigo)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("\(bgManager.stagedItems.count) Original\(bgManager.stagedItems.count == 1 ? "" : "s") Backed Up & Ready to Delete")
-                    .font(.subheadline.weight(.semibold))
-                Text("Safely uploaded & SHA-256 verified on your server. Delete the original file\(bgManager.stagedItems.count == 1 ? "" : "s") from iPhone to free ~\(sizeStr).")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                .foregroundColor(PhotoHubPalette.mint)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("\(bgManager.stagedItems.count) Ready")
+                    .font(.subheadline.weight(.bold))
+                    .foregroundColor(PhotoHubPalette.ink)
+                Text("Free ~\(sizeStr)")
+                    .font(.caption.weight(.medium))
+                    .foregroundColor(PhotoHubPalette.muted)
             }
             Spacer()
-            Button("Delete Originals") {
+            Button("Delete") {
                 viewModel.triggerStagedOvernightCleanupPrompt()
             }
-            .buttonStyle(.borderedProminent)
-            .tint(.indigo)
-            .controlSize(.small)
+            .font(.caption.weight(.bold))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(PhotoHubPalette.orangeGradient, in: Capsule())
+            .foregroundColor(.white)
 
             Button {
                 bgManager.clearAllStagedItems()
             } label: {
                 Image(systemName: "xmark")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .font(.caption2.weight(.bold))
+                    .foregroundColor(PhotoHubPalette.muted)
             }
             .buttonStyle(.plain)
         }
-        .padding(12)
-        .background(Color.indigo.opacity(0.1))
     }
 
     private var recentlyDeletedWarningBanner: some View {
         let sizeStr = ByteCountFormatter.string(fromByteCount: viewModel.recentlyDeletedNoticeBytes, countStyle: .file)
-        return HStack(alignment: .top, spacing: 10) {
-            Image(systemName: "exclamationmark.circle.fill")
-                .foregroundColor(.orange)
-                .padding(.top, 2)
-            VStack(alignment: .leading, spacing: 4) {
-                Text("One More Step to Free ~\(sizeStr) Right Now")
-                    .font(.caption.weight(.semibold))
-                Text("iPhone Photos moved the \(viewModel.recentlyDeletedNoticeCount) deleted original photo(s) to Recently Deleted for 30 days. Open Photos -> Utilities -> Recently Deleted -> Delete All to reclaim that space immediately.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                HStack(spacing: 12) {
-                    Button("Open Photos") {
-                        if let url = URL(string: "photos-redirect://") {
-                            UIApplication.shared.open(url)
-                        }
-                    }
-                    .font(.caption.weight(.semibold))
-
-                    Button("Dismiss") {
-                        viewModel.dismissRecentlyDeletedNotice()
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
-                .padding(.top, 2)
-            }
+        return compactBanner(tint: PhotoHubPalette.warmAmber) {
+            Image(systemName: "trash.fill")
+                .foregroundColor(PhotoHubPalette.orange)
+            Text("Empty Trash · ~\(sizeStr)")
+                .font(.caption.weight(.semibold))
+                .foregroundColor(PhotoHubPalette.ink)
             Spacer()
+            Button("Photos") {
+                if let url = URL(string: "photos-redirect://") {
+                    UIApplication.shared.open(url)
+                }
+            }
+            .font(.caption.weight(.bold))
+            .foregroundColor(PhotoHubPalette.deepOrange)
+
+            Button {
+                viewModel.dismissRecentlyDeletedNotice()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.caption2.weight(.bold))
+                    .foregroundColor(PhotoHubPalette.muted)
+            }
+            .buttonStyle(.plain)
         }
-        .padding(12)
-        .background(Color.orange.opacity(0.12))
     }
 
     private var summaryHeader: some View {
-        VStack(spacing: 8) {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("\(viewModel.candidates.count) Items · Selected \(viewModel.selectedCount)")
-                        .font(.subheadline.weight(.semibold))
-                    let estStr = ByteCountFormatter.string(fromByteCount: viewModel.totalEligibleEstimatedBytes, countStyle: .file)
-                    Text("Est. space: ~\(estStr)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
+        VStack(spacing: 10) {
+            HStack(spacing: 8) {
+                let estStr = ByteCountFormatter.string(fromByteCount: viewModel.totalEligibleEstimatedBytes, countStyle: .file)
+                WarmStatPill(icon: "photo.stack", text: "\(viewModel.candidates.count) · ~\(estStr)", tint: PhotoHubPalette.orange)
 
                 if viewModel.totalSavedBytes > 0 {
-                    Text("Saved \(ByteCountFormatter.string(fromByteCount: viewModel.totalSavedBytes, countStyle: .file))")
-                        .font(.caption2.bold())
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(Color.green.opacity(0.15), in: Capsule())
-                        .foregroundStyle(.green)
+                    WarmStatPill(
+                        icon: "sparkles",
+                        text: ByteCountFormatter.string(fromByteCount: viewModel.totalSavedBytes, countStyle: .file),
+                        tint: PhotoHubPalette.mint
+                    )
                 }
+
+                Spacer()
 
                 if !viewModel.pendingVideoCandidates.isEmpty && !viewModel.isProcessing {
                     let vidStr = ByteCountFormatter.string(fromByteCount: viewModel.pendingVideoEstimatedBytes, countStyle: .file)
                     Button {
                         viewModel.selectTopVideos()
                     } label: {
-                        Label("Videos (~\(vidStr))", systemImage: "video.fill")
-                            .font(.caption.weight(.semibold))
+                        HStack(spacing: 4) {
+                            Image(systemName: "video.fill")
+                                .font(.caption2)
+                            Text(vidStr)
+                                .font(.caption2.weight(.bold))
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(PhotoHubPalette.softPeach, in: Capsule())
+                        .foregroundColor(PhotoHubPalette.deepOrange)
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
+                    .buttonStyle(.plain)
                 }
             }
 
             if viewModel.isCheckingServerProxies {
                 HStack(spacing: 6) {
                     ProgressView()
-                        .controlSize(.small)
-                    Text("Filtering out already-compressed proxies…")
+                        .controlSize(.mini)
+                        .tint(PhotoHubPalette.orange)
+                    Text("Checking proxies…")
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundColor(PhotoHubPalette.muted)
                     Spacer()
                 }
             }
 
-            Picker("After Backup Action", selection: $keepLocalProxyInPhotos) {
-                Text("Replace Original w/ Proxy").tag(true)
-                Text("Delete Original Only").tag(false)
+            Picker("Mode", selection: $keepLocalProxyInPhotos) {
+                Text("Keep Proxy").tag(true)
+                Text("Delete Only").tag(false)
             }
             .pickerStyle(.segmented)
-
-            HStack(spacing: 5) {
-                Image(systemName: "checkmark.shield.fill")
-                    .font(.caption2)
-                    .foregroundColor(.green)
-                Text(
-                    keepLocalProxyInPhotos
-                    ? "SHA-256 verified before delete · Keeps a lightweight proxy in Apple Photos"
-                    : "SHA-256 verified before delete · Removes local copy (stays on Server)"
-                )
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(.horizontal)
+        .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .background(Color(.secondarySystemBackground))
+        .background(PhotoHubPalette.card)
     }
 
     private var actionBar: some View {
         Button {
             viewModel.startProcessingSelectedPhotos()
         } label: {
-            HStack {
-                Image(systemName: "checkmark.shield.fill")
+            HStack(spacing: 8) {
+                Image(systemName: keepLocalProxyInPhotos ? "sparkles" : "icloud.and.arrow.up.fill")
                 Text(
                     keepLocalProxyInPhotos
-                    ? "Upload, Compress & Delete \(viewModel.selectedCount) Original\(viewModel.selectedCount == 1 ? "" : "s")"
-                    : "Back Up & Delete \(viewModel.selectedCount) Original\(viewModel.selectedCount == 1 ? "" : "s")"
+                    ? "Compress \(viewModel.selectedCount)"
+                    : "Backup \(viewModel.selectedCount)"
                 )
-                .fontWeight(.semibold)
+                .font(.headline.weight(.bold))
             }
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 14)
         }
-        .buttonStyle(.borderedProminent)
+        .buttonStyle(PhotoHubPrimaryButtonStyle())
         .disabled(viewModel.isProcessing)
-        .padding()
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
         .background(.ultraThinMaterial)
     }
 }
@@ -474,8 +554,10 @@ private struct PhotoCandidateRow: View {
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: item.isSelected ? "checkmark.circle.fill" : "circle")
-                .foregroundStyle(item.isSelected ? Color.accentColor : Color.secondary)
+                .foregroundColor(item.isSelected ? PhotoHubPalette.orange : PhotoHubPalette.muted.opacity(0.55))
                 .font(.title3)
+                .scaleEffect(item.isSelected ? 1.08 : 1.0)
+                .animation(.spring(response: 0.22, dampingFraction: 0.65), value: item.isSelected)
                 .opacity(item.state.isFinished ? 0.3 : 1.0)
 
             ZStack(alignment: .bottomTrailing) {
@@ -484,19 +566,19 @@ private struct PhotoCandidateRow: View {
                         .resizable()
                         .scaledToFill()
                         .frame(width: 56, height: 56)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                 } else {
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(Color.secondary.opacity(0.2))
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(PhotoHubPalette.softPeach)
                         .frame(width: 56, height: 56)
                 }
 
                 if item.isVideo {
                     Image(systemName: "video.fill")
-                        .font(.system(size: 10, weight: .bold))
+                        .font(.system(size: 9, weight: .bold))
                         .foregroundStyle(.white)
                         .padding(4)
-                        .background(.black.opacity(0.65))
+                        .background(PhotoHubPalette.orange)
                         .clipShape(Circle())
                         .padding(3)
                 }
@@ -505,30 +587,31 @@ private struct PhotoCandidateRow: View {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
                     Text(item.filename)
-                        .font(.subheadline.weight(.medium))
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundColor(PhotoHubPalette.ink)
                         .lineLimit(1)
                     Spacer()
                     Text(item.estimatedSizeLabel)
-                        .font(.caption.monospacedDigit().weight(.medium))
-                        .foregroundStyle(item.isVideo ? .orange : .secondary)
+                        .font(.caption.monospacedDigit().weight(.bold))
+                        .foregroundColor(item.isVideo ? PhotoHubPalette.orange : PhotoHubPalette.muted)
                         .lineLimit(1)
                 }
 
                 Text(subtitleLineText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(.caption2)
+                    .foregroundColor(PhotoHubPalette.muted)
                     .lineLimit(1)
 
                 if item.state != .pending || item.isBackedUpOnServer {
                     HStack(spacing: 5) {
                         if item.state.isIntegrityVerified || item.isBackedUpOnServer {
-                            Image(systemName: "checkmark.shield.fill")
+                            Image(systemName: "checkmark.seal.fill")
                                 .font(.caption2)
-                                .foregroundStyle(.green)
+                                .foregroundColor(PhotoHubPalette.mint)
                         }
                         Text(statusLineText)
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(item.state == .pending && item.isBackedUpOnServer ? .green : badgeColor(for: item.state))
+                            .font(.caption2.weight(.bold))
+                            .foregroundColor(item.state == .pending && item.isBackedUpOnServer ? PhotoHubPalette.mint : badgeColor(for: item.state))
                             .lineLimit(1)
                     }
                 }
@@ -552,20 +635,21 @@ private struct PhotoCandidateRow: View {
 
     private var statusLineText: String {
         if item.state == .pending && item.isBackedUpOnServer {
-            return "Backed up on Server"
+            return "Backed Up"
         }
         return item.state.label
     }
 
     private func badgeColor(for state: PhotoCompressionState) -> Color {
         switch state {
-        case .completed: return .green
-        case .readyToDelete: return .orange
-        case .alreadyProxy: return .blue
-        case .skipped: return .secondary
-        case .failed: return .red
-        case .uploading, .uploadingInBackground, .hashing, .verifyingChecksum, .creatingProxy, .replacingInPhotos: return .blue
-        case .pending: return .secondary
+        case .completed: return PhotoHubPalette.mint
+        case .readyToDelete: return PhotoHubPalette.warmAmber
+        case .alreadyProxy: return PhotoHubPalette.orange
+        case .skipped: return PhotoHubPalette.muted
+        case .failed: return PhotoHubPalette.rose
+        case .uploading, .uploadingInBackground, .hashing, .verifyingChecksum, .creatingProxy, .replacingInPhotos:
+            return PhotoHubPalette.orange
+        case .pending: return PhotoHubPalette.muted
         }
     }
 }
@@ -589,8 +673,8 @@ private struct GalleryProxyInspectionSheet: View {
                 if let actionMessage, !actionMessage.isEmpty {
                     Section {
                         HStack(spacing: 8) {
-                            Image(systemName: "info.circle.fill")
-                                .foregroundStyle(.blue)
+                            Image(systemName: "sparkles")
+                                .foregroundColor(PhotoHubPalette.orange)
                             Text(actionMessage)
                                 .font(.caption)
                         }
@@ -605,7 +689,7 @@ private struct GalleryProxyInspectionSheet: View {
 
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(item.originalName ?? item.displayName)
-                                        .font(.subheadline.weight(.medium))
+                                        .font(.subheadline.weight(.semibold))
                                         .lineLimit(1)
 
                                     verdictBadge(for: item.kind)
@@ -614,25 +698,22 @@ private struct GalleryProxyInspectionSheet: View {
 
                             let localStr = ByteCountFormatter.string(fromByteCount: item.localSizeBytes, countStyle: .file)
                             let origStr = item.originalSizeBytes.flatMap { sz in
-                                sz > 0 ? " · Server Original: \(ByteCountFormatter.string(fromByteCount: sz, countStyle: .file))" : nil
+                                sz > 0 ? " → \(ByteCountFormatter.string(fromByteCount: sz, countStyle: .file))" : nil
                             } ?? ""
-                            let signalText = item.signals.isEmpty
-                                ? "No proxy tag or server proxy match found"
-                                : "Detected via: \(item.signals.joined(separator: ", "))"
 
-                            Text("Local size: \(localStr)\(origStr)\n\(signalText)")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            Text("\(localStr)\(origStr)")
+                                .font(.caption.monospacedDigit())
+                                .foregroundColor(PhotoHubPalette.muted)
 
                             if item.kind == .proxy, item.masterHash != nil {
                                 HStack(spacing: 10) {
                                     Button {
                                         onShareOriginal(item)
                                     } label: {
-                                        Label("Share Original", systemImage: "square.and.arrow.up")
-                                            .font(.caption.weight(.semibold))
+                                        Label("Share", systemImage: "square.and.arrow.up")
+                                            .font(.caption.weight(.bold))
                                     }
-                                    .buttonStyle(.bordered)
+                                    .buttonStyle(PhotoHubSoftButtonStyle())
                                     .disabled(busyItemId != nil)
 
                                     Button {
@@ -640,16 +721,16 @@ private struct GalleryProxyInspectionSheet: View {
                                     } label: {
                                         if busyItemId == item.id {
                                             ProgressView()
-                                                .controlSize(.small)
+                                                .tint(.white)
                                         } else {
                                             Label(
                                                 item.isProtectedOriginal ? "Restored" : "Restore",
                                                 systemImage: "icloud.and.arrow.down"
                                             )
-                                            .font(.caption.weight(.semibold))
+                                            .font(.caption.weight(.bold))
                                         }
                                     }
-                                    .buttonStyle(.borderedProminent)
+                                    .buttonStyle(PhotoHubPrimaryButtonStyle())
                                     .disabled(busyItemId != nil)
                                 }
                                 .padding(.top, 2)
@@ -658,14 +739,10 @@ private struct GalleryProxyInspectionSheet: View {
                         .padding(.vertical, 4)
                     }
                 } header: {
-                    Text(
-                        proxyCount > 0
-                        ? "Detected \(proxyCount) compressed proxy of \(items.count) item(s)"
-                        : "All \(items.count) checked item(s) look like originals"
-                    )
+                    Text(proxyCount > 0 ? "\(proxyCount) Proxy · \(items.count) Checked" : "\(items.count) Original")
                 }
             }
-            .navigationTitle("Gallery Proxy Check")
+            .navigationTitle("Proxy Check")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
@@ -686,18 +763,18 @@ private struct GalleryProxyInspectionSheet: View {
     private func verdictBadge(for kind: GalleryMediaKind) -> some View {
         let (title, color): (String, Color) = {
             switch kind {
-            case .proxy: return ("COMPRESSED PROXY", .orange)
-            case .originalBackedUp: return ("ORIGINAL (BACKED UP)", .green)
-            case .originalUnbacked: return ("ORIGINAL (NOT BACKED UP)", .secondary)
-            case .unknown: return ("ORIGINAL / UNKNOWN (OFFLINE)", .secondary)
+            case .proxy: return ("PROXY", PhotoHubPalette.orange)
+            case .originalBackedUp: return ("ORIGINAL · SYNCED", PhotoHubPalette.mint)
+            case .originalUnbacked: return ("ORIGINAL", PhotoHubPalette.muted)
+            case .unknown: return ("UNKNOWN", PhotoHubPalette.muted)
             }
         }()
         Text(title)
             .font(.caption2.bold())
-            .padding(.horizontal, 7)
-            .padding(.vertical, 2)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
             .background(color.opacity(0.15), in: Capsule())
-            .foregroundStyle(color)
+            .foregroundColor(color)
     }
 }
 
@@ -708,17 +785,17 @@ private struct PHAssetThumbView: View {
 
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color.secondary.opacity(0.16))
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(PhotoHubPalette.softPeach)
             if let image {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFill()
                     .frame(width: 48, height: 48)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             } else {
-                Image(systemName: isVideo ? "video" : "photo")
-                    .foregroundStyle(.secondary)
+                Image(systemName: isVideo ? "video.fill" : "photo.fill")
+                    .foregroundColor(PhotoHubPalette.orange.opacity(0.7))
             }
         }
         .frame(width: 48, height: 48)

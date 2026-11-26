@@ -113,33 +113,49 @@ struct ServerGalleryView: View {
 
     var body: some View {
         AdaptiveNavigationStack {
-            Group {
-                if isLoading && photos.isEmpty {
-                    ProgressView("Loading photos...")
+            ZStack {
+                PhotoHubPalette.canvas.ignoresSafeArea()
+
+                Group {
+                    if isLoading && photos.isEmpty {
+                        VStack(spacing: 14) {
+                            SunnyMascotView(mood: .uploading, size: 112)
+                            Text("Loading…")
+                                .font(.headline.weight(.bold))
+                                .foregroundColor(PhotoHubPalette.ink)
+                        }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if let errorMessage, photos.isEmpty {
-                    CompatibleEmptyStateView(
-                        title: "Could Not Connect",
-                        systemImage: "wifi.exclamationmark",
-                        description: errorMessage
-                    ) {
-                        Button("Retry") {
-                            Task { await loadPhotos() }
+                    } else if let errorMessage, photos.isEmpty {
+                        VStack(spacing: 14) {
+                            SunnyMascotView(mood: .alert, size: 116)
+                            Text("Offline")
+                                .font(.title3.weight(.heavy))
+                                .foregroundColor(PhotoHubPalette.ink)
+                            Text(errorMessage)
+                                .font(.caption)
+                                .foregroundColor(PhotoHubPalette.muted)
+                                .lineLimit(2)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal, 28)
+                            Button("Retry") {
+                                Task { await loadPhotos() }
+                            }
+                            .buttonStyle(PhotoHubPrimaryButtonStyle())
                         }
-                        .buttonStyle(.borderedProminent)
-                    }
-                } else if photos.isEmpty {
-                    CompatibleEmptyStateView(
-                        title: "No Backups Yet",
-                        systemImage: "cloud",
-                        description: "Upload photos or store them on your PhotoHub server to browse them here."
-                    ) {
-                        Button("Refresh") {
-                            Task { await loadPhotos() }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else if photos.isEmpty {
+                        VStack(spacing: 14) {
+                            SunnyMascotView(mood: .sleeping, size: 120)
+                            Text("No Backups")
+                                .font(.title3.weight(.heavy))
+                                .foregroundColor(PhotoHubPalette.ink)
+                            Button("Refresh") {
+                                Task { await loadPhotos() }
+                            }
+                            .buttonStyle(PhotoHubPrimaryButtonStyle())
                         }
-                        .buttonStyle(.borderedProminent)
-                    }
-                } else {
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
                     ScrollViewReader { scrollProxy in
                         VStack(spacing: 0) {
                             if timelineData.years.count > 1 {
@@ -286,13 +302,14 @@ struct ServerGalleryView: View {
                         }
                     }
                 }
+                }
             }
             .safeAreaInset(edge: .bottom) {
                 if isSelectionMode {
                     selectionRestoreBottomBar
                 }
             }
-            .navigationTitle(isSelectionMode ? "\(selectedPhotoHashes.count) Selected" : "Server")
+            .navigationTitle(isSelectionMode ? "\(selectedPhotoHashes.count) Selected" : "Cloud")
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
                     if isSelectionMode {

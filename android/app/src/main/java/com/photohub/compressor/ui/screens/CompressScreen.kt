@@ -8,6 +8,10 @@ import android.text.format.Formatter
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -24,6 +28,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
@@ -36,6 +41,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.photohub.compressor.background.BackgroundBackupManager
 import com.photohub.compressor.data.*
 import com.photohub.compressor.media.*
+import com.photohub.compressor.ui.components.*
 import com.photohub.compressor.ui.theme.*
 import com.photohub.compressor.viewmodel.CompressViewModel
 
@@ -52,6 +58,14 @@ fun CompressScreen(
     val bgState by bgManager.state.collectAsStateWithLifecycle()
 
     var showMenu by remember { mutableStateOf(false) }
+
+    val activeBgCount = maxOf(uiState.backgroundActiveCount, bgState.activeBackgroundCount)
+    val heroMood = when {
+        uiState.accessLevel == MediaAccessLevel.DENIED -> MascotMood.ALERT
+        uiState.isScanning || uiState.isProcessing || activeBgCount > 0 -> MascotMood.UPLOADING
+        bgState.stagedItems.isNotEmpty() || uiState.totalSavedBytes > 0L -> MascotMood.CELEBRATE
+        else -> MascotMood.HAPPY
+    }
 
     val detectProxyPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickMultipleVisualMedia(25)
@@ -118,7 +132,7 @@ fun CompressScreen(
     if (uiState.deleteErrorAlertMessage != null) {
         AlertDialog(
             onDismissRequest = { viewModel.clearDeleteError() },
-            title = { Text("Delete Original Photo") },
+            title = { Text("Delete Original") },
             text = { Text(uiState.deleteErrorAlertMessage.orEmpty()) },
             confirmButton = {
                 if (uiState.pendingDeleteIds.isNotEmpty()) {
@@ -136,7 +150,7 @@ fun CompressScreen(
                         viewModel.dismissPendingDeleteAfterError()
                         openAppSettings(context)
                     }) {
-                        Text("Open Settings")
+                        Text("Settings")
                     }
                     TextButton(onClick = { viewModel.dismissPendingDeleteAfterError() }) {
                         Text("OK")
@@ -147,9 +161,13 @@ fun CompressScreen(
     }
 
     Scaffold(
+        containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             TopAppBar(
-                title = { Text("Compress", fontWeight = FontWeight.SemiBold) },
+                title = { Text("Backup", fontWeight = FontWeight.Bold) },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.background
+                ),
                 navigationIcon = {
                     IconButton(
                         onClick = { viewModel.scanLibrary() },
@@ -173,7 +191,7 @@ fun CompressScreen(
                         },
                         enabled = !uiState.isInspectingGalleryUris && !uiState.isProcessing
                     ) {
-                        Icon(Icons.Rounded.ImageSearch, contentDescription = "Detect Proxy in Gallery")
+                        Icon(Icons.Rounded.ImageSearch, contentDescription = "Check Proxy")
                     }
 
                     if (uiState.candidates.isNotEmpty()) {
@@ -182,7 +200,7 @@ fun CompressScreen(
                                 onClick = { showMenu = true },
                                 enabled = !uiState.isProcessing
                             ) {
-                                Icon(Icons.Rounded.FilterList, contentDescription = "Sort & Filter")
+                                Icon(Icons.Rounded.FilterList, contentDescription = "Sort")
                             }
                             DropdownMenu(
                                 expanded = showMenu,
@@ -205,7 +223,7 @@ fun CompressScreen(
                                 HorizontalDivider()
                                 if (uiState.pendingVideoCandidates.isNotEmpty()) {
                                     DropdownMenuItem(
-                                        text = { Text("Select Largest Videos") },
+                                        text = { Text("Top Videos") },
                                         leadingIcon = { Icon(Icons.Rounded.Videocam, contentDescription = null) },
                                         onClick = {
                                             viewModel.selectTopVideos()
@@ -221,7 +239,7 @@ fun CompressScreen(
                                     }
                                 )
                                 DropdownMenuItem(
-                                    text = { Text("Deselect All") },
+                                    text = { Text("Clear") },
                                     onClick = {
                                         viewModel.selectAllEligible(false)
                                         showMenu = false
@@ -235,30 +253,29 @@ fun CompressScreen(
         },
         bottomBar = {
             if (uiState.selectedCount > 0) {
-                Surface(tonalElevation = 3.dp, shadowElevation = 6.dp) {
+                Surface(
+                    color = MaterialTheme.colorScheme.surface,
+                    tonalElevation = 4.dp,
+                    shadowElevation = 8.dp
+                ) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 12.dp)
+                            .padding(horizontal = 16.dp, vertical = 10.dp)
                     ) {
-                        Button(
-                            onClick = { viewModel.startProcessingSelectedPhotos() },
-                            enabled = !uiState.isProcessing,
-                            shape = RoundedCornerShape(14.dp),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(52.dp)
-                        ) {
-                            Icon(Icons.Rounded.VerifiedUser, contentDescription = null)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            val n = uiState.selectedCount
-                            val label = if (settingsState.keepLocalProxyInPhotos) {
-                                "Upload, Compress & Delete $n Original${if (n == 1) "" else "s"}"
-                            } else {
-                                "Back Up & Delete $n Original${if (n == 1) "" else "s"}"
-                            }
-                            Text(label, fontWeight = FontWeight.SemiBold)
+                        val n = uiState.selectedCount
+                        val label = if (settingsState.keepLocalProxyInPhotos) {
+                            "Compress $n"
+                        } else {
+                            "Backup $n"
                         }
+                        GradientPrimaryButton(
+                            text = label,
+                            icon = if (settingsState.keepLocalProxyInPhotos) Icons.Rounded.AutoAwesome else Icons.Rounded.CloudUpload,
+                            enabled = !uiState.isProcessing,
+                            onClick = { viewModel.startProcessingSelectedPhotos() },
+                            modifier = Modifier.fillMaxWidth()
+                        )
                     }
                 }
             }
@@ -270,112 +287,94 @@ fun CompressScreen(
                 .padding(padding)
         ) {
             Column(modifier = Modifier.fillMaxSize()) {
-            if (uiState.accessLevel == MediaAccessLevel.LIMITED_ACCESS) {
-                Row(
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(PhotoHubOrange.copy(alpha = 0.15f))
-                        .padding(10.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                        .padding(horizontal = 14.dp, vertical = 4.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Icon(Icons.Rounded.Warning, contentDescription = null, tint = PhotoHubOrange)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "Limited Photos Access: Switch to Allow All in Android Settings to scan and remove all originals.",
-                        style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Button(
-                        onClick = { openAppSettings(context) },
-                        colors = ButtonDefaults.buttonColors(containerColor = PhotoHubOrange),
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    if (uiState.accessLevel == MediaAccessLevel.LIMITED_ACCESS) {
+                        CompactBannerCard(tint = PhotoHubAmber) {
+                            Icon(Icons.Rounded.Warning, contentDescription = null, tint = PhotoHubAmber, modifier = Modifier.size(18.dp))
+                            Text(
+                                text = "Limited Access",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Button(
+                                onClick = { openAppSettings(context) },
+                                colors = ButtonDefaults.buttonColors(containerColor = PhotoHubOrange),
+                                shape = CircleShape,
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                                modifier = Modifier.height(32.dp)
+                            ) {
+                                Text("Allow All", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+
+                    AnimatedVisibility(
+                        visible = bgState.stagedItems.isNotEmpty() && !uiState.isProcessing && !uiState.isAwaitingDeleteConfirmation
                     ) {
-                        Text("Full Access", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                        val count = bgState.stagedItems.size
+                        val sizeStr = Formatter.formatFileSize(context, bgState.stagedSavedBytes)
+                        CompactBannerCard(tint = PhotoHubMint) {
+                            Icon(Icons.Rounded.Verified, contentDescription = null, tint = PhotoHubMint, modifier = Modifier.size(20.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "$count Ready",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    text = "Free ~$sizeStr",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Button(
+                                onClick = { viewModel.triggerStagedOvernightCleanupPrompt() },
+                                colors = ButtonDefaults.buttonColors(containerColor = PhotoHubOrange),
+                                shape = CircleShape,
+                                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 4.dp),
+                                modifier = Modifier.height(34.dp)
+                            ) {
+                                Text("Delete", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                            }
+                            IconButton(onClick = { bgManager.clearAllStagedItems() }, modifier = Modifier.size(26.dp)) {
+                                Icon(Icons.Rounded.Close, contentDescription = "Dismiss", modifier = Modifier.size(16.dp))
+                            }
+                        }
                     }
-                }
-            }
 
-            if (bgState.stagedItems.isNotEmpty() && !uiState.isProcessing && !uiState.isAwaitingDeleteConfirmation) {
-                val count = bgState.stagedItems.size
-                val sizeStr = Formatter.formatFileSize(context, bgState.stagedSavedBytes)
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(PhotoHubIndigo.copy(alpha = 0.10f))
-                        .padding(12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(Icons.Rounded.Verified, contentDescription = null, tint = PhotoHubIndigo)
-                    Spacer(modifier = Modifier.width(10.dp))
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "$count Original${if (count == 1) "" else "s"} Backed Up & Ready to Delete",
-                            style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        Text(
-                            text = "Safely uploaded & SHA-256 verified on your server. Move original file${if (count == 1) "" else "s"} to Trash to free ~$sizeStr.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                    AnimatedVisibility(visible = activeBgCount > 0) {
+                        CompactBannerCard(tint = PhotoHubOrange) {
+                            PulsingStatusDot(color = PhotoHubOrange)
+                            Text(
+                                text = "Uploading $activeBgCount",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.weight(1f)
+                            )
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp,
+                                color = PhotoHubOrange
+                            )
+                        }
                     }
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Button(
-                        onClick = { viewModel.triggerStagedOvernightCleanupPrompt() },
-                        colors = ButtonDefaults.buttonColors(containerColor = PhotoHubIndigo),
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                    ) {
-                        Text("Delete Originals", style = MaterialTheme.typography.labelSmall)
-                    }
-                    IconButton(onClick = { bgManager.clearAllStagedItems() }, modifier = Modifier.size(28.dp)) {
-                        Icon(Icons.Rounded.Close, contentDescription = "Dismiss", modifier = Modifier.size(16.dp))
-                    }
-                }
-            }
 
-            if (uiState.backgroundActiveCount > 0) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(PhotoHubBlue.copy(alpha = 0.08f))
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    val c = uiState.backgroundActiveCount
-                    Text(
-                        text = "Background upload running for $c item${if (c == 1) "" else "s"} — automatically skipped from manual upload to prevent duplicates.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-
-            if (uiState.recentlyDeletedNoticeCount > 0) {
-                val sizeStr = Formatter.formatFileSize(context, uiState.recentlyDeletedNoticeBytes)
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(PhotoHubOrange.copy(alpha = 0.12f))
-                        .padding(12.dp),
-                    verticalAlignment = Alignment.Top
-                ) {
-                    Icon(Icons.Rounded.Info, contentDescription = null, tint = PhotoHubOrange)
-                    Spacer(modifier = Modifier.width(10.dp))
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "One More Step to Free ~$sizeStr Right Now",
-                            style = MaterialTheme.typography.bodySmall,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        Text(
-                            text = "Android Gallery moved the ${uiState.recentlyDeletedNoticeCount} deleted original(s) to Trash for 30 days. Empty Gallery Trash to reclaim storage immediately.",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    AnimatedVisibility(visible = uiState.recentlyDeletedNoticeCount > 0) {
+                        val sizeStr = Formatter.formatFileSize(context, uiState.recentlyDeletedNoticeBytes)
+                        CompactBannerCard(tint = PhotoHubAmber) {
+                            Icon(Icons.Rounded.DeleteSweep, contentDescription = null, tint = PhotoHubOrange, modifier = Modifier.size(18.dp))
+                            Text(
+                                text = "Empty Trash · ~$sizeStr",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.weight(1f)
+                            )
                             TextButton(
                                 onClick = {
                                     runCatching {
@@ -386,168 +385,207 @@ fun CompressScreen(
                                         context.startActivity(intent)
                                     }
                                 },
-                                contentPadding = PaddingValues(0.dp)
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
                             ) {
-                                Text("Open Gallery", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                                Text("Gallery", fontWeight = FontWeight.Bold)
                             }
-                            TextButton(
-                                onClick = { viewModel.dismissRecentlyDeletedNotice() },
-                                contentPadding = PaddingValues(0.dp)
+                            IconButton(onClick = { viewModel.dismissRecentlyDeletedNotice() }, modifier = Modifier.size(24.dp)) {
+                                Icon(Icons.Rounded.Close, contentDescription = "Dismiss", modifier = Modifier.size(15.dp))
+                            }
+                        }
+                    }
+
+                    uiState.statusBanner?.takeIf { it.isNotBlank() }?.let { banner ->
+                        CompactBannerCard(tint = PhotoHubOrange) {
+                            Icon(Icons.Rounded.AutoAwesome, contentDescription = null, tint = PhotoHubOrange, modifier = Modifier.size(16.dp))
+                            Text(
+                                banner,
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+
+                    AnimatedVisibility(visible = uiState.isProcessing) {
+                        Surface(
+                            shape = RoundedCornerShape(18.dp),
+                            color = MaterialTheme.colorScheme.surface,
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp)
                             ) {
-                                Text("Dismiss", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                SunnyMascot(mood = MascotMood.UPLOADING, size = 50.dp)
+                                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    val pct = (uiState.overallProgressFraction * 100f).toInt()
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            text = "$pct%",
+                                            style = MaterialTheme.typography.titleSmall,
+                                            fontWeight = FontWeight.ExtraBold,
+                                            color = PhotoHubOrange
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = "· ${uiState.completedCount}/${uiState.totalToProcess}",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                    LinearProgressIndicator(
+                                        progress = { uiState.overallProgressFraction },
+                                        color = PhotoHubOrange,
+                                        trackColor = PhotoHubOrange.copy(alpha = 0.16f),
+                                        modifier = Modifier.fillMaxWidth().height(7.dp).clip(CircleShape)
+                                    )
+                                }
                             }
+                        }
+                    }
+                }
+
+                if (uiState.candidates.isEmpty()) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(24.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        SunnyMascot(mood = heroMood, size = 132.dp)
+                        Spacer(modifier = Modifier.height(14.dp))
+                        Text(
+                            text = when {
+                                uiState.accessLevel == MediaAccessLevel.DENIED -> "Photos Access"
+                                uiState.isScanning -> "Scanning…"
+                                activeBgCount > 0 -> "Syncing…"
+                                else -> "Ready"
+                            },
+                            style = MaterialTheme.typography.headlineSmall,
+                            fontWeight = FontWeight.ExtraBold,
+                            textAlign = TextAlign.Center
+                        )
+
+                        if (uiState.totalSavedBytes > 0L) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            WarmStatChip(
+                                text = "Saved ${Formatter.formatFileSize(context, uiState.totalSavedBytes)}",
+                                tint = PhotoHubMint,
+                                icon = Icons.Rounded.AutoAwesome
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(22.dp))
+
+                        if (uiState.accessLevel == MediaAccessLevel.DENIED) {
+                            GradientPrimaryButton(
+                                text = "Allow Photos",
+                                icon = Icons.Rounded.PhotoLibrary,
+                                onClick = { openAppSettings(context) }
+                            )
+                        } else {
+                            GradientPrimaryButton(
+                                text = "Auto Backup",
+                                icon = Icons.Rounded.Bolt,
+                                enabled = !uiState.isScanning && !uiState.isProcessing,
+                                onClick = { viewModel.scanAndAutoCompressIfEnabled(forceNow = true) },
+                                modifier = Modifier.widthIn(min = 210.dp)
+                            )
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                SoftOrangeButton(
+                                    text = "Pick",
+                                    icon = Icons.Rounded.Checklist,
+                                    enabled = !uiState.isScanning && !uiState.isProcessing,
+                                    onClick = { viewModel.scanLibrary() }
+                                )
+                                SoftOrangeButton(
+                                    text = "Check Proxy",
+                                    icon = Icons.Rounded.ImageSearch,
+                                    enabled = !uiState.isInspectingGalleryUris && !uiState.isProcessing,
+                                    onClick = {
+                                        detectProxyPicker.launch(
+                                            androidx.activity.result.PickVisualMediaRequest(
+                                                ActivityResultContracts.PickVisualMedia.ImageAndVideo
+                                            )
+                                        )
+                                    }
+                                )
+                            }
+                        }
+                    }
+                } else {
+                    SummaryHeader(
+                        uiState = uiState,
+                        keepLocalProxy = settingsState.keepLocalProxyInPhotos,
+                        onToggleKeepLocal = { settings.setKeepLocalProxyInPhotos(it) },
+                        onSelectVideos = { viewModel.selectTopVideos() }
+                    )
+
+                    LazyColumn(modifier = Modifier.fillMaxSize()) {
+                        items(uiState.candidates, key = { it.id }) { item ->
+                            LaunchedEffect(item.id) {
+                                viewModel.loadThumbnailIfNeeded(item)
+                            }
+                            CandidateRow(
+                                item = item,
+                                thumbnail = uiState.thumbnails[item.id],
+                                onClick = { viewModel.toggleSelection(item.id) }
+                            )
+                            HorizontalDivider(
+                                thickness = 0.5.dp,
+                                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)
+                            )
                         }
                     }
                 }
             }
 
-            uiState.statusBanner?.let { banner ->
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(PhotoHubBlue.copy(alpha = 0.10f))
-                        .padding(12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(Icons.Rounded.Info, contentDescription = null, tint = PhotoHubBlue)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(banner, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
-                }
-            }
-
-            if (uiState.isProcessing) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
-                        .padding(14.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    LinearProgressIndicator(
-                        progress = { uiState.overallProgressFraction },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    val pct = (uiState.overallProgressFraction * 100f).toInt()
-                    Text(
-                        text = "Uploading & Compressing $pct% (${uiState.completedCount}/${uiState.totalToProcess})…",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-
-            if (uiState.candidates.isEmpty()) {
-                Column(
+            if (uiState.isInspectingGalleryUris) {
+                Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .padding(24.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center
+                        .background(Color.Black.copy(alpha = 0.40f)),
+                    contentAlignment = Alignment.Center
                 ) {
-                    Icon(
-                        imageVector = Icons.Rounded.PhotoLibrary,
-                        contentDescription = null,
-                        modifier = Modifier.size(64.dp),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(modifier = Modifier.height(14.dp))
-                    Text(
-                        text = "Ready to Back Up & Free Space",
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.SemiBold,
-                        textAlign = TextAlign.Center
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        text = if (uiState.accessLevel == MediaAccessLevel.DENIED) {
-                            "Photos & Videos permission is required. Open Android Settings to allow access."
-                        } else {
-                            "New photos & videos upload silently in the background, and photoHub notifies you when originals are ready to delete — or tap below to scan and free space now."
-                        },
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        textAlign = TextAlign.Center
-                    )
-                    Spacer(modifier = Modifier.height(18.dp))
-                    if (uiState.accessLevel == MediaAccessLevel.DENIED) {
-                        Button(onClick = { openAppSettings(context) }) {
-                            Text("Open Android Settings")
-                        }
-                    } else {
-                        Button(
-                            onClick = { viewModel.scanAndAutoCompressIfEnabled(forceNow = true) },
-                            enabled = !uiState.isScanning && !uiState.isProcessing
+                    Surface(shape = RoundedCornerShape(24.dp), tonalElevation = 6.dp) {
+                        Column(
+                            modifier = Modifier.padding(24.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            Text("Auto-Upload New Photos & Videos")
+                            SunnyMascot(mood = MascotMood.UPLOADING, size = 76.dp)
+                            Text("Checking…", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
                         }
-                        Spacer(modifier = Modifier.height(8.dp))
-                        OutlinedButton(
-                            onClick = { viewModel.scanLibrary() },
-                            enabled = !uiState.isScanning && !uiState.isProcessing
-                        ) {
-                            Text("Scan & Choose Manually")
-                        }
-                        Spacer(modifier = Modifier.height(8.dp))
-                        OutlinedButton(
-                            onClick = {
-                                detectProxyPicker.launch(
-                                    androidx.activity.result.PickVisualMediaRequest(
-                                        ActivityResultContracts.PickVisualMedia.ImageAndVideo
-                                    )
-                                )
-                            },
-                            enabled = !uiState.isInspectingGalleryUris && !uiState.isProcessing
-                        ) {
-                            Icon(Icons.Rounded.ImageSearch, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Detect Proxy in Gallery")
-                        }
-                    }
-                }
-            } else {
-                SummaryHeader(
-                    uiState = uiState,
-                    keepLocalProxy = settingsState.keepLocalProxyInPhotos,
-                    onToggleKeepLocal = { settings.setKeepLocalProxyInPhotos(it) },
-                    onSelectVideos = { viewModel.selectTopVideos() }
-                )
-
-                LazyColumn(modifier = Modifier.fillMaxSize()) {
-                    items(uiState.candidates, key = { it.id }) { item ->
-                        LaunchedEffect(item.id) {
-                            viewModel.loadThumbnailIfNeeded(item)
-                        }
-                        CandidateRow(
-                            item = item,
-                            thumbnail = uiState.thumbnails[item.id],
-                            onClick = { viewModel.toggleSelection(item.id) }
-                        )
-                        HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
                     }
                 }
             }
         }
+    }
+}
 
-        if (uiState.isInspectingGalleryUris) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.45f)),
-                contentAlignment = Alignment.Center
-            ) {
-                Surface(shape = RoundedCornerShape(16.dp), tonalElevation = 6.dp) {
-                    Column(
-                        modifier = Modifier.padding(24.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        CircularProgressIndicator()
-                        Text("Detecting Proxy vs Original status…", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-                    }
-                }
-            }
-        }
-        }
+@Composable
+private fun CompactBannerCard(
+    tint: Color,
+    content: @Composable RowScope.() -> Unit
+) {
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = tint.copy(alpha = 0.12f),
+        border = BorderStroke(1.dp, tint.copy(alpha = 0.25f)),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            content = content
+        )
     }
 }
 
@@ -562,63 +600,55 @@ private fun SummaryHeader(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f))
-            .padding(horizontal = 16.dp, vertical = 10.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+            .background(MaterialTheme.colorScheme.surface)
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = "${uiState.candidates.size} Items · Selected ${uiState.selectedCount}",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold
-                )
-                val estStr = Formatter.formatFileSize(context, uiState.totalEligibleEstimatedBytes)
-                Text(
-                    text = "Est. space: ~$estStr",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            val estStr = Formatter.formatFileSize(context, uiState.totalEligibleEstimatedBytes)
+            WarmStatChip(
+                text = "${uiState.candidates.size} · ~$estStr",
+                tint = PhotoHubOrange,
+                icon = Icons.Rounded.PhotoLibrary
+            )
+
+            if (uiState.totalSavedBytes > 0L) {
+                WarmStatChip(
+                    text = Formatter.formatFileSize(context, uiState.totalSavedBytes),
+                    tint = PhotoHubMint,
+                    icon = Icons.Rounded.AutoAwesome
                 )
             }
 
-            if (uiState.totalSavedBytes > 0L) {
-                val savedStr = Formatter.formatFileSize(context, uiState.totalSavedBytes)
-                Surface(
-                    shape = CircleShape,
-                    color = PhotoHubGreen.copy(alpha = 0.16f)
-                ) {
-                    Text(
-                        text = "Saved $savedStr",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = PhotoHubGreen,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                    )
-                }
-                Spacer(modifier = Modifier.width(6.dp))
-            }
+            Spacer(modifier = Modifier.weight(1f))
 
             if (uiState.pendingVideoCandidates.isNotEmpty() && !uiState.isProcessing) {
                 val vidStr = Formatter.formatFileSize(context, uiState.pendingVideoEstimatedBytes)
-                OutlinedButton(
+                Surface(
                     onClick = onSelectVideos,
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.primaryContainer
                 ) {
-                    Icon(Icons.Rounded.Videocam, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Videos (~$vidStr)", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold)
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(Icons.Rounded.Videocam, null, tint = MaterialTheme.colorScheme.onPrimaryContainer, modifier = Modifier.size(14.dp))
+                        Text(vidStr, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onPrimaryContainer)
+                    }
                 }
             }
         }
 
         if (uiState.isCheckingServerProxies) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
-                Text(
-                    text = "Filtering out already-compressed proxies…",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                CircularProgressIndicator(modifier = Modifier.size(13.dp), strokeWidth = 2.dp, color = PhotoHubOrange)
+                Text("Checking proxies…", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
 
@@ -628,30 +658,15 @@ private fun SummaryHeader(
                 onClick = { onToggleKeepLocal(true) },
                 shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2)
             ) {
-                Text("Replace Original w/ Proxy", style = MaterialTheme.typography.labelMedium, maxLines = 1)
+                Text("Keep Proxy", style = MaterialTheme.typography.labelMedium, maxLines = 1)
             }
             SegmentedButton(
                 selected = !keepLocalProxy,
                 onClick = { onToggleKeepLocal(false) },
                 shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2)
             ) {
-                Text("Delete Original Only", style = MaterialTheme.typography.labelMedium, maxLines = 1)
+                Text("Delete Only", style = MaterialTheme.typography.labelMedium, maxLines = 1)
             }
-        }
-
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-            Icon(Icons.Rounded.VerifiedUser, contentDescription = null, tint = PhotoHubGreen, modifier = Modifier.size(14.dp))
-            Text(
-                text = if (keepLocalProxy) {
-                    "SHA-256 verified before delete · Keeps a lightweight proxy in Gallery"
-                } else {
-                    "SHA-256 verified before delete · Removes local copy (stays on Server)"
-                },
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
         }
     }
 }
@@ -663,19 +678,25 @@ private fun CandidateRow(
     onClick: () -> Unit
 ) {
     val context = LocalContext.current
+    val checkScale by animateFloatAsState(
+        targetValue = if (item.isSelected) 1.08f else 1f,
+        animationSpec = spring(dampingRatio = 0.6f, stiffness = 450f),
+        label = "checkScale"
+    )
     val badgeColor = when (item.state) {
-        is PhotoCompressionState.Completed -> PhotoHubGreen
-        is PhotoCompressionState.ReadyToDelete -> PhotoHubOrange
-        is PhotoCompressionState.AlreadyProxy -> PhotoHubBlue
+        is PhotoCompressionState.Completed -> PhotoHubMint
+        is PhotoCompressionState.ReadyToDelete -> PhotoHubAmber
+        is PhotoCompressionState.AlreadyProxy -> PhotoHubOrange
         is PhotoCompressionState.Skipped, is PhotoCompressionState.Pending ->
             MaterialTheme.colorScheme.onSurfaceVariant
         is PhotoCompressionState.Failed -> PhotoHubRed
-        else -> PhotoHubBlue
+        else -> PhotoHubOrange
     }
 
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surface)
             .clickable(enabled = !item.state.isFinished, onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically
@@ -683,9 +704,10 @@ private fun CandidateRow(
         Icon(
             imageVector = if (item.isSelected) Icons.Rounded.CheckCircle else Icons.Rounded.RadioButtonUnchecked,
             contentDescription = null,
-            tint = if (item.isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+            tint = if (item.isSelected) PhotoHubOrange else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
             modifier = Modifier
-                .size(26.dp)
+                .size(25.dp)
+                .scale(checkScale)
                 .alpha(if (item.state.isFinished) 0.3f else 1f)
         )
 
@@ -694,7 +716,7 @@ private fun CandidateRow(
         Box(
             modifier = Modifier
                 .size(56.dp)
-                .clip(RoundedCornerShape(8.dp))
+                .clip(RoundedCornerShape(12.dp))
                 .background(MaterialTheme.colorScheme.surfaceVariant),
             contentAlignment = Alignment.BottomEnd
         ) {
@@ -711,7 +733,7 @@ private fun CandidateRow(
                     modifier = Modifier
                         .padding(3.dp)
                         .clip(CircleShape)
-                        .background(Color.Black.copy(alpha = 0.65f))
+                        .background(PhotoHubOrange)
                         .padding(4.dp)
                 ) {
                     Icon(
@@ -731,7 +753,7 @@ private fun CandidateRow(
                 Text(
                     text = item.filename,
                     style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.Medium,
+                    fontWeight = FontWeight.SemiBold,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
@@ -740,7 +762,7 @@ private fun CandidateRow(
                 Text(
                     text = item.estimatedSizeLabel(context),
                     style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.Medium,
+                    fontWeight = FontWeight.Bold,
                     color = if (item.isVideo) PhotoHubOrange else MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
@@ -752,7 +774,7 @@ private fun CandidateRow(
             }.orEmpty()
             Text(
                 text = "${item.resolutionLabel}$dateSuffix",
-                style = MaterialTheme.typography.bodySmall,
+                style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
@@ -762,23 +784,23 @@ private fun CandidateRow(
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                     if (item.state.isIntegrityVerified || item.isBackedUpOnServer) {
                         Icon(
-                            imageVector = Icons.Rounded.VerifiedUser,
+                            imageVector = Icons.Rounded.Verified,
                             contentDescription = null,
-                            tint = PhotoHubGreen,
+                            tint = PhotoHubMint,
                             modifier = Modifier.size(14.dp)
                         )
                     }
 
                     val statusText = if (item.state is PhotoCompressionState.Pending && item.isBackedUpOnServer) {
-                        "Backed up on Server"
+                        "Backed Up"
                     } else {
                         item.state.label(context)
                     }
                     Text(
                         text = statusText,
                         style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.SemiBold,
-                        color = if (item.state is PhotoCompressionState.Pending && item.isBackedUpOnServer) PhotoHubGreen else badgeColor,
+                        fontWeight = FontWeight.Bold,
+                        color = if (item.state is PhotoCompressionState.Pending && item.isBackedUpOnServer) PhotoHubMint else badgeColor,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
@@ -802,12 +824,8 @@ private fun GalleryProxyInspectionDialog(
         onDismissRequest = onDismiss,
         title = {
             Text(
-                text = if (proxyCount > 0) {
-                    "Detected $proxyCount Proxy of ${items.size}"
-                } else {
-                    "Checked ${items.size} Gallery Item(s)"
-                },
-                fontWeight = FontWeight.SemiBold
+                text = if (proxyCount > 0) "$proxyCount Proxy · ${items.size} Checked" else "${items.size} Original",
+                fontWeight = FontWeight.Bold
             )
         },
         text = {
@@ -820,8 +838,8 @@ private fun GalleryProxyInspectionDialog(
                 items(items, key = { it.id }) { item ->
                     val isBusy = busyItemId == item.id
                     Surface(
-                        shape = RoundedCornerShape(12.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                        shape = RoundedCornerShape(16.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Column(
@@ -835,7 +853,7 @@ private fun GalleryProxyInspectionDialog(
                                 Box(
                                     modifier = Modifier
                                         .size(48.dp)
-                                        .clip(RoundedCornerShape(8.dp))
+                                        .clip(RoundedCornerShape(10.dp))
                                         .background(MaterialTheme.colorScheme.surface),
                                     contentAlignment = Alignment.Center
                                 ) {
@@ -849,78 +867,56 @@ private fun GalleryProxyInspectionDialog(
                                     } else {
                                         Icon(
                                             if (item.isVideo) Icons.Rounded.Videocam else Icons.Rounded.Photo,
-                                            contentDescription = null
+                                            contentDescription = null,
+                                            tint = PhotoHubOrange
                                         )
                                     }
                                 }
-                                Column(modifier = Modifier.weight(1f)) {
+                                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                     Text(
                                         item.originalName ?: item.displayName,
                                         style = MaterialTheme.typography.bodyMedium,
-                                        fontWeight = FontWeight.Medium,
+                                        fontWeight = FontWeight.SemiBold,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
                                     )
                                     val (verdictLabel, verdictColor) = when (item.kind) {
-                                        GalleryMediaKind.PROXY -> "COMPRESSED PROXY" to PhotoHubOrange
-                                        GalleryMediaKind.ORIGINAL_BACKED_UP -> "ORIGINAL (BACKED UP)" to PhotoHubGreen
-                                        GalleryMediaKind.ORIGINAL_UNBACKED -> "ORIGINAL (NOT BACKED UP)" to MaterialTheme.colorScheme.onSurfaceVariant
-                                        GalleryMediaKind.UNKNOWN -> "ORIGINAL / UNKNOWN (OFFLINE)" to MaterialTheme.colorScheme.onSurfaceVariant
+                                        GalleryMediaKind.PROXY -> "PROXY" to PhotoHubOrange
+                                        GalleryMediaKind.ORIGINAL_BACKED_UP -> "ORIGINAL · SYNCED" to PhotoHubMint
+                                        GalleryMediaKind.ORIGINAL_UNBACKED -> "ORIGINAL" to MaterialTheme.colorScheme.onSurfaceVariant
+                                        GalleryMediaKind.UNKNOWN -> "UNKNOWN" to MaterialTheme.colorScheme.onSurfaceVariant
                                     }
-                                    Surface(shape = CircleShape, color = verdictColor.copy(alpha = 0.14f)) {
-                                        Text(
-                                            verdictLabel,
-                                            style = MaterialTheme.typography.labelSmall,
-                                            fontWeight = FontWeight.Bold,
-                                            color = verdictColor,
-                                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
-                                        )
-                                    }
+                                    WarmStatChip(text = verdictLabel, tint = verdictColor)
                                 }
                             }
 
                             val localStr = Formatter.formatFileSize(context, item.localSizeBytes)
                             val origStr = item.originalSizeBytes?.takeIf { it > 0L }?.let {
-                                " · Server Original: ${Formatter.formatFileSize(context, it)}"
+                                " → ${Formatter.formatFileSize(context, it)}"
                             }.orEmpty()
-                            val signalText = if (item.signals.isNotEmpty()) {
-                                "Detected via: ${item.signals.joinToString(", ")}"
-                            } else {
-                                "No proxy tag or server proxy match found"
-                            }
                             Text(
-                                "Local size: $localStr$origStr\n$signalText",
-                                style = MaterialTheme.typography.bodySmall,
+                                "$localStr$origStr",
+                                style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
 
                             if (item.kind == GalleryMediaKind.PROXY && !item.masterHash.isNullOrBlank()) {
                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    OutlinedButton(
+                                    SoftOrangeButton(
+                                        text = "Share",
+                                        icon = Icons.Rounded.IosShare,
+                                        enabled = busyItemId == null,
                                         onClick = { onShareOriginal(item) },
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    GradientPrimaryButton(
+                                        text = if (item.isProtectedOriginal) "Restored" else "Restore",
+                                        icon = Icons.Rounded.CloudDownload,
                                         enabled = busyItemId == null,
-                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
-                                    ) {
-                                        Icon(Icons.Rounded.IosShare, null, modifier = Modifier.size(16.dp))
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                        Text("Share Original", style = MaterialTheme.typography.labelSmall)
-                                    }
-                                    Button(
+                                        loading = isBusy,
                                         onClick = { onRestore(item) },
-                                        enabled = busyItemId == null,
-                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
-                                    ) {
-                                        if (isBusy) {
-                                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = Color.White)
-                                        } else {
-                                            Icon(Icons.Rounded.CloudDownload, null, modifier = Modifier.size(16.dp))
-                                        }
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                        Text(
-                                            if (item.isProtectedOriginal) "Restored ✓" else "Restore",
-                                            style = MaterialTheme.typography.labelSmall
-                                        )
-                                    }
+                                        modifier = Modifier.weight(1f)
+                                    )
                                 }
                             }
                         }
@@ -929,7 +925,7 @@ private fun GalleryProxyInspectionDialog(
             }
         },
         confirmButton = {
-            TextButton(onClick = onDismiss) { Text("Close") }
+            TextButton(onClick = onDismiss) { Text("Done", fontWeight = FontWeight.Bold) }
         }
     )
 }

@@ -33,8 +33,14 @@ import com.photohub.compressor.media.*
 import com.photohub.compressor.network.ApiHttpException
 import com.photohub.compressor.network.PhotoHubApiClient
 import com.photohub.compressor.sync.LocalProxyTracker
+import com.photohub.compressor.ui.components.GradientPrimaryButton
+import com.photohub.compressor.ui.components.MascotMood
+import com.photohub.compressor.ui.components.SoftOrangeButton
+import com.photohub.compressor.ui.components.SunnyMascot
+import com.photohub.compressor.ui.components.WarmStatChip
 import com.photohub.compressor.ui.theme.PhotoHubBlue
 import com.photohub.compressor.ui.theme.PhotoHubGreen
+import com.photohub.compressor.ui.theme.PhotoHubMint
 import com.photohub.compressor.ui.theme.PhotoHubOrange
 import com.photohub.compressor.ui.theme.PhotoHubRed
 import com.photohub.compressor.ui.theme.PhotoHubTheme
@@ -354,36 +360,26 @@ private fun ShareOriginalScreen(
         ) {
             Column(
                 modifier = Modifier.padding(horizontal = 20.dp, vertical = 18.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Surface(
-                        shape = CircleShape,
-                        color = PhotoHubBlue.copy(alpha = 0.14f),
-                        modifier = Modifier.size(36.dp)
-                    ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Icon(
-                                imageVector = Icons.Rounded.CloudDownload,
-                                contentDescription = null,
-                                tint = PhotoHubBlue,
-                                modifier = Modifier.size(20.dp)
-                            )
-                        }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    val mascotMood = when (uiState) {
+                        is ShareOriginalUiState.Fetching -> MascotMood.UPLOADING
+                        is ShareOriginalUiState.Ready -> MascotMood.CELEBRATE
+                        else -> MascotMood.ALERT
                     }
-                    Spacer(modifier = Modifier.width(12.dp))
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "photoHub · Full-Resolution Original",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        Text(
-                            text = "Auto-fetch & share from server",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
+                    SunnyMascot(mood = mascotMood, size = 50.dp)
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Text(
+                        text = "Share Original",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.ExtraBold,
+                        modifier = Modifier.weight(1f)
+                    )
                     IconButton(onClick = onFinish) {
                         Icon(Icons.Rounded.Close, contentDescription = "Close")
                     }
@@ -392,49 +388,37 @@ private fun ShareOriginalScreen(
                 when (val state = uiState) {
                     is ShareOriginalUiState.NeedsSignIn -> {
                         Text(
-                            text = "Sign in to your photoHub account before sharing full-resolution originals from Android Gallery.",
+                            text = "Sign in required",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-                            OutlinedButton(onClick = onFinish, modifier = Modifier.weight(1f)) {
-                                Text("Close")
-                            }
-                            Button(onClick = onOpenMainApp, modifier = Modifier.weight(1f)) {
-                                Text("Open photoHub")
-                            }
+                            SoftOrangeButton(text = "Close", onClick = onFinish, modifier = Modifier.weight(1f))
+                            GradientPrimaryButton(text = "Open App", onClick = onOpenMainApp, modifier = Modifier.weight(1f))
                         }
                     }
 
                     is ShareOriginalUiState.Fetching -> {
                         if (state.totalCount > 1) {
-                            Text(
-                                text = "Item ${state.currentIndex} of ${state.totalCount}",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = PhotoHubBlue,
-                                fontWeight = FontWeight.SemiBold
-                            )
+                            WarmStatChip(text = "${state.currentIndex} / ${state.totalCount}", tint = PhotoHubOrange)
                         }
                         if (!state.currentFilename.isNullOrBlank()) {
                             Text(
                                 text = state.currentFilename,
                                 style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = FontWeight.Medium,
+                                fontWeight = FontWeight.SemiBold,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
                         }
-                        Text(
-                            text = state.stageText,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
 
                         val total = state.totalBytes
                         if (total != null && total > 0L) {
                             val fraction = (state.downloadedBytes.toFloat() / total.toFloat()).coerceIn(0f, 1f)
                             LinearProgressIndicator(
                                 progress = { fraction },
+                                color = PhotoHubOrange,
+                                trackColor = PhotoHubOrange.copy(alpha = 0.16f),
                                 modifier = Modifier.fillMaxWidth()
                             )
                             Text(
@@ -443,19 +427,21 @@ private fun ShareOriginalScreen(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         } else {
-                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                            LinearProgressIndicator(
+                                color = PhotoHubOrange,
+                                trackColor = PhotoHubOrange.copy(alpha = 0.16f),
+                                modifier = Modifier.fillMaxWidth()
+                            )
                             if (state.downloadedBytes > 0L) {
                                 Text(
-                                    text = "${Formatter.formatFileSize(context, state.downloadedBytes)} fetched…",
+                                    text = Formatter.formatFileSize(context, state.downloadedBytes),
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
                         }
 
-                        OutlinedButton(onClick = onFinish, modifier = Modifier.fillMaxWidth()) {
-                            Text("Cancel")
-                        }
+                        SoftOrangeButton(text = "Cancel", onClick = onFinish, modifier = Modifier.fillMaxWidth())
                     }
 
                     is ShareOriginalUiState.Ready -> {
@@ -465,31 +451,30 @@ private fun ShareOriginalScreen(
                         val summaryNames = if (count == 1) {
                             state.items.first().originalName
                         } else {
-                            "$count full-resolution originals"
+                            "$count Originals"
                         }
 
                         Surface(
-                            shape = RoundedCornerShape(12.dp),
-                            color = PhotoHubGreen.copy(alpha = 0.12f),
+                            shape = RoundedCornerShape(16.dp),
+                            color = PhotoHubMint.copy(alpha = 0.12f),
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Row(
                                 modifier = Modifier.padding(12.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Icon(Icons.Rounded.VerifiedUser, null, tint = PhotoHubGreen, modifier = Modifier.size(20.dp))
+                                Icon(Icons.Rounded.VerifiedUser, null, tint = PhotoHubMint, modifier = Modifier.size(20.dp))
                                 Spacer(modifier = Modifier.width(10.dp))
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(
                                         text = summaryNames,
                                         style = MaterialTheme.typography.bodyMedium,
-                                        fontWeight = FontWeight.SemiBold,
+                                        fontWeight = FontWeight.Bold,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
                                     )
-                                    val cachedNote = if (state.items.all { it.fromCache }) " · Ready from cache" else " · Fetched from server"
                                     Text(
-                                        text = "$sizeText original$cachedNote",
+                                        text = sizeText,
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
@@ -498,26 +483,25 @@ private fun ShareOriginalScreen(
                         }
 
                         if (state.unresolvedCount > 0) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(Icons.Rounded.Warning, null, tint = PhotoHubOrange, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = "${state.unresolvedCount} selected item(s) had no backed-up original on the server.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
+                            WarmStatChip(
+                                text = "${state.unresolvedCount} unmatched",
+                                tint = PhotoHubOrange,
+                                icon = Icons.Rounded.Warning
+                            )
                         }
 
                         state.savedMessage?.let { msg ->
                             Text(
                                 text = msg,
                                 style = MaterialTheme.typography.bodySmall,
-                                color = PhotoHubGreen
+                                color = PhotoHubMint
                             )
                         }
 
-                        Button(
+                        GradientPrimaryButton(
+                            text = if (count == 1) "Share Original" else "Share $count",
+                            icon = Icons.Rounded.IosShare,
+                            enabled = !state.isSavingToGallery,
                             onClick = {
                                 val chooser = ShareUtils.buildShareChooserIntent(
                                     context = context,
@@ -527,25 +511,23 @@ private fun ShareOriginalScreen(
                                 )
                                 chooserLauncher.launch(chooser)
                             },
-                            enabled = !state.isSavingToGallery,
                             modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Icon(Icons.Rounded.IosShare, null)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(if (count == 1) "Share Original" else "Share $count Originals")
-                        }
+                        )
 
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-                            OutlinedButton(
+                            SoftOrangeButton(
+                                text = if (state.isSavingToGallery) "Saving…" else "Save",
+                                icon = Icons.Rounded.ArrowCircleDown,
+                                enabled = !state.isSavingToGallery,
                                 onClick = {
-                                    if (state.isSavingToGallery) return@OutlinedButton
+                                    if (state.isSavingToGallery) return@SoftOrangeButton
                                     uiStateFlow.value = state.copy(isSavingToGallery = true, savedMessage = null)
                                     scope.launch {
                                         val mediaService = MediaLibraryService(context)
                                         if (!mediaService.canWriteGallery()) {
                                             uiStateFlow.value = state.copy(
                                                 isSavingToGallery = false,
-                                                savedMessage = "Photos & Videos permission needed in photoHub."
+                                                savedMessage = "Photos permission needed"
                                             )
                                             return@launch
                                         }
@@ -572,37 +554,27 @@ private fun ShareOriginalScreen(
                                         uiStateFlow.value = state.copy(
                                             isSavingToGallery = false,
                                             savedMessage = if (savedCount > 0) {
-                                                "Saved $savedCount original(s) to Gallery & protected from re-proxying."
+                                                "Saved $savedCount"
                                             } else {
-                                                "Save failed: ${firstError ?: "Unknown error"}"
+                                                firstError ?: "Save failed"
                                             }
                                         )
                                     }
                                 },
-                                enabled = !state.isSavingToGallery,
                                 modifier = Modifier.weight(1f)
-                            ) {
-                                if (state.isSavingToGallery) {
-                                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                                } else {
-                                    Icon(Icons.Rounded.ArrowCircleDown, null, modifier = Modifier.size(18.dp))
-                                }
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("Save to Gallery")
-                            }
+                            )
 
-                            TextButton(
+                            SoftOrangeButton(
+                                text = "Done",
                                 onClick = onFinish,
-                                modifier = Modifier.weight(0.6f)
-                            ) {
-                                Text("Done")
-                            }
+                                modifier = Modifier.weight(0.75f)
+                            )
                         }
                     }
 
                     is ShareOriginalUiState.Failed -> {
                         Surface(
-                            shape = RoundedCornerShape(12.dp),
+                            shape = RoundedCornerShape(14.dp),
                             color = PhotoHubRed.copy(alpha = 0.10f),
                             modifier = Modifier.fillMaxWidth()
                         ) {
@@ -618,43 +590,37 @@ private fun ShareOriginalScreen(
                         }
 
                         if (incomingUris.isNotEmpty()) {
-                            OutlinedButton(
+                            SoftOrangeButton(
+                                text = "Share Copy",
+                                icon = Icons.Rounded.Share,
                                 onClick = {
                                     val fallbackChooser = ShareUtils.buildPassThroughShareChooserIntent(
                                         context = context,
                                         uris = incomingUris,
-                                        title = "Share Gallery Copy",
+                                        title = "Share Copy",
                                         excludeComponents = excludeSelf
                                     )
                                     chooserLauncher.launch(fallbackChooser)
                                 },
                                 modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Icon(Icons.Rounded.Share, null, modifier = Modifier.size(18.dp))
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text("Share Selected Gallery Copy Instead")
-                            }
+                            )
                         }
 
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
                             if (state.canRetry) {
-                                Button(
+                                GradientPrimaryButton(
+                                    text = "Retry",
                                     onClick = { retryCounter += 1 },
                                     modifier = Modifier.weight(1f)
-                                ) {
-                                    Text("Retry")
-                                }
+                                )
                             } else {
-                                Button(
+                                GradientPrimaryButton(
+                                    text = "Open App",
                                     onClick = onOpenMainApp,
                                     modifier = Modifier.weight(1f)
-                                ) {
-                                    Text("Open photoHub")
-                                }
+                                )
                             }
-                            TextButton(onClick = onFinish, modifier = Modifier.weight(1f)) {
-                                Text("Close")
-                            }
+                            SoftOrangeButton(text = "Close", onClick = onFinish, modifier = Modifier.weight(1f))
                         }
                     }
                 }

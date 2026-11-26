@@ -42,6 +42,9 @@ import com.photohub.compressor.data.ServerPhoto
 import com.photohub.compressor.media.MediaLibraryService
 import com.photohub.compressor.media.ShareUtils
 import com.photohub.compressor.sync.LocalProxySyncManager
+import com.photohub.compressor.ui.components.GradientPrimaryButton
+import com.photohub.compressor.ui.components.MascotMood
+import com.photohub.compressor.ui.components.SunnyMascot
 import com.photohub.compressor.ui.theme.PhotoHubGreen
 import com.photohub.compressor.ui.theme.PhotoHubOrange
 import com.photohub.compressor.viewmodel.*
@@ -215,7 +218,10 @@ fun ServerGalleryScreen(
                 )
             } else {
                 TopAppBar(
-                    title = { Text("Server", fontWeight = FontWeight.SemiBold) },
+                    title = { Text("Cloud", fontWeight = FontWeight.Bold) },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = MaterialTheme.colorScheme.background
+                    ),
                     navigationIcon = {
                         IconButton(
                             onClick = {
@@ -351,10 +357,16 @@ fun ServerGalleryScreen(
             when {
                 uiState.isLoading && uiState.photos.isEmpty() -> {
                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            CircularProgressIndicator()
-                            Spacer(modifier = Modifier.height(10.dp))
-                            Text("Loading photos…")
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            SunnyMascot(mood = MascotMood.UPLOADING, size = 112.dp)
+                            Text(
+                                "Loading…",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold
+                            )
                         }
                     }
                 }
@@ -362,14 +374,19 @@ fun ServerGalleryScreen(
                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         Column(
                             horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
                             modifier = Modifier.padding(24.dp)
                         ) {
-                            Icon(Icons.Rounded.WifiOff, null, modifier = Modifier.size(56.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                            Spacer(modifier = Modifier.height(10.dp))
-                            Text("Could Not Connect", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                            Text(uiState.errorMessage.orEmpty(), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            Spacer(modifier = Modifier.height(12.dp))
-                            Button(onClick = { viewModel.loadPhotos() }) { Text("Retry") }
+                            SunnyMascot(mood = MascotMood.ALERT, size = 116.dp)
+                            Text("Offline", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
+                            Text(
+                                uiState.errorMessage.orEmpty(),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            GradientPrimaryButton(text = "Retry", onClick = { viewModel.loadPhotos() })
                         }
                     }
                 }
@@ -377,14 +394,12 @@ fun ServerGalleryScreen(
                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         Column(
                             horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
                             modifier = Modifier.padding(24.dp)
                         ) {
-                            Icon(Icons.Rounded.Cloud, null, modifier = Modifier.size(56.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                            Spacer(modifier = Modifier.height(10.dp))
-                            Text("No Backups Yet", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                            Text("Upload photos or store them on your PhotoHub server to browse them here.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            Spacer(modifier = Modifier.height(12.dp))
-                            Button(onClick = { viewModel.loadPhotos() }) { Text("Refresh") }
+                            SunnyMascot(mood = MascotMood.SLEEPING, size = 120.dp)
+                            Text("No Backups", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
+                            GradientPrimaryButton(text = "Refresh", onClick = { viewModel.loadPhotos() })
                         }
                     }
                 }

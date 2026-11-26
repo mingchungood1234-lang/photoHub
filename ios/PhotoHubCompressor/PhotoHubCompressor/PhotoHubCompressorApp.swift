@@ -184,6 +184,20 @@ struct FetchAndShareOriginalIntent: AppIntent {
         return .result()
     }
 }
+
+@available(iOS 16.4, *)
+struct PhotoHubAppShortcuts: AppShortcutsProvider {
+    static var appShortcuts: [AppShortcut] {
+        AppShortcut(
+            intent: FetchAndShareByNameIntent(),
+            phrases: [
+                "Share original with \(.applicationName)"
+            ],
+            shortTitle: "Share Original",
+            systemImageName: "square.and.arrow.up"
+        )
+    }
+}
 #endif
 
 @main
@@ -208,6 +222,7 @@ struct PhotoHubCompressorApp: App {
                 BackgroundBackupManager.shared.triggerSilentAutoUpload(settings: settings, isMovingToBackground: true)
             } else if phase == .active {
                 pruneStaleTempShareDirs()
+                BackgroundUploadTransport.shared.reconcileOrphanedTasks()
                 BackgroundBackupManager.shared.pruneMissingAssetsFromStaged()
                 BackgroundBackupManager.shared.triggerSilentAutoUpload(settings: settings, isMovingToBackground: false)
             }

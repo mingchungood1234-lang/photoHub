@@ -1,5 +1,6 @@
 import BackgroundTasks
 import Foundation
+import Network
 import Photos
 import UIKit
 import UserNotifications
@@ -29,8 +30,10 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
 
     @Published private(set) var stagedItems: [StagedCleanupItem] = []
     @Published private(set) var lastRunSummary: String = ""
-    @Published private(set) var notificationPermissionLabel: String = "Not Requested"
+    @Published private(set) var notificationPermissionLabel: String = "Off"
     @Published var pendingOpenCleanupFromNotification: Bool = false
+    @Published private(set) var activeBackgroundUploadCount: Int = 0
+    @Published private(set) var liveBackgroundProgress: Double = 0
 
     private var hasRegistered = false
     private var hasRegisteredPhotoObserver = false
@@ -38,12 +41,38 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
     private var pendingRescanAfterSilentRun = false
     private var recentFailureCooldownUntil: [String: Date] = [:]
     private var debouncedSilentTask: Task<Void, Never>?
+    private var pathMonitor: NWPathMonitor?
+    private var lastNetworkSatisfied: Bool = true
     private weak var settingsRef: AppSettings?
 
     private override init() {
         super.init()
         loadPersistedState()
         setupNotificationObservers()
+        startNetworkRecoveryMonitor()
+    }
+
+    func updateLiveBackgroundTransport(activeCount: Int, progress: Double) {
+        activeBackgroundUploadCount = max(activeCount, AssetUploadCoordinator.shared.backgroundActiveAssetIds().count)
+        liveBackgroundProgress = activeCount > 0 ? progress : 0
+    }
+
+    private func startNetworkRecoveryMonitor() {
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            let isOnline = (path.status == .satisfied)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let recovered = isOnline && !self.lastNetworkSatisfied
+                self.lastNetworkSatisfied = isOnline
+                if recovered {
+                    self.recentFailureCooldownUntil.removeAll()
+                    self.scheduleDebouncedSilentCheck(delayNanoseconds: 2_000_000_000)
+                }
+            }
+        }
+        monitor.start(queue: DispatchQueue(label: "photohub.bg.netmonitor", qos: .utility))
+        pathMonitor = monitor
     }
 
     private func setupNotificationObservers() {
@@ -200,19 +229,19 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
         let processingReq = BGProcessingTaskRequest(identifier: Self.taskIdentifier)
         processingReq.requiresNetworkConnectivity = true
         processingReq.requiresExternalPower = settings.nightlyRequiresCharging
-        processingReq.earliestBeginDate = Date(timeIntervalSinceNow: 30 * 60)
+        processingReq.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
 
         let refreshReq = BGAppRefreshTaskRequest(identifier: Self.refreshTaskIdentifier)
-        refreshReq.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
+        refreshReq.earliestBeginDate = Date(timeIntervalSinceNow: 10 * 60)
 
         do {
             try BGTaskScheduler.shared.submit(processingReq)
             try? BGTaskScheduler.shared.submit(refreshReq)
             if lastRunSummary.isEmpty {
-                updateSummary("Silent auto-upload active in background.")
+                updateSummary("Auto backup active")
             }
         } catch {
-            updateSummary("Background schedule note: \(error.localizedDescription)")
+            updateSummary("Schedule: \(error.localizedDescription)")
         }
     }
 
@@ -474,7 +503,7 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
 
                 // Hand off large uploads (or when app just backgrounded) straight to URLSession.background
                 // so the OS daemon uploads silently with zero app time limit & zero screen banners.
-                let useOSBackgroundSession = isMovingToBackground || candidate.isVideo || candidate.estimatedBytes > 15_000_000
+                let useOSBackgroundSession = isMovingToBackground || candidate.isVideo || candidate.estimatedBytes > 8_000_000
                 if useOSBackgroundSession {
                     let outcome = await BackgroundUploadTransport.shared.enqueueSilentUpload(
                         candidate: candidate,
@@ -640,7 +669,7 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                     continue
                 }
 
-                if (candidate.isVideo || candidate.estimatedBytes > 15_000_000), let uploadConfig {
+                if (candidate.isVideo || candidate.estimatedBytes > 8_000_000), let uploadConfig {
                     let outcome = await BackgroundUploadTransport.shared.enqueueSilentUpload(
                         candidate: candidate,
                         photoService: photoService,
