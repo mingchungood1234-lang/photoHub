@@ -14,11 +14,11 @@ enum class ProxyResolutionPreset(
     val title: String,
     val resolutionHint: String
 ) {
-    AUTO_SMART(0, "Auto (Smart 720p)", "Videos: 720p HD · Photos: 1024–1920 px (smart savings)"),
-    P480(854, "480p SD (Smallest)", "Videos: 480p (480×854) · Photos: up to 854 px (~0.5 MP)"),
-    P720(1280, "720p HD (Balanced)", "Videos: 720p HD (720×1280) · Photos: up to 1280 px (~1 MP)"),
-    P1080(1920, "1080p Full HD (Sharper)", "Videos: 1080p Full HD · Photos: up to 1920 px (~2 MP)"),
-    P1440(2560, "1440p 2K (Largest)", "Videos: up to 1440p 2K · Photos: up to 2560 px (~4 MP)");
+    AUTO_SMART(0, "Auto", "Auto · 720p"),
+    P480(854, "480p", "480p · 854 px"),
+    P720(1280, "720p", "720p · 1280 px"),
+    P1080(1920, "1080p", "1080p · 1920 px"),
+    P1440(2560, "1440p", "1440p · 2560 px");
 
     companion object {
         fun fromStoredPixels(px: Int): ProxyResolutionPreset = when {
@@ -35,9 +35,9 @@ enum class ProxyDetailPreset(
     val qualityValue: Float,
     val title: String
 ) {
-    COMPACT(0.50f, "Smallest File"),
-    BALANCED(0.68f, "Balanced (Recommended)"),
-    HIGH_DETAIL(0.85f, "High Detail (Larger)");
+    COMPACT(0.50f, "Smallest"),
+    BALANCED(0.68f, "Balance"),
+    HIGH_DETAIL(0.85f, "High");
 
     companion object {
         fun fromStoredQuality(q: Float): ProxyDetailPreset = when {
@@ -56,6 +56,7 @@ data class AppSettingsState(
     val userName: String = "",
     val userFolder: String = "",
     val serverStorage: ServerStorageInfo? = null,
+    val serverS3Enabled: Boolean = false,
     val uploadMode: UploadMode = UploadMode.DIRECT_VPS,
     val proxyFormat: ProxyFormat = ProxyFormat.HEIC,
     val proxyMaxPixelSize: Int = 0,
@@ -135,6 +136,7 @@ class AppSettings private constructor(context: Context) {
 
     private object PrefKeys {
         const val UPLOAD_MODE = "uploadMode"
+        const val SERVER_S3_ENABLED = "serverS3Enabled"
         const val PROXY_FORMAT = "proxyFormat"
         const val PROXY_MAX_PX = "proxyMaxPixelSize"
         const val PROXY_QUALITY = "proxyQuality"
@@ -171,7 +173,8 @@ class AppSettings private constructor(context: Context) {
         userEmail = SecureTokenStore.get(appContext, SessionKeys.USER_EMAIL).orEmpty(),
         userName = SecureTokenStore.get(appContext, SessionKeys.USER_NAME).orEmpty(),
         userFolder = SecureTokenStore.get(appContext, SessionKeys.USER_FOLDER).orEmpty(),
-        uploadMode = UploadMode.fromRaw(prefs.getString(PrefKeys.UPLOAD_MODE, UploadMode.DIRECT_VPS.rawValue)),
+        serverS3Enabled = prefs.getBoolean(PrefKeys.SERVER_S3_ENABLED, false),
+        uploadMode = if (prefs.getBoolean(PrefKeys.SERVER_S3_ENABLED, false)) UploadMode.S3_PRESIGNED else UploadMode.DIRECT_VPS,
         proxyFormat = ProxyFormat.fromRaw(prefs.getString(PrefKeys.PROXY_FORMAT, ProxyFormat.HEIC.rawValue)),
         proxyMaxPixelSize = prefs.getInt(PrefKeys.PROXY_MAX_PX, 0),
         proxyQuality = prefs.getFloat(PrefKeys.PROXY_QUALITY, 0.72f),
@@ -272,6 +275,25 @@ class AppSettings private constructor(context: Context) {
 
     fun updateServerStorage(storage: ServerStorageInfo?) {
         _state.update { it.copy(serverStorage = storage) }
+    }
+
+    fun updateServerCapabilities(storage: ServerStorageInfo?, s3Enabled: Boolean?) {
+        if (s3Enabled != null) {
+            val mode = if (s3Enabled) UploadMode.S3_PRESIGNED else UploadMode.DIRECT_VPS
+            prefs.edit()
+                .putBoolean(PrefKeys.SERVER_S3_ENABLED, s3Enabled)
+                .putString(PrefKeys.UPLOAD_MODE, mode.rawValue)
+                .apply()
+            _state.update {
+                it.copy(
+                    serverStorage = storage ?: it.serverStorage,
+                    serverS3Enabled = s3Enabled,
+                    uploadMode = mode
+                )
+            }
+        } else if (storage != null) {
+            _state.update { it.copy(serverStorage = storage) }
+        }
     }
 
     fun signOut() {

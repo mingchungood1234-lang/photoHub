@@ -361,14 +361,41 @@ final class LocalProxySyncManager: ObservableObject {
     }
 }
 
+enum DeviceStorageHelper {
+    /// Safety buffer kept free on the phone so iOS never hits 0 MB while writing restored originals.
+    static let minimumHeadroomBytes: Int64 = 512 * 1024 * 1024 // 512 MB
+
+    static func availableBytes() -> Int64? {
+        let homeURL = URL(fileURLWithPath: NSHomeDirectory())
+        if let values = try? homeURL.resourceValues(forKeys: [
+            .volumeAvailableCapacityForImportantUsageKey,
+            .volumeAvailableCapacityKey
+        ]) {
+            if let important = values.volumeAvailableCapacityForImportantUsage, important > 0 {
+                return important
+            }
+            if let standard = values.volumeAvailableCapacity, standard > 0 {
+                return Int64(standard)
+            }
+        }
+        if let attrs = try? FileManager.default.attributesOfFileSystem(forPath: NSHomeDirectory()),
+           let freeNum = attrs[.systemFreeSize] as? NSNumber {
+            return freeNum.int64Value
+        }
+        return nil
+    }
+}
+
 enum BatchRestoreOutcome: Sendable {
     case restored(ServerPhoto?, String, String)
     case failed(String)
+    case lowStorage(String)
 
     var displayName: String {
         switch self {
         case .restored(_, _, let name): return name
         case .failed(let name): return name
+        case .lowStorage(let name): return name
         }
     }
 }
@@ -384,22 +411,60 @@ struct RestoreConfirmPrompt: Identifiable {
     let isRestoreAll: Bool
     let leftoverProxyHashes: Set<String>
     let leftoverProxyCount: Int
+    let deviceAvailableBytes: Int64?
+
+    var hasEnoughStorageForUnrestored: Bool {
+        guard let free = deviceAvailableBytes, unrestoredBytes > 0 else { return true }
+        return free >= unrestoredBytes + DeviceStorageHelper.minimumHeadroomBytes
+    }
+
+    var hasEnoughStorageForAll: Bool {
+        guard let free = deviceAvailableBytes, allBytes > 0 else { return true }
+        return free >= allBytes + DeviceStorageHelper.minimumHeadroomBytes
+    }
+
+    var effectiveTitle: String {
+        if !unrestoredTargets.isEmpty && !hasEnoughStorageForUnrestored {
+            return "Low Phone Storage"
+        }
+        if unrestoredTargets.isEmpty && !(isRestoreAll && leftoverProxyCount > 0) && !hasEnoughStorageForAll {
+            return "Low Phone Storage"
+        }
+        return title
+    }
 
     var messageText: String {
+        let freeText: String = deviceAvailableBytes.map {
+            ByteCountFormatter.string(fromByteCount: max(0, $0), countStyle: .file)
+        } ?? "Unknown"
+
         if unrestoredTargets.isEmpty {
             if isRestoreAll && leftoverProxyCount > 0 {
-                return "All \(allTargets.count) item(s) are already restored & protected on this device, and \(leftoverProxyCount) compressed copy/copies still remain in Photos."
+                return "All \(allTargets.count) already restored · \(leftoverProxyCount) compressed copy(s) left in Photos."
             }
-            return "All \(allTargets.count) selected item(s) are already restored & protected on this device."
+            let allSizeStr = ByteCountFormatter.string(fromByteCount: max(0, allBytes), countStyle: .file)
+            if !hasEnoughStorageForAll, let free = deviceAvailableBytes {
+                let needExtra = ByteCountFormatter.string(
+                    fromByteCount: max(0, (allBytes + DeviceStorageHelper.minimumHeadroomBytes) - free),
+                    countStyle: .file
+                )
+                return "Need ~\(allSizeStr) · Phone free: \(freeText)\nFree up ~\(needExtra) before re-downloading."
+            }
+            return "All \(allTargets.count) already restored · Phone free: \(freeText)."
         }
+
         let sizeStr = ByteCountFormatter.string(fromByteCount: max(0, unrestoredBytes), countStyle: .file)
-        let skipNote = skippedCount > 0
-            ? "\n\n\(skippedCount) already protected/restored item(s) will be skipped."
-            : ""
-        if isRestoreAll {
-            return "Download \(unrestoredTargets.count) full-resolution original(s) (~\(sizeStr)) to Photos, protect them from auto re-compression, and delete matching compressed copies from Photos.\(skipNote)"
+        if !hasEnoughStorageForUnrestored, let free = deviceAvailableBytes {
+            let needExtra = ByteCountFormatter.string(
+                fromByteCount: max(0, (unrestoredBytes + DeviceStorageHelper.minimumHeadroomBytes) - free),
+                countStyle: .file
+            )
+            return "Need ~\(sizeStr) for \(unrestoredTargets.count) item(s) · Phone free: \(freeText)\nFree up ~\(needExtra) on your iPhone first."
         }
-        return "Download \(unrestoredTargets.count) full-resolution original(s) (~\(sizeStr)) to Photos and protect them from auto re-compression.\(skipNote)"
+
+        let skipNote = skippedCount > 0 ? "\nSkipping \(skippedCount) already restored." : ""
+        let proxyNote = isRestoreAll ? " · Removes compressed copies." : ""
+        return "Restore \(unrestoredTargets.count) (~\(sizeStr)) · Phone free: \(freeText)\(proxyNote)\(skipNote)"
     }
 
     static func build(
@@ -408,7 +473,8 @@ struct RestoreConfirmPrompt: Identifiable {
         locallyProtectedHashes: Set<String>,
         isRestoreAll: Bool,
         leftoverProxyHashes: Set<String> = [],
-        leftoverProxyCount: Int = 0
+        leftoverProxyCount: Int = 0,
+        deviceAvailableBytes: Int64? = DeviceStorageHelper.availableBytes()
     ) -> RestoreConfirmPrompt {
         let normProtected = Set(
             locallyProtectedHashes.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
@@ -426,7 +492,8 @@ struct RestoreConfirmPrompt: Identifiable {
             allBytes: targets.reduce(into: Int64(0)) { $0 += max(0, $1.size) },
             isRestoreAll: isRestoreAll,
             leftoverProxyHashes: leftoverProxyHashes,
-            leftoverProxyCount: max(0, leftoverProxyCount)
+            leftoverProxyCount: max(0, leftoverProxyCount),
+            deviceAvailableBytes: deviceAvailableBytes
         )
     }
 }
@@ -460,6 +527,7 @@ enum BatchRestoreRunner {
         var succeeded = 0
         var failed = 0
         var completed = 0
+        var hitLowStorage = false
         var succeededMasterHashes: [String] = []
 
         await withTaskGroup(of: BatchRestoreOutcome?.self) { group in
@@ -483,11 +551,14 @@ enum BatchRestoreRunner {
                     succeededMasterHashes.append(masterHash)
                 case .failed:
                     failed += 1
+                case .lowStorage:
+                    hitLowStorage = true
+                    group.cancelAll()
                 }
                 completed += 1
                 await onProgress(completed, targets.count, outcome.displayName, updatedPhoto)
 
-                if !Task.isCancelled {
+                if !Task.isCancelled && !hitLowStorage {
                     group.addTask {
                         await processNextItem(
                             queue: queue,
@@ -505,42 +576,44 @@ enum BatchRestoreRunner {
 
         if deleteCompressedProxies {
             var cleanupHashes = Set(succeededMasterHashes.map { $0.lowercased() })
-            if !cancelled {
+            if !cancelled && !hitLowStorage {
                 cleanupHashes.formUnion(additionalProxyCleanupHashes.map { $0.lowercased() })
             }
             if !cleanupHashes.isEmpty {
-                await onPhaseChange?("Deleting compressed copies from Photos...")
+                await onPhaseChange?("Deleting compressed copies...")
                 let deleteResult = await PhotoLibraryService.deleteCompressedProxyAssets(forMasterHashes: cleanupHashes)
                 switch deleteResult {
                 case .deleted(let count):
                     deletedProxyCount = count
                     if count > 0 {
-                        proxyNote = " and deleted \(count) compressed copy(s)"
+                        proxyNote = " · Deleted \(count) proxies"
                     }
                 case .cancelledByUser:
-                    proxyNote = "; kept compressed copies in Photos (delete cancelled)"
+                    proxyNote = " · Proxies kept"
                 case .noPermission:
-                    proxyNote = "; grant Full Access in iOS Settings -> photoHub -> Photos to delete compressed copies"
+                    proxyNote = " · Need Full Photos access"
                 case .failed:
-                    proxyNote = "; could not delete some compressed copies (check Full Photos access)"
+                    proxyNote = " · Proxy cleanup failed"
                 }
             }
         }
 
         let message: String
-        if cancelled {
-            message = "Stopped after restoring \(succeeded) original(s)\(proxyNote)."
+        if hitLowStorage {
+            message = "Stopped: low phone storage (restored \(succeeded)\(proxyNote))."
+        } else if cancelled {
+            message = "Stopped · Restored \(succeeded)\(proxyNote)."
         } else if failed > 0 && succeeded == 0 {
-            message = "Restore failed for \(failed) item(s)."
+            message = "Restore failed (\(failed))."
         } else if failed > 0 {
-            message = "Restored \(succeeded) original(s) & protected them\(proxyNote); \(failed) failed."
+            message = "Restored \(succeeded)\(proxyNote) · \(failed) failed."
         } else {
-            message = "Restored \(succeeded) original(s) to Photos & protected them\(proxyNote)."
+            message = "Restored \(succeeded)\(proxyNote)."
         }
         return Summary(
             succeeded: succeeded,
             failed: failed,
-            cancelled: cancelled,
+            cancelled: cancelled || hitLowStorage,
             deletedProxyCount: deletedProxyCount,
             message: message
         )
@@ -553,6 +626,12 @@ enum BatchRestoreRunner {
     ) async -> BatchRestoreOutcome? {
         guard !Task.isCancelled, let item = await queue.next() else {
             return nil
+        }
+        if let freeBytes = DeviceStorageHelper.availableBytes() {
+            let needed = max(Int64(250 * 1024 * 1024), max(0, item.size) + 150 * 1024 * 1024)
+            if freeBytes < needed {
+                return .lowStorage(item.originalName)
+            }
         }
         do {
             let (updated, _) = try await PhotoLibraryService.restoreMasterToPhotos(
@@ -578,6 +657,7 @@ final class OriginalRestoreManager: ObservableObject {
     @Published private(set) var totalCount: Int = 0
     @Published private(set) var unrestoredCount: Int = 0
     @Published private(set) var unrestoredBytes: Int64 = 0
+    @Published private(set) var deviceAvailableBytes: Int64? = DeviceStorageHelper.availableBytes()
 
     @Published private(set) var isRestoring: Bool = false
     @Published private(set) var completedCount: Int = 0
@@ -813,6 +893,7 @@ final class OriginalRestoreManager: ObservableObject {
         totalCount = photos.count
         unrestoredCount = prompt.unrestoredTargets.count
         unrestoredBytes = prompt.unrestoredBytes
+        deviceAvailableBytes = prompt.deviceAvailableBytes
         hasLoadedSummary = markLoaded
     }
 }

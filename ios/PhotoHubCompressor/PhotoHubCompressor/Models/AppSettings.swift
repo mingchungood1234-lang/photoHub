@@ -9,8 +9,8 @@ enum UploadMode: String, CaseIterable, Identifiable {
 
     var displayName: String {
         switch self {
-        case .directVPS: return "Direct to Server"
-        case .s3Presigned: return "S3 / MinIO Pre-signed URL"
+        case .directVPS: return "Direct"
+        case .s3Presigned: return "S3"
         }
     }
 }
@@ -23,8 +23,8 @@ enum ProxyFormat: String, CaseIterable, Identifiable {
 
     var displayName: String {
         switch self {
-        case .heic: return "HEIC (Smallest)"
-        case .jpeg: return "JPEG (Universal)"
+        case .heic: return "HEIC"
+        case .jpeg: return "JPEG"
         }
     }
 }
@@ -40,21 +40,21 @@ enum ProxyResolutionPreset: Int, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .autoSmart: return "Auto (Smart 720p)"
-        case .p480: return "480p SD (Smallest)"
-        case .p720: return "720p HD (Balanced)"
-        case .p1080: return "1080p Full HD (Sharper)"
-        case .p1440: return "1440p 2K (Largest)"
+        case .autoSmart: return "Auto"
+        case .p480: return "480p"
+        case .p720: return "720p"
+        case .p1080: return "1080p"
+        case .p1440: return "1440p"
         }
     }
 
     var resolutionHint: String {
         switch self {
-        case .autoSmart: return "Videos: 720p HD · Photos: 1024–1920 px (smart savings)"
-        case .p480: return "Videos: 480p (480×854) · Photos: up to 854 px (~0.5 MP)"
-        case .p720: return "Videos: 720p HD (720×1280) · Photos: up to 1280 px (~1 MP)"
-        case .p1080: return "Videos: 1080p Full HD · Photos: up to 1920 px (~2 MP)"
-        case .p1440: return "Videos: up to 1080p Full HD · Photos: up to 2560 px (~4 MP)"
+        case .autoSmart: return "Auto · 720p"
+        case .p480: return "480p · 854 px"
+        case .p720: return "720p · 1280 px"
+        case .p1080: return "1080p · 1920 px"
+        case .p1440: return "1440p · 2560 px"
         }
     }
 
@@ -76,9 +76,9 @@ enum ProxyDetailPreset: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .compact: return "Smallest File"
-        case .balanced: return "Balanced (Recommended)"
-        case .highDetail: return "High Detail (Larger)"
+        case .compact: return "Smallest"
+        case .balanced: return "Balance"
+        case .highDetail: return "High"
         }
     }
 
@@ -150,6 +150,7 @@ final class AppSettings: ObservableObject {
     }()
 
     @AppStorage("uploadMode") var uploadModeRaw: String = UploadMode.directVPS.rawValue
+    @AppStorage("serverS3Enabled") var serverS3Enabled: Bool = false
     @AppStorage("proxyFormat") var proxyFormatRaw: String = ProxyFormat.heic.rawValue
     @AppStorage("proxyMaxPixelSize") var proxyMaxPixelSize: Int = 0 // 0 = Auto for all resolutions
     @AppStorage("proxyQuality") var proxyQuality: Double = 0.72
@@ -191,8 +192,22 @@ final class AppSettings: ObservableObject {
     }
 
     var uploadMode: UploadMode {
-        get { UploadMode(rawValue: uploadModeRaw) ?? .directVPS }
-        set { uploadModeRaw = newValue.rawValue }
+        get { serverS3Enabled ? .s3Presigned : .directVPS }
+        set {
+            serverS3Enabled = (newValue == .s3Presigned)
+            uploadModeRaw = newValue.rawValue
+        }
+    }
+
+    @MainActor
+    func applyServerCapabilities(storage: ServerStorageInfo?, s3Enabled: Bool?) {
+        if let storage {
+            serverStorage = storage
+        }
+        if let s3Enabled {
+            serverS3Enabled = s3Enabled
+            uploadModeRaw = (s3Enabled ? UploadMode.s3Presigned : UploadMode.directVPS).rawValue
+        }
     }
 
     var proxyFormat: ProxyFormat {

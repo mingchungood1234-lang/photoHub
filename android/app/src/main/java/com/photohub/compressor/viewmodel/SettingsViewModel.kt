@@ -37,6 +37,7 @@ data class SettingsUiState(
     val restoreLibraryTotalCount: Int = 0,
     val restoreLibraryUnrestoredCount: Int = 0,
     val restoreLibraryUnrestoredBytes: Long = 0L,
+    val deviceAvailableBytes: Long? = DeviceStorageHelper.availableBytes(),
     val isBatchRestoringOriginals: Boolean = false,
     val restoreOriginalsCompleted: Int = 0,
     val restoreOriginalsTotal: Int = 0,
@@ -93,7 +94,8 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 localProxyCacheBytes = store.totalStorageBytes(),
                 mediaPermissionLabel = mediaService.permissionLabel(),
                 hasAllFilesAccess = hasAllFiles,
-                canSilentlyDeleteOriginals = canSilentDelete
+                canSilentlyDeleteOriginals = canSilentDelete,
+                deviceAvailableBytes = DeviceStorageHelper.availableBytes()
             )
         }
         if (canSilentDelete && settings.current.silentAutoDeleteOriginals) {
@@ -124,11 +126,14 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 authManager.refreshGatewayRouteAndStorage()
                 if (!settings.current.isSignedIn) return@launch
                 val info = PhotoHubApiClient(context, settings).whoami()
-                settings.updateServerStorage(info.storage)
+                settings.updateServerCapabilities(info.storage, info.s3Enabled)
                 val folderNote = info.userFolder?.let { "/$it" } ?: "/ (root)"
                 val s3Note = if (info.s3Enabled == true) "S3" else "Direct"
                 _uiState.update {
-                    it.copy(connectionStatus = "Connected · Folder: $folderNote · ${info.indexedPhotos} items ($s3Note)")
+                    it.copy(
+                        connectionStatus = "Connected · Folder: $folderNote · ${info.indexedPhotos} items ($s3Note)",
+                        deviceAvailableBytes = DeviceStorageHelper.availableBytes()
+                    )
                 }
             } catch (err: Exception) {
                 _uiState.update {
@@ -618,7 +623,8 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 hasLoadedRestoreSummary = markLoaded,
                 restoreLibraryTotalCount = photos.size,
                 restoreLibraryUnrestoredCount = prompt.unrestoredTargets.size,
-                restoreLibraryUnrestoredBytes = prompt.unrestoredBytes
+                restoreLibraryUnrestoredBytes = prompt.unrestoredBytes,
+                deviceAvailableBytes = prompt.deviceAvailableBytes
             )
         }
     }

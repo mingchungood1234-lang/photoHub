@@ -468,7 +468,11 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                 }
             }
 
-            guard (try? await apiClient.whoami()) != nil else { return }
+            guard let whoami = try? await apiClient.whoami() else { return }
+            let effectiveUploadMode: UploadMode = (whoami.s3Enabled == true) ? .s3Presigned : .directVPS
+            await MainActor.run {
+                self?.settingsRef?.applyServerCapabilities(storage: whoami.storage, s3Enabled: whoami.s3Enabled)
+            }
 
             let photoService = PhotoLibraryService()
             let tracker = LocalProxyTracker.shared
@@ -501,9 +505,10 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                     continue
                 }
 
-                // Hand off large uploads (or when app just backgrounded) straight to URLSession.background
+                // Hand off large direct-VPS uploads (or when app just backgrounded) straight to URLSession.background
                 // so the OS daemon uploads silently with zero app time limit & zero screen banners.
-                let useOSBackgroundSession = isMovingToBackground || candidate.isVideo || candidate.estimatedBytes > 8_000_000
+                let useOSBackgroundSession = (effectiveUploadMode == .directVPS)
+                    && (isMovingToBackground || candidate.isVideo || candidate.estimatedBytes > 8_000_000)
                 if useOSBackgroundSession {
                     let outcome = await BackgroundUploadTransport.shared.enqueueSilentUpload(
                         candidate: candidate,
@@ -537,7 +542,7 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                         format: format,
                         maxPixelSize: maxPx,
                         quality: quality,
-                        uploadMode: uploadMode,
+                        uploadMode: effectiveUploadMode,
                         keepLocalProxy: keepLocal,
                         normalizedBaseURL: baseURL,
                         cacheScopeKey: cacheScope,
@@ -574,7 +579,7 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                     let totalCount = self.stagedItems.count
                     let totalBytes = self.stagedSavedBytes
                     let totalStr = ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
-                    self.updateSummary("Silently backed up \(uploadedNewCount) item(s); \(totalCount) original(s) ready to delete (~\(totalStr)).")
+                    self.updateSummary("Backed up \(uploadedNewCount) · \(totalCount) ready (~\(totalStr))")
                     if notifyOnFinish && totalCount > 0 {
                         self.sendDeleteOriginalsNotification(
                             count: totalCount,
@@ -636,8 +641,13 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
 
         let work = Task.detached(priority: .utility) { [weak self] in
             var processedNew = 0
+            var effectiveUploadMode: UploadMode = uploadMode
             do {
-                _ = try await apiClient.whoami()
+                let whoami = try await apiClient.whoami()
+                effectiveUploadMode = (whoami.s3Enabled == true) ? .s3Presigned : .directVPS
+                await MainActor.run {
+                    self?.settingsRef?.applyServerCapabilities(storage: whoami.storage, s3Enabled: whoami.s3Enabled)
+                }
             } catch {
                 task.setTaskCompleted(success: false)
                 return
@@ -669,7 +679,9 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                     continue
                 }
 
-                if (candidate.isVideo || candidate.estimatedBytes > 8_000_000), let uploadConfig {
+                if effectiveUploadMode == .directVPS,
+                   (candidate.isVideo || candidate.estimatedBytes > 8_000_000),
+                   let uploadConfig {
                     let outcome = await BackgroundUploadTransport.shared.enqueueSilentUpload(
                         candidate: candidate,
                         photoService: photoService,
@@ -699,7 +711,7 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                         format: format,
                         maxPixelSize: maxPx,
                         quality: quality,
-                        uploadMode: uploadMode,
+                        uploadMode: effectiveUploadMode,
                         keepLocalProxy: keepLocal,
                         normalizedBaseURL: baseURL,
                         cacheScopeKey: cacheScope,
@@ -743,7 +755,7 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                 let totalStr = ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
 
                 if totalCount > 0 {
-                    self.updateSummary("Silently verified \(processedNew) new item(s); \(totalCount) original(s) ready to delete (free ~\(totalStr)).")
+                    self.updateSummary("\(totalCount) ready to delete (~\(totalStr))")
                     if (processedNew > 0 || isOvernight) && notifyImmediate {
                         self.sendDeleteOriginalsNotification(
                             count: totalCount,
@@ -753,7 +765,7 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                         )
                     }
                 } else {
-                    self.updateSummary("Background check complete: all photos are already backed up.")
+                    self.updateSummary("All synced")
                 }
             }
 

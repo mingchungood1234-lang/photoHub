@@ -117,7 +117,7 @@ class GoogleAuthManager private constructor(context: Context) {
                 )
                 runCatching {
                     val info = PhotoHubApiClient(appContext, settings).whoami()
-                    settings.updateServerStorage(info.storage)
+                    settings.updateServerCapabilities(info.storage, info.s3Enabled)
                 }
                 LocalProxySyncManager.getInstance(appContext).syncFromServerOnLaunch()
             } catch (err: Exception) {
@@ -143,7 +143,7 @@ class GoogleAuthManager private constructor(context: Context) {
                 name = resolved.user?.name
             )
             val info = PhotoHubApiClient(appContext, settings).whoami()
-            settings.updateServerStorage(info.storage)
+            settings.updateServerCapabilities(info.storage, info.s3Enabled)
         } catch (err: ApiHttpException) {
             if (err.statusCode == 401) {
                 LocalProxySyncManager.getInstance(appContext).cancel()
@@ -152,7 +152,7 @@ class GoogleAuthManager private constructor(context: Context) {
         } catch (_: Exception) {
             runCatching {
                 val info = PhotoHubApiClient(appContext, settings).whoami()
-                settings.updateServerStorage(info.storage)
+                settings.updateServerCapabilities(info.storage, info.s3Enabled)
             }
         }
     }

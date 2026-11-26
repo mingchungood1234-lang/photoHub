@@ -238,6 +238,15 @@ object ServerTimelineBuilder {
     }
 }
 
+object DeviceStorageHelper {
+    const val MINIMUM_HEADROOM_BYTES: Long = 512L * 1024L * 1024L // 512 MB
+
+    fun availableBytes(): Long? = runCatching {
+        val stat = android.os.StatFs(android.os.Environment.getDataDirectory().path)
+        stat.availableBytes.takeIf { it > 0L }
+    }.getOrNull()
+}
+
 data class BatchRestoreConfirmRequest(
     val title: String,
     val allTargets: List<ServerPhoto>,
@@ -247,8 +256,23 @@ data class BatchRestoreConfirmRequest(
     val allBytes: Long,
     val isRestoreAll: Boolean,
     val leftoverProxyHashes: Set<String> = emptySet(),
-    val leftoverProxyCount: Int = 0
-)
+    val leftoverProxyCount: Int = 0,
+    val deviceAvailableBytes: Long? = null
+) {
+    val hasEnoughStorageForUnrestored: Boolean
+        get() {
+            val free = deviceAvailableBytes ?: return true
+            if (unrestoredBytes <= 0L) return true
+            return free >= unrestoredBytes + DeviceStorageHelper.MINIMUM_HEADROOM_BYTES
+        }
+
+    val hasEnoughStorageForAll: Boolean
+        get() {
+            val free = deviceAvailableBytes ?: return true
+            if (allBytes <= 0L) return true
+            return free >= allBytes + DeviceStorageHelper.MINIMUM_HEADROOM_BYTES
+        }
+}
 
 object BatchRestorePlanner {
     fun buildConfirmRequest(
@@ -257,7 +281,8 @@ object BatchRestorePlanner {
         locallyProtectedHashes: Set<String>,
         isRestoreAll: Boolean,
         leftoverProxyHashes: Set<String> = emptySet(),
-        leftoverProxyCount: Int = 0
+        leftoverProxyCount: Int = 0,
+        deviceAvailableBytes: Long? = DeviceStorageHelper.availableBytes()
     ): BatchRestoreConfirmRequest {
         val normProtected = locallyProtectedHashes.map { it.trim().lowercase(Locale.ROOT) }.toSet()
         val unrestored = targets.filter { photo ->
@@ -272,7 +297,8 @@ object BatchRestorePlanner {
             allBytes = targets.sumOf { maxOf(0L, it.size) },
             isRestoreAll = isRestoreAll,
             leftoverProxyHashes = leftoverProxyHashes,
-            leftoverProxyCount = leftoverProxyCount.coerceAtLeast(0)
+            leftoverProxyCount = leftoverProxyCount.coerceAtLeast(0),
+            deviceAvailableBytes = deviceAvailableBytes
         )
     }
 
@@ -351,6 +377,7 @@ object BatchRestoreExecutor {
         val succeeded = AtomicInteger(0)
         val failed = AtomicInteger(0)
         val completed = AtomicInteger(0)
+        val lowStorageHit = java.util.concurrent.atomic.AtomicBoolean(false)
         val succeededHashes = java.util.Collections.synchronizedList(mutableListOf<String>())
         var cancelled = false
 
@@ -360,7 +387,13 @@ object BatchRestoreExecutor {
                 val workers = List(workerCount) {
                     launch(Dispatchers.IO) {
                         for (item in queue) {
-                            if (!isActive) break
+                            if (!isActive || lowStorageHit.get()) break
+                            val freeBytes = DeviceStorageHelper.availableBytes()
+                            val neededBytes = maxOf(250L * 1024L * 1024L, maxOf(0L, item.size) + 150L * 1024L * 1024L)
+                            if (freeBytes != null && freeBytes < neededBytes) {
+                                lowStorageHit.set(true)
+                                break
+                            }
                             var updatedPhoto: ServerPhoto? = null
                             try {
                                 updatedPhoto = restoreSinglePhotoToGallery(
@@ -397,6 +430,7 @@ object BatchRestoreExecutor {
         } finally {
             val ok = succeeded.get()
             val errCount = failed.get()
+            val stoppedLowStorage = lowStorageHit.get()
             var deletedProxyCount = 0
             var pendingPrompt: com.photohub.compressor.media.CompressedProxyDeleteResult.NeedsSystemConfirmation? = null
 
@@ -406,14 +440,14 @@ object BatchRestoreExecutor {
                         .map { it.trim().lowercase(Locale.ROOT) }
                         .filter { it.isNotEmpty() }
                         .toMutableSet()
-                    if (!cancelled) {
+                    if (!cancelled && !stoppedLowStorage) {
                         additionalProxyCleanupHashes
                             .map { it.trim().lowercase(Locale.ROOT) }
                             .filter { it.isNotEmpty() }
                             .let { cleanupHashes.addAll(it) }
                     }
                     if (cleanupHashes.isNotEmpty()) {
-                        onPhaseChange?.invoke("Deleting compressed copies from Gallery…")
+                        onPhaseChange?.invoke("Deleting compressed copies…")
                         val proxyIds = mediaService.findCompressedProxyAssetIds(tracker, cleanupHashes)
                         if (proxyIds.isNotEmpty()) {
                             when (val delRes = mediaService.deleteCompressedProxiesAfterRestore(tracker, proxyIds)) {
@@ -431,18 +465,23 @@ object BatchRestoreExecutor {
                     }
                 }
 
-                val msg = formatSummaryMessage(
-                    ok = ok,
-                    errCount = errCount,
-                    cancelled = cancelled,
-                    deletedProxyCount = deletedProxyCount,
-                    awaitingDeleteConfirm = pendingPrompt != null
-                )
+                val msg = if (stoppedLowStorage) {
+                    val proxyNote = if (deletedProxyCount > 0) " · Deleted $deletedProxyCount proxies" else ""
+                    "Stopped: low phone storage (restored $ok$proxyNote)."
+                } else {
+                    formatSummaryMessage(
+                        ok = ok,
+                        errCount = errCount,
+                        cancelled = cancelled,
+                        deletedProxyCount = deletedProxyCount,
+                        awaitingDeleteConfirm = pendingPrompt != null
+                    )
+                }
                 onFinished(
                     BatchRestoreResult(
                         succeeded = ok,
                         failed = errCount,
-                        cancelled = cancelled,
+                        cancelled = cancelled || stoppedLowStorage,
                         deletedProxyCount = deletedProxyCount,
                         proxyDeletePending = pendingPrompt,
                         summaryMessage = msg

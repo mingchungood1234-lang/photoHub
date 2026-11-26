@@ -44,7 +44,6 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
     val syncState by viewModel.syncManager.state.collectAsStateWithLifecycle()
 
     var showHourMenu by remember { mutableStateOf(false) }
-    var showUploadModeMenu by remember { mutableStateOf(false) }
     var showFormatMenu by remember { mutableStateOf(false) }
     var showResMenu by remember { mutableStateOf(false) }
     var showDetailMenu by remember { mutableStateOf(false) }
@@ -415,24 +414,13 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
                         viewModel.settings.setKeepLocalProxyInPhotos(it)
                     }
 
-                    Box {
-                        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                            Text("Upload", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-                            TextButton(onClick = { showUploadModeMenu = true }) {
-                                Text(settingsState.uploadMode.displayName, fontWeight = FontWeight.SemiBold)
-                            }
-                        }
-                        DropdownMenu(expanded = showUploadModeMenu, onDismissRequest = { showUploadModeMenu = false }) {
-                            UploadMode.entries.forEach { mode ->
-                                DropdownMenuItem(
-                                    text = { Text(mode.displayName) },
-                                    onClick = {
-                                        viewModel.settings.setUploadMode(mode)
-                                        showUploadModeMenu = false
-                                    }
-                                )
-                            }
-                        }
+                    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text("Upload", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                        WarmStatChip(
+                            text = if (settingsState.serverS3Enabled) "Auto · S3" else "Auto · Direct",
+                            tint = if (settingsState.serverS3Enabled) PhotoHubAmber else PhotoHubMint,
+                            icon = if (settingsState.serverS3Enabled) Icons.Rounded.Cloud else Icons.Rounded.Dns
+                        )
                     }
 
                     Box {
@@ -526,6 +514,19 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
                             else -> {
                                 Text("0 items", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
+                        }
+                    }
+
+                    uiState.deviceAvailableBytes?.let { phoneFree ->
+                        val lowSpace = uiState.restoreLibraryUnrestoredBytes > 0L &&
+                            phoneFree < uiState.restoreLibraryUnrestoredBytes + com.photohub.compressor.viewmodel.DeviceStorageHelper.MINIMUM_HEADROOM_BYTES
+                        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text("Phone Free", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                            WarmStatChip(
+                                text = Formatter.formatFileSize(context, phoneFree),
+                                tint = if (lowSpace) PhotoHubRed else PhotoHubMint,
+                                icon = if (lowSpace) Icons.Rounded.Warning else Icons.Rounded.PhoneAndroid
+                            )
                         }
                     }
 

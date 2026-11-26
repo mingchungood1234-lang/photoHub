@@ -168,14 +168,29 @@ object PhotoBackupPipeline {
                             expectedSha256 = master.sha256,
                             onProgress = progressHandler
                         )
-                        UploadMode.S3_PRESIGNED -> apiClient.uploadMasterPresigned(
-                            file = master.file,
-                            filename = master.filename,
-                            mimeType = master.mimeType,
-                            createdAtMs = candidate.creationDateMs,
-                            expectedSha256 = master.sha256,
-                            onProgress = progressHandler
-                        )
+                        UploadMode.S3_PRESIGNED -> try {
+                            apiClient.uploadMasterPresigned(
+                                file = master.file,
+                                filename = master.filename,
+                                mimeType = master.mimeType,
+                                createdAtMs = candidate.creationDateMs,
+                                expectedSha256 = master.sha256,
+                                onProgress = progressHandler
+                            )
+                        } catch (httpErr: com.photohub.compressor.network.ApiHttpException) {
+                            if (httpErr.statusCode == 501) {
+                                apiClient.uploadMasterDirect(
+                                    file = master.file,
+                                    filename = master.filename,
+                                    mimeType = master.mimeType,
+                                    createdAtMs = candidate.creationDateMs,
+                                    expectedSha256 = master.sha256,
+                                    onProgress = progressHandler
+                                )
+                            } else {
+                                throw httpErr
+                            }
+                        }
                     }
                 }
 

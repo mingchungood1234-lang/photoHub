@@ -38,9 +38,12 @@ class PhotoUploadWorker(
         }
 
         val apiClient = PhotoHubApiClient(context, settings)
-        val reachable = runCatching { apiClient.whoami() }.isSuccess
-        if (!reachable) {
-            return Result.retry()
+        val whoami = runCatching { apiClient.whoami() }.getOrNull() ?: return Result.retry()
+        settings.updateServerCapabilities(whoami.storage, whoami.s3Enabled)
+        val effectiveUploadMode = if (whoami.s3Enabled == true) {
+            com.photohub.compressor.data.UploadMode.S3_PRESIGNED
+        } else {
+            com.photohub.compressor.data.UploadMode.DIRECT_VPS
         }
 
         val isOvernight = inputData.getBoolean(KEY_IS_OVERNIGHT, false)
@@ -89,7 +92,7 @@ class PhotoUploadWorker(
                         format = cur.proxyFormat,
                         maxPixelSize = cur.proxyMaxPixelSize,
                         quality = cur.proxyQuality,
-                        uploadMode = cur.uploadMode,
+                        uploadMode = effectiveUploadMode,
                         keepLocalProxy = cur.keepLocalProxyInPhotos,
                         normalizedBaseUrl = cur.normalizedBaseUrl,
                         cacheScopeKey = cur.apiKeyCacheScope,

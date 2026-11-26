@@ -344,13 +344,16 @@ struct SettingsView: View {
             Toggle("Keep Proxy", isOn: $settings.keepLocalProxyInPhotos)
                 .tint(PhotoHubPalette.orange)
 
-            pickerRow("Upload") {
-                Picker("Upload", selection: $settings.uploadModeRaw) {
-                    ForEach(UploadMode.allCases) { mode in
-                        Text(mode.displayName).tag(mode.rawValue)
-                    }
-                }
-                .labelsHidden()
+            HStack {
+                Text("Upload")
+                    .font(.subheadline)
+                    .foregroundColor(PhotoHubPalette.ink)
+                Spacer()
+                WarmStatPill(
+                    icon: settings.serverS3Enabled ? "externaldrive.connected.to.line.below" : "server.rack",
+                    text: settings.serverS3Enabled ? "Auto · S3" : "Auto · Direct",
+                    tint: settings.serverS3Enabled ? PhotoHubPalette.warmAmber : PhotoHubPalette.mint
+                )
             }
 
             pickerRow("Format") {
@@ -402,6 +405,22 @@ struct SettingsView: View {
                     Text("0 items")
                         .font(.caption)
                         .foregroundColor(PhotoHubPalette.muted)
+                }
+            }
+
+            if let phoneFree = restoreManager.deviceAvailableBytes {
+                let lowSpace = restoreManager.unrestoredBytes > 0
+                    && phoneFree < restoreManager.unrestoredBytes + DeviceStorageHelper.minimumHeadroomBytes
+                HStack {
+                    Text("Phone Free")
+                        .font(.subheadline)
+                        .foregroundColor(PhotoHubPalette.ink)
+                    Spacer()
+                    WarmStatPill(
+                        icon: lowSpace ? "exclamationmark.triangle.fill" : "iphone",
+                        text: formatBytes(phoneFree),
+                        tint: lowSpace ? PhotoHubPalette.rose : PhotoHubPalette.mint
+                    )
                 }
             }
 
@@ -622,6 +641,7 @@ struct SettingsView: View {
             Spacer()
             picker()
                 .tint(PhotoHubPalette.orange)
+                .fixedSize(horizontal: true, vertical: false)
         }
     }
 
@@ -649,7 +669,7 @@ struct SettingsView: View {
 
         do {
             let info = try await PhotoHubAPIClient(settings: settings).whoami()
-            settings.serverStorage = info.storage
+            settings.applyServerCapabilities(storage: info.storage, s3Enabled: info.s3Enabled)
             connectionStatus = "Connected · \(info.indexedPhotos) items"
         } catch {
             connectionStatus = "Offline"
@@ -684,7 +704,7 @@ extension View {
         onConfirm: @escaping (_ targets: [ServerPhoto], _ prompt: RestoreConfirmPrompt) -> Void
     ) -> some View {
         alert(
-            prompt.wrappedValue?.title ?? "Restore Originals",
+            prompt.wrappedValue?.effectiveTitle ?? "Restore Originals",
             isPresented: Binding(
                 get: { prompt.wrappedValue != nil },
                 set: { if !$0 { prompt.wrappedValue = nil } }
@@ -692,12 +712,14 @@ extension View {
             presenting: prompt.wrappedValue
         ) { current in
             if !current.unrestoredTargets.isEmpty {
-                Button("Restore \(current.unrestoredTargets.count)") {
-                    onConfirm(current.unrestoredTargets, current)
-                }
-                if current.skippedCount > 0 {
-                    Button("All (\(current.allTargets.count))") {
-                        onConfirm(current.allTargets, current)
+                if current.hasEnoughStorageForUnrestored {
+                    Button("Restore \(current.unrestoredTargets.count)") {
+                        onConfirm(current.unrestoredTargets, current)
+                    }
+                    if current.skippedCount > 0 && current.hasEnoughStorageForAll {
+                        Button("All (\(current.allTargets.count))") {
+                            onConfirm(current.allTargets, current)
+                        }
                     }
                 }
             } else {
@@ -709,11 +731,16 @@ extension View {
                         onDeleteLeftoverProxies(current.leftoverProxyHashes)
                     }
                 }
-                Button("Re-download (\(current.allTargets.count))") {
-                    onConfirm(current.allTargets, current)
+                if current.hasEnoughStorageForAll {
+                    Button("Re-download (\(current.allTargets.count))") {
+                        onConfirm(current.allTargets, current)
+                    }
                 }
             }
-            Button("Cancel", role: .cancel) {
+            Button(
+                (!current.unrestoredTargets.isEmpty && !current.hasEnoughStorageForUnrestored) ? "OK" : "Cancel",
+                role: .cancel
+            ) {
                 prompt.wrappedValue = nil
             }
         } message: { current in

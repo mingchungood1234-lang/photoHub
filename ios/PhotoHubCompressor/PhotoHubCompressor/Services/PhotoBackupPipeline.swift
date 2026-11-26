@@ -173,14 +173,26 @@ enum PhotoBackupPipeline {
                     onProgress: progressHandler
                 )
             case .s3Presigned:
-                _ = try await apiClient.uploadMasterPresigned(
-                    fileURL: master.fileURL,
-                    filename: master.filename,
-                    mimeType: master.mimeType,
-                    createdAt: candidate.creationDate,
-                    expectedSha256: master.sha256,
-                    onProgress: progressHandler
-                )
+                do {
+                    _ = try await apiClient.uploadMasterPresigned(
+                        fileURL: master.fileURL,
+                        filename: master.filename,
+                        mimeType: master.mimeType,
+                        createdAt: candidate.creationDate,
+                        expectedSha256: master.sha256,
+                        onProgress: progressHandler
+                    )
+                } catch APIClientError.httpError(501, _) {
+                    // Server switched back to direct storage; fall back transparently.
+                    _ = try await apiClient.uploadMasterDirect(
+                        fileURL: master.fileURL,
+                        filename: master.filename,
+                        mimeType: master.mimeType,
+                        createdAt: candidate.creationDate,
+                        expectedSha256: master.sha256,
+                        onProgress: progressHandler
+                    )
+                }
             }
         }
 

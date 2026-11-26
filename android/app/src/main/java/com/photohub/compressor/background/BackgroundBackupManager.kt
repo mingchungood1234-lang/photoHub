@@ -309,8 +309,13 @@ class BackgroundBackupManager private constructor(context: Context) {
             val failedIds = mutableListOf<String>()
             try {
                 val apiClient = PhotoHubApiClient(appContext, settings)
-                val whoamiOk = runCatching { apiClient.whoami() }.isSuccess
-                if (!whoamiOk) return@launch
+                val whoami = runCatching { apiClient.whoami() }.getOrNull() ?: return@launch
+                settings.updateServerCapabilities(whoami.storage, whoami.s3Enabled)
+                val effectiveUploadMode = if (whoami.s3Enabled == true) {
+                    com.photohub.compressor.data.UploadMode.S3_PRESIGNED
+                } else {
+                    com.photohub.compressor.data.UploadMode.DIRECT_VPS
+                }
 
                 val tracker = LocalProxyTracker.getInstance(appContext)
                 val cached = LocalProxyStore.getInstance(appContext)
@@ -356,7 +361,7 @@ class BackgroundBackupManager private constructor(context: Context) {
                             format = cur.proxyFormat,
                             maxPixelSize = cur.proxyMaxPixelSize,
                             quality = cur.proxyQuality,
-                            uploadMode = cur.uploadMode,
+                            uploadMode = effectiveUploadMode,
                             keepLocalProxy = cur.keepLocalProxyInPhotos,
                             normalizedBaseUrl = cur.normalizedBaseUrl,
                             cacheScopeKey = cur.apiKeyCacheScope,

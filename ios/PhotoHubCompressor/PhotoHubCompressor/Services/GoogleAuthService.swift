@@ -122,10 +122,10 @@ final class GoogleAuthService: NSObject, ObservableObject, ASWebAuthenticationPr
                 folderName: exchange.user.folderName
             )
 
-            // Fetch storage usage/limit immediately from assigned node
+            // Fetch storage usage/limit & S3 mode immediately from assigned node
             let nodeClient = PhotoHubAPIClient(settings: settings)
             if let info = try? await nodeClient.whoami() {
-                settings.serverStorage = info.storage
+                settings.applyServerCapabilities(storage: info.storage, s3Enabled: info.s3Enabled)
             }
             LocalProxySyncManager.shared.syncFromServerOnLaunch(settings: settings)
         } catch let authErr as GoogleAuthError {
@@ -152,7 +152,7 @@ final class GoogleAuthService: NSObject, ObservableObject, ASWebAuthenticationPr
                 name: resolved.user?.name
             )
             let info = try await PhotoHubAPIClient(settings: settings).whoami()
-            settings.serverStorage = info.storage
+            settings.applyServerCapabilities(storage: info.storage, s3Enabled: info.s3Enabled)
         } catch APIClientError.httpError(401, _) {
             // Token expired or revoked on server; require clean re-authentication
             LocalProxySyncManager.shared.cancel()
@@ -160,7 +160,7 @@ final class GoogleAuthService: NSObject, ObservableObject, ASWebAuthenticationPr
         } catch {
             // Keep existing cached session/node offline; update storage if assigned node directly reachable
             if let info = try? await PhotoHubAPIClient(settings: settings).whoami() {
-                settings.serverStorage = info.storage
+                settings.applyServerCapabilities(storage: info.storage, s3Enabled: info.s3Enabled)
             }
         }
     }

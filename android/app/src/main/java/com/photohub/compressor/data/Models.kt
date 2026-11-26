@@ -14,8 +14,8 @@ import java.util.Date
 import java.util.Locale
 
 enum class UploadMode(val rawValue: String, val displayName: String) {
-    DIRECT_VPS("direct_vps", "Direct to Server"),
-    S3_PRESIGNED("s3_presigned", "S3 / MinIO Pre-signed URL");
+    DIRECT_VPS("direct_vps", "Direct"),
+    S3_PRESIGNED("s3_presigned", "S3");
 
     companion object {
         fun fromRaw(raw: String?): UploadMode =
@@ -24,8 +24,8 @@ enum class UploadMode(val rawValue: String, val displayName: String) {
 }
 
 enum class ProxyFormat(val rawValue: String, val displayName: String) {
-    HEIC("heic", "HEIC (Smallest)"),
-    JPEG("jpeg", "JPEG (Universal)");
+    HEIC("heic", "HEIC"),
+    JPEG("jpeg", "JPEG");
 
     companion object {
         fun fromRaw(raw: String?): ProxyFormat =

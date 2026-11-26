@@ -722,46 +722,68 @@ fun BatchRestoreConfirmDialog(
     onConfirm: (includeAlreadyRestored: Boolean) -> Unit
 ) {
     val context = LocalContext.current
+    val freeText = request.deviceAvailableBytes?.let { Formatter.formatFileSize(context, it.coerceAtLeast(0L)) } ?: "Unknown"
+    val blockedLowStorage = (!request.unrestoredTargets.isEmpty() && !request.hasEnoughStorageForUnrestored) ||
+        (request.unrestoredTargets.isEmpty() && !(request.isRestoreAll && request.leftoverProxyCount > 0) && !request.hasEnoughStorageForAll)
+
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(request.title) },
+        title = {
+            Text(
+                text = if (blockedLowStorage) "Low Phone Storage" else request.title,
+                fontWeight = FontWeight.Bold
+            )
+        },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (request.unrestoredTargets.isEmpty()) {
                     if (request.isRestoreAll && request.leftoverProxyCount > 0 && onDeleteLeftoverProxies != null) {
                         Text(
-                            "All ${request.allTargets.size} item(s) are already restored & protected on this device, and ${request.leftoverProxyCount} compressed copy(s) still remain in Gallery."
+                            "All ${request.allTargets.size} restored · ${request.leftoverProxyCount} compressed copy(s) left in Gallery."
                         )
-                        TextButton(
-                            onClick = { onConfirm(true) },
-                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp)
-                        ) {
-                            Text("Re-download All (${request.allTargets.size})")
+                        if (request.hasEnoughStorageForAll) {
+                            TextButton(
+                                onClick = { onConfirm(true) },
+                                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp)
+                            ) {
+                                Text("Re-download All (${request.allTargets.size})")
+                            }
                         }
-                    } else {
-                        Text(
-                            "All ${request.allTargets.size} selected item(s) are already restored & protected on this device."
+                    } else if (!request.hasEnoughStorageForAll && request.deviceAvailableBytes != null) {
+                        val allSizeStr = Formatter.formatFileSize(context, request.allBytes)
+                        val needExtra = Formatter.formatFileSize(
+                            context,
+                            ((request.allBytes + com.photohub.compressor.viewmodel.DeviceStorageHelper.MINIMUM_HEADROOM_BYTES) - request.deviceAvailableBytes).coerceAtLeast(0L)
                         )
+                        Text("Need ~$allSizeStr · Phone free: $freeText\nFree up ~$needExtra before re-downloading.")
+                    } else {
+                        Text("All ${request.allTargets.size} already restored · Phone free: $freeText.")
                     }
                 } else {
                     val sizeStr = Formatter.formatFileSize(context, request.unrestoredBytes)
-                    val baseMsg = if (request.isRestoreAll) {
-                        "Download ${request.unrestoredTargets.size} full-resolution original(s) (~$sizeStr) to your Gallery, protect them from auto re-compression, and delete matching compressed copies from Gallery."
-                    } else {
-                        "Download ${request.unrestoredTargets.size} full-resolution original(s) (~$sizeStr) to your Gallery and protect them from auto re-compression."
-                    }
-                    Text(baseMsg)
-                    if (request.skippedCount > 0) {
-                        Text(
-                            "${request.skippedCount} already protected/restored item(s) will be skipped.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                    if (!request.hasEnoughStorageForUnrestored && request.deviceAvailableBytes != null) {
+                        val needExtra = Formatter.formatFileSize(
+                            context,
+                            ((request.unrestoredBytes + com.photohub.compressor.viewmodel.DeviceStorageHelper.MINIMUM_HEADROOM_BYTES) - request.deviceAvailableBytes).coerceAtLeast(0L)
                         )
-                        TextButton(
-                            onClick = { onConfirm(true) },
-                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp)
-                        ) {
-                            Text("Include ${request.skippedCount} already restored (${request.allTargets.size} total)")
+                        Text("Need ~$sizeStr for ${request.unrestoredTargets.size} item(s) · Phone free: $freeText\nFree up ~$needExtra on your phone first.")
+                    } else {
+                        val proxyNote = if (request.isRestoreAll) " · Removes compressed copies." else ""
+                        Text("Restore ${request.unrestoredTargets.size} (~$sizeStr) · Phone free: $freeText$proxyNote")
+                        if (request.skippedCount > 0) {
+                            Text(
+                                "Skipping ${request.skippedCount} already restored.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            if (request.hasEnoughStorageForAll) {
+                                TextButton(
+                                    onClick = { onConfirm(true) },
+                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp)
+                                ) {
+                                    Text("Include all (${request.allTargets.size})")
+                                }
+                            }
                         }
                     }
                 }
@@ -777,14 +799,14 @@ fun BatchRestoreConfirmDialog(
                             contentColor = MaterialTheme.colorScheme.onError
                         )
                     ) {
-                        Text("Delete ${request.leftoverProxyCount} Compressed")
+                        Text("Delete ${request.leftoverProxyCount} Proxies")
                     }
-                } else {
+                } else if (request.hasEnoughStorageForAll) {
                     Button(onClick = { onConfirm(true) }) {
-                        Text("Re-download All (${request.allTargets.size})")
+                        Text("Re-download (${request.allTargets.size})")
                     }
                 }
-            } else {
+            } else if (request.hasEnoughStorageForUnrestored) {
                 Button(onClick = { onConfirm(false) }) {
                     Text("Restore ${request.unrestoredTargets.size}")
                 }
@@ -792,7 +814,7 @@ fun BatchRestoreConfirmDialog(
         },
         dismissButton = {
             TextButton(onClick = onDismiss) {
-                Text("Cancel")
+                Text(if (blockedLowStorage) "OK" else "Cancel")
             }
         }
     )
