@@ -43,6 +43,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Semaphore
 import org.json.JSONArray
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 data class BackgroundBackupUiState(
     val stagedItems: List<StagedCleanupItem> = emptyList(),
@@ -71,11 +72,53 @@ class BackgroundBackupManager private constructor(context: Context) {
     private var isSilentRunning = false
     private var pendingRescan = false
     private var debouncedJob: Job? = null
+    private val activeRestorePauseCount = AtomicInteger(0)
     private val cooldownUntilMs = mutableMapOf<String, Long>()
     private val mediaObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
         override fun onChange(selfChange: Boolean) {
+            if (isPausedForRestore()) return
             scheduleDebouncedSilentCheck(2500L)
         }
+    }
+
+    fun isPausedForRestore(): Boolean = activeRestorePauseCount.get() > 0
+
+    fun beginRestorePause() {
+        val count = activeRestorePauseCount.incrementAndGet()
+        debouncedJob?.cancel()
+        debouncedJob = null
+        pendingRescan = false
+        if (count == 1) {
+            val wm = WorkManager.getInstance(appContext)
+            wm.cancelUniqueWork(UNIQUE_CONTENT_TRIGGER_WORK)
+            wm.cancelUniqueWork(UNIQUE_IMMEDIATE_BG_WORK)
+            wm.cancelUniqueWork(UNIQUE_CONTINUATION_BG_WORK)
+        }
+    }
+
+    fun endRestorePause() {
+        val remaining = activeRestorePauseCount.updateAndGet { (it - 1).coerceAtLeast(0) }
+        if (remaining == 0 && settings.current.nightlyAutoBackupEnabled && settings.current.isSignedIn) {
+            scheduleMediaContentTriggerIfEnabled(replaceExisting = false)
+        }
+    }
+
+    /**
+     * Turns off Auto Backup and cancels all scheduled background upload workers (used by Restore All Originals).
+     */
+    fun disableAutoBackup(): Boolean {
+        if (!settings.current.nightlyAutoBackupEnabled) return false
+        settings.setNightlyAutoBackupEnabled(false)
+        debouncedJob?.cancel()
+        debouncedJob = null
+        pendingRescan = false
+        val wm = WorkManager.getInstance(appContext)
+        wm.cancelUniqueWork(UNIQUE_PERIODIC_WORK)
+        wm.cancelUniqueWork(UNIQUE_CONTENT_TRIGGER_WORK)
+        wm.cancelUniqueWork(UNIQUE_IMMEDIATE_BG_WORK)
+        wm.cancelUniqueWork(UNIQUE_CONTINUATION_BG_WORK)
+        updateSummary("Auto backup off")
+        return true
     }
 
     init {
@@ -177,6 +220,8 @@ class BackgroundBackupManager private constructor(context: Context) {
         if (!cur.nightlyAutoBackupEnabled || !cur.isSignedIn) {
             workManager.cancelUniqueWork(UNIQUE_PERIODIC_WORK)
             workManager.cancelUniqueWork(UNIQUE_CONTENT_TRIGGER_WORK)
+            workManager.cancelUniqueWork(UNIQUE_IMMEDIATE_BG_WORK)
+            workManager.cancelUniqueWork(UNIQUE_CONTINUATION_BG_WORK)
             return
         }
 
@@ -234,7 +279,7 @@ class BackgroundBackupManager private constructor(context: Context) {
     fun scheduleMediaContentTriggerIfEnabled(replaceExisting: Boolean = false) {
         val cur = settings.current
         val workManager = WorkManager.getInstance(appContext)
-        if (!cur.nightlyAutoBackupEnabled || !cur.isSignedIn) {
+        if (isPausedForRestore() || !cur.nightlyAutoBackupEnabled || !cur.isSignedIn) {
             workManager.cancelUniqueWork(UNIQUE_CONTENT_TRIGGER_WORK)
             return
         }
@@ -264,7 +309,7 @@ class BackgroundBackupManager private constructor(context: Context) {
 
     fun scheduleDebouncedSilentCheck(delayMs: Long = 2500L) {
         val cur = settings.current
-        if (!cur.nightlyAutoBackupEnabled || !cur.isSignedIn) return
+        if (isPausedForRestore() || !cur.nightlyAutoBackupEnabled || !cur.isSignedIn) return
         debouncedJob?.cancel()
         debouncedJob = scope.launch {
             delay(delayMs)
@@ -275,7 +320,7 @@ class BackgroundBackupManager private constructor(context: Context) {
     fun triggerSilentAutoUpload(isMovingToBackground: Boolean) {
         ensureMediaObserverAndSchedule()
         val cur = settings.current
-        if (!cur.nightlyAutoBackupEnabled || !cur.isSignedIn || cur.normalizedBaseUrl == null) return
+        if (isPausedForRestore() || !cur.nightlyAutoBackupEnabled || !cur.isSignedIn || cur.normalizedBaseUrl == null) return
 
         val mediaService = MediaLibraryService(appContext)
         if (mediaService.currentAccessLevel() == MediaAccessLevel.DENIED) return

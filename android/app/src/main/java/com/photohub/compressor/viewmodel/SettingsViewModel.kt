@@ -50,7 +50,8 @@ data class SettingsUiState(
     val pendingProxyDeleteBaseRestoredCount: Int = 0,
     val pendingProxyDeleteBaseFailedCount: Int = 0,
     val pendingProxyDeleteAlreadyDeletedCount: Int = 0,
-    val pendingProxyDeleteFromRestoreRun: Boolean = false
+    val pendingProxyDeleteFromRestoreRun: Boolean = false,
+    val pendingProxyDeleteAutoBackupDisabled: Boolean = false
 )
 
 class SettingsViewModel(application: Application) : AndroidViewModel(application) {
@@ -331,7 +332,8 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                     locallyProtectedHashes = computeLocallyProtectedHashes(targets),
                     isRestoreAll = true,
                     leftoverProxyHashes = verifiedLocalHashes,
-                    leftoverProxyCount = leftoverProxyCount
+                    leftoverProxyCount = leftoverProxyCount,
+                    willDisableAutoBackup = settings.current.nightlyAutoBackupEnabled
                 )
             }
             _uiState.update { it.copy(restoreOriginalsConfirmRequest = req) }
@@ -368,6 +370,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         val baseFailed = state.pendingProxyDeleteBaseFailedCount
         val alreadyDeleted = state.pendingProxyDeleteAlreadyDeletedCount
         val fromRestore = state.pendingProxyDeleteFromRestoreRun
+        val autoBackupDisabled = state.pendingProxyDeleteAutoBackupDisabled
 
         viewModelScope.launch {
             if (confirmed) {
@@ -384,7 +387,8 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                                     ok = baseRestored,
                                     errCount = baseFailed,
                                     cancelled = false,
-                                    deletedProxyCount = totalDeleted
+                                    deletedProxyCount = totalDeleted,
+                                    autoBackupDisabled = autoBackupDisabled
                                 )
                             } else {
                                 "Deleted $totalDeleted compressed copy(s) from Gallery."
@@ -394,6 +398,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                                     pendingProxyDeleteIntentSender = null,
                                     pendingProxyDeleteTargetIds = emptyList(),
                                     pendingProxyDeleteRemainingIds = emptyList(),
+                                    pendingProxyDeleteAutoBackupDisabled = false,
                                     restoreOriginalsMessage = msg
                                 )
                             }
@@ -417,7 +422,8 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                         ok = baseRestored,
                         errCount = baseFailed,
                         cancelled = false,
-                        deletedProxyCount = nextDeleted
+                        deletedProxyCount = nextDeleted,
+                        autoBackupDisabled = autoBackupDisabled
                     )
                 } else {
                     "Deleted $nextDeleted compressed copy(s) from Gallery."
@@ -427,11 +433,12 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                         pendingProxyDeleteIntentSender = null,
                         pendingProxyDeleteTargetIds = emptyList(),
                         pendingProxyDeleteRemainingIds = emptyList(),
+                        pendingProxyDeleteAutoBackupDisabled = false,
                         restoreOriginalsMessage = msg
                     )
                 }
             } else {
-                val msg = if (fromRestore) {
+                val baseMsg = if (fromRestore) {
                     if (alreadyDeleted > 0) {
                         "Restored $baseRestored original(s) & deleted $alreadyDeleted compressed copy(s); remaining copies kept (delete cancelled)."
                     } else {
@@ -444,11 +451,17 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                         "Kept compressed copies in Gallery (delete cancelled)."
                     }
                 }
+                val msg = if (fromRestore && autoBackupDisabled) {
+                    "${baseMsg.removeSuffix(".")} · Auto Backup off."
+                } else {
+                    baseMsg
+                }
                 _uiState.update {
                     it.copy(
                         pendingProxyDeleteIntentSender = null,
                         pendingProxyDeleteTargetIds = emptyList(),
                         pendingProxyDeleteRemainingIds = emptyList(),
+                        pendingProxyDeleteAutoBackupDisabled = false,
                         restoreOriginalsMessage = msg
                     )
                 }
@@ -529,6 +542,9 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             return
         }
 
+        // Turn off Auto Backup when restoring the full library so future photos aren't silently offloaded.
+        val turnedOffAutoBackup = bgManager.disableAutoBackup()
+
         restoreOriginalsJob?.cancel()
         _uiState.update {
             it.copy(
@@ -551,6 +567,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 targets = targets,
                 deleteCompressedProxies = true,
                 additionalProxyCleanupHashes = req.leftoverProxyHashes,
+                autoBackupDisabled = turnedOffAutoBackup,
                 onPhaseChange = { stage ->
                     _uiState.update { it.copy(restoreOriginalsCurrentName = stage) }
                 },
@@ -589,7 +606,8 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                             pendingProxyDeleteBaseRestoredCount = result.succeeded,
                             pendingProxyDeleteBaseFailedCount = result.failed,
                             pendingProxyDeleteAlreadyDeletedCount = result.deletedProxyCount,
-                            pendingProxyDeleteFromRestoreRun = pending != null
+                            pendingProxyDeleteFromRestoreRun = pending != null,
+                            pendingProxyDeleteAutoBackupDisabled = pending != null && turnedOffAutoBackup
                         )
                     }
                 }

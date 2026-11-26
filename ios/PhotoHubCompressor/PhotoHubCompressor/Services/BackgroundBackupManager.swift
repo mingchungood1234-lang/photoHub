@@ -39,11 +39,41 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
     private var hasRegisteredPhotoObserver = false
     private var isSilentUploadRunning = false
     private var pendingRescanAfterSilentRun = false
+    private var activeRestorePauseCount: Int = 0
     private var recentFailureCooldownUntil: [String: Date] = [:]
     private var debouncedSilentTask: Task<Void, Never>?
     private var pathMonitor: NWPathMonitor?
     private var lastNetworkSatisfied: Bool = true
     private weak var settingsRef: AppSettings?
+
+    var isPausedForRestore: Bool {
+        activeRestorePauseCount > 0
+    }
+
+    func beginRestorePause() {
+        activeRestorePauseCount += 1
+        debouncedSilentTask?.cancel()
+        debouncedSilentTask = nil
+        pendingRescanAfterSilentRun = false
+    }
+
+    func endRestorePause() {
+        activeRestorePauseCount = max(0, activeRestorePauseCount - 1)
+    }
+
+    /// Turns off Auto Backup and cancels scheduled background upload tasks (used by Restore All Originals).
+    @discardableResult
+    func disableAutoBackup(settings: AppSettings) -> Bool {
+        guard settings.nightlyAutoBackupEnabled else { return false }
+        settings.nightlyAutoBackupEnabled = false
+        debouncedSilentTask?.cancel()
+        debouncedSilentTask = nil
+        pendingRescanAfterSilentRun = false
+        BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Self.taskIdentifier)
+        BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Self.refreshTaskIdentifier)
+        updateSummary("Auto backup off")
+        return true
+    }
 
     private override init() {
         super.init()
@@ -148,12 +178,14 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
 
     nonisolated func photoLibraryDidChange(_ changeInstance: PHChange) {
         Task { @MainActor [weak self] in
-            self?.scheduleDebouncedSilentCheck(delayNanoseconds: 2_500_000_000)
+            guard let self, !self.isPausedForRestore else { return }
+            self.scheduleDebouncedSilentCheck(delayNanoseconds: 2_500_000_000)
         }
     }
 
     private func scheduleDebouncedSilentCheck(delayNanoseconds: UInt64) {
-        guard let settings = settingsRef,
+        guard !isPausedForRestore,
+              let settings = settingsRef,
               settings.nightlyAutoBackupEnabled,
               settings.isSignedIn else {
             return
@@ -405,7 +437,8 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
 
     func triggerSilentAutoUpload(settings: AppSettings, isMovingToBackground: Bool) {
         ensurePhotoObserverIfAuthorized()
-        guard settings.nightlyAutoBackupEnabled,
+        guard !isPausedForRestore,
+              settings.nightlyAutoBackupEnabled,
               settings.isSignedIn,
               let baseURL = settings.normalizedBaseURL,
               let uploadConfig = BackgroundUploadConfig(settings: settings) else {
@@ -613,7 +646,8 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
 
         scheduleNightlyBackupIfEnabled(settings: settings)
 
-        guard settings.nightlyAutoBackupEnabled,
+        guard !isPausedForRestore,
+              settings.nightlyAutoBackupEnabled,
               settings.isSignedIn,
               let baseURL = settings.normalizedBaseURL else {
             task.setTaskCompleted(success: true)

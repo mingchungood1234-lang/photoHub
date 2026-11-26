@@ -7,6 +7,7 @@ import android.net.Uri
 import android.provider.MediaStore
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.photohub.compressor.background.BackgroundBackupManager
 import com.photohub.compressor.data.*
 import com.photohub.compressor.media.MediaLibraryService
 import com.photohub.compressor.media.OriginalDownloadCache
@@ -257,7 +258,8 @@ data class BatchRestoreConfirmRequest(
     val isRestoreAll: Boolean,
     val leftoverProxyHashes: Set<String> = emptySet(),
     val leftoverProxyCount: Int = 0,
-    val deviceAvailableBytes: Long? = null
+    val deviceAvailableBytes: Long? = null,
+    val willDisableAutoBackup: Boolean = false
 ) {
     val hasEnoughStorageForUnrestored: Boolean
         get() {
@@ -282,7 +284,8 @@ object BatchRestorePlanner {
         isRestoreAll: Boolean,
         leftoverProxyHashes: Set<String> = emptySet(),
         leftoverProxyCount: Int = 0,
-        deviceAvailableBytes: Long? = DeviceStorageHelper.availableBytes()
+        deviceAvailableBytes: Long? = DeviceStorageHelper.availableBytes(),
+        willDisableAutoBackup: Boolean = false
     ): BatchRestoreConfirmRequest {
         val normProtected = locallyProtectedHashes.map { it.trim().lowercase(Locale.ROOT) }.toSet()
         val unrestored = targets.filter { photo ->
@@ -298,7 +301,8 @@ object BatchRestorePlanner {
             isRestoreAll = isRestoreAll,
             leftoverProxyHashes = leftoverProxyHashes,
             leftoverProxyCount = leftoverProxyCount.coerceAtLeast(0),
-            deviceAvailableBytes = deviceAvailableBytes
+            deviceAvailableBytes = deviceAvailableBytes,
+            willDisableAutoBackup = willDisableAutoBackup
         )
     }
 
@@ -347,13 +351,28 @@ object BatchRestoreExecutor {
             onProgress = onProgress
         )
         val fileSize = originalFile.length()
-        val savedId = mediaService.saveRestoredOriginalToGallery(
-            file = originalFile,
-            isVideo = photo.isVideo,
-            originalFilename = photo.originalName,
-            creationDateMs = photo.parsedCreationDateMs
-        )
-        tracker.markRestoredOriginal(savedId, photo.hash)
+        val bgManager = BackgroundBackupManager.getInstance(context)
+        val wasAlreadyRestored = tracker.isRestoredMasterHash(photo.hash)
+        bgManager.beginRestorePause()
+        // Pre-mark master hash before writing into MediaStore to eliminate any race window.
+        tracker.markRestoredOriginal(null, photo.hash)
+        val savedId = try {
+            val id = mediaService.saveRestoredOriginalToGallery(
+                file = originalFile,
+                isVideo = photo.isVideo,
+                originalFilename = photo.originalName,
+                creationDateMs = photo.parsedCreationDateMs
+            )
+            tracker.markRestoredOriginal(id, photo.hash)
+            id
+        } catch (err: Exception) {
+            if (!wasAlreadyRestored) {
+                tracker.clearRestoredProtection(photo.hash)
+            }
+            throw err
+        } finally {
+            bgManager.endRestorePause()
+        }
         val updated = runCatching { client.setOriginalProtected(photo.hash, true) }.getOrNull()
         return updated to fileSize
     }
@@ -366,10 +385,13 @@ object BatchRestoreExecutor {
         targets: List<ServerPhoto>,
         deleteCompressedProxies: Boolean = false,
         additionalProxyCleanupHashes: Set<String> = emptySet(),
+        autoBackupDisabled: Boolean = false,
         onPhaseChange: ((String) -> Unit)? = null,
         onItemComplete: (BatchRestoreProgress) -> Unit,
         onFinished: suspend (BatchRestoreResult) -> Unit
     ) {
+        val bgManager = BackgroundBackupManager.getInstance(context)
+        bgManager.beginRestorePause()
         val queue = Channel<ServerPhoto>(Channel.UNLIMITED)
         targets.forEach { queue.trySend(it) }
         queue.close()
@@ -467,16 +489,19 @@ object BatchRestoreExecutor {
 
                 val msg = if (stoppedLowStorage) {
                     val proxyNote = if (deletedProxyCount > 0) " · Deleted $deletedProxyCount proxies" else ""
-                    "Stopped: low phone storage (restored $ok$proxyNote)."
+                    val autoNote = if (autoBackupDisabled) " · Auto Backup off" else ""
+                    "Stopped: low phone storage (restored $ok$proxyNote)$autoNote."
                 } else {
                     formatSummaryMessage(
                         ok = ok,
                         errCount = errCount,
                         cancelled = cancelled,
                         deletedProxyCount = deletedProxyCount,
-                        awaitingDeleteConfirm = pendingPrompt != null
+                        awaitingDeleteConfirm = pendingPrompt != null,
+                        autoBackupDisabled = autoBackupDisabled
                     )
                 }
+                bgManager.endRestorePause()
                 onFinished(
                     BatchRestoreResult(
                         succeeded = ok,
@@ -496,7 +521,8 @@ object BatchRestoreExecutor {
         errCount: Int,
         cancelled: Boolean,
         deletedProxyCount: Int = 0,
-        awaitingDeleteConfirm: Boolean = false
+        awaitingDeleteConfirm: Boolean = false,
+        autoBackupDisabled: Boolean = false
     ): String {
         val proxyNote = when {
             awaitingDeleteConfirm && deletedProxyCount > 0 ->
@@ -507,11 +533,16 @@ object BatchRestoreExecutor {
                 " and deleted $deletedProxyCount compressed copy(s)"
             else -> ""
         }
-        return when {
+        val base = when {
             cancelled -> "Stopped after restoring $ok original(s)$proxyNote."
             errCount > 0 && ok == 0 -> "Restore failed for $errCount item(s)."
             errCount > 0 -> "Restored $ok original(s) & protected them$proxyNote; $errCount failed."
             else -> "Restored $ok original(s) to Gallery & protected them$proxyNote."
+        }
+        return if (autoBackupDisabled) {
+            "${base.removeSuffix(".")} · Auto Backup off."
+        } else {
+            base
         }
     }
 }

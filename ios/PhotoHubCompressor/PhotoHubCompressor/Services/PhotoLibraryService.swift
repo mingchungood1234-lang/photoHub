@@ -834,6 +834,13 @@ final class PhotoLibraryService {
         }
 
         let fileSize = (try? tempURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { Int64($0) } ?? photo.size
+        let wasAlreadyRestored = LocalProxyTracker.shared.isRestoredMasterHash(photo.hash)
+
+        // Pause background auto-upload observer and pre-mark the master hash BEFORE writing to Photos
+        // so there is zero race window where the newly saved original could be scanned for re-upload.
+        await MainActor.run { BackgroundBackupManager.shared.beginRestorePause() }
+        LocalProxyTracker.shared.markRestoredOriginal(assetId: nil, masterHash: photo.hash)
+
         if let sem = photoWriteSemaphore {
             await sem.acquire()
         }
@@ -847,14 +854,19 @@ final class PhotoLibraryService {
             if let sem = photoWriteSemaphore {
                 await sem.release()
             }
+            if !wasAlreadyRestored {
+                LocalProxyTracker.shared.clearRestoredProtection(masterHash: photo.hash)
+            }
+            await MainActor.run { BackgroundBackupManager.shared.endRestorePause() }
             throw error
         }
 
-        // Record both locally (asset ID + hash) and on the server so auto-cleanup won't re-compress it.
+        // Attach the created PHAsset localIdentifier before resuming observers, then protect on server.
         LocalProxyTracker.shared.markRestoredOriginal(
             assetId: createdLocalId.isEmpty ? nil : createdLocalId,
             masterHash: photo.hash
         )
+        await MainActor.run { BackgroundBackupManager.shared.endRestorePause() }
         let updated = try? await client.setOriginalProtected(masterHash: photo.hash, protected: true)
         return (updated, fileSize)
     }

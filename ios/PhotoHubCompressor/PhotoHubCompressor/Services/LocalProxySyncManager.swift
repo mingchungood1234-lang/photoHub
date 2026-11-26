@@ -412,6 +412,7 @@ struct RestoreConfirmPrompt: Identifiable {
     let leftoverProxyHashes: Set<String>
     let leftoverProxyCount: Int
     let deviceAvailableBytes: Int64?
+    let willDisableAutoBackup: Bool
 
     var hasEnoughStorageForUnrestored: Bool {
         guard let free = deviceAvailableBytes, unrestoredBytes > 0 else { return true }
@@ -463,7 +464,12 @@ struct RestoreConfirmPrompt: Identifiable {
         }
 
         let skipNote = skippedCount > 0 ? "\nSkipping \(skippedCount) already restored." : ""
-        let proxyNote = isRestoreAll ? " · Removes compressed copies." : ""
+        let proxyNote: String = {
+            guard isRestoreAll else { return "" }
+            return willDisableAutoBackup
+                ? " · Removes proxies & turns off Auto Backup."
+                : " · Removes compressed copies."
+        }()
         return "Restore \(unrestoredTargets.count) (~\(sizeStr)) · Phone free: \(freeText)\(proxyNote)\(skipNote)"
     }
 
@@ -474,7 +480,8 @@ struct RestoreConfirmPrompt: Identifiable {
         isRestoreAll: Bool,
         leftoverProxyHashes: Set<String> = [],
         leftoverProxyCount: Int = 0,
-        deviceAvailableBytes: Int64? = DeviceStorageHelper.availableBytes()
+        deviceAvailableBytes: Int64? = DeviceStorageHelper.availableBytes(),
+        willDisableAutoBackup: Bool = false
     ) -> RestoreConfirmPrompt {
         let normProtected = Set(
             locallyProtectedHashes.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
@@ -493,7 +500,8 @@ struct RestoreConfirmPrompt: Identifiable {
             isRestoreAll: isRestoreAll,
             leftoverProxyHashes: leftoverProxyHashes,
             leftoverProxyCount: max(0, leftoverProxyCount),
-            deviceAvailableBytes: deviceAvailableBytes
+            deviceAvailableBytes: deviceAvailableBytes,
+            willDisableAutoBackup: willDisableAutoBackup
         )
     }
 }
@@ -520,6 +528,7 @@ enum BatchRestoreRunner {
             _ updatedPhoto: ServerPhoto?
         ) -> Void
     ) async -> Summary {
+        await MainActor.run { BackgroundBackupManager.shared.beginRestorePause() }
         let queue = AsyncWorkQueue(targets)
         let photosWriteSemaphore = AsyncSemaphore(value: 1)
         let workerCount = min(3, targets.count)
@@ -610,6 +619,7 @@ enum BatchRestoreRunner {
         } else {
             message = "Restored \(succeeded)\(proxyNote)."
         }
+        await MainActor.run { BackgroundBackupManager.shared.endRestorePause() }
         return Summary(
             succeeded: succeeded,
             failed: failed,
@@ -749,7 +759,8 @@ final class OriginalRestoreManager: ObservableObject {
                 locallyProtectedHashes: protectedHashes(for: targets),
                 isRestoreAll: true,
                 leftoverProxyHashes: leftoverHashes,
-                leftoverProxyCount: leftoverCount
+                leftoverProxyCount: leftoverCount,
+                willDisableAutoBackup: settings.nightlyAutoBackupEnabled
             )
         }
     }
@@ -781,6 +792,10 @@ final class OriginalRestoreManager: ObservableObject {
                 statusMessage = "Allow Photos permission in iOS Settings to save originals."
                 return
             }
+
+            // Turning off Auto Backup during Restore All prevents future photos from being silently offloaded
+            // after the user has chosen to reclaim their full-resolution library on device.
+            let turnedOffAutoBackup = BackgroundBackupManager.shared.disableAutoBackup(settings: settings)
 
             let client = PhotoHubAPIClient(settings: settings)
             let summary = await BatchRestoreRunner.run(
@@ -816,7 +831,12 @@ final class OriginalRestoreManager: ObservableObject {
             restoreTask = nil
             applySummary(photos: cachedPhotos, markLoaded: hasLoadedSummary || !cachedPhotos.isEmpty)
             NotificationCenter.default.post(name: .localProxyStoreDidChange, object: nil)
-            statusMessage = summary.message
+            if turnedOffAutoBackup {
+                let baseMsg = summary.message.hasSuffix(".") ? String(summary.message.dropLast()) : summary.message
+                statusMessage = "\(baseMsg) · Auto Backup off."
+            } else {
+                statusMessage = summary.message
+            }
         }
     }
 

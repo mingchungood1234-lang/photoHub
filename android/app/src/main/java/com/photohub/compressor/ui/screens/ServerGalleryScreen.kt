@@ -768,7 +768,11 @@ fun BatchRestoreConfirmDialog(
                         )
                         Text("Need ~$sizeStr for ${request.unrestoredTargets.size} item(s) · Phone free: $freeText\nFree up ~$needExtra on your phone first.")
                     } else {
-                        val proxyNote = if (request.isRestoreAll) " · Removes compressed copies." else ""
+                        val proxyNote = when {
+                            !request.isRestoreAll -> ""
+                            request.willDisableAutoBackup -> " · Removes proxies & turns off Auto Backup."
+                            else -> " · Removes compressed copies."
+                        }
                         Text("Restore ${request.unrestoredTargets.size} (~$sizeStr) · Phone free: $freeText$proxyNote")
                         if (request.skippedCount > 0) {
                             Text(

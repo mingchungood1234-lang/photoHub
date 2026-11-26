@@ -28,7 +28,7 @@ class PhotoUploadWorker(
         val cur = settings.current
         val bgManager = BackgroundBackupManager.getInstance(context)
 
-        if (!cur.nightlyAutoBackupEnabled || !cur.isSignedIn || cur.normalizedBaseUrl == null) {
+        if (bgManager.isPausedForRestore() || !cur.nightlyAutoBackupEnabled || !cur.isSignedIn || cur.normalizedBaseUrl == null) {
             return Result.success()
         }
 
@@ -174,8 +174,10 @@ class PhotoUploadWorker(
 
             return Result.success()
         } finally {
-            // Re-arm MediaStore content trigger so Android wakes this worker automatically on future photos.
-            bgManager.scheduleMediaContentTriggerIfEnabled(replaceExisting = true)
+            // Re-arm MediaStore content trigger only when Auto Backup is active and not paused for restore.
+            if (!bgManager.isPausedForRestore() && settings.current.nightlyAutoBackupEnabled) {
+                bgManager.scheduleMediaContentTriggerIfEnabled(replaceExisting = true)
+            }
         }
     }
 

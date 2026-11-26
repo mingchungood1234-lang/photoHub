@@ -291,6 +291,44 @@ class PhotoHubUnitTest {
             "Restored 6 original(s) to Gallery & protected them.",
             BatchRestoreExecutor.formatSummaryMessage(ok = 6, errCount = 0, cancelled = false)
         )
+        assertEquals(
+            "Restored 6 original(s) to Gallery & protected them · Auto Backup off.",
+            BatchRestoreExecutor.formatSummaryMessage(
+                ok = 6,
+                errCount = 0,
+                cancelled = false,
+                autoBackupDisabled = true
+            )
+        )
+    }
+
+    @Test
+    fun `batch restore storage guard blocks restore when free space is below headroom and preserves auto-backup flag`() {
+        val bigPhoto = ServerPhoto("HashBig", "BIG.mov", 2_000_000_000L, "2026-11-20", null, "2026-11-20T10:00:00Z", "2026/BIG.mov", true, true, "p1", 100L, true, 500L, false)
+        val lowSpaceReq = BatchRestorePlanner.buildConfirmRequest(
+            title = "Restore All Originals",
+            targets = listOf(bigPhoto),
+            locallyProtectedHashes = emptySet(),
+            isRestoreAll = true,
+            deviceAvailableBytes = 1_500_000_000L,
+            willDisableAutoBackup = true
+        )
+        assertFalse(lowSpaceReq.hasEnoughStorageForUnrestored)
+        assertFalse(lowSpaceReq.hasEnoughStorageForAll)
+        assertTrue(lowSpaceReq.willDisableAutoBackup)
+
+        val okSpaceReq = BatchRestorePlanner.buildConfirmRequest(
+            title = "Restore All Originals",
+            targets = listOf(bigPhoto),
+            locallyProtectedHashes = emptySet(),
+            isRestoreAll = true,
+            deviceAvailableBytes = 4_000_000_000L,
+            willDisableAutoBackup = true
+        )
+        assertTrue(okSpaceReq.hasEnoughStorageForUnrestored)
+        assertTrue(okSpaceReq.hasEnoughStorageForAll)
+        assertEquals(listOf("Smallest", "Balance", "High"), ProxyDetailPreset.entries.map { it.title })
+        assertEquals(listOf("Auto", "480p", "720p", "1080p", "1440p"), ProxyResolutionPreset.entries.map { it.title })
     }
 
     @Test
