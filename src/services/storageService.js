@@ -202,6 +202,81 @@ async function assertMinimumFreeDisk(storageDir, minFreeDiskBytes, incomingBytes
   }
 }
 
+const PROXY_FILENAME_PREFIX_RE = /^PHOTOHUB_PROXY_([a-f0-9]{8,64})/i;
+const PROXY_MARKER_RE = /PhotoHubProxy:([a-f0-9]{16,64})/i;
+const inFlightUploadLocks = new Map();
+
+/**
+ * Serializes concurrent uploads of the exact same `(storageDir, sha256)` so simultaneous
+ * requests from multiple devices/tabs deduplicate cleanly instead of racing on disk.
+ */
+async function withUploadHashLock(lockKey, fn) {
+  const prev = inFlightUploadLocks.get(lockKey) || Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const tail = prev.then(() => gate, () => gate);
+  inFlightUploadLocks.set(lockKey, tail);
+  await prev.catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (inFlightUploadLocks.get(lockKey) === tail) {
+      inFlightUploadLocks.delete(lockKey);
+    }
+  }
+}
+
+async function readHeadAndTailSamples(filePath, sampleLimit = 256 * 1024) {
+  let fh;
+  try {
+    fh = await fsp.open(filePath, 'r');
+    const stat = await fh.stat();
+    const size = stat.size || 0;
+    if (size <= 0) return { head: Buffer.alloc(0), tail: Buffer.alloc(0) };
+    const headLen = Math.min(size, sampleLimit);
+    const head = Buffer.alloc(headLen);
+    await fh.read(head, 0, headLen, 0);
+    if (size <= sampleLimit) {
+      return { head, tail: Buffer.alloc(0) };
+    }
+    const tailLen = Math.min(size - headLen, sampleLimit);
+    const tail = Buffer.alloc(tailLen);
+    await fh.read(tail, 0, tailLen, size - tailLen);
+    return { head, tail };
+  } catch {
+    return { head: Buffer.alloc(0), tail: Buffer.alloc(0) };
+  } finally {
+    if (fh) await fh.close().catch(() => {});
+  }
+}
+
+function extractProxyHintHex(originalName, headBuf, tailBuf) {
+  const base = path.basename(String(originalName || '').trim());
+  const nameMatch = base.match(PROXY_FILENAME_PREFIX_RE);
+  if (nameMatch && nameMatch[1]) {
+    return nameMatch[1].toLowerCase();
+  }
+  for (const buf of [headBuf, tailBuf]) {
+    if (!Buffer.isBuffer(buf) || buf.length === 0) continue;
+    const latin = buf.toString('latin1');
+    const markerMatch = latin.match(PROXY_MARKER_RE);
+    if (markerMatch && markerMatch[1]) {
+      return markerMatch[1].toLowerCase();
+    }
+  }
+  return null;
+}
+
+async function detectUploadedProxyMaster({ originalName, headBuf, tailBuf, hashIndex }) {
+  if (!hashIndex || typeof hashIndex.findByMasterHashPrefix !== 'function') return null;
+  const hintHex = extractProxyHintHex(originalName, headBuf, tailBuf);
+  if (!hintHex) return null;
+  return hashIndex.findByMasterHashPrefix(hintHex);
+}
+
 /**
  * Stores a photo buffer into STORAGE_DIR/YYYY/YYYY-MM-DD/<filename>,
  * verifies its SHA-256 on disk, and updates the HashIndex.
@@ -239,133 +314,166 @@ async function storeAndVerifyPhoto({
     throw err;
   }
 
-  // 1. Proxy guard: never store a known proxy hash as a new master original
-  const proxyCheck = await hashIndex.lookup(actualHash, { allowStatFastPath: true });
-  if (proxyCheck.status === 'proxy' && proxyCheck.record) {
-    return {
-      success: true,
-      backedUp: true,
-      canDelete: false,
-      canReplaceWithProxy: false,
-      checksumVerified: false,
-      isDuplicate: true,
-      isProxy: true,
-      status: 'existing_proxy',
-      message: 'Uploaded bytes match an existing compressed proxy; master is already stored.',
-      hash: actualHash,
-      masterHash: proxyCheck.masterHash,
-      serverSha256: proxyCheck.masterHash,
-      savedPath: proxyCheck.record.relativePath,
-      originalName: proxyCheck.record.originalName,
-      size: proxyCheck.record.size,
-    };
-  }
-
-  // 2. Duplicate check: check both actual uploaded file hash and optional client hash
-  const existingRecord =
-    (await hashIndex.verifyExisting(actualHash)) ||
-    (!strictChecksum && cleanClientHash
-      ? await hashIndex.verifyExisting(cleanClientHash)
-      : null);
-
-  if (existingRecord) {
-    // Also alias cleanClientHash if not yet recorded so future /api/check/:hash calls hit immediately
-    if (cleanClientHash && cleanClientHash !== existingRecord.hash) {
-      await hashIndex.set(cleanClientHash, existingRecord);
+  return withUploadHashLock(`${storageDir}|${actualHash}`, async () => {
+    // 1. Proxy guard: never store a known proxy hash or PhotoHub-tagged compressed proxy as a new master original
+    const proxyCheck = await hashIndex.lookup(actualHash, { allowStatFastPath: true });
+    if (proxyCheck.status === 'proxy' && proxyCheck.record) {
+      return {
+        success: true,
+        backedUp: true,
+        canDelete: false,
+        canReplaceWithProxy: false,
+        checksumVerified: false,
+        isDuplicate: true,
+        isProxy: true,
+        status: 'existing_proxy',
+        message: 'Uploaded bytes match an existing compressed proxy; master is already stored.',
+        hash: actualHash,
+        masterHash: proxyCheck.masterHash,
+        serverSha256: proxyCheck.masterHash,
+        savedPath: proxyCheck.record.relativePath,
+        originalName: proxyCheck.record.originalName,
+        size: proxyCheck.record.size,
+      };
     }
-    const isProtectedOriginal = Boolean(existingRecord.keepOriginalOnDevice);
+
+    const headSample = buffer.subarray(0, Math.min(buffer.length, 256 * 1024));
+    const tailSample =
+      buffer.length > 256 * 1024
+        ? buffer.subarray(Math.max(256 * 1024, buffer.length - 256 * 1024))
+        : Buffer.alloc(0);
+    const taggedProxyMaster = await detectUploadedProxyMaster({
+      originalName,
+      headBuf: headSample,
+      tailBuf: tailSample,
+      hashIndex,
+    });
+    if (taggedProxyMaster && taggedProxyMaster.record) {
+      return {
+        success: true,
+        backedUp: true,
+        canDelete: false,
+        canReplaceWithProxy: false,
+        checksumVerified: false,
+        isDuplicate: true,
+        isProxy: true,
+        status: 'existing_proxy',
+        message: 'Uploaded file is a PhotoHub compressed proxy; full original is already stored.',
+        hash: actualHash,
+        masterHash: taggedProxyMaster.masterHash,
+        serverSha256: taggedProxyMaster.masterHash,
+        savedPath: taggedProxyMaster.record.relativePath,
+        originalName: taggedProxyMaster.record.originalName,
+        size: taggedProxyMaster.record.size,
+      };
+    }
+
+    // 2. Duplicate check: check both actual uploaded file hash and optional client hash
+    const existingRecord =
+      (await hashIndex.verifyExisting(actualHash)) ||
+      (!strictChecksum && cleanClientHash
+        ? await hashIndex.verifyExisting(cleanClientHash)
+        : null);
+
+    if (existingRecord) {
+      // Also alias cleanClientHash if not yet recorded so future /api/check/:hash calls hit immediately
+      if (cleanClientHash && cleanClientHash !== existingRecord.hash) {
+        await hashIndex.set(cleanClientHash, existingRecord);
+      }
+      const isProtectedOriginal = Boolean(existingRecord.keepOriginalOnDevice);
+      return {
+        success: true,
+        backedUp: true,
+        canDelete: !isProtectedOriginal,
+        canReplaceWithProxy: !isProtectedOriginal,
+        isProtectedOriginal,
+        keepOriginalOnDevice: isProtectedOriginal,
+        checksumVerified: true,
+        isDuplicate: true,
+        status: 'duplicate_verified',
+        message:
+          'Photo already exists on server and passed disk verification.',
+        hash: actualHash,
+        serverSha256: actualHash,
+        savedPath: existingRecord.relativePath,
+        originalName: existingRecord.originalName,
+        size: existingRecord.size,
+        photoDate: existingRecord.photoDate,
+      };
+    }
+
+    assertWithinQuota(hashIndex, quotaBytes, buffer.length);
+    await assertMinimumFreeDisk(storageDir, minFreeDiskBytes, buffer.length);
+
+    // 2. Determine date folder (YYYY/YYYY-MM-DD) and target filename
+    const { year, dateFolder, dateObj, takenAt } = parseDateFolder(createdAt);
+    const safeName = sanitizeFilename(originalName, mimeType, actualHash);
+    const targetDir = await ensureTargetDateDir(storageDir, year, dateFolder);
+    const { finalFileName, targetPath } = await resolveUniqueTargetPath(targetDir, safeName, actualHash);
+
+    // 3. Write to storage (supports both local Linux/Windows disks and Ubuntu gdrive FUSE mounts)
+    await writePhotoFile(targetDir, targetPath, finalFileName, buffer);
+
+    // Preserve original photo timestamp on the file if supported
+    try {
+      await fsp.utimes(targetPath, dateObj, dateObj);
+    } catch {
+      // Ignore timestamp errors on FUSE/gdrive filesystems
+    }
+
+    // 4. Read back the saved file from disk and verify SHA-256 & byte size
+    const writtenStat = await fsp.stat(targetPath);
+    const diskHash = await computeFileSha256(targetPath);
+
+    if (writtenStat.size !== buffer.length || diskHash !== actualHash) {
+      await fsp.unlink(targetPath).catch(() => {});
+      const err = new Error('Disk verification failed after writing file');
+      err.statusCode = 500;
+      throw err;
+    }
+
+    const relativePath = path
+      .relative(storageDir, targetPath)
+      .split(path.sep)
+      .join('/');
+
+    const entryData = {
+      hash: actualHash,
+      diskHash: actualHash,
+      relativePath,
+      originalName: finalFileName,
+      size: writtenStat.size,
+      mtimeMs: writtenStat.mtimeMs,
+      photoDate: dateFolder,
+      takenAt: takenAt || null,
+      uploadedAt: new Date().toISOString(),
+    };
+
+    const record = await hashIndex.set(actualHash, entryData);
+
+    // If iOS Shortcut generated a pre-transcode hash (e.g. HEIC hash before iOS converted to JPEG),
+    // index that client hash too so /api/check/:hash recognizes it on future runs!
+    if (cleanClientHash && cleanClientHash !== actualHash) {
+      await hashIndex.set(cleanClientHash, entryData);
+    }
+
     return {
       success: true,
       backedUp: true,
-      canDelete: !isProtectedOriginal,
-      canReplaceWithProxy: !isProtectedOriginal,
-      isProtectedOriginal,
-      keepOriginalOnDevice: isProtectedOriginal,
+      canDelete: true,
+      canReplaceWithProxy: true,
       checksumVerified: true,
-      isDuplicate: true,
-      status: 'duplicate_verified',
-      message:
-        'Photo already exists on server and passed disk verification.',
+      isDuplicate: false,
+      status: 'stored_verified',
+      message: 'Photo backed up and verified on disk.',
       hash: actualHash,
       serverSha256: actualHash,
-      savedPath: existingRecord.relativePath,
-      originalName: existingRecord.originalName,
-      size: existingRecord.size,
-      photoDate: existingRecord.photoDate,
+      savedPath: record.relativePath,
+      originalName: record.originalName,
+      size: record.size,
+      photoDate: record.photoDate,
     };
-  }
-
-  assertWithinQuota(hashIndex, quotaBytes, buffer.length);
-  await assertMinimumFreeDisk(storageDir, minFreeDiskBytes, buffer.length);
-
-  // 2. Determine date folder (YYYY/YYYY-MM-DD) and target filename
-  const { year, dateFolder, dateObj, takenAt } = parseDateFolder(createdAt);
-  const safeName = sanitizeFilename(originalName, mimeType, actualHash);
-  const targetDir = await ensureTargetDateDir(storageDir, year, dateFolder);
-  const { finalFileName, targetPath } = await resolveUniqueTargetPath(targetDir, safeName, actualHash);
-
-  // 3. Write to storage (supports both local Linux/Windows disks and Ubuntu gdrive FUSE mounts)
-  await writePhotoFile(targetDir, targetPath, finalFileName, buffer);
-
-  // Preserve original photo timestamp on the file if supported
-  try {
-    await fsp.utimes(targetPath, dateObj, dateObj);
-  } catch {
-    // Ignore timestamp errors on FUSE/gdrive filesystems
-  }
-
-  // 4. Read back the saved file from disk and verify SHA-256 & byte size
-  const writtenStat = await fsp.stat(targetPath);
-  const diskHash = await computeFileSha256(targetPath);
-
-  if (writtenStat.size !== buffer.length || diskHash !== actualHash) {
-    await fsp.unlink(targetPath).catch(() => {});
-    const err = new Error('Disk verification failed after writing file');
-    err.statusCode = 500;
-    throw err;
-  }
-
-  const relativePath = path
-    .relative(storageDir, targetPath)
-    .split(path.sep)
-    .join('/');
-
-  const entryData = {
-    hash: actualHash,
-    diskHash: actualHash,
-    relativePath,
-    originalName: finalFileName,
-    size: writtenStat.size,
-    mtimeMs: writtenStat.mtimeMs,
-    photoDate: dateFolder,
-    takenAt: takenAt || null,
-    uploadedAt: new Date().toISOString(),
-  };
-
-  const record = await hashIndex.set(actualHash, entryData);
-
-  // If iOS Shortcut generated a pre-transcode hash (e.g. HEIC hash before iOS converted to JPEG),
-  // index that client hash too so /api/check/:hash recognizes it on future runs!
-  if (cleanClientHash && cleanClientHash !== actualHash) {
-    await hashIndex.set(cleanClientHash, entryData);
-  }
-
-  return {
-    success: true,
-    backedUp: true,
-    canDelete: true,
-    canReplaceWithProxy: true,
-    checksumVerified: true,
-    isDuplicate: false,
-    status: 'stored_verified',
-    message: 'Photo backed up and verified on disk.',
-    hash: actualHash,
-    serverSha256: actualHash,
-    savedPath: record.relativePath,
-    originalName: record.originalName,
-    size: record.size,
-    photoDate: record.photoDate,
-  };
+  });
 }
 
 /**
@@ -473,128 +581,158 @@ async function storeAndVerifyStream({
       throw err;
     }
 
-    const proxyCheck = await hashIndex.lookup(actualHash, { allowStatFastPath: true });
-    if (proxyCheck.status === 'proxy' && proxyCheck.record) {
-      await fsp.unlink(stagingPath).catch(() => {});
-      return {
-        success: true,
-        backedUp: true,
-        canDelete: false,
-        canReplaceWithProxy: false,
-        checksumVerified: false,
-        isDuplicate: true,
-        isProxy: true,
-        status: 'existing_proxy',
-        message: 'Uploaded bytes match an existing compressed proxy; master is already stored.',
-        hash: actualHash,
-        masterHash: proxyCheck.masterHash,
-        serverSha256: proxyCheck.masterHash,
-        savedPath: proxyCheck.record.relativePath,
-        originalName: proxyCheck.record.originalName,
-        size: proxyCheck.record.size,
-      };
-    }
-
-    const existingRecord =
-      (await hashIndex.verifyExisting(actualHash)) ||
-      (!strictChecksum && cleanClientHash
-        ? await hashIndex.verifyExisting(cleanClientHash)
-        : null);
-
-    if (existingRecord) {
-      await fsp.unlink(stagingPath).catch(() => {});
-      if (cleanClientHash && cleanClientHash !== existingRecord.hash) {
-        await hashIndex.set(cleanClientHash, existingRecord);
+    return await withUploadHashLock(`${storageDir}|${actualHash}`, async () => {
+      const proxyCheck = await hashIndex.lookup(actualHash, { allowStatFastPath: true });
+      if (proxyCheck.status === 'proxy' && proxyCheck.record) {
+        await fsp.unlink(stagingPath).catch(() => {});
+        return {
+          success: true,
+          backedUp: true,
+          canDelete: false,
+          canReplaceWithProxy: false,
+          checksumVerified: false,
+          isDuplicate: true,
+          isProxy: true,
+          status: 'existing_proxy',
+          message: 'Uploaded bytes match an existing compressed proxy; master is already stored.',
+          hash: actualHash,
+          masterHash: proxyCheck.masterHash,
+          serverSha256: proxyCheck.masterHash,
+          savedPath: proxyCheck.record.relativePath,
+          originalName: proxyCheck.record.originalName,
+          size: proxyCheck.record.size,
+        };
       }
-      const isProtectedOriginal = Boolean(existingRecord.keepOriginalOnDevice);
+
+      const { head, tail } = await readHeadAndTailSamples(stagingPath);
+      const taggedProxyMaster = await detectUploadedProxyMaster({
+        originalName,
+        headBuf: head,
+        tailBuf: tail,
+        hashIndex,
+      });
+      if (taggedProxyMaster && taggedProxyMaster.record) {
+        await fsp.unlink(stagingPath).catch(() => {});
+        return {
+          success: true,
+          backedUp: true,
+          canDelete: false,
+          canReplaceWithProxy: false,
+          checksumVerified: false,
+          isDuplicate: true,
+          isProxy: true,
+          status: 'existing_proxy',
+          message: 'Uploaded file is a PhotoHub compressed proxy; full original is already stored.',
+          hash: actualHash,
+          masterHash: taggedProxyMaster.masterHash,
+          serverSha256: taggedProxyMaster.masterHash,
+          savedPath: taggedProxyMaster.record.relativePath,
+          originalName: taggedProxyMaster.record.originalName,
+          size: taggedProxyMaster.record.size,
+        };
+      }
+
+      const existingRecord =
+        (await hashIndex.verifyExisting(actualHash)) ||
+        (!strictChecksum && cleanClientHash
+          ? await hashIndex.verifyExisting(cleanClientHash)
+          : null);
+
+      if (existingRecord) {
+        await fsp.unlink(stagingPath).catch(() => {});
+        if (cleanClientHash && cleanClientHash !== existingRecord.hash) {
+          await hashIndex.set(cleanClientHash, existingRecord);
+        }
+        const isProtectedOriginal = Boolean(existingRecord.keepOriginalOnDevice);
+        return {
+          success: true,
+          backedUp: true,
+          canDelete: !isProtectedOriginal,
+          canReplaceWithProxy: !isProtectedOriginal,
+          isProtectedOriginal,
+          keepOriginalOnDevice: isProtectedOriginal,
+          checksumVerified: true,
+          isDuplicate: true,
+          status: 'duplicate_verified',
+          message: 'Photo already exists on server and passed disk verification.',
+          hash: actualHash,
+          serverSha256: actualHash,
+          savedPath: existingRecord.relativePath,
+          originalName: existingRecord.originalName,
+          size: existingRecord.size,
+          photoDate: existingRecord.photoDate,
+        };
+      }
+
+      assertWithinQuota(hashIndex, quotaBytes, totalBytes);
+      await assertMinimumFreeDisk(storageDir, minFreeDiskBytes, totalBytes);
+
+      const { year, dateFolder, dateObj, takenAt } = parseDateFolder(createdAt);
+      const safeName = sanitizeFilename(originalName, mimeType, actualHash);
+      const targetDir = await ensureTargetDateDir(storageDir, year, dateFolder);
+      const { finalFileName, targetPath } = await resolveUniqueTargetPath(targetDir, safeName, actualHash);
+
+      try {
+        await renameWithRetry(stagingPath, targetPath);
+      } catch {
+        await fsp.copyFile(stagingPath, targetPath);
+        await fsp.unlink(stagingPath).catch(() => {});
+      }
+
+      try {
+        await fsp.utimes(targetPath, dateObj, dateObj);
+      } catch {
+        // Ignore timestamp errors on FUSE mounts
+      }
+
+      const writtenStat = await fsp.stat(targetPath);
+      const diskHash = await computeFileSha256(targetPath);
+      if (writtenStat.size !== totalBytes || diskHash !== actualHash) {
+        await fsp.unlink(targetPath).catch(() => {});
+        const err = new Error('Disk verification failed after writing file');
+        err.statusCode = 500;
+        throw err;
+      }
+
+      const relativePath = path
+        .relative(storageDir, targetPath)
+        .split(path.sep)
+        .join('/');
+
+      const entryData = {
+        hash: actualHash,
+        diskHash: actualHash,
+        relativePath,
+        originalName: finalFileName,
+        size: writtenStat.size,
+        mtimeMs: writtenStat.mtimeMs,
+        photoDate: dateFolder,
+        takenAt: takenAt || null,
+        uploadedAt: new Date().toISOString(),
+      };
+
+      const record = await hashIndex.set(actualHash, entryData);
+      if (cleanClientHash && cleanClientHash !== actualHash) {
+        await hashIndex.set(cleanClientHash, entryData);
+      }
+
       return {
         success: true,
         backedUp: true,
-        canDelete: !isProtectedOriginal,
-        canReplaceWithProxy: !isProtectedOriginal,
-        isProtectedOriginal,
-        keepOriginalOnDevice: isProtectedOriginal,
+        canDelete: true,
+        canReplaceWithProxy: true,
         checksumVerified: true,
-        isDuplicate: true,
-        status: 'duplicate_verified',
-        message: 'Photo already exists on server and passed disk verification.',
+        isDuplicate: false,
+        status: 'stored_verified',
+        message: 'Photo backed up and verified on disk.',
         hash: actualHash,
         serverSha256: actualHash,
-        savedPath: existingRecord.relativePath,
-        originalName: existingRecord.originalName,
-        size: existingRecord.size,
-        photoDate: existingRecord.photoDate,
+        savedPath: record.relativePath,
+        originalName: record.originalName,
+        size: record.size,
+        photoDate: record.photoDate,
       };
-    }
-
-    assertWithinQuota(hashIndex, quotaBytes, totalBytes);
-    await assertMinimumFreeDisk(storageDir, minFreeDiskBytes, totalBytes);
-
-    const { year, dateFolder, dateObj, takenAt } = parseDateFolder(createdAt);
-    const safeName = sanitizeFilename(originalName, mimeType, actualHash);
-    const targetDir = await ensureTargetDateDir(storageDir, year, dateFolder);
-    const { finalFileName, targetPath } = await resolveUniqueTargetPath(targetDir, safeName, actualHash);
-
-    try {
-      await renameWithRetry(stagingPath, targetPath);
-    } catch {
-      await fsp.copyFile(stagingPath, targetPath);
-      await fsp.unlink(stagingPath).catch(() => {});
-    }
-
-    try {
-      await fsp.utimes(targetPath, dateObj, dateObj);
-    } catch {
-      // Ignore timestamp errors on FUSE mounts
-    }
-
-    const writtenStat = await fsp.stat(targetPath);
-    const diskHash = await computeFileSha256(targetPath);
-    if (writtenStat.size !== totalBytes || diskHash !== actualHash) {
-      await fsp.unlink(targetPath).catch(() => {});
-      const err = new Error('Disk verification failed after writing file');
-      err.statusCode = 500;
-      throw err;
-    }
-
-    const relativePath = path
-      .relative(storageDir, targetPath)
-      .split(path.sep)
-      .join('/');
-
-    const entryData = {
-      hash: actualHash,
-      diskHash: actualHash,
-      relativePath,
-      originalName: finalFileName,
-      size: writtenStat.size,
-      mtimeMs: writtenStat.mtimeMs,
-      photoDate: dateFolder,
-      takenAt: takenAt || null,
-      uploadedAt: new Date().toISOString(),
-    };
-
-    const record = await hashIndex.set(actualHash, entryData);
-    if (cleanClientHash && cleanClientHash !== actualHash) {
-      await hashIndex.set(cleanClientHash, entryData);
-    }
-
-    return {
-      success: true,
-      backedUp: true,
-      canDelete: true,
-      canReplaceWithProxy: true,
-      checksumVerified: true,
-      isDuplicate: false,
-      status: 'stored_verified',
-      message: 'Photo backed up and verified on disk.',
-      hash: actualHash,
-      serverSha256: actualHash,
-      savedPath: record.relativePath,
-      originalName: record.originalName,
-      size: record.size,
-      photoDate: record.photoDate,
-    };
+    });
   } catch (err) {
     await fsp.unlink(stagingPath).catch(() => {});
     throw err;

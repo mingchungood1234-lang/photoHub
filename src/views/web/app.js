@@ -15,23 +15,51 @@
     whoami: null,
     activeView: 'landing', // 'landing' | 'gallery'
     photos: [],
+    trashPhotos: [],
+    trashCount: 0,
+    isLoadingTrash: false,
     years: [],
     totalPhotos: 0,
     hasMore: false,
     isLoadingPhotos: false,
     isLoadingMore: false,
     photosEtag: null,
-    filterMedia: 'all', // 'all' | 'photo' | 'video' | 'protected'
+    filterMedia: 'all', // 'all' | 'photo' | 'video' | 'favorite' | 'protected' | 'trash'
     grouping: 'day', // 'day' | 'month' | 'year'
     searchQuery: '',
     selectedYear: null,
     isSelectionMode: false,
     selectedHashes: new Set(),
+    lastSelectedIndex: -1,
     visibleFlatPhotos: [],
     lightboxIndex: -1,
     lightboxBlobUrl: null,
+    lightboxZoom: 1,
+    lightboxPanX: 0,
+    lightboxPanY: 0,
+    shareTargetHashes: [],
     confirmCallback: null,
   };
+
+  // Bounded LRU cache for preloaded lightbox full previews (eliminates spinner flash on swipe/next)
+  const MAX_LB_CACHE = 12;
+  const lbPreviewCache = new Map(); // hash -> objectURL
+  const lbPreviewInFlight = new Map(); // hash -> Promise<string|null>
+
+  const MONTH_SEARCH_NAMES = [
+    ['january', 'jan'],
+    ['february', 'feb'],
+    ['march', 'mar'],
+    ['april', 'apr'],
+    ['may'],
+    ['june', 'jun'],
+    ['july', 'jul'],
+    ['august', 'aug'],
+    ['september', 'sept', 'sep'],
+    ['october', 'oct'],
+    ['november', 'nov'],
+    ['december', 'dec'],
+  ];
 
   // Bounded LRU ObjectURL cache for grid thumbnails (prevents memory leaks on huge libraries)
   const MAX_THUMB_CACHE = 300;
@@ -568,15 +596,69 @@
     }
   }
 
+  function clearLbPreviewCache() {
+    for (const url of lbPreviewCache.values()) {
+      URL.revokeObjectURL(url);
+    }
+    lbPreviewCache.clear();
+    lbPreviewInFlight.clear();
+  }
+
+  function fetchLightboxPreviewCached(hash) {
+    if (!hash) return Promise.resolve(null);
+    if (lbPreviewCache.has(hash)) {
+      const url = lbPreviewCache.get(hash);
+      lbPreviewCache.delete(hash);
+      lbPreviewCache.set(hash, url);
+      return Promise.resolve(url);
+    }
+    if (lbPreviewInFlight.has(hash)) {
+      return lbPreviewInFlight.get(hash);
+    }
+    const p = apiFetch(`/api/photo/${encodeURIComponent(hash)}/preview`)
+      .then((res) => (res.ok ? res.blob() : null))
+      .then((blob) => {
+        if (!blob || blob.size === 0) return null;
+        const objUrl = URL.createObjectURL(blob);
+        lbPreviewCache.set(hash, objUrl);
+        if (lbPreviewCache.size > MAX_LB_CACHE) {
+          const oldest = lbPreviewCache.keys().next().value;
+          const oldUrl = lbPreviewCache.get(oldest);
+          lbPreviewCache.delete(oldest);
+          if (oldUrl) URL.revokeObjectURL(oldUrl);
+        }
+        return objUrl;
+      })
+      .catch(() => null)
+      .finally(() => {
+        lbPreviewInFlight.delete(hash);
+      });
+    lbPreviewInFlight.set(hash, p);
+    return p;
+  }
+
+  function preloadAdjacentLightboxItems(index) {
+    for (const delta of [1, -1]) {
+      const neighbor = state.visibleFlatPhotos[index + delta];
+      if (neighbor && !isVideoPhoto(neighbor)) {
+        fetchLightboxPreviewCached(neighbor.hash);
+      }
+    }
+  }
+
   function signOut(notify = true) {
     saveSession(null);
     state.whoami = null;
     state.photos = [];
+    state.trashPhotos = [];
+    state.trashCount = 0;
     state.years = [];
     state.photosEtag = null;
     state.selectedHashes.clear();
+    state.lastSelectedIndex = -1;
     state.isSelectionMode = false;
     clearThumbCache();
+    clearLbPreviewCache();
     updateSelectionBar();
     updateAuthUI();
     switchView('landing');
@@ -640,7 +722,9 @@
       const data = await res.json();
       state.photos = Array.isArray(data.photos) ? data.photos : [];
       state.totalPhotos = Number(data.total) || state.photos.length;
+      state.trashCount = Number(data.trashCount) || 0;
       state.hasMore = Boolean(data.hasMore);
+      updateTrashBadge();
       if (Array.isArray(data.years)) {
         state.years = data.years;
         renderYearPills();
@@ -728,17 +812,75 @@
     }
   }
 
+  function updateTrashBadge() {
+    const badge = $('trashCountBadge');
+    if (!badge) return;
+    if (state.trashCount > 0) {
+      badge.textContent = String(state.trashCount);
+      badge.classList.remove('hidden');
+    } else {
+      badge.classList.add('hidden');
+    }
+  }
+
+  async function loadTrash() {
+    if (!state.session || state.isLoadingTrash) return;
+    state.isLoadingTrash = true;
+    try {
+      const res = await apiFetch('/api/photos/trash');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      state.trashPhotos = Array.isArray(data.photos) ? data.photos : [];
+      state.trashCount = Number(data.total) || state.trashPhotos.length;
+      updateTrashBadge();
+      $('trashBannerSub').textContent =
+        state.trashPhotos.length > 0
+          ? `${state.trashPhotos.length} item(s) (${formatBytes(data.trashBytes || 0)}) · Auto-deleted after ${data.retentionDays || 30} days.`
+          : 'Trash is empty. Deleted items stay here for 30 days before permanent removal.';
+      $('emptyTrashBtn').disabled = state.trashPhotos.length === 0;
+      renderGallery();
+    } catch (err) {
+      showToast(err.message || 'Could not load Trash', 'rose');
+    } finally {
+      state.isLoadingTrash = false;
+    }
+  }
+
+  function matchesSmartSearch(p, rawQuery) {
+    const q = String(rawQuery || '').trim().toLowerCase();
+    if (!q) return true;
+    const tokens = q.split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) return true;
+    const isVid = isVideoPhoto(p);
+    const dateStr = String(p.photoDate || (p.takenAt || '').slice(0, 10) || (p.uploadedAt || '').slice(0, 10));
+    const mo = /^\d{4}-(\d{2})/.test(dateStr) ? Number(dateStr.slice(5, 7)) : 0;
+    const moNames = mo >= 1 && mo <= 12 ? MONTH_SEARCH_NAMES[mo - 1] : [];
+    const hay = [
+      p.originalName || '',
+      p.photoDate || '',
+      p.takenAt || '',
+      p.savedPath || '',
+      p.cameraModel || '',
+      ...moNames,
+      isVid ? 'video videos movie clip' : 'photo photos image picture',
+      p.isFavorite ? 'favorite favorites fav starred heart' : '',
+      p.keepOriginalOnDevice ? 'protected restored original' : '',
+    ]
+      .join(' ')
+      .toLowerCase();
+    return tokens.every((tok) => hay.includes(tok));
+  }
+
   function filteredPhotos() {
-    const q = state.searchQuery.trim().toLowerCase();
-    return state.photos.filter((p) => {
+    const isTrash = state.filterMedia === 'trash';
+    const source = isTrash ? state.trashPhotos : state.photos;
+    return source.filter((p) => {
       const isVid = isVideoPhoto(p);
       if (state.filterMedia === 'photo' && isVid) return false;
       if (state.filterMedia === 'video' && !isVid) return false;
+      if (state.filterMedia === 'favorite' && !p.isFavorite) return false;
       if (state.filterMedia === 'protected' && !p.keepOriginalOnDevice) return false;
-      if (q) {
-        const hay = `${p.originalName || ''} ${p.photoDate || ''} ${p.savedPath || ''}`.toLowerCase();
-        if (!hay.includes(q)) return false;
-      }
+      if (state.searchQuery && !matchesSmartSearch(p, state.searchQuery)) return false;
       return true;
     });
   }
@@ -891,12 +1033,16 @@
   }
 
   function renderGallery() {
+    const isTrashView = state.filterMedia === 'trash';
+    $('trashBanner').classList.toggle('hidden', !isTrashView);
     const items = filteredPhotos();
     state.visibleFlatPhotos = items;
 
     const vidCount = state.photos.filter(isVideoPhoto).length;
     const photoCount = state.photos.length - vidCount;
-    $('galleryCountsText').textContent = `${state.totalPhotos} total · ${photoCount} photos · ${vidCount} videos`;
+    $('galleryCountsText').textContent = isTrashView
+      ? `${state.trashPhotos.length} item(s) in Trash`
+      : `${state.totalPhotos} total · ${photoCount} photos · ${vidCount} videos`;
 
     const container = $('galleryTimeline');
     container.innerHTML = '';
@@ -904,11 +1050,16 @@
     if (items.length === 0) {
       $('galleryEmptyState').classList.remove('hidden');
       setMascotMood($('emptyStateMascot'), 'sleeping');
-      $('emptyStateTitle').textContent = state.photos.length === 0 ? 'No Backups Yet' : 'No Matching Items';
-      $('emptyStateText').textContent =
-        state.photos.length === 0
-          ? 'Open PhotoHub on iOS or Android to start backing up photos.'
-          : 'Try clearing your search or switching filters.';
+      if (isTrashView) {
+        $('emptyStateTitle').textContent = 'Trash is Empty';
+        $('emptyStateText').textContent = 'Deleted photos appear here for 30 days before permanent removal.';
+      } else {
+        $('emptyStateTitle').textContent = state.photos.length === 0 ? 'No Backups Yet' : 'No Matching Items';
+        $('emptyStateText').textContent =
+          state.photos.length === 0
+            ? 'Drop photos onto this page or open PhotoHub on iOS / Android to back up.'
+            : 'Try clearing your search or switching filters.';
+      }
       $('loadMoreWrap').classList.add('hidden');
       return;
     }
@@ -965,16 +1116,44 @@
           tile.appendChild(vp);
         }
 
-        if (photo.keepOriginalOnDevice) {
+        if (photo.keepOriginalOnDevice || photo.isFavorite) {
           const badges = document.createElement('div');
           badges.className = 'tile-badges';
-          badges.innerHTML = `<span class="tile-badge tile-badge--protected" title="Restored original protected">✓</span>`;
+          if (photo.isFavorite) {
+            badges.innerHTML += `<span class="tile-badge tile-badge--fav" title="Favorite">♥</span>`;
+          }
+          if (photo.keepOriginalOnDevice) {
+            badges.innerHTML += `<span class="tile-badge tile-badge--protected" title="Restored original protected">✓</span>`;
+          }
           tile.appendChild(badges);
         }
 
-        tile.addEventListener('click', () => {
-          if (state.isSelectionMode) {
-            togglePhotoSelect(photo.hash, tile);
+        if (isTrashView && typeof photo.daysRemaining === 'number') {
+          const tp = document.createElement('div');
+          tp.className = 'tile-trash-pill';
+          tp.textContent = `${photo.daysRemaining}d left`;
+          tile.appendChild(tp);
+        }
+
+        tile.addEventListener('click', (e) => {
+          if (state.isSelectionMode || e.shiftKey) {
+            if (!state.isSelectionMode) {
+              state.isSelectionMode = true;
+              $('selectModeBtn').textContent = 'Done';
+            }
+            if (e.shiftKey && state.lastSelectedIndex >= 0 && state.lastSelectedIndex < state.visibleFlatPhotos.length) {
+              const start = Math.min(state.lastSelectedIndex, idx);
+              const end = Math.max(state.lastSelectedIndex, idx);
+              for (let r = start; r <= end; r++) {
+                state.selectedHashes.add(state.visibleFlatPhotos[r].hash.toLowerCase());
+              }
+              state.lastSelectedIndex = idx;
+              updateSelectionBar();
+              renderGallery();
+            } else {
+              state.lastSelectedIndex = idx;
+              togglePhotoSelect(photo.hash, tile);
+            }
           } else {
             openLightbox(idx);
           }
@@ -1012,10 +1191,13 @@
     { rootMargin: '300px 0px' }
   );
 
-  // ==================== MULTI-SELECT & DELETE ====================
+  // ==================== MULTI-SELECT, TRASH, ZIP & SHARE ====================
   function toggleSelectionMode(force) {
     state.isSelectionMode = typeof force === 'boolean' ? force : !state.isSelectionMode;
-    if (!state.isSelectionMode) state.selectedHashes.clear();
+    if (!state.isSelectionMode) {
+      state.selectedHashes.clear();
+      state.lastSelectedIndex = -1;
+    }
     $('selectModeBtn').textContent = state.isSelectionMode ? 'Done' : 'Select';
     updateSelectionBar();
     renderGallery();
@@ -1041,21 +1223,31 @@
     const bar = $('selectionBar');
     bar.classList.toggle('hidden', !state.isSelectionMode);
     if (!state.isSelectionMode) return;
+    const isTrash = state.filterMedia === 'trash';
+    const source = isTrash ? state.trashPhotos : state.photos;
     const count = state.selectedHashes.size;
     let totalBytes = 0;
-    for (const p of state.photos) {
+    for (const p of source) {
       if (state.selectedHashes.has(p.hash.toLowerCase())) {
         totalBytes += Number(p.size) || 0;
       }
     }
     $('selectionCountText').textContent = `${count} selected`;
-    $('selectionSizeText').textContent = formatBytes(totalBytes);
+    $('selectionSizeText').textContent = `${formatBytes(totalBytes)} · Shift+Click for range`;
     $('deleteSelectedBtn').disabled = count === 0;
+    $('deleteSelectedBtn').textContent = isTrash ? 'Delete Forever' : 'Trash';
+    $('downloadZipBtn').classList.toggle('hidden', isTrash);
+    $('downloadZipBtn').disabled = count === 0;
+    $('shareSelectedBtn').classList.toggle('hidden', isTrash);
+    $('shareSelectedBtn').disabled = count === 0;
+    $('restoreSelectedBtn').classList.toggle('hidden', !isTrash);
+    $('restoreSelectedBtn').disabled = count === 0;
   }
 
-  function openConfirmModal(title, text, onConfirm) {
+  function openConfirmModal(title, text, onConfirm, okLabel = 'Confirm') {
     $('confirmTitle').textContent = title;
     $('confirmText').textContent = text;
+    $('confirmOkBtn').textContent = okLabel;
     state.confirmCallback = onConfirm;
     $('confirmModal').classList.remove('hidden');
   }
@@ -1065,35 +1257,213 @@
     state.confirmCallback = null;
   }
 
-  async function deletePhotosOnServer(hashes) {
+  async function movePhotosToTrash(hashes) {
     if (!hashes || hashes.length === 0) return;
     try {
-      const res = await apiFetch('/api/photos/delete', {
+      const res = await apiFetch('/api/photos/trash', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ hashes }),
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || 'Delete failed');
-      const removed = new Set(
-        [...(data.deleted || []), ...(data.missing || [])].map((h) => String(h).toLowerCase())
-      );
-      state.photos = state.photos.filter((p) => !removed.has(p.hash.toLowerCase()));
-      state.totalPhotos = Math.max(0, state.totalPhotos - removed.size);
+      if (!res.ok) throw new Error(data.error || 'Move to Trash failed');
+      const moved = new Set((data.trashed || []).map((h) => String(h).toLowerCase()));
+      state.photos = state.photos.filter((p) => !moved.has(p.hash.toLowerCase()));
+      state.totalPhotos = Math.max(0, state.totalPhotos - moved.size);
+      state.trashCount += moved.size;
       state.photosEtag = null;
+      for (const h of moved) state.selectedHashes.delete(h);
+      updateTrashBadge();
+      showToast(`Moved ${moved.size} item(s) to Trash (kept 30 days)`, 'amber');
+      toggleSelectionMode(false);
+    } catch (err) {
+      showToast(err.message || 'Could not move to Trash', 'rose');
+    }
+  }
+
+  async function restorePhotosFromTrash(hashes) {
+    if (!hashes || hashes.length === 0) return;
+    try {
+      const res = await apiFetch('/api/photos/trash/restore', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hashes }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Restore failed');
+      const restored = new Set((data.restored || []).map((h) => String(h).toLowerCase()));
+      state.trashPhotos = state.trashPhotos.filter((p) => !restored.has(p.hash.toLowerCase()));
+      state.trashCount = state.trashPhotos.length;
+      state.photosEtag = null;
+      for (const h of restored) state.selectedHashes.delete(h);
+      updateTrashBadge();
+      showToast(`Restored ${restored.size} item(s) to library`, 'mint');
+      toggleSelectionMode(false);
+      loadGallery(false);
+    } catch (err) {
+      showToast(err.message || 'Restore failed', 'rose');
+    }
+  }
+
+  async function emptyTrashOnServer(hashes = null) {
+    try {
+      const res = await apiFetch('/api/photos/trash/empty', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(hashes && hashes.length ? { hashes } : {}),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Empty Trash failed');
+      const removed = new Set((data.deleted || []).map((h) => String(h).toLowerCase()));
+      state.trashPhotos = hashes && hashes.length
+        ? state.trashPhotos.filter((p) => !removed.has(p.hash.toLowerCase()))
+        : [];
+      state.trashCount = state.trashPhotos.length;
       for (const h of removed) state.selectedHashes.delete(h);
       if (data.storage && state.whoami) {
         state.whoami.storage = { ...(state.whoami.storage || {}), ...data.storage };
         updateStorageBanner(state.whoami.storage);
       }
-      showToast(`Deleted ${removed.size} item(s) · Freed ${formatBytes(data.freedBytes || 0)}`, 'mint');
+      updateTrashBadge();
+      showToast(`Permanently deleted ${removed.size} item(s) · Freed ${formatBytes(data.freedBytes || 0)}`, 'mint');
       toggleSelectionMode(false);
     } catch (err) {
-      showToast(err.message || 'Delete failed', 'rose');
+      showToast(err.message || 'Could not empty Trash', 'rose');
+    }
+  }
+
+  async function downloadSelectedAsZip(hashes) {
+    if (!hashes || hashes.length === 0) return;
+    showToast(`Preparing ZIP for ${hashes.length} item(s)…`, 'orange');
+    try {
+      const res = await apiFetch('/api/photos/download-zip', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hashes }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `HTTP ${res.status}`);
+      }
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = blobUrl;
+      a.download = `PhotoHub-${new Date().toISOString().slice(0, 10)}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 8000);
+      showToast(`Downloaded ZIP (${formatBytes(blob.size)})`, 'mint');
+    } catch (err) {
+      showToast(`ZIP download failed: ${err.message}`, 'rose');
+    }
+  }
+
+  function openShareModal(hashes, defaultTitle = '') {
+    state.shareTargetHashes = Array.from(hashes || []);
+    if (state.shareTargetHashes.length === 0) return;
+    $('shareModalTitle').textContent =
+      state.shareTargetHashes.length === 1
+        ? 'Share Photo Link'
+        : `Share ${state.shareTargetHashes.length} Photos`;
+    $('shareTitleInput').value = defaultTitle || '';
+    $('sharePasscodeInput').value = '';
+    $('shareExpirySelect').value = '168';
+    $('shareResultBox').classList.add('hidden');
+    $('shareUrlOutput').value = '';
+    $('shareGenerateBtn').disabled = false;
+    $('shareGenerateBtn').textContent = 'Create Link';
+    $('shareModal').classList.remove('hidden');
+  }
+
+  function closeShareModal() {
+    $('shareModal').classList.add('hidden');
+  }
+
+  async function handleCreateShareLink(e) {
+    e.preventDefault();
+    if (!state.shareTargetHashes.length) return;
+    const btn = $('shareGenerateBtn');
+    btn.disabled = true;
+    btn.textContent = 'Creating…';
+    try {
+      const res = await apiFetch('/api/shares', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          hashes: state.shareTargetHashes,
+          title: $('shareTitleInput').value.trim(),
+          expiresInHours: Number($('shareExpirySelect').value) || 168,
+          passcode: $('sharePasscodeInput').value.trim(),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success || !data.share) {
+        throw new Error(data.error || 'Could not create share link.');
+      }
+      const shareUrl = data.share.sharePath
+        ? `${window.location.origin}${data.share.sharePath}`
+        : data.share.shareUrl;
+      $('shareUrlOutput').value = shareUrl;
+      $('shareResultBox').classList.remove('hidden');
+      showToast('Share link ready!', 'mint');
+    } catch (err) {
+      showToast(err.message || 'Share link creation failed', 'rose');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Create Another Link';
     }
   }
 
   // ==================== LIGHTBOX ====================
+  function applyLightboxZoomTransform() {
+    const img = $('lbImage');
+    if (!img) return;
+    const zoomed = state.lightboxZoom > 1.01;
+    img.classList.toggle('is-zoomed', zoomed);
+    if (!zoomed) {
+      state.lightboxZoom = 1;
+      state.lightboxPanX = 0;
+      state.lightboxPanY = 0;
+      img.style.transform = '';
+    } else {
+      img.style.transform = `translate3d(${state.lightboxPanX}px, ${state.lightboxPanY}px, 0) scale(${state.lightboxZoom})`;
+    }
+  }
+
+  function resetLightboxZoom() {
+    state.lightboxZoom = 1;
+    state.lightboxPanX = 0;
+    state.lightboxPanY = 0;
+    applyLightboxZoomTransform();
+  }
+
+  function renderLightboxInfoPanel(photo) {
+    const list = $('lbInfoList');
+    if (!list || !photo) return;
+    const rows = [
+      ['Filename', photo.originalName || '—'],
+      ['Date', photo.takenAt ? new Date(photo.takenAt).toLocaleString() : photo.photoDate || 'Undated'],
+      ['Original Size', formatBytes(photo.size)],
+      ['Proxy Size', photo.proxySize ? formatBytes(photo.proxySize) : photo.videoProxySize ? formatBytes(photo.videoProxySize) : 'None'],
+      ['Camera', photo.cameraModel || '—'],
+      ['Verification', `SHA-256 Verified (${String(photo.hash || '').slice(0, 12)}…)`],
+    ];
+    if (photo.deletedAt) {
+      rows.push(['Trashed', `${new Date(photo.deletedAt).toLocaleDateString()} (${photo.daysRemaining ?? 30}d left)`]);
+    }
+    list.innerHTML = '';
+    for (const [label, value] of rows) {
+      const dt = document.createElement('dt');
+      dt.textContent = label;
+      const dd = document.createElement('dd');
+      dd.textContent = value;
+      list.appendChild(dt);
+      list.appendChild(dd);
+    }
+  }
+
   function cleanupLightboxMedia() {
     const img = $('lbImage');
     const vid = $('lbVideo');
@@ -1103,24 +1473,23 @@
     vid.classList.add('hidden');
     img.classList.add('hidden');
     img.removeAttribute('src');
-    if (state.lightboxBlobUrl) {
-      URL.revokeObjectURL(state.lightboxBlobUrl);
-      state.lightboxBlobUrl = null;
-    }
+    resetLightboxZoom();
     $('lbDownloadBar').classList.add('hidden');
   }
 
   function openLightbox(index) {
     if (index < 0 || index >= state.visibleFlatPhotos.length) return;
     state.lightboxIndex = index;
-    $('lightbox').classList.remove('hidden');
+    $('lightbox').classList.remove('hidden', 'is-immersive');
+    $('lbInfoPanel').classList.add('hidden');
     document.body.style.overflow = 'hidden';
     renderLightboxItem();
   }
 
   function closeLightbox() {
     cleanupLightboxMedia();
-    $('lightbox').classList.add('hidden');
+    $('lightbox').classList.add('hidden', 'is-immersive');
+    $('lbInfoPanel').classList.add('hidden');
     document.body.style.overflow = '';
     state.lightboxIndex = -1;
   }
@@ -1131,6 +1500,7 @@
     cleanupLightboxMedia();
 
     const isVid = isVideoPhoto(photo);
+    const isTrash = state.filterMedia === 'trash' || Boolean(photo.deletedAt);
     $('lbFilename').textContent = photo.originalName || photo.hash.slice(0, 12);
     const dateStr = photo.photoDate || (photo.uploadedAt || '').slice(0, 10) || 'Undated';
     $('lbMeta').textContent = `${dateStr} · Original ${formatBytes(photo.size)}`;
@@ -1138,10 +1508,18 @@
     $('lbPrevBtn').disabled = state.lightboxIndex <= 0;
     $('lbNextBtn').disabled = state.lightboxIndex >= state.visibleFlatPhotos.length - 1;
 
+    const favBtn = $('lbFavBtn');
+    favBtn.classList.toggle('hidden', isTrash);
+    favBtn.classList.toggle('is-fav', Boolean(photo.isFavorite));
+    favBtn.textContent = photo.isFavorite ? '♥' : '♡';
+
     const badges = $('lbBadges');
     badges.innerHTML = '';
     if (isVid) {
       badges.innerHTML += `<span class="mini-badge mini-badge--orange">Video</span>`;
+    }
+    if (photo.isFavorite) {
+      badges.innerHTML += `<span class="mini-badge mini-badge--orange">♥ Favorite</span>`;
     }
     if (photo.keepOriginalOnDevice) {
       badges.innerHTML += `<span class="mini-badge mini-badge--mint">Protected Original</span>`;
@@ -1150,7 +1528,12 @@
       badges.innerHTML += `<span class="mini-badge mini-badge--amber">Proxy ${formatBytes(photo.proxySize)}</span>`;
     }
 
+    $('lbProtectBtn').classList.toggle('hidden', isTrash);
+    $('lbShareBtn').classList.toggle('hidden', isTrash);
+    $('lbRestoreBtn').classList.toggle('hidden', !isTrash);
     $('lbProtectBtn').textContent = photo.keepOriginalOnDevice ? 'Unprotect' : 'Protect';
+    $('lbDeleteBtn').textContent = isTrash ? 'Delete Forever' : 'Trash';
+    renderLightboxInfoPanel(photo);
 
     const spinner = $('lbSpinner');
     spinner.classList.remove('hidden');
@@ -1181,25 +1564,53 @@
           showToast('Video codec not playable in browser — tap Original to download.', 'amber');
         }
       };
+      preloadAdjacentLightboxItems(state.lightboxIndex);
       return;
     }
 
     try {
-      const res = await apiFetch(`/api/photo/${encodeURIComponent(photo.hash)}/preview`);
-      if (!res.ok) throw new Error('Preview unavailable');
-      const blob = await res.blob();
+      const objUrl = await fetchLightboxPreviewCached(photo.hash);
+      if (!objUrl) throw new Error('Preview unavailable');
       if (state.visibleFlatPhotos[state.lightboxIndex]?.hash !== photo.hash) return;
-      const objUrl = URL.createObjectURL(blob);
-      state.lightboxBlobUrl = objUrl;
       const img = $('lbImage');
       img.src = objUrl;
-      img.onload = () => {
+      if (img.complete && img.naturalWidth > 0) {
         spinner.classList.add('hidden');
         img.classList.remove('hidden');
-      };
+      } else {
+        img.onload = () => {
+          spinner.classList.add('hidden');
+          img.classList.remove('hidden');
+        };
+      }
+      preloadAdjacentLightboxItems(state.lightboxIndex);
     } catch {
       spinner.classList.add('hidden');
       showToast('Preview not available — tap Original to download.', 'amber');
+    }
+  }
+
+  async function toggleLightboxFavorite() {
+    const photo = state.visibleFlatPhotos[state.lightboxIndex];
+    if (!photo) return;
+    const nextFav = !photo.isFavorite;
+    try {
+      const res = await apiFetch(`/api/photo/${encodeURIComponent(photo.hash)}/favorite`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ isFavorite: nextFav }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Could not update favorite');
+      photo.isFavorite = nextFav;
+      state.photosEtag = null;
+      const favBtn = $('lbFavBtn');
+      favBtn.classList.toggle('is-fav', nextFav);
+      favBtn.textContent = nextFav ? '♥' : '♡';
+      renderGallery();
+      showToast(nextFav ? 'Added to Favorites ♥' : 'Removed from Favorites', 'mint');
+    } catch (err) {
+      showToast(err.message || 'Could not update favorite', 'rose');
     }
   }
 
@@ -1546,16 +1957,32 @@
     renderUploadTray();
 
     try {
+      // Never re-upload a PhotoHub compressed proxy as a brand-new original
+      if (/^PHOTOHUB_PROXY_[a-f0-9]{8,}/i.test(String(file.name || '').trim())) {
+        uploadState.duplicateCount++;
+        return;
+      }
+
       const sha256 = await computeFileSha256Hex(file);
       if (uploadState.cancelled || uploadState.quotaExceeded) return;
 
-      // Fast pre-upload duplicate check so already-backed-up files finish instantly with zero upload bandwidth
+      // Intra-batch deduplication: if the user dropped duplicate copies in the same batch, skip immediately
+      if (sha256) {
+        if (!uploadState.seenHashes) uploadState.seenHashes = new Set();
+        if (uploadState.seenHashes.has(sha256)) {
+          uploadState.duplicateCount++;
+          return;
+        }
+        uploadState.seenHashes.add(sha256);
+      }
+
+      // Fast pre-upload duplicate & proxy check so already-backed-up files finish instantly with zero upload bandwidth
       if (sha256) {
         try {
           const checkRes = await apiFetch(`/api/check/${encodeURIComponent(sha256)}`);
           if (checkRes.ok) {
             const checkData = await checkRes.json().catch(() => ({}));
-            if (checkData.exists && checkData.isMaster) {
+            if (checkData.exists && (checkData.isMaster || checkData.isProxy)) {
               uploadState.duplicateCount++;
               return;
             }
@@ -1690,12 +2117,27 @@
       uploadState.totalBytes = 0;
       uploadState.completedBytes = 0;
       uploadState.currentFilename = '';
+      uploadState.seenHashes = new Set();
+      uploadState.seenFileKeys = new Set();
     }
 
+    if (!uploadState.seenFileKeys) uploadState.seenFileKeys = new Set();
+    let addedCount = 0;
     for (const f of files) {
+      const fileKey = `${f.name}|${f.size}|${f.lastModified || 0}`;
+      if (uploadState.seenFileKeys.has(fileKey)) {
+        uploadState.duplicateCount++;
+        continue;
+      }
+      uploadState.seenFileKeys.add(fileKey);
       uploadState.queue.push(f);
       uploadState.totalCount++;
       uploadState.totalBytes += f.size;
+      addedCount++;
+    }
+    if (addedCount === 0 && !uploadState.isRunning) {
+      showToast('Duplicate file(s) already queued or backed up.', 'mint');
+      return;
     }
 
     if (!uploadState.isRunning) {
@@ -1835,8 +2277,41 @@
         document.querySelectorAll('#mediaFilterPills .f-pill').forEach((b) => b.classList.remove('is-active'));
         btn.classList.add('is-active');
         state.filterMedia = btn.dataset.filter;
-        renderGallery();
+        state.selectedHashes.clear();
+        state.lastSelectedIndex = -1;
+        updateSelectionBar();
+        if (state.filterMedia === 'trash') {
+          loadTrash();
+        } else {
+          renderGallery();
+        }
       });
+    });
+
+    // Subtle upload file picker button (great for mobile/tablet browsers alongside desktop drag-and-drop)
+    $('webUploadBtn').addEventListener('click', () => {
+      if (!state.session) {
+        openLoginModal('Sign in with Google first to upload photos.');
+        return;
+      }
+      $('webUploadInput').click();
+    });
+    $('webUploadInput').addEventListener('change', (e) => {
+      const picked = Array.from(e.target.files || []).filter(isSupportedMediaFile);
+      e.target.value = '';
+      if (picked.length > 0) {
+        enqueueWebUploads(picked);
+      }
+    });
+
+    $('emptyTrashBtn').addEventListener('click', () => {
+      if (state.trashPhotos.length === 0) return;
+      openConfirmModal(
+        `Empty Trash (${state.trashPhotos.length} item(s))?`,
+        'This permanently deletes all trashed originals and proxies from your server and frees space immediately.',
+        () => emptyTrashOnServer(null),
+        'Empty Trash'
+      );
     });
 
     document.querySelectorAll('#groupingControl .seg-btn').forEach((btn) => {
@@ -1864,17 +2339,64 @@
       updateSelectionBar();
       renderGallery();
     });
+    $('downloadZipBtn').addEventListener('click', () => {
+      const hashes = Array.from(state.selectedHashes);
+      if (hashes.length > 0) downloadSelectedAsZip(hashes);
+    });
+    $('shareSelectedBtn').addEventListener('click', () => {
+      const hashes = Array.from(state.selectedHashes);
+      if (hashes.length > 0) openShareModal(hashes);
+    });
+    $('restoreSelectedBtn').addEventListener('click', () => {
+      const hashes = Array.from(state.selectedHashes);
+      if (hashes.length > 0) restorePhotosFromTrash(hashes);
+    });
     $('deleteSelectedBtn').addEventListener('click', () => {
       const hashes = Array.from(state.selectedHashes);
       if (hashes.length === 0) return;
-      openConfirmModal(
-        `Delete ${hashes.length} item(s)?`,
-        'This permanently deletes the originals and proxies from your server.',
-        () => deletePhotosOnServer(hashes)
-      );
+      if (state.filterMedia === 'trash') {
+        openConfirmModal(
+          `Permanently delete ${hashes.length} item(s)?`,
+          'This cannot be undone and removes the originals from your server immediately.',
+          () => emptyTrashOnServer(hashes),
+          'Delete Forever'
+        );
+      } else {
+        openConfirmModal(
+          `Move ${hashes.length} item(s) to Trash?`,
+          'Items stay in Trash for 30 days so you can restore them anytime before permanent removal.',
+          () => movePhotosToTrash(hashes),
+          'Move to Trash'
+        );
+      }
     });
-    $('refreshGalleryBtn').addEventListener('click', () => loadGallery(true));
-    $('emptyRetryBtn').addEventListener('click', () => loadGallery(true));
+    $('refreshGalleryBtn').addEventListener('click', () => {
+      if (state.filterMedia === 'trash') loadTrash();
+      else loadGallery(true);
+    });
+    $('emptyRetryBtn').addEventListener('click', () => {
+      if (state.filterMedia === 'trash') loadTrash();
+      else loadGallery(true);
+    });
+
+    // Share modal
+    $('closeShareModalBtn').addEventListener('click', closeShareModal);
+    $('shareModal').addEventListener('click', (e) => {
+      if (e.target === $('shareModal')) closeShareModal();
+    });
+    $('shareCreateForm').addEventListener('submit', handleCreateShareLink);
+    $('shareCopyBtn').addEventListener('click', async () => {
+      const val = $('shareUrlOutput').value;
+      if (!val) return;
+      try {
+        await navigator.clipboard.writeText(val);
+        showToast('Link copied to clipboard!', 'mint');
+      } catch {
+        $('shareUrlOutput').select();
+        document.execCommand('copy');
+        showToast('Link copied!', 'mint');
+      }
+    });
 
     // Confirm modal
     $('confirmCancelBtn').addEventListener('click', closeConfirmModal);
@@ -1887,8 +2409,21 @@
       if (cb) await cb();
     });
 
-    // Lightbox controls + keyboard + swipe
+    // Lightbox controls + keyboard + zoom + swipe
     $('lbCloseBtn').addEventListener('click', closeLightbox);
+    $('lbFavBtn').addEventListener('click', toggleLightboxFavorite);
+    $('lbInfoBtn').addEventListener('click', () => $('lbInfoPanel').classList.toggle('hidden'));
+    $('lbInfoCloseBtn').addEventListener('click', () => $('lbInfoPanel').classList.add('hidden'));
+    $('lbShareBtn').addEventListener('click', () => {
+      const photo = state.visibleFlatPhotos[state.lightboxIndex];
+      if (photo) openShareModal([photo.hash], photo.originalName || '');
+    });
+    $('lbRestoreBtn').addEventListener('click', async () => {
+      const photo = state.visibleFlatPhotos[state.lightboxIndex];
+      if (!photo) return;
+      closeLightbox();
+      await restorePhotosFromTrash([photo.hash]);
+    });
     $('lbPrevBtn').addEventListener('click', () => {
       if (state.lightboxIndex > 0) {
         state.lightboxIndex--;
@@ -1906,14 +2441,80 @@
     $('lbDeleteBtn').addEventListener('click', () => {
       const photo = state.visibleFlatPhotos[state.lightboxIndex];
       if (!photo) return;
-      openConfirmModal(
-        `Delete ${photo.originalName}?`,
-        'This permanently deletes the original and compressed proxy from your server.',
-        async () => {
-          closeLightbox();
-          await deletePhotosOnServer([photo.hash]);
-        }
-      );
+      if (state.filterMedia === 'trash' || photo.deletedAt) {
+        openConfirmModal(
+          `Permanently delete ${photo.originalName}?`,
+          'This cannot be undone and removes the original from your server immediately.',
+          async () => {
+            closeLightbox();
+            await emptyTrashOnServer([photo.hash]);
+          },
+          'Delete Forever'
+        );
+      } else {
+        openConfirmModal(
+          `Move ${photo.originalName} to Trash?`,
+          'You can restore this item from Trash for up to 30 days.',
+          async () => {
+            closeLightbox();
+            await movePhotosToTrash([photo.hash]);
+          },
+          'Move to Trash'
+        );
+      }
+    });
+
+    // Lightbox image double-click zoom, wheel zoom, drag pan, pinch zoom & tap-to-toggle chrome
+    const lbImg = $('lbImage');
+    let lbDragStart = null;
+    let lbDragged = false;
+    lbImg.addEventListener('dblclick', (e) => {
+      e.stopPropagation();
+      if (state.lightboxZoom > 1.05) {
+        resetLightboxZoom();
+      } else {
+        state.lightboxZoom = 2.4;
+        state.lightboxPanX = 0;
+        state.lightboxPanY = 0;
+        applyLightboxZoomTransform();
+      }
+    });
+    lbImg.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (lbDragged) {
+        lbDragged = false;
+        return;
+      }
+      if (state.lightboxZoom <= 1.05) {
+        $('lightbox').classList.toggle('is-immersive');
+      }
+    });
+    $('lbMediaBox').addEventListener(
+      'wheel',
+      (e) => {
+        if (lbImg.classList.contains('hidden')) return;
+        e.preventDefault();
+        const factor = e.deltaY < 0 ? 1.18 : 0.85;
+        state.lightboxZoom = Math.min(4.5, Math.max(1, state.lightboxZoom * factor));
+        applyLightboxZoomTransform();
+      },
+      { passive: false }
+    );
+    lbImg.addEventListener('mousedown', (e) => {
+      if (state.lightboxZoom <= 1.05) return;
+      e.preventDefault();
+      lbDragStart = { x: e.clientX - state.lightboxPanX, y: e.clientY - state.lightboxPanY };
+      lbDragged = false;
+    });
+    window.addEventListener('mousemove', (e) => {
+      if (!lbDragStart) return;
+      lbDragged = true;
+      state.lightboxPanX = e.clientX - lbDragStart.x;
+      state.lightboxPanY = e.clientY - lbDragStart.y;
+      applyLightboxZoomTransform();
+    });
+    window.addEventListener('mouseup', () => {
+      lbDragStart = null;
     });
 
     document.addEventListener('keydown', (e) => {
@@ -1925,24 +2526,68 @@
       } else if (e.key === 'ArrowRight' && state.lightboxIndex < state.visibleFlatPhotos.length - 1) {
         state.lightboxIndex++;
         renderLightboxItem();
+      } else if (e.key.toLowerCase() === 'i') {
+        $('lbInfoPanel').classList.toggle('hidden');
       }
     });
 
     let touchStartX = 0;
-    $('lbStage').addEventListener('touchstart', (e) => {
-      touchStartX = e.changedTouches[0].clientX;
-    }, { passive: true });
-    $('lbStage').addEventListener('touchend', (e) => {
-      const dx = e.changedTouches[0].clientX - touchStartX;
-      if (Math.abs(dx) < 48) return;
-      if (dx > 0 && state.lightboxIndex > 0) {
-        state.lightboxIndex--;
-        renderLightboxItem();
-      } else if (dx < 0 && state.lightboxIndex < state.visibleFlatPhotos.length - 1) {
-        state.lightboxIndex++;
-        renderLightboxItem();
-      }
-    }, { passive: true });
+    let pinchStartDist = 0;
+    let pinchStartZoom = 1;
+    let lastTapTs = 0;
+    $('lbStage').addEventListener(
+      'touchstart',
+      (e) => {
+        if (e.touches.length === 2) {
+          const dx = e.touches[0].clientX - e.touches[1].clientX;
+          const dy = e.touches[0].clientY - e.touches[1].clientY;
+          pinchStartDist = Math.hypot(dx, dy);
+          pinchStartZoom = state.lightboxZoom;
+        } else if (e.touches.length === 1) {
+          touchStartX = e.changedTouches[0].clientX;
+          const now = Date.now();
+          if (now - lastTapTs < 280 && !lbImg.classList.contains('hidden')) {
+            if (state.lightboxZoom > 1.05) resetLightboxZoom();
+            else {
+              state.lightboxZoom = 2.3;
+              applyLightboxZoomTransform();
+            }
+          }
+          lastTapTs = now;
+        }
+      },
+      { passive: true }
+    );
+    $('lbStage').addEventListener(
+      'touchmove',
+      (e) => {
+        if (e.touches.length === 2 && pinchStartDist > 0 && !lbImg.classList.contains('hidden')) {
+          const dx = e.touches[0].clientX - e.touches[1].clientX;
+          const dy = e.touches[0].clientY - e.touches[1].clientY;
+          const dist = Math.hypot(dx, dy);
+          state.lightboxZoom = Math.min(4.5, Math.max(1, pinchStartZoom * (dist / pinchStartDist)));
+          applyLightboxZoomTransform();
+        }
+      },
+      { passive: true }
+    );
+    $('lbStage').addEventListener(
+      'touchend',
+      (e) => {
+        if (e.touches.length < 2) pinchStartDist = 0;
+        if (state.lightboxZoom > 1.05) return;
+        const dx = e.changedTouches[0].clientX - touchStartX;
+        if (Math.abs(dx) < 48) return;
+        if (dx > 0 && state.lightboxIndex > 0) {
+          state.lightboxIndex--;
+          renderLightboxItem();
+        } else if (dx < 0 && state.lightboxIndex < state.visibleFlatPhotos.length - 1) {
+          state.lightboxIndex++;
+          renderLightboxItem();
+        }
+      },
+      { passive: true }
+    );
 
     loadMoreObserver.observe($('loadMoreWrap'));
     initInvisibleDragAndDrop();
@@ -1954,6 +2599,11 @@
     hydrateSunnyMascots();
     initShowcaseInteractions();
     bindEvents();
+
+    // Register PWA Service Worker for installable fullscreen web app experience
+    if ('serviceWorker' in navigator && window.isSecureContext) {
+      navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {});
+    }
 
     // 1. Fetch public server capabilities (/api/auth/config)
     try {

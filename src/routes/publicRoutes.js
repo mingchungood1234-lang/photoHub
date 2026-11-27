@@ -12,7 +12,7 @@
 
 const express = require('express');
 
-function createPublicRoutes({ healthController, authController }) {
+function createPublicRoutes({ healthController, authController, shareController }) {
   const router = express.Router();
 
   router.get('/health', healthController.getHealth);
@@ -21,6 +21,12 @@ function createPublicRoutes({ healthController, authController }) {
   router.get('/auth/google/start', authController.startGoogleAuth);
   router.get('/auth/google/callback', authController.handleGoogleCallback);
   router.post('/auth/exchange', authController.exchangeCode);
+
+  if (shareController) {
+    router.get('/public/share/:token', shareController.getPublicShare);
+    router.get('/public/share/:token/preview/:hash', shareController.streamPublicPreview);
+    router.get('/public/share/:token/download/:hash', shareController.downloadPublicOriginal);
+  }
 
   return router;
 }

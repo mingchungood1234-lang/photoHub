@@ -92,13 +92,18 @@ final class CompressorViewModel: ObservableObject {
                 let service = self.photoService
                 let tracker = self.tracker
                 let mode = self.sortMode
+                let backupOnly = self.settings.isBackupOnlyMode
                 let isSignedIn = self.settings.isSignedIn
                 let cachedServerPhotos = LocalProxyStore.shared.cachedPhotos(
                     baseURL: self.settings.normalizedBaseURL,
                     apiKey: self.settings.apiKey
                 )
                 Task.detached(priority: .userInitiated) { [weak self] in
-                    let raw = service.scanCandidates(tracker: tracker, knownServerPhotos: cachedServerPhotos)
+                    let raw = service.scanCandidates(
+                        tracker: tracker,
+                        knownServerPhotos: cachedServerPhotos,
+                        skipBackedUpOriginals: backupOnly
+                    )
                     let sorted = PhotoBackupPipeline.sortCandidates(raw, by: mode)
                     let eligibleCount = sorted.filter { !$0.state.isFinished }.count
                     await MainActor.run {
@@ -108,7 +113,9 @@ final class CompressorViewModel: ObservableObject {
                         self.pendingAutoDeleteWhenActive = false
                         self.isScanning = false
                         if sorted.isEmpty {
-                            self.statusBanner = "No uncompressed photos or videos found to compress."
+                            self.statusBanner = backupOnly
+                                ? "All photos & videos are safely backed up · Originals kept on iPhone."
+                                : "No uncompressed photos or videos found to compress."
                         }
                         if eligibleCount > 0 && isSignedIn {
                             self.launchDeepProxyDetection(cachedServerPhotos: cachedServerPhotos)
@@ -146,6 +153,7 @@ final class CompressorViewModel: ObservableObject {
                 let service = self.photoService
                 let tracker = self.tracker
                 let mode = self.sortMode
+                let backupOnly = self.settings.isBackupOnlyMode
                 let isSignedIn = self.settings.isSignedIn
                 let apiClient = PhotoHubAPIClient(settings: self.settings)
                 let cachedServerPhotos = LocalProxyStore.shared.cachedPhotos(
@@ -157,7 +165,8 @@ final class CompressorViewModel: ObservableObject {
                         tracker: tracker,
                         knownServerPhotos: cachedServerPhotos,
                         maxResults: 200,
-                        maxInspect: 3000
+                        maxInspect: 3000,
+                        skipBackedUpOriginals: backupOnly
                     )
                     var sorted = PhotoBackupPipeline.sortCandidates(raw, by: mode)
                     if isSignedIn && sorted.contains(where: { $0.state == .pending }) {
@@ -171,7 +180,7 @@ final class CompressorViewModel: ObservableObject {
                             cachedServerPhotos: cachedServerPhotos
                         )
                         if !matches.isEmpty {
-                            sorted = Self.applyDeepMatches(sorted, matches: matches)
+                            sorted = Self.applyDeepMatches(sorted, matches: matches, backupOnly: backupOnly, tracker: tracker)
                         }
                     }
                     let eligibleCount = sorted.filter { !$0.state.isFinished }.count
@@ -199,6 +208,7 @@ final class CompressorViewModel: ObservableObject {
         isCheckingServerProxies = true
         let client = PhotoHubAPIClient(settings: self.settings)
         let tracker = self.tracker
+        let backupOnly = self.settings.isBackupOnlyMode
 
         deepProxyScanTask = Task.detached(priority: .utility) { [weak self] in
             let matches = await GalleryProxyDetector.enrichCandidatesWithServer(
@@ -210,7 +220,7 @@ final class CompressorViewModel: ObservableObject {
             await MainActor.run {
                 guard let self else { return }
                 if !matches.isEmpty {
-                    self.candidates = Self.applyDeepMatches(self.candidates, matches: matches)
+                    self.candidates = Self.applyDeepMatches(self.candidates, matches: matches, backupOnly: backupOnly, tracker: tracker)
                     if self.candidates.isEmpty {
                         self.statusBanner = "All scanned photos & videos are already backed up."
                     }
@@ -222,12 +232,20 @@ final class CompressorViewModel: ObservableObject {
 
     private nonisolated static func applyDeepMatches(
         _ items: [PhotoCandidate],
-        matches: [String: CandidateDeepCheckMatch]
+        matches: [String: CandidateDeepCheckMatch],
+        backupOnly: Bool = false,
+        tracker: LocalProxyTracker = .shared
     ) -> [PhotoCandidate] {
         items.compactMap { item in
             guard let m = matches[item.id] else { return item }
             if m.isProxy || (m.isMaster && m.isProtectedOriginal) {
                 // Already recorded in LocalProxyTracker; remove cleanly so Compress stays focused on uncompressed items.
+                return nil
+            }
+            if backupOnly && m.isMaster {
+                if let hash = m.masterHash, !hash.isEmpty {
+                    tracker.markUploadedOriginal(assetId: item.id, masterHash: hash)
+                }
                 return nil
             }
             var copy = item
@@ -351,10 +369,16 @@ final class CompressorViewModel: ObservableObject {
 
     func startProcessingSelectedPhotos() {
         guard !isProcessing else { return }
-        let targetIds = candidates
-            .filter { $0.isSelected && !$0.state.isFinished }
-            .map { $0.id }
-        guard !targetIds.isEmpty else { return }
+        let selectedCandidates = candidates.filter { $0.isSelected && !$0.state.isFinished }
+        guard !selectedCandidates.isEmpty else { return }
+        let backupOnly = settings.isBackupOnlyMode
+        let effectiveKeepLocal = !backupOnly && settings.keepLocalProxyInPhotos
+        // When keeping lightweight proxies in Apple Photos, process & save chronologically
+        // oldest-first so the newest photo is inserted LAST and shows FIRST in Recents / Share pickers.
+        let orderedCandidates = (effectiveKeepLocal && selectedCandidates.count > 1)
+            ? PhotoChronologicalOrder.sortCandidatesOldestFirst(selectedCandidates)
+            : selectedCandidates
+        let targetIds = orderedCandidates.map { $0.id }
 
         isProcessing = true
         completedCount = 0
@@ -363,13 +387,13 @@ final class CompressorViewModel: ObservableObject {
         activeItemProgress.removeAll()
         statusBanner = nil
 
-        if settings.notifyWhenBackgroundUploadFinishes {
+        if !backupOnly && settings.notifyWhenBackgroundUploadFinishes {
             BackgroundBackupManager.shared.requestNotificationPermissionIfNeeded()
         }
 
         beginAppBackgroundTask()
         activeUploadTask?.cancel()
-        let notifyOnFinish = settings.notifyWhenBackgroundUploadFinishes
+        let notifyOnFinish = !backupOnly && settings.notifyWhenBackgroundUploadFinishes
         let morningHour = settings.morningReminderHour
 
         let apiClient = PhotoHubAPIClient(settings: settings)
@@ -377,7 +401,7 @@ final class CompressorViewModel: ObservableObject {
         let maxPx = settings.proxyMaxPixelSize
         let quality = settings.proxyQuality
         let uploadMode = settings.uploadMode
-        let keepLocal = settings.keepLocalProxyInPhotos
+        let keepLocal = effectiveKeepLocal
         let normalizedBaseURL = settings.normalizedBaseURL
         let apiKey = settings.apiKey
 
@@ -410,33 +434,41 @@ final class CompressorViewModel: ObservableObject {
                 return
             }
 
-            let queue = AsyncWorkQueue(targetIds)
+            let indexedTargets = targetIds.enumerated().map { (index: $0.offset, id: $0.element) }
+            let queue = AsyncWorkQueue(indexedTargets)
             let videoSemaphore = AsyncSemaphore(value: 1)
             let photosSaveSemaphore = AsyncSemaphore(value: 1)
+            let commitGate = keepLocal ? OrderedCommitGate() : nil
             let workerCount = min(3, targetIds.count)
 
             let failedCount = await withTaskGroup(of: Int.self) { group in
                 for _ in 0..<workerCount {
                     group.addTask {
                         var workerFailures = 0
-                        while !Task.isCancelled, let nextId = await queue.next() {
+                        while !Task.isCancelled, let work = await queue.next() {
                             let ok = await self.processSingleCandidate(
-                                id: nextId,
+                                id: work.id,
                                 apiClient: apiClient,
                                 format: format,
                                 maxPx: maxPx,
                                 quality: quality,
                                 uploadMode: uploadMode,
                                 keepLocal: keepLocal,
+                                backupOnly: backupOnly,
                                 normalizedBaseURL: normalizedBaseURL,
                                 apiKey: apiKey,
                                 videoSemaphore: videoSemaphore,
                                 photosSaveSemaphore: photosSaveSemaphore,
+                                commitGate: commitGate,
+                                commitIndex: work.index,
                                 totalCount: targetIds.count
                             )
                             if !ok {
                                 workerFailures += 1
                             }
+                        }
+                        if Task.isCancelled, let commitGate {
+                            await commitGate.cancelAll()
                         }
                         return workerFailures
                     }
@@ -447,6 +479,9 @@ final class CompressorViewModel: ObservableObject {
                     totalFailures += workerFailures
                 }
                 return totalFailures
+            }
+            if let commitGate {
+                await commitGate.cancelAll()
             }
 
             if let updatedInfo = try? await apiClient.whoami() {
@@ -463,7 +498,7 @@ final class CompressorViewModel: ObservableObject {
                 self.overallProgressFraction = finishedCleanly ? 1.0 : self.overallProgressFraction
                 self.endAppBackgroundTask()
                 let savedStr = ByteCountFormatter.string(fromByteCount: self.totalSavedBytes, countStyle: .file)
-                if !self.pendingDeleteAssets.isEmpty {
+                if !backupOnly && !self.pendingDeleteAssets.isEmpty {
                     let readyCount = self.pendingDeleteAssets.count
                     if notifyOnFinish && UIApplication.shared.applicationState != .active {
                         BackgroundBackupManager.shared.sendDeleteOriginalsNotification(
@@ -475,9 +510,13 @@ final class CompressorViewModel: ObservableObject {
                     }
                     self.scheduleAutomaticDeletePrompt()
                 } else if failedCount > 0 && self.statusBanner == nil {
-                    self.statusBanner = "Finished with \(failedCount) error(s). Space saved: \(savedStr)."
+                    self.statusBanner = backupOnly
+                        ? "Finished with \(failedCount) error(s). Backed-up originals kept on iPhone."
+                        : "Finished with \(failedCount) error(s). Space saved: \(savedStr)."
                 } else if failedCount == 0 {
-                    self.statusBanner = "Finished! All originals backed up & verified."
+                    self.statusBanner = backupOnly
+                        ? "Backed up \(targetIds.count) item(s) safely · Originals kept on iPhone."
+                        : "Finished! All originals backed up & verified."
                 }
             }
         }
@@ -506,12 +545,21 @@ final class CompressorViewModel: ObservableObject {
         quality: Double,
         uploadMode: UploadMode,
         keepLocal: Bool,
+        backupOnly: Bool = false,
         normalizedBaseURL: URL?,
         apiKey: String,
         videoSemaphore: AsyncSemaphore,
         photosSaveSemaphore: AsyncSemaphore,
+        commitGate: OrderedCommitGate? = nil,
+        commitIndex: Int? = nil,
         totalCount: Int
     ) async -> Bool {
+        let releaseTurnIfNeeded: () async -> Void = {
+            if let commitGate, let commitIndex {
+                await commitGate.completeTurn(commitIndex)
+            }
+        }
+
         let candidate: PhotoCandidate? = await MainActor.run {
             guard let index = self.candidates.firstIndex(where: { $0.id == currentId }) else {
                 return nil
@@ -520,6 +568,7 @@ final class CompressorViewModel: ObservableObject {
         }
 
         guard let candidate else {
+            await releaseTurnIfNeeded()
             await MainActor.run {
                 self.completedCount += 1
                 self.recordItemProgress(id: currentId, fraction: 1.0, totalCount: totalCount)
@@ -549,6 +598,7 @@ final class CompressorViewModel: ObservableObject {
         }
 
         guard canProcess else {
+            await releaseTurnIfNeeded()
             return true
         }
         defer { AssetUploadCoordinator.shared.releaseAsset(currentId, owner: .manual) }
@@ -567,7 +617,9 @@ final class CompressorViewModel: ObservableObject {
                 normalizedBaseURL: normalizedBaseURL,
                 cacheScopeKey: apiKey,
                 videoSemaphore: videoSemaphore,
-                photosSaveSemaphore: photosSaveSemaphore
+                photosSaveSemaphore: photosSaveSemaphore,
+                commitGate: commitGate,
+                commitIndex: commitIndex
             ) { [weak self] newState in
                 Task { @MainActor in
                     guard let self else { return }
@@ -583,20 +635,27 @@ final class CompressorViewModel: ObservableObject {
             await MainActor.run {
                 switch result {
                 case .backedUp(let outcome):
-                    self.stageOriginalForDeletion(
-                        id: currentId,
-                        asset: candidate.asset,
-                        savedBytes: outcome.savedBytes
-                    )
-                    BackgroundBackupManager.shared.appendStagedItems([
-                        StagedCleanupItem(
+                    if backupOnly {
+                        self.updateState(id: currentId, state: .completed(savedBytes: 0))
+                        if let idx = self.candidates.firstIndex(where: { $0.id == currentId }) {
+                            self.candidates[idx].isSelected = false
+                        }
+                    } else {
+                        self.stageOriginalForDeletion(
                             id: currentId,
-                            filename: outcome.filename,
-                            masterSha256: outcome.masterSha256,
-                            savedBytes: outcome.savedBytes,
-                            verifiedAt: Date()
-                        ),
-                    ])
+                            asset: candidate.asset,
+                            savedBytes: outcome.savedBytes
+                        )
+                        BackgroundBackupManager.shared.appendStagedItems([
+                            StagedCleanupItem(
+                                id: currentId,
+                                filename: outcome.filename,
+                                masterSha256: outcome.masterSha256,
+                                savedBytes: outcome.savedBytes,
+                                verifiedAt: Date()
+                            ),
+                        ])
+                    }
                 case .skippedExistingProxy, .skippedProtectedOriginal:
                     self.candidates.removeAll { $0.id == currentId }
                 case .skippedInFlight:

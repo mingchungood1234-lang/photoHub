@@ -147,12 +147,17 @@ fun ServerGalleryScreen(
     uiState.deleteConfirmTargets?.let { targets ->
         val totalBytes = targets.sumOf { maxOf(0L, it.size) }
         val sizeStr = Formatter.formatFileSize(context, totalBytes)
+        val permanent = uiState.deleteConfirmIsPermanent
         AlertDialog(
             onDismissRequest = { viewModel.dismissDeleteConfirm() },
-            title = { Text("Delete from Server?") },
+            title = { Text(if (permanent) "Delete Permanently?" else "Move to Trash?") },
             text = {
                 Text(
-                    "Permanently delete ${targets.size} backed-up original(s) (~$sizeStr) and their server proxies from your PhotoHub server? This cannot be undone."
+                    if (permanent) {
+                        "Permanently delete ${targets.size} item(s) (~$sizeStr) from your server? This cannot be undone."
+                    } else {
+                        "Move ${targets.size} item(s) (~$sizeStr) to Trash? You can restore them anytime within 30 days."
+                    }
                 )
             },
             confirmButton = {
@@ -163,7 +168,7 @@ fun ServerGalleryScreen(
                         contentColor = MaterialTheme.colorScheme.onError
                     )
                 ) {
-                    Text("Delete ${targets.size}")
+                    Text(if (permanent) "Delete Forever (${targets.size})" else "Move to Trash (${targets.size})")
                 }
             },
             dismissButton = {
@@ -175,14 +180,25 @@ fun ServerGalleryScreen(
     }
 
     if (detailState != null) {
+        val visibleList = uiState.visiblePhotos
+        val activeHash = detailState!!.photo.hash
+        val initIdx = visibleList.indexOfFirst { it.hash.equals(activeHash, ignoreCase = true) }.coerceAtLeast(0)
         ServerPhotoDetailDialog(
             detail = detailState!!,
+            allPhotos = if (visibleList.isNotEmpty()) visibleList else listOf(detailState!!.photo),
+            initialIndex = initIdx,
+            getCachedThumbnail = { hash -> viewModel.getCachedThumbnail(hash) },
+            onPageChanged = { photo -> viewModel.openPhotoDetail(photo) },
             onDismiss = { viewModel.closePhotoDetail() },
             onCreateProxy = { viewModel.createProxyForDetail() },
             onShareOriginal = { viewModel.shareOriginalFromDetail() },
             onSaveProxy = { viewModel.saveProxyToGalleryFromDetail() },
             onRestoreOriginal = { viewModel.restoreFullMasterFromDetail() },
             onDeleteFromServer = { viewModel.deletePhotoFromDetail() },
+            onRestoreFromTrash = { viewModel.restorePhotoFromTrashDetail() },
+            onToggleFavorite = { viewModel.toggleFavoriteFromDetail() },
+            onCreateShareLink = { title, hours, pass -> viewModel.createShareLinkFromDetail(title, hours, pass) },
+            onClearShareLink = { viewModel.clearCreatedShareLink() },
             onToggleProtection = { viewModel.updateOriginalProtection(it) },
             onShareFileConsumed = { file ->
                 shareFileViaChooser(context, file)
@@ -203,6 +219,7 @@ fun ServerGalleryScreen(
         hasUnproxiedBanner,
         hasRestoreBanner,
         hasDeleteBanner,
+        uiState.isViewingTrash,
         syncState.isSyncing
     ) {
         val map = mutableMapOf<String, Int>()
@@ -212,6 +229,7 @@ fun ServerGalleryScreen(
         if (hasUnproxiedBanner) idx++
         if (hasRestoreBanner) idx++
         if (hasDeleteBanner) idx++
+        if (uiState.isViewingTrash) idx++
         if (syncState.isSyncing) idx++
         for (sec in uiState.timeline.sections) {
             if (sec.startsNewYear && uiState.timelineGrouping != ServerTimelineGrouping.YEAR) {
@@ -544,6 +562,49 @@ fun ServerGalleryScreen(
                                 }
                             }
 
+                            if (uiState.isViewingTrash) {
+                                item(key = "cloud-trash-info-banner", span = { GridItemSpan(maxLineSpan) }) {
+                                    Surface(
+                                        shape = RoundedCornerShape(16.dp),
+                                        color = PhotoHubRed.copy(alpha = 0.08f),
+                                        border = BorderStroke(1.dp, PhotoHubRed.copy(alpha = 0.28f)),
+                                        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                        ) {
+                                            Icon(Icons.Rounded.DeleteSweep, null, tint = PhotoHubRed, modifier = Modifier.size(20.dp))
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    "Trash · 30-Day Safety Bin",
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    fontWeight = FontWeight.ExtraBold
+                                                )
+                                                Text(
+                                                    if (uiState.trashPhotos.isEmpty()) "No deleted items."
+                                                    else "${uiState.trashPhotos.size} item(s) · Auto-removed after 30 days",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                            if (uiState.trashPhotos.isNotEmpty()) {
+                                                Button(
+                                                    onClick = { viewModel.requestEmptyTrashAll() },
+                                                    colors = ButtonDefaults.buttonColors(containerColor = PhotoHubRed),
+                                                    shape = CircleShape,
+                                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                                                    modifier = Modifier.height(32.dp)
+                                                ) {
+                                                    Text("Empty", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             if (syncState.isSyncing) {
                                 item(key = "cloud-sync-banner", span = { GridItemSpan(maxLineSpan) }) {
                                     Surface(
@@ -756,7 +817,10 @@ fun ServerGalleryScreen(
                         if (uiState.isSelectionMode) {
                             SelectionRestoreBottomBar(
                                 uiState = uiState,
-                                onRestoreSelected = { viewModel.requestRestoreSelected() },
+                                onRestoreSelected = {
+                                    if (uiState.isViewingTrash) viewModel.restoreSelectedFromTrash()
+                                    else viewModel.requestRestoreSelected()
+                                },
                                 onDeleteSelected = { viewModel.requestDeleteSelected() },
                                 modifier = Modifier
                                     .align(Alignment.BottomCenter)
@@ -993,7 +1057,7 @@ private fun CloudControlBar(
                         Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
                             if (uiState.searchQuery.isEmpty()) {
                                 Text(
-                                    "Search name or date…",
+                                    "Search Nov 2026, video, name…",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     maxLines = 1,
@@ -1060,10 +1124,12 @@ private fun CloudControlBar(
             LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 items(ServerMediaTypeFilter.entries) { media ->
                     val selected = uiState.mediaTypeFilter == media && uiState.filterMode == ServerGalleryFilter.ALL
-                    val label = if (media == ServerMediaTypeFilter.PROTECTED && uiState.protectedCount > 0) {
-                        "${media.title} (${uiState.protectedCount})"
-                    } else {
-                        media.title
+                    val label = when {
+                        media == ServerMediaTypeFilter.FAVORITES && uiState.favoriteCount > 0 -> "♥ ${media.title} (${uiState.favoriteCount})"
+                        media == ServerMediaTypeFilter.FAVORITES -> "♥ ${media.title}"
+                        media == ServerMediaTypeFilter.PROTECTED && uiState.protectedCount > 0 -> "${media.title} (${uiState.protectedCount})"
+                        media == ServerMediaTypeFilter.TRASH && uiState.trashCount > 0 -> "${media.title} (${uiState.trashCount})"
+                        else -> media.title
                     }
                     Surface(
                         onClick = {
@@ -1550,7 +1616,7 @@ private fun SelectionRestoreBottomBar(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-    val selectedList = uiState.photos.filter { it.hash.lowercase(Locale.ROOT) in uiState.selectedHashes }
+    val selectedList = uiState.activeSourcePhotos.filter { it.hash.lowercase(Locale.ROOT) in uiState.selectedHashes }
     val unrestored = selectedList.filter { !uiState.isRestoredOrProtected(it) }
     val targetBytes = (if (unrestored.isNotEmpty()) unrestored else selectedList).sumOf { maxOf(0L, it.size) }
     val sizeStr = Formatter.formatFileSize(context, targetBytes)
@@ -1613,7 +1679,7 @@ private fun SelectionRestoreBottomBar(
                             modifier = Modifier.size(16.dp)
                         )
                         Text(
-                            "Delete",
+                            if (uiState.isViewingTrash) "Delete Forever" else "Trash",
                             style = MaterialTheme.typography.labelMedium,
                             fontWeight = FontWeight.Bold,
                             color = PhotoHubRed.copy(alpha = if (actionsEnabled) 1f else 0.45f)
@@ -1741,6 +1807,38 @@ private fun ServerThumbnailCell(
                     "Video",
                     style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.Bold,
+                    color = Color.White
+                )
+            }
+        }
+
+        if (photo.isFavorited && !photo.isTrashed) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(6.dp)
+                    .size(22.dp)
+                    .clip(CircleShape)
+                    .background(PhotoHubRed.copy(alpha = 0.88f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(Icons.Rounded.Favorite, null, tint = Color.White, modifier = Modifier.size(13.dp))
+            }
+        }
+
+        if (photo.isTrashed && photo.daysRemaining != null) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(6.dp)
+                    .clip(CircleShape)
+                    .background(PhotoHubRed.copy(alpha = 0.88f))
+                    .padding(horizontal = 7.dp, vertical = 2.dp)
+            ) {
+                Text(
+                    "${photo.daysRemaining}d",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.ExtraBold,
                     color = Color.White
                 )
             }

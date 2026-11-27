@@ -9,6 +9,31 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import java.net.URI
 
+enum class BackupStorageMode(
+    val rawValue: String,
+    val title: String,
+    val shortTitle: String,
+    val subtitle: String
+) {
+    OPTIMIZE_STORAGE(
+        rawValue = "optimize_storage",
+        title = "Optimize Phone Storage",
+        shortTitle = "Optimize Storage",
+        subtitle = "Back up full-res originals & keep lightweight previews on phone to save up to 90% space."
+    ),
+    BACKUP_ONLY(
+        rawValue = "backup_only",
+        title = "Backup Only",
+        shortTitle = "Backup Only",
+        subtitle = "Back up full-res photos & videos safely to cloud without deleting or modifying phone media."
+    );
+
+    companion object {
+        fun fromRaw(raw: String?): BackupStorageMode =
+            entries.firstOrNull { it.rawValue == raw } ?: OPTIMIZE_STORAGE
+    }
+}
+
 enum class ProxyResolutionPreset(
     val maxPixelSize: Int,
     val title: String,
@@ -57,6 +82,8 @@ data class AppSettingsState(
     val userFolder: String = "",
     val serverStorage: ServerStorageInfo? = null,
     val serverS3Enabled: Boolean = false,
+    val backupStorageMode: BackupStorageMode = BackupStorageMode.OPTIMIZE_STORAGE,
+    val hasCompletedOnboarding: Boolean = false,
     val uploadMode: UploadMode = UploadMode.DIRECT_VPS,
     val proxyFormat: ProxyFormat = ProxyFormat.HEIC,
     val proxyMaxPixelSize: Int = 0,
@@ -69,6 +96,7 @@ data class AppSettingsState(
     val autoSaveProxiesToPhotosApp: Boolean = false,
     val nightlyAutoBackupEnabled: Boolean = true,
     val nightlyRequiresCharging: Boolean = false,
+    val wifiOnlyBackup: Boolean = false,
     val notifyWhenBackgroundUploadFinishes: Boolean = true,
     val silentAutoDeleteOriginals: Boolean = false,
     val morningReminderHour: Int = 8,
@@ -76,6 +104,9 @@ data class AppSettingsState(
 ) {
     val isSignedIn: Boolean
         get() = authToken.trim().isNotEmpty()
+
+    val isBackupOnlyMode: Boolean
+        get() = backupStorageMode == BackupStorageMode.BACKUP_ONLY
 
     val gatewayUrl: String?
         get() = normalizeUrl(BuildConfig.PHOTOHUB_GATEWAY_URL, defaultScheme = "https")
@@ -135,6 +166,8 @@ class AppSettings private constructor(context: Context) {
     }
 
     private object PrefKeys {
+        const val BACKUP_STORAGE_MODE = "backupStorageMode"
+        const val HAS_COMPLETED_ONBOARDING = "hasCompletedOnboarding"
         const val UPLOAD_MODE = "uploadMode"
         const val SERVER_S3_ENABLED = "serverS3Enabled"
         const val PROXY_FORMAT = "proxyFormat"
@@ -148,6 +181,7 @@ class AppSettings private constructor(context: Context) {
         const val AUTO_SAVE_PHOTOS = "autoSaveProxiesToPhotosApp"
         const val NIGHTLY_BACKUP = "nightlyAutoBackupEnabled"
         const val NIGHTLY_CHARGING = "nightlyRequiresCharging"
+        const val WIFI_ONLY_BACKUP = "wifiOnlyBackup"
         const val NOTIFY_ON_FINISH = "notifyWhenBackgroundUploadFinishes"
         const val SILENT_AUTO_DELETE = "silentAutoDeleteOriginals"
         const val MORNING_HOUR = "morningReminderHour"
@@ -174,6 +208,10 @@ class AppSettings private constructor(context: Context) {
         userName = SecureTokenStore.get(appContext, SessionKeys.USER_NAME).orEmpty(),
         userFolder = SecureTokenStore.get(appContext, SessionKeys.USER_FOLDER).orEmpty(),
         serverS3Enabled = prefs.getBoolean(PrefKeys.SERVER_S3_ENABLED, false),
+        backupStorageMode = BackupStorageMode.fromRaw(
+            prefs.getString(PrefKeys.BACKUP_STORAGE_MODE, BackupStorageMode.OPTIMIZE_STORAGE.rawValue)
+        ),
+        hasCompletedOnboarding = prefs.getBoolean(PrefKeys.HAS_COMPLETED_ONBOARDING, false),
         uploadMode = if (prefs.getBoolean(PrefKeys.SERVER_S3_ENABLED, false)) UploadMode.S3_PRESIGNED else UploadMode.DIRECT_VPS,
         proxyFormat = ProxyFormat.fromRaw(prefs.getString(PrefKeys.PROXY_FORMAT, ProxyFormat.HEIC.rawValue)),
         proxyMaxPixelSize = prefs.getInt(PrefKeys.PROXY_MAX_PX, 0),
@@ -186,6 +224,7 @@ class AppSettings private constructor(context: Context) {
         autoSaveProxiesToPhotosApp = prefs.getBoolean(PrefKeys.AUTO_SAVE_PHOTOS, false),
         nightlyAutoBackupEnabled = prefs.getBoolean(PrefKeys.NIGHTLY_BACKUP, true),
         nightlyRequiresCharging = prefs.getBoolean(PrefKeys.NIGHTLY_CHARGING, false),
+        wifiOnlyBackup = prefs.getBoolean(PrefKeys.WIFI_ONLY_BACKUP, false),
         notifyWhenBackgroundUploadFinishes = prefs.getBoolean(PrefKeys.NOTIFY_ON_FINISH, true),
         silentAutoDeleteOriginals = prefs.getBoolean(PrefKeys.SILENT_AUTO_DELETE, false),
         morningReminderHour = prefs.getInt(PrefKeys.MORNING_HOUR, 8),
@@ -311,6 +350,28 @@ class AppSettings private constructor(context: Context) {
         }
     }
 
+    fun setBackupStorageMode(mode: BackupStorageMode) {
+        prefs.edit().putString(PrefKeys.BACKUP_STORAGE_MODE, mode.rawValue).apply()
+        _state.update { it.copy(backupStorageMode = mode) }
+    }
+
+    fun completeOnboarding(mode: BackupStorageMode) {
+        val editor = prefs.edit()
+            .putString(PrefKeys.BACKUP_STORAGE_MODE, mode.rawValue)
+            .putBoolean(PrefKeys.HAS_COMPLETED_ONBOARDING, true)
+        if (mode == BackupStorageMode.OPTIMIZE_STORAGE) {
+            editor.putBoolean(PrefKeys.KEEP_LOCAL_PROXY, true)
+        }
+        editor.apply()
+        _state.update {
+            it.copy(
+                backupStorageMode = mode,
+                hasCompletedOnboarding = true,
+                keepLocalProxyInPhotos = if (mode == BackupStorageMode.OPTIMIZE_STORAGE) true else it.keepLocalProxyInPhotos
+            )
+        }
+    }
+
     fun setUploadMode(mode: UploadMode) {
         prefs.edit().putString(PrefKeys.UPLOAD_MODE, mode.rawValue).apply()
         _state.update { it.copy(uploadMode = mode) }
@@ -365,6 +426,11 @@ class AppSettings private constructor(context: Context) {
     fun setNightlyRequiresCharging(enabled: Boolean) {
         prefs.edit().putBoolean(PrefKeys.NIGHTLY_CHARGING, enabled).apply()
         _state.update { it.copy(nightlyRequiresCharging = enabled) }
+    }
+
+    fun setWifiOnlyBackup(enabled: Boolean) {
+        prefs.edit().putBoolean(PrefKeys.WIFI_ONLY_BACKUP, enabled).apply()
+        _state.update { it.copy(wifiOnlyBackup = enabled) }
     }
 
     fun setNotifyWhenBackgroundUploadFinishes(enabled: Boolean) {

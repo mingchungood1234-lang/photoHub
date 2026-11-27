@@ -2181,3 +2181,335 @@ test('Web frontend assets serve cleanly and Google PKCE allows same-origin web c
     await ctx.cleanup();
   }
 });
+
+test('Favorites, smart search, 30-day Trash lifecycle, Bulk ZIP download, Public Share links, and PWA endpoints work end-to-end', async (t) => {
+  const ctx = await startTestServer({
+    userKeys: 'alice_key:alice,bob_key:bob',
+  });
+  t.after(() => ctx.cleanup());
+
+  // 1. PWA endpoints serve manifest & service worker cleanly
+  const manifestRes = await ctx.request('/manifest.webmanifest');
+  assert.equal(manifestRes.status, 200);
+  const manifestJson = await manifestRes.json();
+  assert.ok(manifestJson.name && manifestJson.short_name === 'PhotoHub');
+
+  const swRes = await ctx.request('/sw.js');
+  assert.equal(swRes.status, 200);
+  const swText = swRes.buffer.toString('utf8');
+  assert.ok(swText.includes('photohub-shell'));
+
+  // 2. Upload two photos + one video for Alice
+  const img1Bytes = Buffer.from('jpeg-favorite-beach-photo-payload-2026-11');
+  const img2Bytes = Buffer.from('jpeg-second-mountain-photo-payload-2026-11');
+  const vidBytes = Buffer.from('mp4-vacation-clip-payload-2026-11');
+
+  const up1 = await (
+    await ctx.request('/api/upload', {
+      method: 'POST',
+      headers: {
+        'X-API-Key': 'alice_key',
+        'X-File-Name': 'IMG_BEACH.jpg',
+        'X-Photo-Date': '2026-11-15T10:30:00Z',
+        'Content-Type': 'image/jpeg',
+      },
+      body: img1Bytes,
+    })
+  ).json();
+  const up2 = await (
+    await ctx.request('/api/upload', {
+      method: 'POST',
+      headers: {
+        'X-API-Key': 'alice_key',
+        'X-File-Name': 'IMG_MOUNTAIN.jpg',
+        'X-Photo-Date': '2026-08-03T12:00:00Z',
+        'Content-Type': 'image/jpeg',
+      },
+      body: img2Bytes,
+    })
+  ).json();
+  const upVid = await (
+    await ctx.request('/api/upload', {
+      method: 'POST',
+      headers: {
+        'X-API-Key': 'alice_key',
+        'X-File-Name': 'CLIP_TRIP.mp4',
+        'X-Photo-Date': '2026-11-18T18:00:00Z',
+        'Content-Type': 'video/mp4',
+      },
+      body: vidBytes,
+    })
+  ).json();
+  assert.equal(up1.success, true);
+  assert.equal(up2.success, true);
+  assert.equal(upVid.success, true);
+
+  // 3. Favorites toggle & filter + smart multi-token search (month name + media keyword)
+  const favRes = await ctx.request(`/api/photo/${up1.hash}/favorite`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-Key': 'alice_key' },
+    body: JSON.stringify({ isFavorite: true }),
+  });
+  assert.equal(favRes.status, 200);
+  const favBody = await favRes.json();
+  assert.equal(favBody.isFavorite, true);
+  assert.equal(favBody.photo.isFavorite, true);
+
+  const favList = await (
+    await ctx.request('/api/photos?favorite=1', { headers: { 'X-API-Key': 'alice_key' } })
+  ).json();
+  assert.equal(favList.total, 1);
+  assert.equal(favList.photos[0].hash, up1.hash);
+
+  const smartMonthSearch = await (
+    await ctx.request('/api/photos?q=nov%202026', { headers: { 'X-API-Key': 'alice_key' } })
+  ).json();
+  assert.equal(smartMonthSearch.total, 2);
+
+  const smartVideoSearch = await (
+    await ctx.request('/api/photos?q=nov%20video', { headers: { 'X-API-Key': 'alice_key' } })
+  ).json();
+  assert.equal(smartVideoSearch.total, 1);
+  assert.equal(smartVideoSearch.photos[0].hash, upVid.hash);
+
+  // 4. Bulk streaming ZIP download (STORE archive with valid PKZIP headers & payload)
+  const zipRes = await ctx.request('/api/photos/download-zip', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-Key': 'alice_key' },
+    body: JSON.stringify({ hashes: [up1.hash, up2.hash], filename: 'trip-photos.zip' }),
+  });
+  assert.equal(zipRes.status, 200);
+  assert.equal(zipRes.headers['content-type'], 'application/zip');
+  const zipBuf = zipRes.buffer;
+  assert.equal(zipBuf.readUInt32LE(0), 0x04034b50); // Local File Header PK\x03\x04
+  assert.ok(zipBuf.includes(Buffer.from('IMG_BEACH.jpg')));
+  assert.ok(zipBuf.includes(Buffer.from('IMG_MOUNTAIN.jpg')));
+  assert.ok(zipBuf.includes(img1Bytes));
+  assert.ok(zipBuf.includes(img2Bytes));
+  assert.ok(zipBuf.includes(Buffer.from([0x50, 0x4b, 0x05, 0x06]))); // EOCD signature
+
+  // 5. Public Share Link with Passcode + Expiry + Revocation (submitted oldest-first -> returned newest-first)
+  const shareCreate = await ctx.request('/api/shares', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-Key': 'alice_key' },
+    body: JSON.stringify({
+      hashes: [up2.hash, up1.hash],
+      title: 'Beach Weekend',
+      expiresInHours: 24,
+      passcode: 'sunny2026',
+    }),
+  });
+  assert.equal(shareCreate.status, 201);
+  const shareCreateBody = await shareCreate.json();
+  assert.equal(shareCreateBody.success, true);
+  assert.equal(shareCreateBody.share.hasPasscode, true);
+  assert.equal(shareCreateBody.share.itemCount, 2);
+  assert.ok(shareCreateBody.share.shareUrl);
+  assert.equal(shareCreateBody.share.url, shareCreateBody.share.shareUrl);
+  const shareToken = shareCreateBody.share.token;
+
+  // Public share page HTML loads cleanly
+  const shareHtmlRes = await ctx.request(`/s/${shareToken}`);
+  assert.equal(shareHtmlRes.status, 200);
+  assert.ok(shareHtmlRes.buffer.toString('utf8').includes('PhotoHub'));
+
+  // Without passcode -> 401 requiresPasscode
+  const lockedMeta = await ctx.request(`/api/public/share/${shareToken}`);
+  assert.equal(lockedMeta.status, 401);
+  const lockedBody = await lockedMeta.json();
+  assert.equal(lockedBody.requiresPasscode, true);
+
+  // Wrong passcode -> 401
+  const wrongPassMeta = await ctx.request(`/api/public/share/${shareToken}`, {
+    headers: { 'X-Share-Passcode': 'wrongpass' },
+  });
+  assert.equal(wrongPassMeta.status, 401);
+
+  // Correct passcode -> 200 with both items + original download works
+  const unlockedMeta = await ctx.request(`/api/public/share/${shareToken}`, {
+    headers: { 'X-Share-Passcode': 'sunny2026' },
+  });
+  assert.equal(unlockedMeta.status, 200);
+  const unlockedBody = await unlockedMeta.json();
+  assert.equal(unlockedBody.share.title, 'Beach Weekend');
+  assert.equal(unlockedBody.photos.length, 2);
+  // Newest photo (2026-11-15 up1) must be shown before older photo (2026-08-03 up2)
+  assert.equal(unlockedBody.photos[0].hash, up1.hash);
+  assert.equal(unlockedBody.photos[1].hash, up2.hash);
+
+  const sharePrev = await ctx.request(`/api/public/share/${shareToken}/preview/${up1.hash}`, {
+    headers: { 'X-Share-Passcode': 'sunny2026' },
+  });
+  assert.equal(sharePrev.status, 200);
+
+  const shareDl = await ctx.request(`/api/public/share/${shareToken}/download/${up1.hash}`, {
+    headers: { 'X-Share-Passcode': 'sunny2026' },
+  });
+  assert.equal(shareDl.status, 200);
+  assert.deepEqual(shareDl.buffer, img1Bytes);
+
+  // Revoke share link -> 404 thereafter
+  const revokeRes = await ctx.request(`/api/shares/${shareToken}`, {
+    method: 'DELETE',
+    headers: { 'X-API-Key': 'alice_key' },
+  });
+  assert.equal(revokeRes.status, 200);
+  const revokedFetch = await ctx.request(`/api/public/share/${shareToken}`, {
+    headers: { 'X-Share-Passcode': 'sunny2026' },
+  });
+  assert.equal(revokedFetch.status, 404);
+
+  // 6. 30-Day Server Trash: soft-delete, list, preview still served, restore, soft-delete via mode=trash, empty permanently
+  const trashRes = await ctx.request('/api/photos/trash', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-Key': 'alice_key' },
+    body: JSON.stringify({ hashes: [up2.hash] }),
+  });
+  assert.equal(trashRes.status, 200);
+  const trashBody = await trashRes.json();
+  assert.deepEqual(trashBody.deleted, [up2.hash]);
+
+  // Active gallery excludes trashed item and reports trashCount=1; /api/check reports exists=false
+  const activeAfterTrash = await (
+    await ctx.request('/api/photos', { headers: { 'X-API-Key': 'alice_key' } })
+  ).json();
+  assert.equal(activeAfterTrash.total, 2);
+  assert.equal(activeAfterTrash.trashCount, 1);
+
+  const checkTrashed = await (
+    await ctx.request(`/api/check/${up2.hash}`, { headers: { 'X-API-Key': 'alice_key' } })
+  ).json();
+  assert.equal(checkTrashed.exists, false);
+
+  // Trash endpoint lists item with daysRemaining (~30) & preview still works
+  const listTrash = await (
+    await ctx.request('/api/photos/trash', { headers: { 'X-API-Key': 'alice_key' } })
+  ).json();
+  assert.equal(listTrash.total, 1);
+  assert.equal(listTrash.photos[0].hash, up2.hash);
+  assert.ok(listTrash.photos[0].daysRemaining >= 29);
+
+  const trashedPreview = await ctx.request(`/api/photo/${up2.hash}/preview`, {
+    headers: { 'X-API-Key': 'alice_key' },
+  });
+  assert.equal(trashedPreview.status, 200);
+
+  // Restore from Trash brings it right back into active gallery
+  const restoreRes = await ctx.request('/api/photos/trash/restore', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-Key': 'alice_key' },
+    body: JSON.stringify({ hashes: [up2.hash] }),
+  });
+  assert.equal(restoreRes.status, 200);
+  const restoreBody = await restoreRes.json();
+  assert.deepEqual(restoreBody.restored, [up2.hash]);
+
+  const activeAfterRestore = await (
+    await ctx.request('/api/photos', { headers: { 'X-API-Key': 'alice_key' } })
+  ).json();
+  assert.equal(activeAfterRestore.total, 3);
+  assert.equal(activeAfterRestore.trashCount, 0);
+
+  // Soft-delete via /api/photos/delete with mode: 'trash', then permanently empty trash
+  const softDelRes = await ctx.request('/api/photos/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-Key': 'alice_key' },
+    body: JSON.stringify({ hashes: [up2.hash], mode: 'trash' }),
+  });
+  assert.equal(softDelRes.status, 200);
+  const up2MasterPath = path.join(ctx.storageDir, 'alice', up2.savedPath);
+  assert.ok(await fsp.stat(up2MasterPath)); // Still safely on disk while in Trash
+
+  const emptyRes = await ctx.request('/api/photos/trash/empty', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-Key': 'alice_key' },
+    body: JSON.stringify({}),
+  });
+  assert.equal(emptyRes.status, 200);
+  const emptyBody = await emptyRes.json();
+  assert.deepEqual(emptyBody.deleted, [up2.hash]);
+  assert.ok(emptyBody.freedBytes >= img2Bytes.length);
+  await assert.rejects(() => fsp.stat(up2MasterPath)); // Permanently removed from disk
+});
+
+test('Duplicate prevention blocks tagged proxy re-uploads (filename & EXIF marker) and serializes concurrent identical uploads', async (t) => {
+  const ctx = await startTestServer({
+    userKeys: 'alice_key:alice',
+  });
+  t.after(() => ctx.cleanup());
+
+  // 1. Concurrent identical uploads serialize cleanly -> 1 stored_verified, 1 duplicate_verified, 1 indexed item
+  const racePayload = Buffer.from('concurrent-identical-upload-photo-bytes-2026');
+  const [r1, r2] = await Promise.all([
+    ctx.request('/api/upload', {
+      method: 'POST',
+      headers: {
+        'X-API-Key': 'alice_key',
+        'X-File-Name': 'IMG_RACE.jpg',
+        'X-Photo-Date': '2026-11-20T09:00:00Z',
+        'Content-Type': 'image/jpeg',
+      },
+      body: racePayload,
+    }),
+    ctx.request('/api/upload', {
+      method: 'POST',
+      headers: {
+        'X-API-Key': 'alice_key',
+        'X-File-Name': 'IMG_RACE.jpg',
+        'X-Photo-Date': '2026-11-20T09:00:00Z',
+        'Content-Type': 'image/jpeg',
+      },
+      body: racePayload,
+    }),
+  ]);
+  assert.equal(r1.status, 200);
+  assert.equal(r2.status, 200);
+  const b1 = await r1.json();
+  const b2 = await r2.json();
+  const statuses = [b1.status, b2.status].sort();
+  assert.deepEqual(statuses, ['duplicate_verified', 'stored_verified']);
+  const masterHash = b1.hash;
+
+  // 2. Re-uploading a compressed proxy identified by PHOTOHUB_PROXY_<prefix16> filename is blocked as existing_proxy
+  const proxyPrefix = masterHash.slice(0, 16);
+  const proxyByNameRes = await ctx.request('/api/upload', {
+    method: 'POST',
+    headers: {
+      'X-API-Key': 'alice_key',
+      'X-File-Name': `PHOTOHUB_PROXY_${proxyPrefix}.jpg`,
+      'Content-Type': 'image/jpeg',
+    },
+    body: Buffer.from('re-encoded-compressed-proxy-bytes-different-sha'),
+  });
+  assert.equal(proxyByNameRes.status, 200);
+  const proxyByNameBody = await proxyByNameRes.json();
+  assert.equal(proxyByNameBody.isProxy, true);
+  assert.equal(proxyByNameBody.isDuplicate, true);
+  assert.equal(proxyByNameBody.canDelete, false);
+  assert.equal(proxyByNameBody.masterHash, masterHash);
+
+  // 3. Re-uploading a renamed proxy carrying embedded PhotoHubProxy:<masterHash> metadata is also blocked
+  const renamedProxyBytes = Buffer.from(`fake-jpeg-header-PhotoHubProxy:${masterHash}-tiny-payload`);
+  const proxyByMarkerRes = await ctx.request('/api/upload', {
+    method: 'POST',
+    headers: {
+      'X-API-Key': 'alice_key',
+      'X-File-Name': 'Renamed_Copy_01.jpg',
+      'Content-Type': 'image/jpeg',
+    },
+    body: renamedProxyBytes,
+  });
+  assert.equal(proxyByMarkerRes.status, 200);
+  const proxyByMarkerBody = await proxyByMarkerRes.json();
+  assert.equal(proxyByMarkerBody.isProxy, true);
+  assert.equal(proxyByMarkerBody.isDuplicate, true);
+  assert.equal(proxyByMarkerBody.canDelete, false);
+  assert.equal(proxyByMarkerBody.masterHash, masterHash);
+
+  // Verify gallery still has ONLY the single original master (zero duplicates stored!)
+  const listAfter = await (
+    await ctx.request('/api/photos', { headers: { 'X-API-Key': 'alice_key' } })
+  ).json();
+  assert.equal(listAfter.total, 1);
+  assert.equal(listAfter.photos[0].hash, masterHash);
+});

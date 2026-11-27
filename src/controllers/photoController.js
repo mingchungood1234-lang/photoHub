@@ -20,8 +20,59 @@ const zlib = require('zlib');
 const { promisify } = require('util');
 const { isS3Configured, createPresignedUrl, deleteS3Object } = require('../services/s3Service');
 const { isVideoFilename } = require('../services/proxyService');
+const {
+  streamZipToResponse,
+  createDiskReadStream,
+  createHttpReadStream,
+} = require('../services/zipStreamService');
 
 const MAX_BATCH_DELETE_COUNT = 500;
+const MAX_ZIP_ITEMS = 250;
+const TRASH_RETENTION_DAYS = 30;
+const TRASH_RETENTION_MS = TRASH_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+
+const MONTH_KEYWORDS = [
+  ['january', 'jan'],
+  ['february', 'feb'],
+  ['march', 'mar'],
+  ['april', 'apr'],
+  ['may'],
+  ['june', 'jun'],
+  ['july', 'jul'],
+  ['august', 'aug'],
+  ['september', 'sept', 'sep'],
+  ['october', 'oct'],
+  ['november', 'nov'],
+  ['december', 'dec'],
+];
+
+function matchesSmartSearchQuery(item, rawQuery) {
+  const q = String(rawQuery || '').trim().toLowerCase();
+  if (!q) return true;
+  const tokens = q.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return true;
+
+  const isVid = isVideoFilename(item.originalName || item.savedPath || '');
+  const dateStr = String(item.photoDate || (item.takenAt || '').slice(0, 10) || (item.uploadedAt || '').slice(0, 10));
+  const monthNum = /^\d{4}-(\d{2})/.test(dateStr) ? Number(dateStr.slice(5, 7)) : 0;
+  const monthNames = monthNum >= 1 && monthNum <= 12 ? MONTH_KEYWORDS[monthNum - 1] : [];
+
+  const haystack = [
+    item.originalName || '',
+    item.photoDate || '',
+    item.takenAt || '',
+    item.savedPath || '',
+    item.cameraModel || '',
+    ...monthNames,
+    isVid ? 'video videos movie clip' : 'photo photos image picture',
+    item.isFavorite ? 'favorite favorites fav starred heart' : '',
+    item.keepOriginalOnDevice ? 'protected restored original' : '',
+  ]
+    .join(' ')
+    .toLowerCase();
+
+  return tokens.every((tok) => haystack.includes(tok));
+}
 
 const gzipAsync = promisify(zlib.gzip);
 
@@ -96,9 +147,12 @@ function sendImmutableMediaFile(
 }
 
 function createPhotoController({ config }) {
-  async function lookupPhotoOr404(req, res) {
+  async function lookupPhotoOr404(req, res, { includeTrashed = true } = {}) {
     const { hashIndex } = req.userContext;
-    const lookupResult = await hashIndex.lookup(req.params.hash, { allowStatFastPath: true });
+    const lookupResult = await hashIndex.lookup(req.params.hash, {
+      allowStatFastPath: true,
+      includeTrashed,
+    });
     if (lookupResult.status === 'missing' || !lookupResult.record) {
       res.status(404).json({
         success: false,
@@ -192,21 +246,53 @@ function createPhotoController({ config }) {
     );
   }
 
+  const lastTrashPurgeByIndex = new WeakMap();
+
+  async function purgeExpiredTrashIfDue(hashIndex, storageDir, force = false) {
+    const now = Date.now();
+    const last = lastTrashPurgeByIndex.get(hashIndex) || 0;
+    if (!force && now - last < 60 * 60 * 1000) return 0;
+    lastTrashPurgeByIndex.set(hashIndex, now);
+
+    const expired = hashIndex.getExpiredTrashRecords(TRASH_RETENTION_MS);
+    if (expired.length === 0) return 0;
+
+    const keysToRemove = new Set();
+    let purgedCount = 0;
+    for (const found of expired) {
+      try {
+        await deleteRecordFiles({ storageDir, record: found.record });
+        for (const k of found.keys) keysToRemove.add(k);
+        purgedCount += 1;
+      } catch {
+        // retry on next cycle
+      }
+    }
+    if (keysToRemove.size > 0) {
+      await hashIndex.removeKeys(Array.from(keysToRemove), { persist: true });
+    }
+    return purgedCount;
+  }
+
   return {
     async listPhotos(req, res) {
       try {
-        const { hashIndex, folderName } = req.userContext;
+        const { hashIndex, folderName, storageDir } = req.userContext;
         if (req.query.sync === '1' || req.query.sync === 'true') {
           await hashIndex.syncStorageDir();
         }
+        await purgeExpiredTrashIfDue(hashIndex, storageDir, false);
+
         const limit = Math.min(1000, Math.max(1, Number(req.query.limit) || 200));
         const offset = Math.max(0, Number(req.query.offset) || 0);
         const yearParam = req.query.year ? String(req.query.year).trim() : '';
         const mediaTypeParam = req.query.mediaType ? String(req.query.mediaType).trim() : '';
         const prefixParam = req.query.prefix ? String(req.query.prefix).trim().toLowerCase() : '';
+        const favoriteParam = req.query.favorite === '1' || req.query.favorite === 'true' ? '1' : '';
+        const searchParam = req.query.q ? String(req.query.q).trim() : '';
         const orderParam = req.query.order === 'asc' ? 'asc' : 'desc';
 
-        const etag = `W/"v${hashIndex.version || 1}-${hashIndex.size()}-${offset}-${limit}-${yearParam}-${mediaTypeParam}-${prefixParam}-${orderParam}"`;
+        const etag = `W/"v${hashIndex.version || 1}-${hashIndex.size()}-${offset}-${limit}-${yearParam}-${mediaTypeParam}-${prefixParam}-${favoriteParam}-${encodeURIComponent(searchParam)}-${orderParam}"`;
         res.setHeader('ETag', etag);
         res.setHeader('Cache-Control', 'private, no-cache');
         const ifNoneMatch = String(req.headers['if-none-match'] || '').trim();
@@ -215,6 +301,7 @@ function createPhotoController({ config }) {
         }
 
         let all = hashIndex.listMasters();
+        const storageUsage = hashIndex.getStorageUsage();
 
         const yearCountsMap = new Map();
         for (const item of all) {
@@ -237,6 +324,12 @@ function createPhotoController({ config }) {
             return wantVideo ? isVid : !isVid;
           });
         }
+        if (favoriteParam === '1') {
+          all = all.filter((item) => Boolean(item.isFavorite));
+        }
+        if (searchParam) {
+          all = all.filter((item) => matchesSmartSearchQuery(item, searchParam));
+        }
         if (req.query.prefix && /^[0-9a-f]{8,64}$/i.test(String(req.query.prefix).trim())) {
           const targetPrefix = String(req.query.prefix).trim().toLowerCase();
           all = all.filter((item) => String(item.hash || '').toLowerCase().startsWith(targetPrefix));
@@ -250,6 +343,7 @@ function createPhotoController({ config }) {
           success: true,
           userFolder: folderName,
           total: all.length,
+          trashCount: storageUsage.trashItemCount || 0,
           hasMore: offset + photos.length < all.length,
           years,
           photos,
@@ -370,6 +464,243 @@ function createPhotoController({ config }) {
       }
     },
 
+    async setFavorite(req, res) {
+      try {
+        const { hashIndex } = req.userContext;
+        const body = req.body || {};
+        const isFav =
+          body.isFavorite !== undefined
+            ? Boolean(body.isFavorite)
+            : body.favorite !== undefined
+              ? Boolean(body.favorite)
+              : true;
+
+        const updated = await hashIndex.setFavorite(req.params.hash, isFav);
+        if (!updated) {
+          return res.status(404).json({
+            success: false,
+            error: 'Photo not found',
+          });
+        }
+
+        return res.json({
+          success: true,
+          isFavorite: Boolean(updated.isFavorite),
+          photo: hashIndex.formatMasterSummary(updated, req.params.hash),
+        });
+      } catch (err) {
+        return res.status(500).json({
+          success: false,
+          error: err.message,
+        });
+      }
+    },
+
+    async listTrash(req, res) {
+      try {
+        const { hashIndex, storageDir } = req.userContext;
+        await purgeExpiredTrashIfDue(hashIndex, storageDir, true);
+        const photos = hashIndex.listTrashed(TRASH_RETENTION_DAYS);
+        const usage = hashIndex.getStorageUsage();
+        return sendJsonOptimized(req, res, {
+          success: true,
+          retentionDays: TRASH_RETENTION_DAYS,
+          total: photos.length,
+          trashBytes: usage.trashBytes || 0,
+          photos,
+        });
+      } catch (err) {
+        return res.status(500).json({
+          success: false,
+          error: err.message,
+        });
+      }
+    },
+
+    async moveToTrash(req, res) {
+      try {
+        const { hashIndex } = req.userContext;
+        const rawHashes = req.body && Array.isArray(req.body.hashes) ? req.body.hashes : null;
+        if (!rawHashes || rawHashes.length === 0) {
+          return res.status(400).json({
+            success: false,
+            error: 'JSON body must include a non-empty "hashes" array.',
+          });
+        }
+        const { trashed, missing } = await hashIndex.moveToTrash(
+          rawHashes.slice(0, MAX_BATCH_DELETE_COUNT)
+        );
+        return res.json({
+          success: true,
+          mode: 'trash',
+          trashed,
+          deleted: trashed,
+          missing,
+          trashedCount: trashed.length,
+          deletedCount: trashed.length,
+          freedBytes: 0,
+          retentionDays: TRASH_RETENTION_DAYS,
+          storage: hashIndex.getStorageUsage(),
+        });
+      } catch (err) {
+        return res.status(err.statusCode || 500).json({
+          success: false,
+          error: err.message,
+        });
+      }
+    },
+
+    async restoreFromTrash(req, res) {
+      try {
+        const { hashIndex } = req.userContext;
+        const rawHashes = req.body && Array.isArray(req.body.hashes) ? req.body.hashes : null;
+        if (!rawHashes || rawHashes.length === 0) {
+          return res.status(400).json({
+            success: false,
+            error: 'JSON body must include a non-empty "hashes" array.',
+          });
+        }
+        const { restored, missing } = await hashIndex.restoreFromTrash(
+          rawHashes.slice(0, MAX_BATCH_DELETE_COUNT)
+        );
+        return res.json({
+          success: true,
+          restored,
+          missing,
+          restoredCount: restored.length,
+          storage: hashIndex.getStorageUsage(),
+        });
+      } catch (err) {
+        return res.status(err.statusCode || 500).json({
+          success: false,
+          error: err.message,
+        });
+      }
+    },
+
+    async emptyTrash(req, res) {
+      try {
+        const { hashIndex, storageDir } = req.userContext;
+        const rawHashes = req.body && Array.isArray(req.body.hashes) && req.body.hashes.length > 0
+          ? req.body.hashes.slice(0, MAX_BATCH_DELETE_COUNT)
+          : hashIndex.listTrashed(TRASH_RETENTION_DAYS).map((p) => p.hash);
+
+        const keysToRemove = new Set();
+        const handledCanonical = new Set();
+        const deleted = [];
+        const failed = [];
+        let freedBytes = 0;
+
+        for (const raw of rawHashes) {
+          const norm = String(raw || '').trim().toLowerCase();
+          const found = hashIndex.findMasterRecordKeys(norm);
+          if (!found || !found.record || !found.record.deletedAt) continue;
+          if (handledCanonical.has(found.canonicalHash)) continue;
+          handledCanonical.add(found.canonicalHash);
+          try {
+            const bytes = await deleteRecordFiles({ storageDir, record: found.record });
+            freedBytes += bytes;
+            deleted.push(found.canonicalHash);
+            for (const k of found.keys) keysToRemove.add(k);
+          } catch (err) {
+            failed.push({ hash: found.canonicalHash, error: err.message || 'Delete failed' });
+          }
+        }
+
+        if (keysToRemove.size > 0) {
+          await hashIndex.removeKeys(Array.from(keysToRemove), { persist: true });
+        }
+
+        return res.json({
+          success: failed.length === 0,
+          deleted,
+          failed,
+          deletedCount: deleted.length,
+          freedBytes,
+          storage: hashIndex.getStorageUsage(),
+        });
+      } catch (err) {
+        return res.status(err.statusCode || 500).json({
+          success: false,
+          error: err.message,
+        });
+      }
+    },
+
+    async downloadZip(req, res) {
+      try {
+        const { hashIndex, storageDir } = req.userContext;
+        const rawHashes = req.body && Array.isArray(req.body.hashes) ? req.body.hashes : null;
+        if (!rawHashes || rawHashes.length === 0) {
+          return res.status(400).json({
+            success: false,
+            error: 'JSON body must include a non-empty "hashes" array.',
+          });
+        }
+
+        const entries = [];
+        const seen = new Set();
+        for (const raw of rawHashes) {
+          const norm = String(raw || '').trim().toLowerCase();
+          if (!norm || seen.has(norm)) continue;
+          seen.add(norm);
+          const found = await hashIndex.lookup(norm, { allowStatFastPath: true, includeTrashed: true });
+          if (found.status === 'missing' || !found.record) continue;
+          const record = found.record;
+          const entryDate = record.takenAt
+            ? new Date(record.takenAt)
+            : record.uploadedAt
+              ? new Date(record.uploadedAt)
+              : new Date();
+          const name = record.originalName || path.basename(record.relativePath || `${found.masterHash.slice(0, 12)}.bin`);
+
+          if (record.storageType === 's3' && isS3Configured(config.s3)) {
+            entries.push({
+              name,
+              date: entryDate,
+              openStream: () => {
+                const url = createPresignedUrl({
+                  s3Config: config.s3,
+                  method: 'GET',
+                  objectKey: record.relativePath,
+                  expiresIn: 300,
+                });
+                return createHttpReadStream(url);
+              },
+            });
+          } else if (record.relativePath) {
+            const fullPath = resolveInsideStorageDir(storageDir, record.relativePath);
+            if (fullPath && (await fileExistsAsync(fullPath))) {
+              entries.push({
+                name,
+                date: entryDate,
+                openStream: async () => createDiskReadStream(fullPath),
+              });
+            }
+          }
+          if (entries.length >= MAX_ZIP_ITEMS) break;
+        }
+
+        if (entries.length === 0) {
+          return res.status(404).json({
+            success: false,
+            error: 'No downloadable files found for the selected items.',
+          });
+        }
+
+        const stamp = new Date().toISOString().slice(0, 10);
+        res.setHeader('Content-Type', 'application/zip');
+        res.setHeader('Content-Disposition', `attachment; filename="PhotoHub-${stamp}.zip"`);
+        res.setHeader('Cache-Control', 'no-store');
+        return streamZipToResponse(res, entries);
+      } catch (err) {
+        if (!res.headersSent) {
+          return res.status(500).json({ success: false, error: err.message });
+        }
+        return res.end();
+      }
+    },
+
     async deletePhoto(req, res) {
       try {
         const { hashIndex, storageDir } = req.userContext;
@@ -411,6 +742,25 @@ function createPhotoController({ config }) {
           return res.status(400).json({
             success: false,
             error: 'JSON body must include a "hashes" array.',
+          });
+        }
+
+        // Optional 30-day soft-delete mode (`mode: 'trash'` or `soft: true`)
+        if (req.body && (req.body.mode === 'trash' || req.body.soft === true)) {
+          const { trashed, missing } = await hashIndex.moveToTrash(
+            rawHashes.slice(0, MAX_BATCH_DELETE_COUNT)
+          );
+          return res.json({
+            success: true,
+            mode: 'trash',
+            trashed,
+            deleted: trashed,
+            missing,
+            failed: [],
+            deletedCount: trashed.length,
+            freedBytes: 0,
+            retentionDays: TRASH_RETENTION_DAYS,
+            storage: hashIndex.getStorageUsage(),
           });
         }
 

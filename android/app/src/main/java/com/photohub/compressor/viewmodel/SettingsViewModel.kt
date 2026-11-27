@@ -105,6 +105,13 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         bgManager.ensureMediaObserverAndSchedule()
     }
 
+    fun setBackupStorageMode(mode: BackupStorageMode) {
+        settings.setBackupStorageMode(mode)
+        if (mode == BackupStorageMode.BACKUP_ONLY) {
+            bgManager.clearAllStagedItems()
+        }
+    }
+
     fun setSilentAutoDeleteOriginals(enabled: Boolean) {
         settings.setSilentAutoDeleteOriginals(enabled)
         _uiState.update {

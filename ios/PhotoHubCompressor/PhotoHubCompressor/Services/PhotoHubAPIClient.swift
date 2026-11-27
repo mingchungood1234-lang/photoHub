@@ -82,11 +82,24 @@ struct ServerPhoto: Codable, Identifiable, Hashable, Sendable {
     let hasVideoProxy: Bool?
     let videoProxySize: Int64?
     let keepOriginalOnDevice: Bool?
+    var isFavorite: Bool? = nil
+    var deletedAt: String? = nil
+    var daysRemaining: Int? = nil
+    var cameraModel: String? = nil
 
     var id: String { hash }
 
     var isProtectedOriginal: Bool {
         keepOriginalOnDevice == true
+    }
+
+    var isFavorited: Bool {
+        isFavorite == true
+    }
+
+    var isTrashed: Bool {
+        if let deletedAt, !deletedAt.isEmpty { return true }
+        return false
     }
 
     var isVideo: Bool {
@@ -160,7 +173,89 @@ private struct ServerPhotosResponse: Decodable {
     let success: Bool
     let total: Int
     let hasMore: Bool?
+    let trashCount: Int?
     let photos: [ServerPhoto]
+}
+
+struct TrashListResult: Sendable {
+    let photos: [ServerPhoto]
+    let total: Int
+    let trashBytes: Int64
+}
+
+struct ShareLinkResult: Decodable, Sendable, Identifiable {
+    let token: String
+    let url: String
+    let shareUrl: String?
+    let sharePath: String?
+    let title: String?
+    let itemCount: Int?
+    let expiresAt: String?
+    let hasPasscode: Bool?
+
+    var id: String { token }
+
+    private enum CodingKeys: String, CodingKey {
+        case token, url, shareUrl, sharePath, title, itemCount, expiresAt, hasPasscode
+    }
+
+    init(
+        token: String,
+        url: String,
+        shareUrl: String? = nil,
+        sharePath: String? = nil,
+        title: String? = nil,
+        itemCount: Int? = nil,
+        expiresAt: String? = nil,
+        hasPasscode: Bool? = nil
+    ) {
+        self.token = token
+        self.url = url
+        self.shareUrl = shareUrl ?? url
+        self.sharePath = sharePath
+        self.title = title
+        self.itemCount = itemCount
+        self.expiresAt = expiresAt
+        self.hasPasscode = hasPasscode
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.token = try c.decode(String.self, forKey: .token)
+        let decodedShareUrl = try c.decodeIfPresent(String.self, forKey: .shareUrl)
+        let decodedUrl = try c.decodeIfPresent(String.self, forKey: .url)
+        let decodedPath = try c.decodeIfPresent(String.self, forKey: .sharePath)
+        self.shareUrl = decodedShareUrl
+        self.sharePath = decodedPath
+        self.url = decodedShareUrl ?? decodedUrl ?? decodedPath ?? ""
+        self.title = try c.decodeIfPresent(String.self, forKey: .title)
+        self.itemCount = try c.decodeIfPresent(Int.self, forKey: .itemCount)
+        self.expiresAt = try c.decodeIfPresent(String.self, forKey: .expiresAt)
+        self.hasPasscode = try c.decodeIfPresent(Bool.self, forKey: .hasPasscode)
+    }
+}
+
+private struct FavoriteResponse: Decodable {
+    let success: Bool
+    let isFavorite: Bool?
+    let photo: ServerPhoto?
+}
+
+private struct TrashListResponse: Decodable {
+    let success: Bool
+    let total: Int?
+    let trashBytes: Int64?
+    let photos: [ServerPhoto]?
+}
+
+private struct TrashRestoreResponse: Decodable {
+    let success: Bool
+    let restored: [String]?
+}
+
+private struct CreateShareResponse: Decodable {
+    let success: Bool
+    let share: ShareLinkResult?
 }
 
 struct CheckResponse: Decodable {
@@ -517,7 +612,10 @@ final class PhotoHubAPIClient {
         return page?.photos ?? []
     }
 
-    func fetchAllServerPhotos(sync: Bool = true) async throws -> [ServerPhoto] {
+    func fetchAllServerPhotos(
+        sync: Bool = true,
+        onPageLoaded: (@Sendable ([ServerPhoto], Int) -> Void)? = nil
+    ) async throws -> [ServerPhoto] {
         let scopeKey = photosCacheScopeKey()
         let cachedLocal = LocalProxyStore.shared.cachedPhotos(
             baseURL: settings.normalizedBaseURL,
@@ -536,6 +634,7 @@ final class PhotoHubAPIClient {
         var offset = 0
         let pageSize = 500
         var firstPageETag: String?
+        var latestTrashCount = 0
 
         while true {
             let (page, responseETag) = try await fetchServerPhotosPage(
@@ -552,12 +651,16 @@ final class PhotoHubAPIClient {
                 firstPageETag = responseETag
             }
             let resolvedPage = page!
+            if let tc = resolvedPage.trashCount {
+                latestTrashCount = tc
+            }
             for item in resolvedPage.photos {
                 let key = item.hash.lowercased()
                 if seenHashes.insert(key).inserted {
                     collected.append(item)
                 }
             }
+            onPageLoaded?(collected, latestTrashCount)
             if resolvedPage.photos.isEmpty {
                 break
             }
@@ -739,7 +842,11 @@ final class PhotoHubAPIClient {
             proxySize: photo.isVideo ? posterSize : proxy.sizeBytes,
             hasVideoProxy: photo.isVideo ? true : photo.hasVideoProxy,
             videoProxySize: photo.isVideo ? proxy.sizeBytes : photo.videoProxySize,
-            keepOriginalOnDevice: photo.keepOriginalOnDevice
+            keepOriginalOnDevice: photo.keepOriginalOnDevice,
+            isFavorite: photo.isFavorite,
+            deletedAt: photo.deletedAt,
+            daysRemaining: photo.daysRemaining,
+            cameraModel: photo.cameraModel
         )
 
         LocalProxyStore.shared.updatePhoto(
@@ -1727,6 +1834,190 @@ final class PhotoHubAPIClient {
             deleted: allDeleted,
             missing: allMissing,
             freedBytes: totalFreed
+        )
+    }
+
+    func setPhotoFavorite(masterHash: String, favorite: Bool) async throws -> ServerPhoto {
+        let cleanHash = masterHash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let url = try makeURL("/api/photo/\(cleanHash)/favorite")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyAuth(to: &request)
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["isFavorite": favorite])
+
+        let (data, response) = try await pooledSession.data(for: request)
+        try validateHTTP(response: response, data: data)
+        let decoded = try JSONDecoder().decode(FavoriteResponse.self, from: data)
+        guard decoded.success, let updated = decoded.photo else {
+            throw APIClientError.invalidResponse
+        }
+        LocalProxyStore.shared.updatePhoto(
+            updated,
+            baseURL: settings.normalizedBaseURL,
+            apiKey: settings.apiKey,
+            notify: true
+        )
+        return updated
+    }
+
+    func fetchTrashPhotos(limit: Int = 500, offset: Int = 0) async throws -> TrashListResult {
+        var components = URLComponents(url: try makeURL("/api/photos/trash"), resolvingAgainstBaseURL: false)
+        components?.queryItems = [
+            URLQueryItem(name: "limit", value: String(limit)),
+            URLQueryItem(name: "offset", value: String(offset)),
+        ]
+        guard let url = components?.url else {
+            throw APIClientError.invalidServerURL
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        applyAuth(to: &request)
+
+        let (data, response) = try await pooledSession.data(for: request)
+        try validateHTTP(response: response, data: data)
+        let decoded = try JSONDecoder().decode(TrashListResponse.self, from: data)
+        let items = decoded.photos ?? []
+        return TrashListResult(
+            photos: items,
+            total: decoded.total ?? items.count,
+            trashBytes: decoded.trashBytes ?? items.reduce(0) { $0 + max(0, $1.size) }
+        )
+    }
+
+    func moveServerPhotosToTrash(hashes: [String]) async throws -> DeletePhotosResult {
+        var seen = Set<String>()
+        let cleaned = hashes.compactMap { raw -> String? in
+            let norm = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !norm.isEmpty, seen.insert(norm).inserted else { return nil }
+            return norm
+        }
+        guard !cleaned.isEmpty else {
+            return DeletePhotosResult(success: true, deleted: [], missing: [], freedBytes: 0)
+        }
+
+        let url = try makeURL("/api/photos/trash")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyAuth(to: &request)
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["hashes": cleaned])
+
+        let (data, response) = try await pooledSession.data(for: request)
+        try validateHTTP(response: response, data: data)
+        let decoded = try JSONDecoder().decode(DeletePhotosResult.self, from: data)
+        let toEvict = (decoded.deleted ?? []) + (decoded.missing ?? [])
+        if !toEvict.isEmpty {
+            LocalProxyStore.shared.removePhotos(
+                hashes: toEvict,
+                baseURL: settings.normalizedBaseURL,
+                apiKey: settings.apiKey,
+                notify: true
+            )
+            for h in toEvict {
+                LocalProxyTracker.shared.clearRestoredProtection(masterHash: h)
+            }
+            OriginalDownloadCache.shared.removeCachedOriginals(hashes: toEvict)
+        }
+        return decoded
+    }
+
+    func restoreServerPhotosFromTrash(hashes: [String]) async throws -> [String] {
+        var seen = Set<String>()
+        let cleaned = hashes.compactMap { raw -> String? in
+            let norm = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !norm.isEmpty, seen.insert(norm).inserted else { return nil }
+            return norm
+        }
+        guard !cleaned.isEmpty else { return [] }
+
+        let url = try makeURL("/api/photos/trash/restore")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyAuth(to: &request)
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["hashes": cleaned])
+
+        let (data, response) = try await pooledSession.data(for: request)
+        try validateHTTP(response: response, data: data)
+        let decoded = try JSONDecoder().decode(TrashRestoreResponse.self, from: data)
+        Self.photosETagLock.lock()
+        Self.photosETagByScope.removeValue(forKey: photosCacheScopeKey())
+        Self.photosETagLock.unlock()
+        return decoded.restored ?? []
+    }
+
+    func emptyServerTrash(hashes: [String]? = nil) async throws -> DeletePhotosResult {
+        let url = try makeURL("/api/photos/trash/empty")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyAuth(to: &request)
+        var body: [String: Any] = [:]
+        if let hashes, !hashes.isEmpty {
+            body["hashes"] = hashes.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await pooledSession.data(for: request)
+        try validateHTTP(response: response, data: data)
+        return try JSONDecoder().decode(DeletePhotosResult.self, from: data)
+    }
+
+    func createShareLink(
+        hashes: [String],
+        title: String,
+        expiresInHours: Int,
+        passcode: String
+    ) async throws -> ShareLinkResult {
+        let url = try makeURL("/api/shares")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyAuth(to: &request)
+        var payload: [String: Any] = [
+            "hashes": hashes.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() },
+            "title": title,
+            "expiresInHours": expiresInHours,
+        ]
+        let trimmedPass = passcode.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedPass.isEmpty {
+            payload["passcode"] = trimmedPass
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+
+        let (data, response) = try await pooledSession.data(for: request)
+        try validateHTTP(response: response, data: data)
+        let decoded = try JSONDecoder().decode(CreateShareResponse.self, from: data)
+        guard decoded.success, let share = decoded.share else {
+            throw APIClientError.invalidResponse
+        }
+        // Prefer gateway public URL when share.url is relative or points to an internal storage node
+        let resolvedUrl: String = {
+            if let sharePath = share.sharePath, !sharePath.isEmpty,
+               let gatewayBase = settings.gatewayURL {
+                let baseStr = gatewayBase.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                let path = sharePath.hasPrefix("/") ? sharePath : "/\(sharePath)"
+                return baseStr + path
+            }
+            if share.url.hasPrefix("http://") || share.url.hasPrefix("https://") {
+                return share.url
+            }
+            if let base = settings.gatewayURL ?? settings.normalizedBaseURL {
+                let baseStr = base.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                let path = share.url.hasPrefix("/") ? share.url : "/\(share.url)"
+                return baseStr + path
+            }
+            return share.url
+        }()
+        return ShareLinkResult(
+            token: share.token,
+            url: resolvedUrl,
+            sharePath: share.sharePath,
+            title: share.title,
+            itemCount: share.itemCount,
+            expiresAt: share.expiresAt,
+            hasPasscode: share.hasPasscode
         )
     }
 

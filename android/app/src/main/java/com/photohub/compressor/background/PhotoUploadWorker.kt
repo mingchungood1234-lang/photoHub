@@ -41,6 +41,9 @@ class PhotoUploadWorker(
         if (bgManager.isPausedForRestore() || !cur.nightlyAutoBackupEnabled || !cur.isSignedIn || cur.normalizedBaseUrl == null) {
             return Result.success()
         }
+        if (!bgManager.isNetworkAllowedForAutoBackup()) {
+            return Result.retry()
+        }
 
         val mediaService = MediaLibraryService(context)
         if (mediaService.currentAccessLevel() == MediaAccessLevel.DENIED) {
@@ -64,39 +67,56 @@ class PhotoUploadWorker(
         val tracker = LocalProxyTracker.getInstance(context)
         val cachedPhotos = LocalProxyStore.getInstance(context)
             .cachedPhotos(cur.normalizedBaseUrl, cur.apiKeyCacheScope)
+        val backupOnly = cur.isBackupOnlyMode
+        val effectiveKeepLocal = !backupOnly && cur.keepLocalProxyInPhotos
         val rawCandidates = mediaService.scanCandidates(
             tracker = tracker,
             knownServerPhotos = cachedPhotos,
             maxResults = scanCap,
-            maxInspect = inspectCap
+            maxInspect = inspectCap,
+            oldestFirst = effectiveKeepLocal,
+            skipBackedUpOriginals = backupOnly
         )
 
         val stagedIds = bgManager.state.value.stagedItems.map { it.id }.toSet()
         val activeIds = AssetUploadCoordinator.activeAssetIds()
-        val allEligible = PhotoBackupPipeline
-            .sortCandidates(rawCandidates, CandidateSortMode.LARGEST_VIDEOS_FIRST)
-            .filter { it.id !in stagedIds && it.id !in activeIds }
+        val sortedCandidates = if (effectiveKeepLocal) {
+            PhotoBackupPipeline.sortCandidatesOldestFirst(rawCandidates)
+        } else {
+            PhotoBackupPipeline.sortCandidates(rawCandidates, CandidateSortMode.LARGEST_VIDEOS_FIRST)
+        }
+        val allEligible = sortedCandidates.filter { it.id !in stagedIds && it.id !in activeIds }
         val hasMoreBatches = allEligible.size > maxItems
         val prioritized = allEligible.take(maxItems)
 
         val videoSem = Semaphore(1)
         val gallerySem = Semaphore(1)
+        val commitGate = if (effectiveKeepLocal) {
+            com.photohub.compressor.media.OrderedCommitGate()
+        } else {
+            null
+        }
         val newStaged = Collections.synchronizedList(mutableListOf<StagedCleanupItem>())
+        val backedUpOnlyCount = AtomicInteger(0)
         val silentDeletedCount = AtomicInteger(0)
         val silentDeletedBytes = AtomicLong(0L)
         val quotaHit = AtomicBoolean(false)
 
         try {
-            val queue = Channel<com.photohub.compressor.data.PhotoCandidate>(Channel.UNLIMITED)
-            prioritized.forEach { queue.trySend(it) }
+            val queue = Channel<Pair<Int, com.photohub.compressor.data.PhotoCandidate>>(Channel.UNLIMITED)
+            prioritized.forEachIndexed { idx, cand -> queue.trySend(idx to cand) }
             queue.close()
 
             coroutineScope {
                 val workers = List(minOf(3, prioritized.size)) {
                     launch(Dispatchers.IO) {
-                        for (candidate in queue) {
-                            if (isStopped || !isActive || quotaHit.get() || bgManager.isPausedForRestore()) break
+                        for ((workIndex, candidate) in queue) {
+                            if (isStopped || !isActive || quotaHit.get() || bgManager.isPausedForRestore()) {
+                                commitGate?.cancelAll()
+                                break
+                            }
                             if (!AssetUploadCoordinator.tryClaimAsset(candidate.id, UploadOwner.BACKGROUND)) {
+                                commitGate?.completeTurn(workIndex)
                                 continue
                             }
                             try {
@@ -110,44 +130,52 @@ class PhotoUploadWorker(
                                     maxPixelSize = cur.proxyMaxPixelSize,
                                     quality = cur.proxyQuality,
                                     uploadMode = effectiveUploadMode,
-                                    keepLocalProxy = cur.keepLocalProxyInPhotos,
+                                    keepLocalProxy = effectiveKeepLocal,
                                     normalizedBaseUrl = cur.normalizedBaseUrl,
                                     cacheScopeKey = cur.apiKeyCacheScope,
                                     videoSemaphore = videoSem,
                                     gallerySaveSemaphore = gallerySem,
+                                    commitGate = commitGate,
+                                    commitIndex = workIndex,
                                     onStageChange = {}
                                 )
                                 if (res is BackupPipelineResult.BackedUp) {
-                                    val deletedSilently = bgManager.tryHandleBackedUpSilentDelete(
-                                        candidateId = candidate.id,
-                                        outcome = res.outcome,
-                                        settingsState = cur,
-                                        mediaService = mediaService,
-                                        tracker = tracker
-                                    )
-                                    if (deletedSilently) {
-                                        silentDeletedCount.incrementAndGet()
-                                        silentDeletedBytes.addAndGet(res.outcome.savedBytes.coerceAtLeast(0L))
+                                    if (backupOnly) {
+                                        backedUpOnlyCount.incrementAndGet()
                                     } else {
-                                        newStaged.add(
-                                            StagedCleanupItem(
-                                                id = candidate.id,
-                                                filename = res.outcome.filename,
-                                                masterSha256 = res.outcome.masterSha256,
-                                                savedBytes = res.outcome.savedBytes,
-                                                verifiedAtMs = System.currentTimeMillis()
-                                            )
+                                        val deletedSilently = bgManager.tryHandleBackedUpSilentDelete(
+                                            candidateId = candidate.id,
+                                            outcome = res.outcome,
+                                            settingsState = cur,
+                                            mediaService = mediaService,
+                                            tracker = tracker
                                         )
+                                        if (deletedSilently) {
+                                            silentDeletedCount.incrementAndGet()
+                                            silentDeletedBytes.addAndGet(res.outcome.savedBytes.coerceAtLeast(0L))
+                                        } else {
+                                            newStaged.add(
+                                                StagedCleanupItem(
+                                                    id = candidate.id,
+                                                    filename = res.outcome.filename,
+                                                    masterSha256 = res.outcome.masterSha256,
+                                                    savedBytes = res.outcome.savedBytes,
+                                                    verifiedAtMs = System.currentTimeMillis()
+                                                )
+                                            )
+                                        }
                                     }
                                 }
                             } catch (err: ApiHttpException) {
                                 if (err.statusCode == 507) {
                                     quotaHit.set(true)
+                                    commitGate?.cancelAll()
                                     break
                                 }
                             } catch (_: Exception) {
                                 // Continue remaining candidates silently
                             } finally {
+                                commitGate?.completeTurn(workIndex)
                                 AssetUploadCoordinator.releaseAsset(candidate.id, UploadOwner.BACKGROUND)
                             }
                         }
@@ -155,40 +183,50 @@ class PhotoUploadWorker(
                 }
                 workers.joinAll()
             }
+            commitGate?.cancelAll()
 
             if (!isStopped) {
                 LocalProxySyncManager.getInstance(context).syncFromServerOnLaunch()
             }
 
-            val stagedSnapshot = newStaged.toList()
-            bgManager.appendStagedItems(stagedSnapshot)
-            bgManager.pruneMissingAssetsFromStaged()
-            val prevSilentCleaned = bgManager.silentlyCleanStagedItemsIfAllowed()
-
-            val stagedCount = bgManager.state.value.stagedItems.size
-            val stagedBytes = bgManager.state.value.stagedSavedBytes
-            val sizeStr = android.text.format.Formatter.formatFileSize(context, stagedBytes)
-            val totalSilent = silentDeletedCount.get() + prevSilentCleaned
             val quotaReached = quotaHit.get()
-
-            if (quotaReached) {
-                bgManager.updateSummary("Storage full")
-            } else if (stagedCount > 0) {
-                bgManager.updateSummary("$stagedCount ready to delete (~$sizeStr)")
-                if ((stagedSnapshot.isNotEmpty() || isOvernight) && cur.notifyWhenBackgroundUploadFinishes) {
-                    bgManager.sendDeleteOriginalsNotification(
-                        count = stagedCount,
-                        savedBytes = stagedBytes,
-                        immediate = !isOvernight,
-                        morningHour = cur.morningReminderHour
-                    )
+            if (backupOnly) {
+                val uploadedCount = backedUpOnlyCount.get()
+                when {
+                    quotaReached -> bgManager.updateSummary("Storage full")
+                    uploadedCount > 0 -> bgManager.updateSummary("Backed up $uploadedCount · Originals kept on phone")
+                    else -> bgManager.updateSummary("All backed up · Originals kept")
                 }
-            } else if (totalSilent > 0) {
-                val freedStr = android.text.format.Formatter.formatFileSize(context, silentDeletedBytes.get())
-                val spaceNote = if (silentDeletedBytes.get() > 0L) " · ~$freedStr" else ""
-                bgManager.updateSummary("Backed up $totalSilent$spaceNote")
             } else {
-                bgManager.updateSummary("All synced")
+                val stagedSnapshot = newStaged.toList()
+                bgManager.appendStagedItems(stagedSnapshot)
+                bgManager.pruneMissingAssetsFromStaged()
+                val prevSilentCleaned = bgManager.silentlyCleanStagedItemsIfAllowed()
+
+                val stagedCount = bgManager.state.value.stagedItems.size
+                val stagedBytes = bgManager.state.value.stagedSavedBytes
+                val sizeStr = android.text.format.Formatter.formatFileSize(context, stagedBytes)
+                val totalSilent = silentDeletedCount.get() + prevSilentCleaned
+
+                if (quotaReached) {
+                    bgManager.updateSummary("Storage full")
+                } else if (stagedCount > 0) {
+                    bgManager.updateSummary("$stagedCount ready to delete (~$sizeStr)")
+                    if ((stagedSnapshot.isNotEmpty() || isOvernight) && cur.notifyWhenBackgroundUploadFinishes) {
+                        bgManager.sendDeleteOriginalsNotification(
+                            count = stagedCount,
+                            savedBytes = stagedBytes,
+                            immediate = !isOvernight,
+                            morningHour = cur.morningReminderHour
+                        )
+                    }
+                } else if (totalSilent > 0) {
+                    val freedStr = android.text.format.Formatter.formatFileSize(context, silentDeletedBytes.get())
+                    val spaceNote = if (silentDeletedBytes.get() > 0L) " · ~$freedStr" else ""
+                    bgManager.updateSummary("Backed up $totalSilent$spaceNote")
+                } else {
+                    bgManager.updateSummary("All synced")
+                }
             }
 
             if (hasMoreBatches && !isStopped && !quotaReached && !bgManager.isPausedForRestore()) {

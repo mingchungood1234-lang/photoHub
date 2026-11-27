@@ -23,6 +23,8 @@ import com.photohub.compressor.data.PhotoCompressionState
 import com.photohub.compressor.data.ServerPhoto
 import com.photohub.compressor.sync.LocalProxyTracker
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.IOException
@@ -168,33 +170,66 @@ class MediaLibraryService(private val context: Context) {
         return fmt.format(Date(ms))
     }
 
+    private fun normalizeFilenameStem(rawName: String): String {
+        val base = File(rawName).name.trim().lowercase(Locale.ROOT)
+        val noExt = base.substringBeforeLast('.', base)
+        return noExt.replace(Regex("""(?:\s*\(\d+\)|\s+copy|\s*-\s*copy)$"""), "").trim()
+    }
+
     /**
-     * Builds normalized match keys (`filename|size`, `filename|yyyy-MM-dd` with +-1 day timezone tolerance, or `filename`)
-     * to detect originals already sitting in Android MediaStore without hashing gigabytes of files.
+     * Builds normalized match keys (`filename|size`, `stem|size`, `isVideo|size|day`, `filename|day`, `stem|day`)
+     * to detect originals already sitting in Android MediaStore without hashing gigabytes of files,
+     * including HEIC/JPG re-extensions and MediaStore ` (1)` collision suffixes.
      */
-    fun originalMatchKeys(filename: String, creationDateMs: Long?, sizeBytes: Long? = null): List<String> {
+    fun originalMatchKeys(
+        filename: String,
+        creationDateMs: Long?,
+        sizeBytes: Long? = null,
+        isVideo: Boolean? = null
+    ): List<String> {
         val base = File(filename).name.trim().lowercase(Locale.ROOT)
         if (base.isEmpty() || base.startsWith(ProxyGenerator.PROXY_FILENAME_PREFIX.lowercase(Locale.ROOT))) {
             return emptyList()
         }
+        val stem = normalizeFilenameStem(base)
         val keys = mutableListOf<String>()
         if (sizeBytes != null && sizeBytes > 0L) {
             keys.add("sz:$base|$sizeBytes")
+            if (stem.isNotEmpty()) {
+                keys.add("szs:$stem|$sizeBytes")
+            }
         }
         if (creationDateMs != null && creationDateMs > 0L) {
             val dayMs = 86_400_000L
-            keys.add("dt:$base|${formatUtcDay(creationDateMs)}")
-            keys.add("dt:$base|${formatUtcDay(creationDateMs - dayMs)}")
-            keys.add("dt:$base|${formatUtcDay(creationDateMs + dayMs)}")
+            val d0 = formatUtcDay(creationDateMs)
+            val dm = formatUtcDay(creationDateMs - dayMs)
+            val dp = formatUtcDay(creationDateMs + dayMs)
+            if (sizeBytes != null && sizeBytes > 0L && isVideo != null) {
+                val kind = if (isVideo) "v" else "i"
+                keys.add("szd:$kind|$sizeBytes|$d0")
+                keys.add("szd:$kind|$sizeBytes|$dm")
+                keys.add("szd:$kind|$sizeBytes|$dp")
+            }
+            keys.add("dt:$base|$d0")
+            keys.add("dt:$base|$dm")
+            keys.add("dt:$base|$dp")
+            if (stem.isNotEmpty()) {
+                keys.add("dts:$stem|$d0")
+                keys.add("dts:$stem|$dm")
+                keys.add("dts:$stem|$dp")
+            }
         } else {
             keys.add("nm:$base")
+            if (stem.isNotEmpty()) {
+                keys.add("nms:$stem")
+            }
         }
         return keys
     }
 
     /**
      * Scans native Android MediaStore metadata for existing non-proxy originals so Cloud can load
-     * straight from Gallery and sync/Save Proxy never creates duplicate media on the phone.
+     * straight from Gallery and sync/Save Proxy/Restore never creates duplicate media on the phone.
      */
     fun scanExistingOriginalMapInGallery(): Map<String, String> {
         if (currentAccessLevel() == MediaAccessLevel.DENIED) return emptyMap()
@@ -209,7 +244,7 @@ class MediaLibraryService(private val context: Context) {
             MediaStore.MediaColumns.DATE_ADDED
         )
         val trashClause = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            " AND COALESCE(${MediaStore.MediaColumns.IS_TRASHED}, 0) = 0"
+            " AND COALESCE(${MediaStore.MediaColumns.IS_TRASHED}, 0) = 0 AND COALESCE(${MediaStore.MediaColumns.IS_PENDING}, 0) = 0"
         } else {
             ""
         }
@@ -219,6 +254,7 @@ class MediaLibraryService(private val context: Context) {
             MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString()
         )
         val proxyPrefixLower = ProxyGenerator.PROXY_FILENAME_PREFIX.lowercase(Locale.ROOT)
+        val tracker = LocalProxyTracker.getInstance(context)
         val map = HashMap<String, String>(512)
 
         runCatching {
@@ -235,6 +271,16 @@ class MediaLibraryService(private val context: Context) {
                     if (base.isEmpty() || base.startsWith(proxyPrefixLower)) continue
                     val id = cursor.getLong(idCol)
                     val mediaType = cursor.getInt(typeCol)
+                    val isVideo = (mediaType == MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO)
+                    val uriStr = ContentUris.withAppendedId(
+                        if (isVideo) {
+                            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                        } else {
+                            MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                        },
+                        id
+                    ).toString()
+                    if (tracker.isKnownProxy(uriStr)) continue
                     val size = cursor.getLong(sizeCol)
                     val takenMs = if (takenCol >= 0) cursor.getLong(takenCol) else 0L
                     val addedSec = if (addedCol >= 0) cursor.getLong(addedCol) else 0L
@@ -243,21 +289,20 @@ class MediaLibraryService(private val context: Context) {
                         addedSec > 0L -> addedSec * 1000L
                         else -> 0L
                     }
-                    val uriStr = ContentUris.withAppendedId(
-                        if (mediaType == MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO) {
-                            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-                        } else {
-                            MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-                        },
-                        id
-                    ).toString()
+                    val stem = normalizeFilenameStem(base)
+                    val kind = if (isVideo) "v" else "i"
                     if (size > 0L) {
                         map.putIfAbsent("sz:$base|$size", uriStr)
+                        if (stem.isNotEmpty()) map.putIfAbsent("szs:$stem|$size", uriStr)
                     }
                     if (effectiveMs > 0L) {
-                        map.putIfAbsent("dt:$base|${formatUtcDay(effectiveMs)}", uriStr)
+                        val day = formatUtcDay(effectiveMs)
+                        if (size > 0L) map.putIfAbsent("szd:$kind|$size|$day", uriStr)
+                        map.putIfAbsent("dt:$base|$day", uriStr)
+                        if (stem.isNotEmpty()) map.putIfAbsent("dts:$stem|$day", uriStr)
                     }
                     map.putIfAbsent("nm:$base", uriStr)
+                    if (stem.isNotEmpty()) map.putIfAbsent("nms:$stem", uriStr)
                 }
             }
         }
@@ -265,7 +310,7 @@ class MediaLibraryService(private val context: Context) {
     }
 
     fun findMatchingOriginalAssetIdInGallery(photo: ServerPhoto): String? {
-        val keys = originalMatchKeys(photo.originalName, photo.parsedCreationDateMs, photo.size)
+        val keys = originalMatchKeys(photo.originalName, photo.parsedCreationDateMs, photo.size, photo.isVideo)
         if (keys.isEmpty()) return null
         val existing = scanExistingOriginalMapInGallery()
         for (key in keys) {
@@ -273,6 +318,17 @@ class MediaLibraryService(private val context: Context) {
             if (found != null) return found
         }
         return null
+    }
+
+    /**
+     * Checks if a live full-resolution original (never a compressed proxy) for [photo] already exists
+     * in Android Gallery, so Restore never writes a second duplicate original copy onto the phone.
+     */
+    fun findExistingLiveOriginalUri(photo: ServerPhoto, tracker: LocalProxyTracker = LocalProxyTracker.getInstance(context)): String? {
+        if (currentAccessLevel() == MediaAccessLevel.DENIED) return null
+        tracker.liveRestoredAssetId(photo.hash)?.takeIf { !tracker.isKnownProxy(it) }?.let { return it }
+        tracker.liveUploadedOriginalAssetId(photo.hash)?.takeIf { !tracker.isKnownProxy(it) }?.let { return it }
+        return findMatchingOriginalAssetIdInGallery(photo)?.takeIf { !tracker.isKnownProxy(it) }
     }
 
     /**
@@ -389,7 +445,9 @@ class MediaLibraryService(private val context: Context) {
         tracker: LocalProxyTracker,
         knownServerPhotos: List<ServerPhoto> = emptyList(),
         maxResults: Int? = null,
-        maxInspect: Int? = null
+        maxInspect: Int? = null,
+        oldestFirst: Boolean = false,
+        skipBackedUpOriginals: Boolean = false
     ): List<PhotoCandidate> {
         if (currentAccessLevel() == MediaAccessLevel.DENIED) return emptyList()
 
@@ -418,7 +476,11 @@ class MediaLibraryService(private val context: Context) {
             MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE.toString(),
             MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString()
         )
-        val sortOrder = "${MediaStore.MediaColumns.DATE_ADDED} DESC"
+        val sortOrder = if (oldestFirst) {
+            "${MediaStore.MediaColumns.DATE_TAKEN} ASC, ${MediaStore.MediaColumns.DATE_ADDED} ASC"
+        } else {
+            "${MediaStore.MediaColumns.DATE_ADDED} DESC"
+        }
 
         val prefixToServer = mutableMapOf<String, ServerPhoto>()
         val hashToServer = mutableMapOf<String, ServerPhoto>()
@@ -429,10 +491,21 @@ class MediaLibraryService(private val context: Context) {
         }
 
         val candidates = mutableListOf<PhotoCandidate>()
-        var inspected = 0
+        var inspectedNonTracked = 0
+        var totalRowsScanned = 0
         var eligibleCount = 0
 
-        resolver.query(collection, projection.toTypedArray(), selection, args, sortOrder)?.use { cursor ->
+        val cursor = runCatching {
+            resolver.query(collection, projection.toTypedArray(), selection, args, sortOrder)
+        }.getOrNull() ?: resolver.query(
+            collection,
+            projection.toTypedArray(),
+            selection,
+            args,
+            if (oldestFirst) "${MediaStore.MediaColumns.DATE_ADDED} ASC" else "${MediaStore.MediaColumns.DATE_ADDED} DESC"
+        )
+
+        cursor?.use { cursor ->
             val idCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID)
             val typeCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.MEDIA_TYPE)
             val nameCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
@@ -445,9 +518,10 @@ class MediaLibraryService(private val context: Context) {
             val durCol = cursor.getColumnIndex(MediaStore.MediaColumns.DURATION)
 
             while (cursor.moveToNext()) {
-                if (maxInspect != null && inspected >= maxInspect) break
+                if (totalRowsScanned >= 50_000) break
+                if (maxInspect != null && inspectedNonTracked >= maxInspect) break
                 if (maxResults != null && eligibleCount >= maxResults) break
-                inspected++
+                totalRowsScanned++
 
                 val id = cursor.getLong(idCol)
                 val mediaType = cursor.getInt(typeCol)
@@ -458,6 +532,9 @@ class MediaLibraryService(private val context: Context) {
                 )
                 val assetId = contentUri.toString()
                 if (tracker.isRestoredOriginal(assetId)) {
+                    continue
+                }
+                if (skipBackedUpOriginals && tracker.isUploadedOriginal(assetId)) {
                     continue
                 }
 
@@ -491,6 +568,8 @@ class MediaLibraryService(private val context: Context) {
                     )
                     continue
                 }
+
+                inspectedNonTracked++
 
                 // 3. Fast EXIF marker inspection on compact local images (handles renamed proxies)
                 if (!isVideo && sizeBytes <= 4_000_000L && maxOf(w, h) <= 2400) {
@@ -635,26 +714,40 @@ class MediaLibraryService(private val context: Context) {
 
     suspend fun saveCompressedProxyToGallery(
         originalCandidate: PhotoCandidate,
-        proxyFile: File
-    ): String = saveFileToGallery(
-        file = proxyFile,
-        isVideo = originalCandidate.isVideo,
-        displayName = proxyFile.name,
-        creationDateMs = originalCandidate.creationDateMs
-    )
+        proxyFile: File,
+        masterHash: String? = null
+    ): String = galleryWriteMutex.withLock {
+        if (!masterHash.isNullOrBlank()) {
+            val tracker = LocalProxyTracker.getInstance(context)
+            tracker.liveProxyAssetId(masterHash)?.let { return@withLock it }
+            val prefix = ProxyGenerator.proxyPrefixTag(masterHash)
+            if (prefix.isNotEmpty()) {
+                scanExistingProxyPrefixesInGallery()[prefix]?.let { existingUri ->
+                    tracker.markMasterHandledForPhotos(masterHash)
+                    return@withLock existingUri
+                }
+            }
+        }
+        saveFileToGallery(
+            file = proxyFile,
+            isVideo = originalCandidate.isVideo,
+            displayName = proxyFile.name,
+            creationDateMs = originalCandidate.creationDateMs
+        )
+    }
 
     suspend fun saveServerProxyToGallery(
         photo: ServerPhoto,
         imageData: ByteArray?,
         videoFile: File?
-    ): String {
-        // Strict duplicate guard: never insert a second copy into phone Gallery if ANY live copy
+    ): String = galleryWriteMutex.withLock {
+        // Strict serialized duplicate guard: never insert a second copy into phone Gallery if ANY live copy
         // (restored original, uploaded original, synced proxy, or matching original) already exists.
         val tracker = LocalProxyTracker.getInstance(context)
         val existingTrackedUri = tracker.liveGalleryAssetUri(photo.hash)
         if (existingTrackedUri != null) {
             tracker.markMasterHandledForPhotos(photo.hash)
-            return existingTrackedUri.toString()
+            return@withLock existingTrackedUri.toString()
         }
         val prefix = ProxyGenerator.proxyPrefixTag(photo.hash).ifEmpty { photo.hash.take(12) }
         val existingPrefixUri = scanExistingProxyPrefixesInGallery()[prefix]
@@ -665,17 +758,17 @@ class MediaLibraryService(private val context: Context) {
                 masterHash = photo.hash,
                 originalName = photo.originalName
             )
-            return existingPrefixUri
+            return@withLock existingPrefixUri
         }
         val existingOrigUri = findMatchingOriginalAssetIdInGallery(photo)
         if (existingOrigUri != null) {
             tracker.markUploadedOriginal(existingOrigUri, photo.hash)
             tracker.markMasterHandledForPhotos(photo.hash)
-            return existingOrigUri
+            return@withLock existingOrigUri
         }
 
         val dateMs = photo.parsedCreationDateMs
-        return if (photo.isVideo) {
+        if (photo.isVideo) {
             val vid = videoFile ?: throw IOException("Missing video proxy file to save.")
             val name = "${ProxyGenerator.PROXY_FILENAME_PREFIX}$prefix.mp4"
             val actualSha = runCatching { ProxyGenerator.computeFileSha256(vid) }.getOrNull().orEmpty()
@@ -773,6 +866,18 @@ class MediaLibraryService(private val context: Context) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val doneValues = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
                 resolver.update(insertedUri, doneValues, null, null)
+            }
+            if (creationDateMs != null && creationDateMs > 0L) {
+                // Best-effort alignment of DATE_MODIFIED (seconds) with original capture timestamp so
+                // third-party share pickers (WhatsApp, Telegram, Instagram, etc.) that sort by
+                // DATE_MODIFIED DESC keep newest photos first, matching the native Gallery timeline.
+                runCatching {
+                    val tsValues = ContentValues().apply {
+                        put(MediaStore.MediaColumns.DATE_TAKEN, creationDateMs)
+                        put(MediaStore.MediaColumns.DATE_MODIFIED, creationDateMs / 1000L)
+                    }
+                    resolver.update(insertedUri, tsValues, null, null)
+                }
             }
             insertedUri.toString()
         } catch (err: Exception) {
@@ -1015,6 +1120,8 @@ class MediaLibraryService(private val context: Context) {
     }
 
     companion object {
+        val galleryWriteMutex = Mutex()
+
         fun isSafeSilentDeleteFilename(filenameOrPath: String): Boolean {
             val trimmed = filenameOrPath.trim()
             if (trimmed.isEmpty()) return false

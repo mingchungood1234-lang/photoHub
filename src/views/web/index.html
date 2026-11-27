@@ -5,12 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta name="theme-color" content="#F97316" />
   <title>PhotoHub — Full-Res Cloud, Feather-Light Phone</title>
+  <link rel="manifest" href="/manifest.webmanifest" />
   <link rel="icon" type="image/png" href="/web/icon.png" />
   <link rel="apple-touch-icon" href="/web/icon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/web/styles.css?v=4" />
+  <link rel="stylesheet" href="/web/styles.css?v=5" />
 </head>
 <body>
   <!-- Animated Sunny Boot Splash Screen -->
@@ -314,13 +315,15 @@
             <button type="button" class="f-pill is-active" data-filter="all">All</button>
             <button type="button" class="f-pill" data-filter="photo">Photos</button>
             <button type="button" class="f-pill" data-filter="video">Videos</button>
+            <button type="button" class="f-pill" data-filter="favorite">♥ Favorites</button>
             <button type="button" class="f-pill" data-filter="protected">Protected</button>
+            <button type="button" class="f-pill f-pill--trash" data-filter="trash" id="trashFilterBtn">Trash <span id="trashCountBadge" class="pill-count hidden">0</span></button>
           </div>
 
           <div class="toolbar-right">
             <div class="search-wrap">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-              <input type="search" id="gallerySearchInput" placeholder="Search name or date…" autocomplete="off" />
+              <input type="search" id="gallerySearchInput" placeholder="Search Nov 2026, video, name…" autocomplete="off" />
             </div>
 
             <div class="segmented-control segmented-control--sm" id="groupingControl">
@@ -330,6 +333,10 @@
             </div>
 
             <button type="button" class="btn-soft btn-sm" id="selectModeBtn">Select</button>
+            <input type="file" id="webUploadInput" class="hidden" multiple accept="image/*,video/*" />
+            <button type="button" class="icon-btn" id="webUploadBtn" title="Upload Photos & Videos" aria-label="Upload photos and videos">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+            </button>
             <button type="button" class="icon-btn" id="refreshGalleryBtn" title="Refresh from Server" aria-label="Refresh gallery">
               <svg class="refresh-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
             </button>
@@ -338,6 +345,17 @@
 
         <!-- Year Quick Jump Bar -->
         <div class="year-pills hidden" id="yearJumpBar"></div>
+      </div>
+
+      <!-- 30-Day Trash Retention Banner -->
+      <div id="trashBanner" class="trash-banner hidden">
+        <div class="trash-banner-text">
+          <strong>Trash · 30-Day Safety Bin</strong>
+          <span id="trashBannerSub">Items are automatically removed 30 days after deletion.</span>
+        </div>
+        <div class="trash-banner-actions">
+          <button type="button" class="btn-danger btn-sm" id="emptyTrashBtn">Empty Trash</button>
+        </div>
       </div>
 
       <!-- Shimmer Loading Skeleton -->
@@ -374,11 +392,14 @@
   <div id="selectionBar" class="selection-bar hidden">
     <div class="selection-info">
       <strong id="selectionCountText">0 selected</strong>
-      <span id="selectionSizeText">0 B</span>
+      <span id="selectionSizeText">0 B · Shift+Click for range</span>
     </div>
     <div class="selection-actions">
-      <button type="button" class="btn-soft btn-sm" id="selectAllVisibleBtn">Select All</button>
-      <button type="button" class="btn-danger btn-sm" id="deleteSelectedBtn" disabled>Delete</button>
+      <button type="button" class="btn-soft btn-sm" id="selectAllVisibleBtn">All</button>
+      <button type="button" class="btn-primary btn-sm" id="downloadZipBtn" disabled>ZIP</button>
+      <button type="button" class="btn-soft btn-sm" id="shareSelectedBtn" disabled>Share</button>
+      <button type="button" class="btn-primary btn-sm hidden" id="restoreSelectedBtn" disabled>Restore</button>
+      <button type="button" class="btn-danger btn-sm" id="deleteSelectedBtn" disabled>Trash</button>
       <button type="button" class="btn-soft btn-sm" id="cancelSelectBtn">Done</button>
     </div>
   </div>
@@ -409,22 +430,35 @@
         <strong id="lbFilename">IMG_0001.HEIC</strong>
         <span id="lbMeta">2026-11-27 · 4.2 MB</span>
       </div>
-      <button type="button" class="lb-icon-btn" id="lbCloseBtn" aria-label="Close viewer">✕</button>
+      <div class="lb-top-actions">
+        <button type="button" class="lb-icon-btn" id="lbFavBtn" aria-label="Toggle favorite" title="Favorite">♡</button>
+        <button type="button" class="lb-icon-btn" id="lbInfoBtn" aria-label="Photo details" title="Details">i</button>
+        <button type="button" class="lb-icon-btn" id="lbCloseBtn" aria-label="Close viewer">✕</button>
+      </div>
     </div>
 
     <div class="lightbox-stage" id="lbStage">
       <button type="button" class="lb-nav lb-nav--prev" id="lbPrevBtn" aria-label="Previous photo">‹</button>
 
-      <div class="lb-media-box">
+      <div class="lb-media-box" id="lbMediaBox">
         <div id="lbSpinner" class="lb-spinner hidden">
           <div class="sunny-stage sunny-stage--sm" data-sunny-mood="uploading"></div>
           <span id="lbSpinnerText">Loading…</span>
         </div>
-        <img id="lbImage" class="lb-img hidden" alt="" />
+        <img id="lbImage" class="lb-img hidden" alt="" draggable="false" />
         <video id="lbVideo" class="lb-video hidden" controls playsinline preload="metadata"></video>
       </div>
 
       <button type="button" class="lb-nav lb-nav--next" id="lbNextBtn" aria-label="Next photo">›</button>
+
+      <!-- Optional Info Drawer (hides technical SHA-256 & EXIF cleanly until requested) -->
+      <aside id="lbInfoPanel" class="lb-info-panel hidden" aria-label="Photo details">
+        <div class="lb-info-head">
+          <strong>Details</strong>
+          <button type="button" class="lb-icon-btn lb-icon-btn--sm" id="lbInfoCloseBtn" aria-label="Close details">✕</button>
+        </div>
+        <dl id="lbInfoList" class="lb-info-list"></dl>
+      </aside>
     </div>
 
     <div id="lbDownloadBar" class="lb-dl-bar hidden">
@@ -439,8 +473,44 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
           <span>Original</span>
         </button>
+        <button type="button" class="btn-soft btn-sm" id="lbShareBtn">Share Link</button>
         <button type="button" class="btn-soft btn-sm" id="lbProtectBtn">Protect</button>
-        <button type="button" class="btn-danger btn-sm" id="lbDeleteBtn">Delete</button>
+        <button type="button" class="btn-primary btn-sm hidden" id="lbRestoreBtn">Restore</button>
+        <button type="button" class="btn-danger btn-sm" id="lbDeleteBtn">Trash</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== SHARE LINK MODAL ==================== -->
+  <div id="shareModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="shareModalTitle">
+    <div class="modal-card">
+      <button type="button" class="modal-close" id="closeShareModalBtn" aria-label="Close">✕</button>
+      <h3 id="shareModalTitle">Create Share Link</h3>
+      <p class="modal-sub" id="shareModalSub">Anyone with this link can view and download full-resolution originals without signing in.</p>
+
+      <form id="shareCreateForm" class="share-form">
+        <label class="form-field">
+          <span>Title</span>
+          <input type="text" id="shareTitleInput" placeholder="e.g. Weekend Trip" maxlength="120" />
+        </label>
+        <label class="form-field">
+          <span>Expires in</span>
+          <select id="shareExpirySelect">
+            <option value="24">24 hours</option>
+            <option value="168" selected>7 days</option>
+            <option value="720">30 days</option>
+          </select>
+        </label>
+        <label class="form-field">
+          <span>Passcode (optional)</span>
+          <input type="text" id="sharePasscodeInput" placeholder="Leave blank for open link" autocomplete="off" />
+        </label>
+        <button type="submit" class="btn-primary btn-full" id="shareGenerateBtn">Create Link</button>
+      </form>
+
+      <div id="shareResultBox" class="share-result hidden">
+        <input type="text" id="shareUrlOutput" readonly />
+        <button type="button" class="btn-primary btn-sm" id="shareCopyBtn">Copy</button>
       </div>
     </div>
   </div>
@@ -494,6 +564,6 @@
     </div>
   </footer>
 
-  <script src="/web/app.js?v=4" defer></script>
+  <script src="/web/app.js?v=5" defer></script>
 </body>
 </html>

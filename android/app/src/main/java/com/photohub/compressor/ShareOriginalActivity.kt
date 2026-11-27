@@ -533,16 +533,20 @@ private fun ShareOriginalScreen(
                                         }
                                         val tracker = LocalProxyTracker.getInstance(context)
                                         val client = PhotoHubApiClient(context, settings)
+                                        val orderedToSave = state.items.sortedWith(
+                                            compareBy<FetchedOriginalResult> { it.creationDateMs ?: 0L }
+                                                .thenBy { it.masterHash }
+                                        )
                                         var savedCount = 0
                                         var firstError: String? = null
-                                        for (item in state.items) {
+                                        for (item in orderedToSave) {
                                             try {
                                                 val isVideo = item.mimeType.startsWith("video/")
                                                 val savedId = mediaService.saveRestoredOriginalToGallery(
                                                     file = item.file,
                                                     isVideo = isVideo,
                                                     originalFilename = item.originalName,
-                                                    creationDateMs = null
+                                                    creationDateMs = item.creationDateMs
                                                 )
                                                 tracker.markRestoredOriginal(savedId, item.masterHash)
                                                 runCatching { client.setOriginalProtected(item.masterHash, true) }

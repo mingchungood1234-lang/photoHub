@@ -9,7 +9,10 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.database.ContentObserver
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -85,6 +88,19 @@ class BackgroundBackupManager private constructor(context: Context) {
     }
 
     fun isPausedForRestore(): Boolean = activeRestorePauseCount.get() > 0
+
+    fun isNetworkAllowedForAutoBackup(): Boolean {
+        val cur = settings.current
+        if (!cur.wifiOnlyBackup) return true
+        return runCatching {
+            val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                ?: return@runCatching true
+            val network = cm.activeNetwork ?: return@runCatching false
+            val caps = cm.getNetworkCapabilities(network) ?: return@runCatching false
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+        }.getOrDefault(true)
+    }
 
     fun beginRestorePause() {
         val count = activeRestorePauseCount.incrementAndGet()
@@ -258,8 +274,9 @@ class BackgroundBackupManager private constructor(context: Context) {
     fun scheduleBatchContinuationIfEnabled(isOvernight: Boolean) {
         val cur = settings.current
         if (!cur.nightlyAutoBackupEnabled || !cur.isSignedIn) return
+        val netType = if (isOvernight || cur.wifiOnlyBackup) NetworkType.UNMETERED else NetworkType.CONNECTED
         val constraints = Constraints.Builder()
-            .setRequiredNetworkType(if (isOvernight) NetworkType.UNMETERED else NetworkType.CONNECTED)
+            .setRequiredNetworkType(netType)
             .setRequiresBatteryNotLow(true)
             .build()
         val continuation = OneTimeWorkRequestBuilder<PhotoUploadWorker>()
@@ -290,7 +307,7 @@ class BackgroundBackupManager private constructor(context: Context) {
         if (mediaService.currentAccessLevel() == MediaAccessLevel.DENIED) return
 
         val triggerConstraints = Constraints.Builder()
-            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .setRequiredNetworkType(if (cur.wifiOnlyBackup) NetworkType.UNMETERED else NetworkType.CONNECTED)
             .addContentUriTrigger(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, true)
             .addContentUriTrigger(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, true)
             .setTriggerContentUpdateDelay(3, TimeUnit.SECONDS)
@@ -336,7 +353,7 @@ class BackgroundBackupManager private constructor(context: Context) {
         // If moving to background, enqueue a silent WorkManager task so OS finishes uploads even if killed
         if (isMovingToBackground) {
             val constraints = Constraints.Builder()
-                .setRequiredNetworkType(NetworkType.CONNECTED)
+                .setRequiredNetworkType(if (cur.wifiOnlyBackup) NetworkType.UNMETERED else NetworkType.CONNECTED)
                 .build()
             val oneTime = OneTimeWorkRequestBuilder<PhotoUploadWorker>()
                 .setConstraints(constraints)
@@ -350,6 +367,8 @@ class BackgroundBackupManager private constructor(context: Context) {
             )
             return
         }
+
+        if (!isNetworkAllowedForAutoBackup()) return
 
         isSilentRunning = true
         scope.launch {
@@ -366,46 +385,63 @@ class BackgroundBackupManager private constructor(context: Context) {
                 }
 
                 val tracker = LocalProxyTracker.getInstance(appContext)
+                val backupOnly = cur.isBackupOnlyMode
+                val effectiveKeepLocal = !backupOnly && cur.keepLocalProxyInPhotos
                 val cached = LocalProxyStore.getInstance(appContext)
                     .cachedPhotos(cur.normalizedBaseUrl, cur.apiKeyCacheScope)
                 val raw = mediaService.scanCandidates(
                     tracker = tracker,
                     knownServerPhotos = cached,
                     maxResults = 60,
-                    maxInspect = 3000
+                    maxInspect = 3000,
+                    oldestFirst = effectiveKeepLocal,
+                    skipBackedUpOriginals = backupOnly
                 )
 
                 val now = System.currentTimeMillis()
                 val stagedIds = _state.value.stagedItems.map { it.id }.toSet()
                 val activeIds = AssetUploadCoordinator.activeAssetIds()
-                val eligible = PhotoBackupPipeline
-                    .sortCandidates(raw, CandidateSortMode.LARGEST_VIDEOS_FIRST)
-                    .filter { cand ->
-                        cand.id !in stagedIds &&
-                            cand.id !in activeIds &&
-                            (cooldownUntilMs[cand.id] ?: 0L) <= now
-                    }
+                val sortedRaw = if (effectiveKeepLocal) {
+                    PhotoBackupPipeline.sortCandidatesOldestFirst(raw)
+                } else {
+                    PhotoBackupPipeline.sortCandidates(raw, CandidateSortMode.LARGEST_VIDEOS_FIRST)
+                }
+                val eligible = sortedRaw.filter { cand ->
+                    cand.id !in stagedIds &&
+                        cand.id !in activeIds &&
+                        (cooldownUntilMs[cand.id] ?: 0L) <= now
+                }
 
                 hasMoreEligible = eligible.size > 24
                 val batch = eligible.take(24)
                 val videoSem = Semaphore(1)
                 val gallerySem = Semaphore(1)
+                val commitGate = if (effectiveKeepLocal) {
+                    com.photohub.compressor.media.OrderedCommitGate()
+                } else {
+                    null
+                }
                 val newStaged = java.util.Collections.synchronizedList(mutableListOf<StagedCleanupItem>())
                 val syncFailed = java.util.Collections.synchronizedList(mutableListOf<String>())
+                val backedUpOnlyCount = AtomicInteger(0)
                 val silentDeletedCount = AtomicInteger(0)
                 val silentDeletedBytes = java.util.concurrent.atomic.AtomicLong(0L)
                 val quotaHit = java.util.concurrent.atomic.AtomicBoolean(false)
 
-                val workQueue = Channel<com.photohub.compressor.data.PhotoCandidate>(Channel.UNLIMITED)
-                batch.forEach { workQueue.trySend(it) }
+                val workQueue = Channel<Pair<Int, com.photohub.compressor.data.PhotoCandidate>>(Channel.UNLIMITED)
+                batch.forEachIndexed { idx, cand -> workQueue.trySend(idx to cand) }
                 workQueue.close()
 
                 coroutineScope {
                     val workers = List(minOf(3, batch.size)) {
                         launch(Dispatchers.IO) {
-                            for (candidate in workQueue) {
-                                if (!isActive || quotaHit.get() || isPausedForRestore()) break
+                            for ((workIndex, candidate) in workQueue) {
+                                if (!isActive || quotaHit.get() || isPausedForRestore()) {
+                                    commitGate?.cancelAll()
+                                    break
+                                }
                                 if (!AssetUploadCoordinator.tryClaimAsset(candidate.id, UploadOwner.BACKGROUND)) {
+                                    commitGate?.completeTurn(workIndex)
                                     continue
                                 }
                                 try {
@@ -419,45 +455,53 @@ class BackgroundBackupManager private constructor(context: Context) {
                                         maxPixelSize = cur.proxyMaxPixelSize,
                                         quality = cur.proxyQuality,
                                         uploadMode = effectiveUploadMode,
-                                        keepLocalProxy = cur.keepLocalProxyInPhotos,
+                                        keepLocalProxy = effectiveKeepLocal,
                                         normalizedBaseUrl = cur.normalizedBaseUrl,
                                         cacheScopeKey = cur.apiKeyCacheScope,
                                         videoSemaphore = videoSem,
                                         gallerySaveSemaphore = gallerySem,
+                                        commitGate = commitGate,
+                                        commitIndex = workIndex,
                                         onStageChange = {}
                                     )
                                     if (res is BackupPipelineResult.BackedUp) {
-                                        val deletedSilently = tryHandleBackedUpSilentDelete(
-                                            candidateId = candidate.id,
-                                            outcome = res.outcome,
-                                            settingsState = cur,
-                                            mediaService = mediaService,
-                                            tracker = tracker
-                                        )
-                                        if (deletedSilently) {
-                                            silentDeletedCount.incrementAndGet()
-                                            silentDeletedBytes.addAndGet(res.outcome.savedBytes.coerceAtLeast(0L))
+                                        if (backupOnly) {
+                                            backedUpOnlyCount.incrementAndGet()
                                         } else {
-                                            newStaged.add(
-                                                StagedCleanupItem(
-                                                    id = candidate.id,
-                                                    filename = res.outcome.filename,
-                                                    masterSha256 = res.outcome.masterSha256,
-                                                    savedBytes = res.outcome.savedBytes,
-                                                    verifiedAtMs = System.currentTimeMillis()
-                                                )
+                                            val deletedSilently = tryHandleBackedUpSilentDelete(
+                                                candidateId = candidate.id,
+                                                outcome = res.outcome,
+                                                settingsState = cur,
+                                                mediaService = mediaService,
+                                                tracker = tracker
                                             )
+                                            if (deletedSilently) {
+                                                silentDeletedCount.incrementAndGet()
+                                                silentDeletedBytes.addAndGet(res.outcome.savedBytes.coerceAtLeast(0L))
+                                            } else {
+                                                newStaged.add(
+                                                    StagedCleanupItem(
+                                                        id = candidate.id,
+                                                        filename = res.outcome.filename,
+                                                        masterSha256 = res.outcome.masterSha256,
+                                                        savedBytes = res.outcome.savedBytes,
+                                                        verifiedAtMs = System.currentTimeMillis()
+                                                    )
+                                                )
+                                            }
                                         }
                                     }
                                 } catch (err: ApiHttpException) {
                                     if (err.statusCode == 507) {
                                         quotaHit.set(true)
+                                        commitGate?.cancelAll()
                                         break
                                     }
                                     syncFailed.add(candidate.id)
                                 } catch (_: Exception) {
                                     syncFailed.add(candidate.id)
                                 } finally {
+                                    commitGate?.completeTurn(workIndex)
                                     AssetUploadCoordinator.releaseAsset(candidate.id, UploadOwner.BACKGROUND)
                                 }
                             }
@@ -465,33 +509,41 @@ class BackgroundBackupManager private constructor(context: Context) {
                     }
                     workers.joinAll()
                 }
+                commitGate?.cancelAll()
                 failedIds.addAll(syncFailed)
                 if (quotaHit.get()) hasMoreEligible = false
 
-                val stagedList = newStaged.toList()
-                if (stagedList.isNotEmpty()) {
-                    appendStagedItems(stagedList)
-                }
-                pruneMissingAssetsFromStaged()
-                silentlyCleanStagedItemsIfAllowed()
-
-                val stagedCount = _state.value.stagedItems.size
-                val stagedBytes = _state.value.stagedSavedBytes
-                val totalStr = Formatter.formatFileSize(appContext, stagedBytes)
-                val silentDeletedTotal = silentDeletedCount.get()
-                if (stagedCount > 0 && stagedList.isNotEmpty()) {
-                    updateSummary("Backed up ${stagedList.size} · $stagedCount ready (~$totalStr)")
-                    if (cur.notifyWhenBackgroundUploadFinishes) {
-                        sendDeleteOriginalsNotification(
-                            count = stagedCount,
-                            savedBytes = stagedBytes,
-                            immediate = true,
-                            morningHour = cur.morningReminderHour
-                        )
+                if (backupOnly) {
+                    val count = backedUpOnlyCount.get()
+                    if (count > 0) {
+                        updateSummary("Backed up $count · Originals kept on phone")
                     }
-                } else if (silentDeletedTotal > 0) {
-                    val freedStr = Formatter.formatFileSize(appContext, silentDeletedBytes.get())
-                    updateSummary("Backed up $silentDeletedTotal · ~$freedStr")
+                } else {
+                    val stagedList = newStaged.toList()
+                    if (stagedList.isNotEmpty()) {
+                        appendStagedItems(stagedList)
+                    }
+                    pruneMissingAssetsFromStaged()
+                    silentlyCleanStagedItemsIfAllowed()
+
+                    val stagedCount = _state.value.stagedItems.size
+                    val stagedBytes = _state.value.stagedSavedBytes
+                    val totalStr = Formatter.formatFileSize(appContext, stagedBytes)
+                    val silentDeletedTotal = silentDeletedCount.get()
+                    if (stagedCount > 0 && stagedList.isNotEmpty()) {
+                        updateSummary("Backed up ${stagedList.size} · $stagedCount ready (~$totalStr)")
+                        if (cur.notifyWhenBackgroundUploadFinishes) {
+                            sendDeleteOriginalsNotification(
+                                count = stagedCount,
+                                savedBytes = stagedBytes,
+                                immediate = true,
+                                morningHour = cur.morningReminderHour
+                            )
+                        }
+                    } else if (silentDeletedTotal > 0) {
+                        val freedStr = Formatter.formatFileSize(appContext, silentDeletedBytes.get())
+                        updateSummary("Backed up $silentDeletedTotal · ~$freedStr")
+                    }
                 }
             } finally {
                 val retryAt = System.currentTimeMillis() + 180_000L
@@ -568,6 +620,9 @@ class BackgroundBackupManager private constructor(context: Context) {
         mediaService: MediaLibraryService = MediaLibraryService(appContext),
         tracker: LocalProxyTracker = LocalProxyTracker.getInstance(appContext)
     ): Boolean {
+        if (settingsState.isBackupOnlyMode) {
+            return false
+        }
         if (!settingsState.silentAutoDeleteOriginals || !mediaService.canSilentlyDeleteOriginals()) {
             return false
         }
@@ -582,6 +637,9 @@ class BackgroundBackupManager private constructor(context: Context) {
 
     suspend fun silentlyCleanStagedItemsIfAllowed(): Int {
         val cur = settings.current
+        if (cur.isBackupOnlyMode) {
+            return 0
+        }
         val mediaService = MediaLibraryService(appContext)
         if (!cur.silentAutoDeleteOriginals || !mediaService.canSilentlyDeleteOriginals()) {
             return 0
@@ -702,10 +760,24 @@ class BackgroundBackupManager private constructor(context: Context) {
             val sizePx = appContext.resources
                 .getDimensionPixelSize(android.R.dimen.notification_large_icon_width)
                 .coerceIn(96, 256)
-            val baseDrawable = runCatching {
-                appContext.packageManager.getApplicationIcon(appContext.applicationInfo)
-            }.getOrNull()
-                ?: ContextCompat.getDrawable(appContext, R.mipmap.ic_launcher_round)
+
+            // Decode our bundled Sunny round/launcher PNG directly so OEM PackageManager icon caches
+            // never surface a stale old app icon after an in-place APK upgrade.
+            val decoded = BitmapFactory.decodeResource(appContext.resources, R.mipmap.ic_launcher_round)
+                ?: BitmapFactory.decodeResource(appContext.resources, R.mipmap.ic_launcher)
+            if (decoded != null) {
+                val scaled = if (decoded.width == sizePx && decoded.height == sizePx) {
+                    decoded
+                } else {
+                    Bitmap.createScaledBitmap(decoded, sizePx, sizePx, true).also {
+                        if (it !== decoded) decoded.recycle()
+                    }
+                }
+                cachedNotificationLargeIcon = scaled
+                return@runCatching scaled
+            }
+
+            val baseDrawable = ContextCompat.getDrawable(appContext, R.mipmap.ic_launcher_round)
                 ?: ContextCompat.getDrawable(appContext, R.mipmap.ic_launcher)
                 ?: return@runCatching null
 

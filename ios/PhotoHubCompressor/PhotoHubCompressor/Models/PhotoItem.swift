@@ -54,6 +54,9 @@ enum PhotoCompressionState: Equatable, Sendable {
             let formatted = ByteCountFormatter.string(fromByteCount: max(0, savedBytes), countStyle: .file)
             return "Backed Up · Ready to Delete Original (Free \(formatted))"
         case .completed(let savedBytes):
+            if savedBytes <= 0 {
+                return "Backed Up · Original Kept"
+            }
             let formatted = ByteCountFormatter.string(fromByteCount: max(0, savedBytes), countStyle: .file)
             return "Verified & Saved \(formatted)"
         case .skipped(let reason):

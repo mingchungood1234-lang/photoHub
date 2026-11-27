@@ -87,10 +87,15 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
     private var debouncedSilentTask: Task<Void, Never>?
     private var pathMonitor: NWPathMonitor?
     private var lastNetworkSatisfied: Bool = true
+    private var lastNetworkIsWifi: Bool = true
     private weak var settingsRef: AppSettings?
 
     var isPausedForRestore: Bool {
         activeRestorePauseCount > 0
+    }
+
+    func isNetworkAllowedForAutoBackup(settings: AppSettings) -> Bool {
+        !settings.wifiOnlyBackup || lastNetworkIsWifi
     }
 
     func beginRestorePause() {
@@ -134,11 +139,14 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
         let monitor = NWPathMonitor()
         monitor.pathUpdateHandler = { [weak self] path in
             let isOnline = (path.status == .satisfied)
+            let isWifi = isOnline && !path.isExpensive && (path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet))
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let recovered = isOnline && !self.lastNetworkSatisfied
+                let joinedWifi = isWifi && !self.lastNetworkIsWifi
                 self.lastNetworkSatisfied = isOnline
-                if recovered {
+                self.lastNetworkIsWifi = isWifi
+                if recovered || joinedWifi {
                     self.recentFailureCooldownUntil.removeAll()
                     self.scheduleDebouncedSilentCheck(delayNanoseconds: 2_000_000_000)
                 }
@@ -344,6 +352,8 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                     content: content,
                     trigger: trigger
                 )
+                UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [req.identifier])
+                UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [req.identifier])
                 UNUserNotificationCenter.current().add(req)
             }
         }
@@ -397,6 +407,10 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                 content: content,
                 trigger: trigger
             )
+            UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [
+                Self.morningNotificationIdentifier,
+                Self.deleteReadyNotificationIdentifier,
+            ])
             UNUserNotificationCenter.current().add(req)
         }
     }
@@ -483,6 +497,7 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
         guard !isPausedForRestore,
               settings.nightlyAutoBackupEnabled,
               settings.isSignedIn,
+              isNetworkAllowedForAutoBackup(settings: settings),
               let baseURL = settings.normalizedBaseURL,
               let uploadConfig = BackgroundUploadConfig(settings: settings) else {
             return
@@ -509,10 +524,11 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
         let maxPx = settings.proxyMaxPixelSize
         let quality = settings.proxyQuality
         let uploadMode = settings.uploadMode
-        let keepLocal = settings.keepLocalProxyInPhotos
+        let backupOnly = settings.isBackupOnlyMode
+        let keepLocal = !backupOnly && settings.keepLocalProxyInPhotos
         let cacheScope = settings.apiKey
         let morningHour = settings.morningReminderHour
-        let notifyOnFinish = settings.notifyWhenBackgroundUploadFinishes
+        let notifyOnFinish = !backupOnly && settings.notifyWhenBackgroundUploadFinishes
         let existingStagedIds = Set(stagedItems.map { $0.id })
         let now = Date()
         recentFailureCooldownUntil = recentFailureCooldownUntil.filter { $0.value > now }
@@ -559,16 +575,19 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                 tracker: tracker,
                 knownServerPhotos: cachedServerPhotos,
                 maxResults: 60,
-                maxInspect: 3000
+                maxInspect: 3000,
+                oldestFirst: keepLocal,
+                skipBackedUpOriginals: backupOnly
             )
             let activeIds = AssetUploadCoordinator.shared.activeAssetIds()
-            let eligible = PhotoBackupPipeline
-                .sortCandidates(rawCandidates, by: .largestVideosFirst)
-                .filter {
-                    !existingStagedIds.contains($0.id) &&
-                    !activeIds.contains($0.id) &&
-                    !cooldownIds.contains($0.id)
-                }
+            let sortedCandidates = keepLocal
+                ? PhotoChronologicalOrder.sortCandidatesOldestFirst(rawCandidates)
+                : PhotoBackupPipeline.sortCandidates(rawCandidates, by: .largestVideosFirst)
+            let eligible = sortedCandidates.filter {
+                !existingStagedIds.contains($0.id) &&
+                !activeIds.contains($0.id) &&
+                !cooldownIds.contains($0.id)
+            }
             let batchLimit = isMovingToBackground ? 16 : 24
             hasMoreEligible = eligible.count > batchLimit
             let prioritized = Array(eligible.prefix(batchLimit))
@@ -611,14 +630,20 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
             }
 
             if !inProcessCandidates.isEmpty && !Task.isCancelled && !counters.isQuotaHit {
-                let queue = AsyncWorkQueue(inProcessCandidates)
+                let indexedInProcess = inProcessCandidates.enumerated().map { (index: $0.offset, candidate: $0.element) }
+                let queue = AsyncWorkQueue(indexedInProcess)
+                let commitGate = keepLocal ? OrderedCommitGate() : nil
                 let workerCount = min(3, inProcessCandidates.count)
                 await withTaskGroup(of: Void.self) { group in
                     for _ in 0..<workerCount {
                         group.addTask { [weak self] in
                             while !Task.isCancelled && !counters.isQuotaHit {
-                                guard let candidate = await queue.next() else { break }
+                                guard let work = await queue.next() else { break }
+                                let candidate = work.candidate
                                 guard AssetUploadCoordinator.shared.tryClaimAsset(candidate.id, owner: .background) else {
+                                    if let commitGate {
+                                        await commitGate.completeTurn(work.index)
+                                    }
                                     continue
                                 }
                                 defer { AssetUploadCoordinator.shared.releaseAsset(candidate.id, owner: .background) }
@@ -638,31 +663,47 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                                         cacheScopeKey: cacheScope,
                                         videoSemaphore: videoSemaphore,
                                         photosSaveSemaphore: photosSaveSemaphore,
+                                        commitGate: commitGate,
+                                        commitIndex: work.index,
                                         onStageChange: { _ in }
                                     )
 
                                     if case .backedUp(let outcome) = result {
-                                        let entry = StagedCleanupItem(
-                                            id: candidate.id,
-                                            filename: outcome.filename,
-                                            masterSha256: outcome.masterSha256,
-                                            savedBytes: outcome.savedBytes,
-                                            verifiedAt: Date()
-                                        )
-                                        await MainActor.run {
-                                            self?.appendStagedItem(entry)
+                                        if !backupOnly {
+                                            let entry = StagedCleanupItem(
+                                                id: candidate.id,
+                                                filename: outcome.filename,
+                                                masterSha256: outcome.masterSha256,
+                                                savedBytes: outcome.savedBytes,
+                                                verifiedAt: Date()
+                                            )
+                                            await MainActor.run {
+                                                self?.appendStagedItem(entry)
+                                            }
                                         }
                                         counters.incrementUploaded()
                                     }
                                 } catch APIClientError.httpError(507, _) {
                                     counters.markQuotaHit()
+                                    if let commitGate {
+                                        await commitGate.cancelAll()
+                                    }
                                     break
                                 } catch {
+                                    if let commitGate {
+                                        await commitGate.completeTurn(work.index)
+                                    }
                                     counters.appendFailed(candidate.id)
                                 }
                             }
+                            if (Task.isCancelled || counters.isQuotaHit), let commitGate {
+                                await commitGate.cancelAll()
+                            }
                         }
                     }
+                }
+                if let commitGate {
+                    await commitGate.cancelAll()
                 }
             }
 
@@ -678,6 +719,10 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
             if uploadedNewCount > 0 {
                 await MainActor.run {
                     guard let self else { return }
+                    if backupOnly {
+                        self.updateSummary("Backed up \(uploadedNewCount) · Originals kept on phone")
+                        return
+                    }
                     self.pruneMissingAssetsFromStaged()
                     let totalCount = self.stagedItems.count
                     let totalBytes = self.stagedSavedBytes
@@ -724,6 +769,12 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
             return
         }
 
+        if !isNetworkAllowedForAutoBackup(settings: settings) {
+            updateSummary("Waiting for Wi-Fi")
+            task.setTaskCompleted(success: true)
+            return
+        }
+
         let authStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         guard authStatus == .authorized || authStatus == .limited else {
             task.setTaskCompleted(success: false)
@@ -735,10 +786,11 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
         let maxPx = settings.proxyMaxPixelSize
         let quality = settings.proxyQuality
         let uploadMode = settings.uploadMode
-        let keepLocal = settings.keepLocalProxyInPhotos
+        let backupOnly = settings.isBackupOnlyMode
+        let keepLocal = !backupOnly && settings.keepLocalProxyInPhotos
         let cacheScope = settings.apiKey
         let morningHour = settings.morningReminderHour
-        let notifyImmediate = settings.notifyWhenBackgroundUploadFinishes
+        let notifyImmediate = !backupOnly && settings.notifyWhenBackgroundUploadFinishes
         let existingStagedIds = Set(stagedItems.map { $0.id })
         let activeBgIds = BackgroundUploadTransport.shared.activeAssetIds()
         let uploadConfig = BackgroundUploadConfig(settings: settings)
@@ -766,11 +818,15 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                 tracker: tracker,
                 knownServerPhotos: cachedServerPhotos,
                 maxResults: scanCap,
-                maxInspect: inspectCap
+                maxInspect: inspectCap,
+                oldestFirst: keepLocal,
+                skipBackedUpOriginals: backupOnly
             )
             let activeIds = AssetUploadCoordinator.shared.activeAssetIds()
-            let prioritized = PhotoBackupPipeline
-                .sortCandidates(rawCandidates, by: .largestVideosFirst)
+            let sortedScheduled = keepLocal
+                ? PhotoChronologicalOrder.sortCandidatesOldestFirst(rawCandidates)
+                : PhotoBackupPipeline.sortCandidates(rawCandidates, by: .largestVideosFirst)
+            let prioritized = sortedScheduled
                 .filter { !existingStagedIds.contains($0.id) && !activeIds.contains($0.id) }
                 .prefix(maxItems)
 
@@ -826,15 +882,17 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                     )
 
                     if case .backedUp(let outcome) = result {
-                        let entry = StagedCleanupItem(
-                            id: candidate.id,
-                            filename: outcome.filename,
-                            masterSha256: outcome.masterSha256,
-                            savedBytes: outcome.savedBytes,
-                            verifiedAt: Date()
-                        )
-                        await MainActor.run {
-                            self?.appendStagedItem(entry)
+                        if !backupOnly {
+                            let entry = StagedCleanupItem(
+                                id: candidate.id,
+                                filename: outcome.filename,
+                                masterSha256: outcome.masterSha256,
+                                savedBytes: outcome.savedBytes,
+                                verifiedAt: Date()
+                            )
+                            await MainActor.run {
+                                self?.appendStagedItem(entry)
+                            }
                         }
                         processedNew += 1
                     }
@@ -854,6 +912,10 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
 
             await MainActor.run {
                 guard let self else { return }
+                if backupOnly {
+                    self.updateSummary(processedNew > 0 ? "Backed up \(processedNew) · Originals kept on phone" : "All backed up · Originals kept")
+                    return
+                }
                 self.pruneMissingAssetsFromStaged()
                 let totalCount = self.stagedItems.count
                 let totalBytes = self.stagedSavedBytes
@@ -889,7 +951,7 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
         }
     }
 
-    private func updateSummary(_ message: String) {
+    func updateSummary(_ message: String) {
         lastRunSummary = message
         UserDefaults.standard.set(message, forKey: lastRunSummaryKey)
     }

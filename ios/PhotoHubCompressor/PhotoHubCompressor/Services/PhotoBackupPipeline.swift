@@ -74,8 +74,16 @@ enum PhotoBackupPipeline {
         cacheScopeKey: String,
         videoSemaphore: AsyncSemaphore,
         photosSaveSemaphore: AsyncSemaphore,
+        commitGate: OrderedCommitGate? = nil,
+        commitIndex: Int? = nil,
         onStageChange: @Sendable @escaping (PhotoCompressionState) -> Void
     ) async throws -> BackupPipelineResult {
+        func releaseCommitTurnIfNeeded() async {
+            if let commitGate, let commitIndex {
+                await commitGate.completeTurn(commitIndex)
+            }
+        }
+
         // Fast local metadata guard before any export/iCloud download
         if let proxyMatch = PhotoLibraryService.proxyHashPrefixFromAssetResources(candidate.asset) {
             tracker.markAsProxy(
@@ -84,14 +92,22 @@ enum PhotoBackupPipeline {
                 masterHash: nil,
                 originalName: proxyMatch.filename
             )
+            await releaseCommitTurnIfNeeded()
             return .skippedExistingProxy(masterHash: nil)
         }
         if tracker.isRestoredOriginal(assetId: candidate.id) {
+            await releaseCommitTurnIfNeeded()
             return .skippedProtectedOriginal(masterHash: nil)
         }
 
         // Step 1: Export full-resolution original & compute SHA-256
-        let master = try await photoService.exportOriginalMasterAsync(for: candidate.asset)
+        let master: ExportedMaster
+        do {
+            master = try await photoService.exportOriginalMasterAsync(for: candidate.asset)
+        } catch {
+            await releaseCommitTurnIfNeeded()
+            throw error
+        }
         defer { try? FileManager.default.removeItem(at: master.fileURL) }
 
         // Step 1b: Inspect embedded EXIF/QuickTime proxy marker (catches iCloud-synced proxies even if renamed/re-encoded)
@@ -105,11 +121,18 @@ enum PhotoBackupPipeline {
                 masterHash: embeddedMasterHash,
                 originalName: master.filename
             )
+            await releaseCommitTurnIfNeeded()
             return .skippedExistingProxy(masterHash: embeddedMasterHash)
         }
 
         // Step 2: Check server & upload original if not already verified on server
-        let checkResult = try await apiClient.checkHash(master.sha256)
+        let checkResult: CheckHashResponse
+        do {
+            checkResult = try await apiClient.checkHash(master.sha256)
+        } catch {
+            await releaseCommitTurnIfNeeded()
+            throw error
+        }
         if checkResult.isProxy == true {
             tracker.markAsProxy(
                 assetId: candidate.id,
@@ -117,12 +140,14 @@ enum PhotoBackupPipeline {
                 masterHash: checkResult.masterHash,
                 originalName: master.filename
             )
+            await releaseCommitTurnIfNeeded()
             return .skippedExistingProxy(masterHash: checkResult.masterHash)
         }
 
         let resolvedMasterHash = checkResult.masterHash ?? master.sha256
         tracker.markUploadedOriginal(assetId: candidate.id, masterHash: resolvedMasterHash)
         guard AssetUploadCoordinator.shared.tryClaimMasterHash(resolvedMasterHash) else {
+            await releaseCommitTurnIfNeeded()
             return .skippedInFlight
         }
         defer { AssetUploadCoordinator.shared.releaseMasterHash(resolvedMasterHash) }
@@ -133,6 +158,7 @@ enum PhotoBackupPipeline {
             || tracker.isRestoredMasterHash(resolvedMasterHash)
         if isProtectedOriginal {
             tracker.markRestoredOriginal(assetId: candidate.id, masterHash: resolvedMasterHash)
+            await releaseCommitTurnIfNeeded()
             return .skippedProtectedOriginal(masterHash: resolvedMasterHash)
         }
 
@@ -144,6 +170,7 @@ enum PhotoBackupPipeline {
         // If original + server proxy (and local proxy if needed) are already completed,
         // skip both uploading and re-compressing/saving duplicate proxies to Apple Photos.
         if !needsUpload && serverHasProxy && (!keepLocalProxy || localProxyAlreadyExists) {
+            await releaseCommitTurnIfNeeded()
             let knownProxyBytes = checkResult.proxySize ?? 0
             let savedBytes = keepLocalProxy ? max(0, master.sizeBytes - knownProxyBytes) : master.sizeBytes
             return .backedUp(
@@ -163,28 +190,9 @@ enum PhotoBackupPipeline {
                 onStageChange(.uploading(progress))
             }
 
-            switch uploadMode {
-            case .directVPS:
-                _ = try await apiClient.uploadMasterDirect(
-                    fileURL: master.fileURL,
-                    filename: master.filename,
-                    mimeType: master.mimeType,
-                    createdAt: candidate.creationDate,
-                    expectedSha256: master.sha256,
-                    onProgress: progressHandler
-                )
-            case .s3Presigned:
-                do {
-                    _ = try await apiClient.uploadMasterPresigned(
-                        fileURL: master.fileURL,
-                        filename: master.filename,
-                        mimeType: master.mimeType,
-                        createdAt: candidate.creationDate,
-                        expectedSha256: master.sha256,
-                        onProgress: progressHandler
-                    )
-                } catch APIClientError.httpError(501, _) {
-                    // Server switched back to direct storage; fall back transparently.
+            do {
+                switch uploadMode {
+                case .directVPS:
                     _ = try await apiClient.uploadMasterDirect(
                         fileURL: master.fileURL,
                         filename: master.filename,
@@ -193,7 +201,31 @@ enum PhotoBackupPipeline {
                         expectedSha256: master.sha256,
                         onProgress: progressHandler
                     )
+                case .s3Presigned:
+                    do {
+                        _ = try await apiClient.uploadMasterPresigned(
+                            fileURL: master.fileURL,
+                            filename: master.filename,
+                            mimeType: master.mimeType,
+                            createdAt: candidate.creationDate,
+                            expectedSha256: master.sha256,
+                            onProgress: progressHandler
+                        )
+                    } catch APIClientError.httpError(501, _) {
+                        // Server switched back to direct storage; fall back transparently.
+                        _ = try await apiClient.uploadMasterDirect(
+                            fileURL: master.fileURL,
+                            filename: master.filename,
+                            mimeType: master.mimeType,
+                            createdAt: candidate.creationDate,
+                            expectedSha256: master.sha256,
+                            onProgress: progressHandler
+                        )
+                    }
                 }
+            } catch {
+                await releaseCommitTurnIfNeeded()
+                throw error
             }
         }
 
@@ -216,19 +248,25 @@ enum PhotoBackupPipeline {
                 await videoSemaphore.release()
             } catch {
                 await videoSemaphore.release()
+                await releaseCommitTurnIfNeeded()
                 throw error
             }
             previewFileForServer = proxy.posterFileURL
             previewFormatForServer = "jpeg"
             videoProxyFileForServer = proxy.fileURL
         } else {
-            proxy = try ProxyGenerator.createProxy(
-                from: master.fileURL,
-                format: format,
-                maxPixelSize: maxPixelSize,
-                quality: quality,
-                masterHash: master.sha256
-            )
+            do {
+                proxy = try ProxyGenerator.createProxy(
+                    from: master.fileURL,
+                    format: format,
+                    maxPixelSize: maxPixelSize,
+                    quality: quality,
+                    masterHash: master.sha256
+                )
+            } catch {
+                await releaseCommitTurnIfNeeded()
+                throw error
+            }
             previewFileForServer = proxy.fileURL
             previewFormatForServer = format.rawValue
             videoProxyFileForServer = nil
@@ -295,24 +333,39 @@ enum PhotoBackupPipeline {
             : master.sizeBytes
 
         if keepLocalProxy {
+            onStageChange(.replacingInPhotos)
+            let canCommit: Bool
+            if let commitGate, let commitIndex {
+                canCommit = await commitGate.waitForTurn(commitIndex)
+            } else {
+                canCommit = true
+            }
+            if !canCommit {
+                await releaseCommitTurnIfNeeded()
+                throw CancellationError()
+            }
+            await photosSaveSemaphore.acquire()
             let existingProxyPrefix = ProxyGenerator.proxyPrefixTag(forMasterHash: master.sha256)
             let alreadyHasProxyInPhotos = tracker.liveProxyAssetId(forMasterHash: master.sha256) != nil
                 || PhotoLibraryService.scanExistingProxyPrefixesInPhotos()[existingProxyPrefix] != nil
             if alreadyHasProxyInPhotos {
                 tracker.markMasterHandledForPhotos(master.sha256)
+                await photosSaveSemaphore.release()
+                await releaseCommitTurnIfNeeded()
             } else {
-                onStageChange(.replacingInPhotos)
-                await photosSaveSemaphore.acquire()
                 let newAssetId: String
                 do {
                     newAssetId = try await photoService.saveCompressedProxyToPhotosAsync(
                         originalAsset: candidate.asset,
                         mediaType: candidate.mediaType,
-                        proxyFileURL: proxy.fileURL
+                        proxyFileURL: proxy.fileURL,
+                        masterHash: master.sha256
                     )
                     await photosSaveSemaphore.release()
+                    await releaseCommitTurnIfNeeded()
                 } catch {
                     await photosSaveSemaphore.release()
+                    await releaseCommitTurnIfNeeded()
                     throw error
                 }
 
@@ -326,6 +379,7 @@ enum PhotoBackupPipeline {
                 }
             }
         } else {
+            await releaseCommitTurnIfNeeded()
             tracker.markMasterHandledForPhotos(master.sha256)
         }
 

@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#F97316" />
+  <title>Shared Photos — PhotoHub</title>
+  <link rel="icon" type="image/png" href="/web/icon.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --orange: #F97316;
+      --deep-orange: #EA580C;
+      --amber: #F59E0B;
+      --mint: #10B981;
+      --rose: #EF4444;
+      --canvas: #FFF9F5;
+      --soft-peach: #FFF0E5;
+      --card: #FFFFFF;
+      --border: rgba(249, 216, 193, 0.85);
+      --ink: #261C15;
+      --muted: #8C7466;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --orange: #FB923C;
+        --deep-orange: #F97316;
+        --canvas: #14100E;
+        --soft-peach: #2E231D;
+        --card: #211A16;
+        --border: rgba(74, 57, 47, 0.85);
+        --ink: #FFF7F0;
+        --muted: #B8A498;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100dvh;
+      font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: var(--canvas);
+      color: var(--ink);
+    }
+    .hidden { display: none !important; }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 30;
+      backdrop-filter: blur(16px);
+      background: color-mix(in srgb, var(--canvas) 84%, transparent);
+      border-bottom: 1px solid var(--border);
+    }
+    .hdr-inner {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 12px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 800;
+      text-decoration: none;
+      color: var(--ink);
+    }
+    .brand img { width: 32px; height: 32px; border-radius: 9px; }
+    .pill {
+      font-size: 0.76rem;
+      font-weight: 700;
+      padding: 5px 11px;
+      border-radius: 999px;
+      background: var(--soft-peach);
+      color: var(--orange);
+      border: 1px solid var(--border);
+    }
+    main {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 24px 18px 64px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      padding: 26px 22px;
+      max-width: 420px;
+      margin: 48px auto;
+      text-align: center;
+      box-shadow: 0 14px 36px rgba(234, 88, 12, 0.10);
+    }
+    .card h1 { margin: 8px 0 6px; font-size: 1.35rem; font-weight: 800; }
+    .card p { margin: 0 0 18px; color: var(--muted); font-size: 0.9rem; }
+    .input {
+      width: 100%;
+      padding: 12px 15px;
+      border-radius: 14px;
+      border: 1.5px solid var(--border);
+      background: var(--canvas);
+      color: var(--ink);
+      font: inherit;
+      font-size: 0.95rem;
+      margin-bottom: 12px;
+      outline: none;
+    }
+    .input:focus { border-color: var(--orange); }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      border: none;
+      border-radius: 999px;
+      font: inherit;
+      font-weight: 700;
+      padding: 11px 20px;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, #FF9E44, var(--orange), var(--deep-orange));
+      color: #fff;
+      box-shadow: 0 8px 20px rgba(249, 115, 22, 0.3);
+    }
+    .btn-soft {
+      background: var(--soft-peach);
+      color: var(--deep-orange);
+      border: 1px solid var(--border);
+    }
+    .err { color: var(--rose); font-size: 0.84rem; font-weight: 700; margin-bottom: 10px; }
+    .album-head {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      padding: 18px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+    .album-head h1 { margin: 0 0 4px; font-size: 1.3rem; font-weight: 800; }
+    .album-meta { font-size: 0.82rem; color: var(--muted); font-weight: 600; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+      gap: 10px;
+    }
+    .tile {
+      position: relative;
+      aspect-ratio: 1 / 1;
+      border-radius: 16px;
+      overflow: hidden;
+      background: var(--soft-peach);
+      border: 1px solid var(--border);
+      cursor: pointer;
+    }
+    .tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .tile-vid {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      color: var(--muted);
+      font-weight: 700;
+      font-size: 0.8rem;
+    }
+    .tile-dl {
+      position: absolute;
+      right: 8px;
+      bottom: 8px;
+      padding: 5px 10px;
+      font-size: 0.72rem;
+      border-radius: 999px;
+      background: rgba(20, 16, 14, 0.75);
+      color: #fff;
+      text-decoration: none;
+      font-weight: 700;
+    }
+    .lightbox {
+      position: fixed;
+      inset: 0;
+      z-index: 90;
+      background: rgba(14, 10, 8, 0.95);
+      display: flex;
+      flex-direction: column;
+      color: #FFF7F0;
+    }
+    .lb-top, .lb-bot {
+      padding: 14px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .lb-stage {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 12px;
+      min-height: 0;
+    }
+    .lb-stage img, .lb-stage video {
+      max-width: 100%;
+      max-height: 100%;
+      border-radius: 12px;
+      object-fit: contain;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="hdr-inner">
+      <a class="brand" href="/">
+        <img src="/web/icon.png" alt="PhotoHub" />
+        <span>PhotoHub</span>
+      </a>
+      <span class="pill" id="expiryPill">Shared Link</span>
+    </div>
+  </header>
+
+  <main>
+    <div id="loadingBox" class="card">
+      <h1>Loading Shared Photos…</h1>
+      <p>Preparing full-resolution previews.</p>
+    </div>
+
+    <div id="passcodeBox" class="card hidden">
+      <h1 id="lockTitle">Protected Share</h1>
+      <p id="lockSub">Enter the passcode to view and download these photos.</p>
+      <div id="lockErr" class="err hidden"></div>
+      <form id="passcodeForm">
+        <input type="password" id="passcodeInput" class="input" placeholder="Enter passcode" autocomplete="off" required />
+        <button type="submit" class="btn btn-primary" style="width:100%">Unlock Photos</button>
+      </form>
+    </div>
+
+    <div id="errorBox" class="card hidden">
+      <h1>Link Unavailable</h1>
+      <p id="errorText">This share link has expired or been revoked.</p>
+      <a href="/" class="btn btn-soft">Open PhotoHub</a>
+    </div>
+
+    <div id="albumView" class="hidden">
+      <div class="album-head">
+        <div>
+          <h1 id="albumTitle">Shared Photos</h1>
+          <div class="album-meta" id="albumMeta"></div>
+        </div>
+        <a href="/" class="btn btn-soft">Open PhotoHub</a>
+      </div>
+      <div id="photoGrid" class="grid"></div>
+    </div>
+  </main>
+
+  <div id="lightbox" class="lightbox hidden">
+    <div class="lb-top">
+      <strong id="lbName"></strong>
+      <button type="button" class="btn btn-soft" id="lbClose">Close</button>
+    </div>
+    <div class="lb-stage">
+      <img id="lbImg" class="hidden" alt="" />
+      <video id="lbVid" class="hidden" controls playsinline></video>
+    </div>
+    <div class="lb-bot">
+      <span id="lbMeta" style="font-size:0.82rem;color:#B8A498"></span>
+      <a id="lbDownload" class="btn btn-primary" download>Download Original</a>
+    </div>
+  </div>
+
+  <script>
+    (() => {
+      const token = decodeURIComponent(window.location.pathname.replace(/^\/s\//, '').split('/')[0] || '');
+      let activePasscode = '';
+      let sharePhotos = [];
+      const $ = (id) => document.getElementById(id);
+
+      function fmtBytes(b) {
+        const n = Number(b) || 0;
+        const u = ['B', 'KB', 'MB', 'GB'];
+        let v = n, i = 0;
+        while (v >= 1000 && i < u.length - 1) { v /= 1000; i++; }
+        return `${v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)} ${u[i]}`;
+      }
+
+      function qsPass() {
+        return activePasscode ? `?passcode=${encodeURIComponent(activePasscode)}` : '';
+      }
+
+      async function loadShare(pass = '') {
+        activePasscode = pass;
+        $('loadingBox').classList.remove('hidden');
+        $('passcodeBox').classList.add('hidden');
+        $('errorBox').classList.add('hidden');
+        $('albumView').classList.add('hidden');
+
+        try {
+          const headers = pass ? { 'X-Share-Passcode': pass } : {};
+          const res = await fetch(`/api/public/share/${encodeURIComponent(token)}`, { headers });
+          const data = await res.json().catch(() => ({}));
+          $('loadingBox').classList.add('hidden');
+
+          if (res.status === 401 && data.requiresPasscode) {
+            $('lockTitle').textContent = data.title || 'Protected Share';
+            $('lockSub').textContent = `${data.itemCount || 0} item(s) · Enter passcode to unlock.`;
+            if (pass) {
+              $('lockErr').textContent = data.error || 'Incorrect passcode.';
+              $('lockErr').classList.remove('hidden');
+            } else {
+              $('lockErr').classList.add('hidden');
+            }
+            $('passcodeBox').classList.remove('hidden');
+            $('passcodeInput').focus();
+            return;
+          }
+
+          if (!res.ok || !data.success) {
+            $('errorText').textContent = data.error || 'This share link has expired or does not exist.';
+            $('errorBox').classList.remove('hidden');
+            return;
+          }
+
+          sharePhotos = data.photos || [];
+          $('albumTitle').textContent = data.share.title || 'Shared Photos';
+          const expDate = new Date(data.share.expiresAt);
+          const expStr = Number.isNaN(expDate.getTime()) ? '' : `Expires ${expDate.toLocaleDateString()}`;
+          $('expiryPill').textContent = expStr || 'Shared Link';
+          $('albumMeta').textContent = `${sharePhotos.length} full-resolution item(s)${data.share.ownerName ? ' · Shared by ' + data.share.ownerName : ''}`;
+          renderGrid();
+          $('albumView').classList.remove('hidden');
+        } catch {
+          $('loadingBox').classList.add('hidden');
+          $('errorText').textContent = 'Network error loading shared photos.';
+          $('errorBox').classList.remove('hidden');
+        }
+      }
+
+      function renderGrid() {
+        const grid = $('photoGrid');
+        grid.innerHTML = '';
+        for (const p of sharePhotos) {
+          const tile = document.createElement('div');
+          tile.className = 'tile';
+          const prevUrl = `/api/public/share/${encodeURIComponent(token)}/preview/${encodeURIComponent(p.hash)}${qsPass()}`;
+          const dlUrl = `/api/public/share/${encodeURIComponent(token)}/download/${encodeURIComponent(p.hash)}${qsPass()}`;
+
+          if (p.isVideo && !p.hasPreview) {
+            tile.innerHTML = `<div class="tile-vid"><span>▶ Video</span><small>${fmtBytes(p.size)}</small></div>`;
+          } else {
+            const img = document.createElement('img');
+            img.src = prevUrl;
+            img.alt = p.originalName || '';
+            img.loading = 'lazy';
+            tile.appendChild(img);
+          }
+
+          const dl = document.createElement('a');
+          dl.className = 'tile-dl';
+          dl.href = dlUrl;
+          dl.textContent = '↓ Original';
+          dl.addEventListener('click', (e) => e.stopPropagation());
+          tile.appendChild(dl);
+
+          tile.addEventListener('click', () => openLightbox(p, prevUrl, dlUrl));
+          grid.appendChild(tile);
+        }
+      }
+
+      function openLightbox(p, prevUrl, dlUrl) {
+        $('lbName').textContent = p.originalName || 'Photo';
+        $('lbMeta').textContent = `${p.photoDate || ''} · ${fmtBytes(p.size)}`;
+        $('lbDownload').href = dlUrl;
+        const img = $('lbImg');
+        const vid = $('lbVid');
+        vid.pause();
+        vid.removeAttribute('src');
+        img.classList.add('hidden');
+        vid.classList.add('hidden');
+        if (p.isVideo) {
+          vid.src = dlUrl;
+          vid.classList.remove('hidden');
+        } else {
+          img.src = prevUrl;
+          img.classList.remove('hidden');
+        }
+        $('lightbox').classList.remove('hidden');
+      }
+
+      $('lbClose').addEventListener('click', () => {
+        $('lbVid').pause();
+        $('lightbox').classList.add('hidden');
+      });
+
+      $('passcodeForm').addEventListener('submit', (e) => {
+        e.preventDefault();
+        loadShare($('passcodeInput').value.trim());
+      });
+
+      if (!token) {
+        $('loadingBox').classList.add('hidden');
+        $('errorBox').classList.remove('hidden');
+      } else {
+        loadShare('');
+      }
+    })();
+  </script>
+</body>
+</html>

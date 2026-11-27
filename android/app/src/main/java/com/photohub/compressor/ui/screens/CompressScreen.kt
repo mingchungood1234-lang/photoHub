@@ -81,6 +81,14 @@ fun CompressScreen(
         viewModel.clearShareFileReady()
     }
 
+    uiState.cleanupPreviewItems?.let { previewItems ->
+        CleanupPreviewConfirmDialog(
+            items = previewItems,
+            onDismiss = { viewModel.dismissCleanupPreview() },
+            onConfirm = { viewModel.confirmCleanupPreviewAndDelete() }
+        )
+    }
+
     uiState.galleryInspectionResults?.let { inspectionList ->
         GalleryProxyInspectionDialog(
             items = inspectionList,
@@ -264,14 +272,18 @@ fun CompressScreen(
                             .padding(horizontal = 16.dp, vertical = 10.dp)
                     ) {
                         val n = uiState.selectedCount
-                        val label = if (settingsState.keepLocalProxyInPhotos) {
-                            "Compress $n"
-                        } else {
-                            "Backup $n"
+                        val label = when {
+                            settingsState.isBackupOnlyMode -> "Back Up $n (Keep Originals)"
+                            settingsState.keepLocalProxyInPhotos -> "Compress $n"
+                            else -> "Backup $n"
                         }
                         GradientPrimaryButton(
                             text = label,
-                            icon = if (settingsState.keepLocalProxyInPhotos) Icons.Rounded.AutoAwesome else Icons.Rounded.CloudUpload,
+                            icon = if (!settingsState.isBackupOnlyMode && settingsState.keepLocalProxyInPhotos) {
+                                Icons.Rounded.AutoAwesome
+                            } else {
+                                Icons.Rounded.CloudUpload
+                            },
                             enabled = !uiState.isProcessing,
                             onClick = { viewModel.startProcessingSelectedPhotos() },
                             modifier = Modifier.fillMaxWidth()
@@ -315,7 +327,7 @@ fun CompressScreen(
                     }
 
                     AnimatedVisibility(
-                        visible = bgState.stagedItems.isNotEmpty() && !uiState.isProcessing && !uiState.isAwaitingDeleteConfirmation
+                        visible = !settingsState.isBackupOnlyMode && bgState.stagedItems.isNotEmpty() && !uiState.isProcessing && !uiState.isAwaitingDeleteConfirmation
                     ) {
                         val count = bgState.stagedItems.size
                         val sizeStr = Formatter.formatFileSize(context, bgState.stagedSavedBytes)
@@ -334,13 +346,14 @@ fun CompressScreen(
                                 )
                             }
                             Button(
-                                onClick = { viewModel.triggerStagedOvernightCleanupPrompt() },
+                                onClick = { viewModel.openStagedCleanupPreview() },
+                                enabled = !uiState.isLoadingCleanupPreview,
                                 colors = ButtonDefaults.buttonColors(containerColor = PhotoHubOrange),
                                 shape = CircleShape,
                                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 4.dp),
                                 modifier = Modifier.height(34.dp)
                             ) {
-                                Text("Delete", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                                Text(if (uiState.isLoadingCleanupPreview) "…" else "Delete", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
                             }
                             IconButton(onClick = { bgManager.clearAllStagedItems() }, modifier = Modifier.size(26.dp)) {
                                 Icon(Icons.Rounded.Close, contentDescription = "Dismiss", modifier = Modifier.size(16.dp))
@@ -522,6 +535,7 @@ fun CompressScreen(
                 } else {
                     SummaryHeader(
                         uiState = uiState,
+                        isBackupOnlyMode = settingsState.isBackupOnlyMode,
                         keepLocalProxy = settingsState.keepLocalProxyInPhotos,
                         onToggleKeepLocal = { settings.setKeepLocalProxyInPhotos(it) },
                         onSelectVideos = { viewModel.selectTopVideos() }
@@ -592,6 +606,7 @@ private fun CompactBannerCard(
 @Composable
 private fun SummaryHeader(
     uiState: com.photohub.compressor.viewmodel.CompressUiState,
+    isBackupOnlyMode: Boolean,
     keepLocalProxy: Boolean,
     onToggleKeepLocal: (Boolean) -> Unit,
     onSelectVideos: () -> Unit
@@ -652,20 +667,47 @@ private fun SummaryHeader(
             }
         }
 
-        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-            SegmentedButton(
-                selected = keepLocalProxy,
-                onClick = { onToggleKeepLocal(true) },
-                shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2)
+        if (isBackupOnlyMode) {
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = PhotoHubMint.copy(alpha = 0.12f),
+                modifier = Modifier.fillMaxWidth()
             ) {
-                Text("Keep Proxy", style = MaterialTheme.typography.labelMedium, maxLines = 1)
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        Icons.Rounded.VerifiedUser,
+                        contentDescription = null,
+                        tint = PhotoHubMint,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Text(
+                        text = "Backup Only · Full originals stay untouched on phone",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
             }
-            SegmentedButton(
-                selected = !keepLocalProxy,
-                onClick = { onToggleKeepLocal(false) },
-                shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2)
-            ) {
-                Text("Delete Only", style = MaterialTheme.typography.labelMedium, maxLines = 1)
+        } else {
+            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                SegmentedButton(
+                    selected = keepLocalProxy,
+                    onClick = { onToggleKeepLocal(true) },
+                    shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2)
+                ) {
+                    Text("Keep Proxy", style = MaterialTheme.typography.labelMedium, maxLines = 1)
+                }
+                SegmentedButton(
+                    selected = !keepLocalProxy,
+                    onClick = { onToggleKeepLocal(false) },
+                    shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2)
+                ) {
+                    Text("Delete Only", style = MaterialTheme.typography.labelMedium, maxLines = 1)
+                }
             }
         }
     }
@@ -926,6 +968,109 @@ private fun GalleryProxyInspectionDialog(
         },
         confirmButton = {
             TextButton(onClick = onDismiss) { Text("Done", fontWeight = FontWeight.Bold) }
+        }
+    )
+}
+
+@Composable
+private fun CleanupPreviewConfirmDialog(
+    items: List<com.photohub.compressor.viewmodel.CleanupPreviewItem>,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit
+) {
+    val context = LocalContext.current
+    val totalBytes = items.sumOf { it.savedBytes.coerceAtLeast(0L) }
+    val totalStr = Formatter.formatFileSize(context, totalBytes)
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(Icons.Rounded.Verified, null, tint = PhotoHubMint, modifier = Modifier.size(22.dp))
+                Text("Free ~$totalStr Safely", fontWeight = FontWeight.ExtraBold)
+            }
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "These ${items.size} original(s) are SHA-256 verified on your cloud server and safe to remove from your phone:",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                androidx.compose.foundation.lazy.LazyRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    items(items.take(24).size) { idx ->
+                        val item = items[idx]
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier.width(68.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(64.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(MaterialTheme.colorScheme.surfaceVariant),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (item.thumbnail != null) {
+                                    Image(
+                                        bitmap = item.thumbnail.asImageBitmap(),
+                                        contentDescription = item.filename,
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                } else {
+                                    Icon(Icons.Rounded.Photo, null, tint = PhotoHubOrange)
+                                }
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.TopEnd)
+                                        .padding(4.dp)
+                                        .size(16.dp)
+                                        .clip(CircleShape)
+                                        .background(PhotoHubMint),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(Icons.Rounded.Check, null, tint = Color.White, modifier = Modifier.size(11.dp))
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(3.dp))
+                            Text(
+                                text = Formatter.formatFileSize(context, item.savedBytes.coerceAtLeast(0L)),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1
+                            )
+                        }
+                    }
+                }
+                if (items.size > 24) {
+                    Text(
+                        "+ ${items.size - 24} more verified item(s)",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = PhotoHubOrange,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onConfirm,
+                colors = ButtonDefaults.buttonColors(containerColor = PhotoHubOrange)
+            ) {
+                Text("Free Space (${items.size})", fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
         }
     )
 }

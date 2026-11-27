@@ -329,7 +329,10 @@ class PhotoHubApiClient(
         }
     }
 
-    suspend fun fetchAllServerPhotos(sync: Boolean = true): List<ServerPhoto> = withContext(Dispatchers.IO) {
+    suspend fun fetchAllServerPhotos(
+        sync: Boolean = true,
+        onPageLoaded: ((photos: List<ServerPhoto>, trashCount: Int) -> Unit)? = null
+    ): List<ServerPhoto> = withContext(Dispatchers.IO) {
         val cur = settings.current
         val scopeKey = "${cur.normalizedBaseUrl.orEmpty()}|${cur.apiKeyCacheScope}"
         val cachedLocal = LocalProxyStore.getInstance(context)
@@ -344,8 +347,9 @@ class PhotoHubApiClient(
         val collected = mutableListOf<ServerPhoto>()
         val seenHashes = hashSetOf<String>()
         var offset = 0
-        val pageSize = 500
+        val pageSize = 300
         var firstPageEtag: String? = null
+        var trashCount = 0
 
         while (true) {
             val syncParam = if (sync && offset == 0) "&sync=1" else ""
@@ -371,6 +375,9 @@ class PhotoHubApiClient(
                 }
                 val json = JSONObject(text)
                 total = json.optInt("total", 0)
+                if (offset == 0 && json.has("trashCount")) {
+                    trashCount = json.optInt("trashCount", 0)
+                }
                 serverHasMore = if (json.has("hasMore") && !json.isNull("hasMore")) json.optBoolean("hasMore") else null
                 val pagePhotos = ServerPhoto.listFromJsonArray(json.optJSONArray("photos"))
                 pageCount = pagePhotos.size
@@ -383,6 +390,10 @@ class PhotoHubApiClient(
 
             if (notModified) {
                 return@withContext cachedLocal
+            }
+
+            if (pageCount > 0 && onPageLoaded != null) {
+                onPageLoaded(collected.toList(), trashCount)
             }
 
             if (pageCount == 0) break
@@ -1178,6 +1189,180 @@ class PhotoHubApiClient(
                 notify = true
             )
             updated
+        }
+    }
+
+    suspend fun setPhotoFavorite(masterHash: String, isFavorite: Boolean): ServerPhoto = withContext(Dispatchers.IO) {
+        val body = JSONObject().apply { put("isFavorite", isFavorite) }.toString()
+        val req = Request.Builder()
+            .url(makeUrl("/api/photo/$masterHash/favorite"))
+            .applyAuth()
+            .post(body.toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull()))
+            .build()
+
+        client.newCall(req).execute().use { resp ->
+            val text = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw ApiHttpException(resp.code, parseErrorMessage(resp.code, text))
+            val json = JSONObject(text)
+            val photoObj = json.optJSONObject("photo")
+            if (!json.optBoolean("success", false) || photoObj == null) {
+                throw IOException("Invalid favorite response")
+            }
+            val updated = ServerPhoto.fromJson(photoObj)
+            val cur = settings.current
+            LocalProxyStore.getInstance(context).updatePhoto(
+                updated,
+                cur.normalizedBaseUrl,
+                cur.apiKeyCacheScope,
+                notify = true
+            )
+            updated
+        }
+    }
+
+    suspend fun fetchTrashPhotos(): TrashListResult = withContext(Dispatchers.IO) {
+        val req = Request.Builder()
+            .url(makeUrl("/api/photos/trash"))
+            .get()
+            .applyAuth()
+            .build()
+        client.newCall(req).execute().use { resp ->
+            val text = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw ApiHttpException(resp.code, parseErrorMessage(resp.code, text))
+            val json = JSONObject(text)
+            val photos = ServerPhoto.listFromJsonArray(json.optJSONArray("photos"))
+            TrashListResult(
+                photos = photos,
+                total = json.optInt("total", photos.size),
+                trashBytes = json.optLong("trashBytes", 0L),
+                retentionDays = json.optInt("retentionDays", 30)
+            )
+        }
+    }
+
+    suspend fun moveServerPhotosToTrash(hashes: List<String>): DeletePhotosResult = withContext(Dispatchers.IO) {
+        val cleaned = hashes.map { it.trim().lowercase(Locale.ROOT) }.filter { it.isNotEmpty() }.distinct()
+        if (cleaned.isEmpty()) {
+            return@withContext DeletePhotosResult(true, emptyList(), emptyList(), 0L)
+        }
+        val payload = JSONObject().apply { put("hashes", JSONArray(cleaned)) }.toString()
+        val req = Request.Builder()
+            .url(makeUrl("/api/photos/trash"))
+            .applyAuth()
+            .post(payload.toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull()))
+            .build()
+
+        val trashed = mutableListOf<String>()
+        val missing = mutableListOf<String>()
+        client.newCall(req).execute().use { resp ->
+            val text = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw ApiHttpException(resp.code, parseErrorMessage(resp.code, text))
+            val json = JSONObject(text)
+            json.optJSONArray("trashed")?.let { arr ->
+                for (i in 0 until arr.length()) arr.optString(i).takeIf { it.isNotBlank() }?.let(trashed::add)
+            }
+            json.optJSONArray("missing")?.let { arr ->
+                for (i in 0 until arr.length()) arr.optString(i).takeIf { it.isNotBlank() }?.let(missing::add)
+            }
+        }
+        val cur = settings.current
+        val toEvict = (trashed + missing).distinct()
+        if (toEvict.isNotEmpty()) {
+            LocalProxyStore.getInstance(context).removePhotos(
+                hashes = toEvict,
+                baseUrl = cur.normalizedBaseUrl,
+                scopeKey = cur.apiKeyCacheScope,
+                notify = true
+            )
+        }
+        DeletePhotosResult(success = true, deleted = trashed, missing = missing, freedBytes = 0L)
+    }
+
+    suspend fun restoreServerPhotosFromTrash(hashes: List<String>): List<String> = withContext(Dispatchers.IO) {
+        val cleaned = hashes.map { it.trim().lowercase(Locale.ROOT) }.filter { it.isNotEmpty() }.distinct()
+        if (cleaned.isEmpty()) return@withContext emptyList()
+        val payload = JSONObject().apply { put("hashes", JSONArray(cleaned)) }.toString()
+        val req = Request.Builder()
+            .url(makeUrl("/api/photos/trash/restore"))
+            .applyAuth()
+            .post(payload.toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull()))
+            .build()
+        val restored = mutableListOf<String>()
+        client.newCall(req).execute().use { resp ->
+            val text = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw ApiHttpException(resp.code, parseErrorMessage(resp.code, text))
+            val json = JSONObject(text)
+            json.optJSONArray("restored")?.let { arr ->
+                for (i in 0 until arr.length()) arr.optString(i).takeIf { it.isNotBlank() }?.let(restored::add)
+            }
+        }
+        restored
+    }
+
+    suspend fun emptyServerTrash(hashes: List<String>? = null): DeletePhotosResult = withContext(Dispatchers.IO) {
+        val payload = JSONObject().apply {
+            if (!hashes.isNullOrEmpty()) {
+                put("hashes", JSONArray(hashes.map { it.trim().lowercase(Locale.ROOT) }.filter { it.isNotEmpty() }))
+            }
+        }.toString()
+        val req = Request.Builder()
+            .url(makeUrl("/api/photos/trash/empty"))
+            .applyAuth()
+            .post(payload.toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull()))
+            .build()
+        val deleted = mutableListOf<String>()
+        var freed = 0L
+        var ok = true
+        client.newCall(req).execute().use { resp ->
+            val text = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw ApiHttpException(resp.code, parseErrorMessage(resp.code, text))
+            val json = JSONObject(text)
+            ok = json.optBoolean("success", true)
+            freed = json.optLong("freedBytes", 0L)
+            json.optJSONArray("deleted")?.let { arr ->
+                for (i in 0 until arr.length()) arr.optString(i).takeIf { it.isNotBlank() }?.let(deleted::add)
+            }
+        }
+        if (deleted.isNotEmpty()) {
+            val tracker = LocalProxyTracker.getInstance(context)
+            deleted.forEach { tracker.clearRestoredProtection(it) }
+            OriginalDownloadCache.removeCachedOriginals(context, deleted)
+        }
+        DeletePhotosResult(success = ok, deleted = deleted, missing = emptyList(), freedBytes = freed)
+    }
+
+    suspend fun createShareLink(
+        hashes: List<String>,
+        title: String = "",
+        expiresInHours: Int = 168,
+        passcode: String = ""
+    ): ShareLinkResult = withContext(Dispatchers.IO) {
+        val payload = JSONObject().apply {
+            put("hashes", JSONArray(hashes))
+            if (title.isNotBlank()) put("title", title.trim())
+            put("expiresInHours", expiresInHours)
+            if (passcode.isNotBlank()) put("passcode", passcode.trim())
+        }.toString()
+        val req = Request.Builder()
+            .url(makeUrl("/api/shares"))
+            .applyAuth()
+            .post(payload.toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull()))
+            .build()
+        client.newCall(req).execute().use { resp ->
+            val text = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw ApiHttpException(resp.code, parseErrorMessage(resp.code, text))
+            val json = JSONObject(text)
+            val shareObj = json.optJSONObject("share") ?: throw IOException("Invalid share link response")
+            ShareLinkResult(
+                token = shareObj.optString("token"),
+                shareUrl = shareObj.optString("shareUrl").ifBlank {
+                    val base = (settings.current.gatewayUrl ?: settings.current.normalizedBaseUrl.orEmpty()).trimEnd('/')
+                    "$base${shareObj.optString("sharePath")}"
+                },
+                title = shareObj.optString("title", "Shared Photos"),
+                expiresAt = shareObj.optString("expiresAt", ""),
+                hasPasscode = shareObj.optBoolean("hasPasscode", false)
+            )
         }
     }
 

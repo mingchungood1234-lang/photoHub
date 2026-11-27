@@ -28,9 +28,18 @@ data class TrashPromptRequest(
     val targetIds: List<String>
 )
 
+data class CleanupPreviewItem(
+    val id: String,
+    val filename: String,
+    val savedBytes: Long,
+    val thumbnail: Bitmap?
+)
+
 data class CompressUiState(
     val candidates: List<PhotoCandidate> = emptyList(),
     val thumbnails: Map<String, Bitmap> = emptyMap(),
+    val cleanupPreviewItems: List<CleanupPreviewItem>? = null,
+    val isLoadingCleanupPreview: Boolean = false,
     val isCheckingServerProxies: Boolean = false,
     val isInspectingGalleryUris: Boolean = false,
     val galleryInspectionResults: List<GalleryProxyInspectionItem>? = null,
@@ -141,10 +150,15 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
 
         val mode = _uiState.value.sortMode
         val cur = settings.current
+        val backupOnly = cur.isBackupOnlyMode
         viewModelScope.launch(Dispatchers.IO) {
             val cached = LocalProxyStore.getInstance(context)
                 .cachedPhotos(cur.normalizedBaseUrl, cur.apiKeyCacheScope)
-            val raw = mediaService.scanCandidates(tracker = tracker, knownServerPhotos = cached)
+            val raw = mediaService.scanCandidates(
+                tracker = tracker,
+                knownServerPhotos = cached,
+                skipBackedUpOriginals = backupOnly
+            )
             val sorted = PhotoBackupPipeline.sortCandidates(raw, mode)
             val eligibleCount = sorted.count { !it.state.isFinished }
             withContext(Dispatchers.Main) {
@@ -154,7 +168,11 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
                         pendingDeleteIds = emptyList(),
                         isScanning = false,
                         statusBanner = if (sorted.isEmpty()) {
-                            "No uncompressed gallery photos or videos found to compress."
+                            if (backupOnly) {
+                                "All gallery photos & videos are safely backed up · Originals kept on phone."
+                            } else {
+                                "No uncompressed gallery photos or videos found to compress."
+                            }
                         } else {
                             null
                         }
@@ -192,6 +210,7 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
 
         val mode = _uiState.value.sortMode
         val cur = settings.current
+        val backupOnly = cur.isBackupOnlyMode
         viewModelScope.launch(Dispatchers.IO) {
             val cached = LocalProxyStore.getInstance(context)
                 .cachedPhotos(cur.normalizedBaseUrl, cur.apiKeyCacheScope)
@@ -199,7 +218,8 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
                 tracker = tracker,
                 knownServerPhotos = cached,
                 maxResults = 200,
-                maxInspect = 3000
+                maxInspect = 3000,
+                skipBackedUpOriginals = backupOnly
             )
             var sorted = PhotoBackupPipeline.sortCandidates(raw, mode)
             if (cur.isSignedIn && sorted.any { it.state is PhotoCompressionState.Pending }) {
@@ -215,7 +235,7 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
                     cachedServerPhotos = cached
                 )
                 if (matches.isNotEmpty()) {
-                    sorted = applyDeepMatches(sorted, matches)
+                    sorted = applyDeepMatches(sorted, matches, backupOnly = backupOnly)
                 }
             }
             val eligibleCount = sorted.count { !it.state.isFinished }
@@ -240,6 +260,7 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
         if (snapshot.none { it.state is PhotoCompressionState.Pending && !it.isVideo }) return
 
         _uiState.update { it.copy(isCheckingServerProxies = true) }
+        val backupOnly = settings.current.isBackupOnlyMode
         deepProxyScanJob = viewModelScope.launch(Dispatchers.IO) {
             try {
                 val client = PhotoHubApiClient(context, settings)
@@ -253,7 +274,7 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
                 if (matches.isNotEmpty()) {
                     withContext(Dispatchers.Main) {
                         _uiState.update { prev ->
-                            val updated = applyDeepMatches(prev.candidates, matches)
+                            val updated = applyDeepMatches(prev.candidates, matches, backupOnly = backupOnly)
                             prev.copy(
                                 candidates = updated,
                                 isCheckingServerProxies = false,
@@ -280,11 +301,16 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
 
     private fun applyDeepMatches(
         candidates: List<PhotoCandidate>,
-        matches: Map<String, CandidateDeepCheckMatch>
+        matches: Map<String, CandidateDeepCheckMatch>,
+        backupOnly: Boolean = false
     ): List<PhotoCandidate> = candidates.mapNotNull { item ->
         val m = matches[item.id] ?: return@mapNotNull item
         when {
             m.isProxy || (m.isMaster && m.isProtectedOriginal) -> null
+            backupOnly && m.isMaster -> {
+                m.masterHash?.takeIf { it.isNotBlank() }?.let { tracker.markUploadedOriginal(item.id, it) }
+                null
+            }
             m.isMaster -> item.copy(
                 masterHash = m.masterHash ?: item.masterHash,
                 detectionSource = m.signal,
@@ -404,10 +430,19 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
 
     fun startProcessingSelectedPhotos() {
         if (_uiState.value.isProcessing) return
-        val targetIds = _uiState.value.candidates
-            .filter { it.isSelected && !it.state.isFinished }
-            .map { it.id }
-        if (targetIds.isEmpty()) return
+        val cur = settings.current
+        val backupOnly = cur.isBackupOnlyMode
+        val effectiveKeepLocal = !backupOnly && cur.keepLocalProxyInPhotos
+        val selectedCandidates = _uiState.value.candidates.filter { it.isSelected && !it.state.isFinished }
+        if (selectedCandidates.isEmpty()) return
+        // When keeping lightweight proxies in Gallery, process & commit chronologically oldest-first
+        // so the newest photo is inserted LAST and shows FIRST in WhatsApp / Telegram / Share pickers.
+        val orderedCandidates = if (effectiveKeepLocal && selectedCandidates.size > 1) {
+            PhotoBackupPipeline.sortCandidatesOldestFirst(selectedCandidates)
+        } else {
+            selectedCandidates
+        }
+        val targetIds = orderedCandidates.map { it.id }
 
         itemProgress.clear()
         _uiState.update {
@@ -420,7 +455,6 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
             )
         }
 
-        val cur = settings.current
         val apiClient = PhotoHubApiClient(context, settings)
 
         activeUploadJob?.cancel()
@@ -449,34 +483,50 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
                 return@launch
             }
 
-            val queue = Channel<String>(Channel.UNLIMITED)
-            targetIds.forEach { queue.trySend(it) }
+            val queue = Channel<Pair<Int, String>>(Channel.UNLIMITED)
+            targetIds.forEachIndexed { idx, id -> queue.trySend(idx to id) }
             queue.close()
 
             val videoSem = Semaphore(1)
             val gallerySem = Semaphore(1)
+            val commitGate = if (effectiveKeepLocal) {
+                com.photohub.compressor.media.OrderedCommitGate()
+            } else {
+                null
+            }
             val failedCount = AtomicInteger(0)
             val totalCount = targetIds.size
 
-            coroutineScope {
-                val workerCount = minOf(3, targetIds.size)
-                val workers = List(workerCount) {
-                    launch(Dispatchers.Default) {
-                        for (id in queue) {
-                            if (!isActive) break
-                            val ok = processSingleCandidate(
-                                id = id,
-                                apiClient = apiClient,
-                                cur = cur,
-                                videoSem = videoSem,
-                                gallerySem = gallerySem,
-                                totalCount = totalCount
-                            )
-                            if (!ok) failedCount.incrementAndGet()
+            try {
+                coroutineScope {
+                    val workerCount = minOf(3, targetIds.size)
+                    val workers = List(workerCount) {
+                        launch(Dispatchers.Default) {
+                            for ((workIndex, id) in queue) {
+                                if (!isActive) {
+                                    commitGate?.cancelAll()
+                                    break
+                                }
+                                val ok = processSingleCandidate(
+                                    id = id,
+                                    apiClient = apiClient,
+                                    cur = cur,
+                                    backupOnly = backupOnly,
+                                    effectiveKeepLocal = effectiveKeepLocal,
+                                    videoSem = videoSem,
+                                    gallerySem = gallerySem,
+                                    commitGate = commitGate,
+                                    commitIndex = workIndex,
+                                    totalCount = totalCount
+                                )
+                                if (!ok) failedCount.incrementAndGet()
+                            }
                         }
                     }
+                    workers.joinAll()
                 }
-                workers.joinAll()
+            } finally {
+                commitGate?.cancelAll()
             }
 
             runCatching { apiClient.whoami() }.getOrNull()?.let { updated ->
@@ -495,7 +545,7 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
                 )
             }
 
-            if (pendingIds.isNotEmpty()) {
+            if (!backupOnly && pendingIds.isNotEmpty()) {
                 val latestSettings = settings.current
                 if (latestSettings.silentAutoDeleteOriginals && mediaService.canSilentlyDeleteOriginals()) {
                     val silentlyDeleted = mutableListOf<String>()
@@ -517,9 +567,19 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
                     triggerTrashConfirmation(pendingIds)
                 }
             } else if (failures > 0 && _uiState.value.statusBanner == null) {
-                _uiState.update { it.copy(statusBanner = "Finished with $failures error(s). Space saved: $savedStr.") }
+                val msg = if (backupOnly) {
+                    "Finished with $failures error(s). Backed-up originals kept on phone."
+                } else {
+                    "Finished with $failures error(s). Space saved: $savedStr."
+                }
+                _uiState.update { it.copy(statusBanner = msg) }
             } else if (failures == 0) {
-                _uiState.update { it.copy(statusBanner = "Finished! All originals backed up & verified.") }
+                val msg = if (backupOnly) {
+                    "Backed up $totalCount item(s) safely · Originals kept on phone."
+                } else {
+                    "Finished! All originals backed up & verified."
+                }
+                _uiState.update { it.copy(statusBanner = msg) }
             }
         }
     }
@@ -528,18 +588,24 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
         id: String,
         apiClient: PhotoHubApiClient,
         cur: AppSettingsState,
+        backupOnly: Boolean = false,
+        effectiveKeepLocal: Boolean = cur.keepLocalProxyInPhotos,
         videoSem: Semaphore,
         gallerySem: Semaphore,
+        commitGate: com.photohub.compressor.media.OrderedCommitGate? = null,
+        commitIndex: Int? = null,
         totalCount: Int
     ): Boolean {
         val candidate = _uiState.value.candidates.firstOrNull { it.id == id }
         if (candidate == null) {
+            if (commitGate != null && commitIndex != null) commitGate.completeTurn(commitIndex)
             recordDone(id, totalCount)
             return true
         }
 
-        val stagedMatch = bgManager.state.value.stagedItems.firstOrNull { it.id == id }
+        val stagedMatch = if (backupOnly) null else bgManager.state.value.stagedItems.firstOrNull { it.id == id }
         if (stagedMatch != null) {
+            if (commitGate != null && commitIndex != null) commitGate.completeTurn(commitIndex)
             withContext(Dispatchers.Main) {
                 stageOriginalForDeletion(id, stagedMatch.savedBytes)
             }
@@ -550,6 +616,7 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
         if (AssetUploadCoordinator.isClaimedByBackground(id) ||
             !AssetUploadCoordinator.tryClaimAsset(id, UploadOwner.MANUAL)
         ) {
+            if (commitGate != null && commitIndex != null) commitGate.completeTurn(commitIndex)
             updateCandidateState(id, PhotoCompressionState.UploadingInBackground, clearSelect = true)
             recordDone(id, totalCount)
             return true
@@ -567,11 +634,13 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
                 maxPixelSize = cur.proxyMaxPixelSize,
                 quality = cur.proxyQuality,
                 uploadMode = cur.uploadMode,
-                keepLocalProxy = cur.keepLocalProxyInPhotos,
+                keepLocalProxy = effectiveKeepLocal,
                 normalizedBaseUrl = cur.normalizedBaseUrl,
                 cacheScopeKey = cur.apiKeyCacheScope,
                 videoSemaphore = videoSem,
                 gallerySaveSemaphore = gallerySem,
+                commitGate = commitGate,
+                commitIndex = commitIndex,
                 onStageChange = { stage ->
                     updateCandidateState(id, stage)
                     recordItemProgress(id, stage.stageFraction, totalCount)
@@ -581,18 +650,22 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
             withContext(Dispatchers.Main) {
                 when (result) {
                     is BackupPipelineResult.BackedUp -> {
-                        stageOriginalForDeletion(id, result.outcome.savedBytes)
-                        bgManager.appendStagedItems(
-                            listOf(
-                                StagedCleanupItem(
-                                    id = id,
-                                    filename = result.outcome.filename,
-                                    masterSha256 = result.outcome.masterSha256,
-                                    savedBytes = result.outcome.savedBytes,
-                                    verifiedAtMs = System.currentTimeMillis()
+                        if (backupOnly) {
+                            updateCandidateState(id, PhotoCompressionState.Completed(0L), clearSelect = true)
+                        } else {
+                            stageOriginalForDeletion(id, result.outcome.savedBytes)
+                            bgManager.appendStagedItems(
+                                listOf(
+                                    StagedCleanupItem(
+                                        id = id,
+                                        filename = result.outcome.filename,
+                                        masterSha256 = result.outcome.masterSha256,
+                                        savedBytes = result.outcome.savedBytes,
+                                        verifiedAtMs = System.currentTimeMillis()
+                                    )
                                 )
                             )
-                        )
+                        }
                     }
                     is BackupPipelineResult.SkippedExistingProxy,
                     is BackupPipelineResult.SkippedProtectedOriginal -> {
@@ -666,6 +739,64 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
     private fun recordDone(id: String, totalCount: Int) {
         recordItemProgress(id, 1.0, totalCount)
         _uiState.update { it.copy(completedCount = it.completedCount + 1) }
+    }
+
+    fun openStagedCleanupPreview() {
+        val staged = bgManager.state.value.stagedItems
+        if (staged.isEmpty()) return
+        _uiState.update { it.copy(isLoadingCleanupPreview = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            val liveIds = mediaService.fetchLiveAssetIds(staged.map { it.id }).map { it.toString() }.toSet()
+            val liveStaged = staged.filter { it.id in liveIds }
+            if (liveStaged.isEmpty()) {
+                bgManager.clearAllStagedItems()
+                withContext(Dispatchers.Main) {
+                    _uiState.update { it.copy(isLoadingCleanupPreview = false, cleanupPreviewItems = null) }
+                }
+                return@launch
+            }
+            val previews = liveStaged.mapIndexed { idx, item ->
+                val bmp = if (idx < 24) {
+                    runCatching {
+                        mediaService.loadThumbnail(android.net.Uri.parse(item.id), sizePx = 180)
+                    }.getOrNull()
+                } else {
+                    null
+                }
+                CleanupPreviewItem(
+                    id = item.id,
+                    filename = item.filename,
+                    savedBytes = item.savedBytes,
+                    thumbnail = bmp
+                )
+            }
+            withContext(Dispatchers.Main) {
+                _uiState.update {
+                    it.copy(
+                        isLoadingCleanupPreview = false,
+                        cleanupPreviewItems = previews
+                    )
+                }
+            }
+        }
+    }
+
+    fun dismissCleanupPreview() {
+        _uiState.update { it.copy(cleanupPreviewItems = null, isLoadingCleanupPreview = false) }
+    }
+
+    fun confirmCleanupPreviewAndDelete() {
+        val items = _uiState.value.cleanupPreviewItems ?: return
+        _uiState.update { it.copy(cleanupPreviewItems = null) }
+        val ids = items.map { it.id }
+        val totalSaved = items.sumOf { it.savedBytes.coerceAtLeast(0L) }
+        _uiState.update {
+            it.copy(
+                pendingDeleteIds = ids,
+                totalSavedBytes = if (it.totalSavedBytes == 0L) totalSaved else it.totalSavedBytes
+            )
+        }
+        triggerTrashConfirmation(ids)
     }
 
     fun triggerStagedOvernightCleanupPrompt() {

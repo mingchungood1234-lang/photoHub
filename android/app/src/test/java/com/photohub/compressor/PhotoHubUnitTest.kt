@@ -4,9 +4,14 @@ import com.photohub.compressor.background.AssetUploadCoordinator
 import com.photohub.compressor.background.UploadOwner
 import com.photohub.compressor.data.*
 import com.photohub.compressor.media.MediaLibraryService
+import com.photohub.compressor.media.OrderedCommitGate
 import com.photohub.compressor.media.PhotoBackupPipeline
 import com.photohub.compressor.media.ProxyGenerator
 import com.photohub.compressor.media.ShareUtils
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import com.photohub.compressor.network.ContentRangeInfo
 import com.photohub.compressor.network.DownloadRangePlanner
 import com.photohub.compressor.provider.PhotoHubDocumentIdParser
@@ -348,5 +353,78 @@ class PhotoHubUnitTest {
             "*/*",
             ShareUtils.computeCombinedShareMimeType(listOf("image/jpeg", "video/mp4"))
         )
+    }
+
+    @Test
+    fun `oldest first sorting orders photos chronologically so newest commits last to gallery`() {
+        val newest = ServerPhoto("h3", "NEW.jpg", 1000L, "2026-11-25", "2026-11-25T10:00:00Z", "2026-11-25T10:00:00Z", "2026/NEW.jpg", true, true, null, null, false, null, false)
+        val oldest = ServerPhoto("h1", "OLD.jpg", 1000L, "2023-01-10", "2023-01-10T08:00:00Z", "2023-01-10T08:00:00Z", "2023/OLD.jpg", true, true, null, null, false, null, false)
+        val middle = ServerPhoto("h2", "MID.jpg", 1000L, "2025-06-15", "2025-06-15T12:00:00Z", "2025-06-15T12:00:00Z", "2025/MID.jpg", true, true, null, null, false, null, false)
+
+        val orderedServer = PhotoBackupPipeline.sortServerPhotosOldestFirst(listOf(newest, middle, oldest))
+        assertEquals(listOf("h1", "h2", "h3"), orderedServer.map { it.hash })
+
+        val cNewest = PhotoCandidate("c3", 3L, false, 0L, "NEW.jpg", "image/jpeg", 4000, 3000, 3000L, 1_000_000L)
+        val cUndated = PhotoCandidate("c0", 0L, false, 0L, "NO_DATE.jpg", "image/jpeg", 4000, 3000, null, 1_000_000L)
+        val cOldest = PhotoCandidate("c1", 1L, false, 0L, "OLD.jpg", "image/jpeg", 4000, 3000, 1000L, 1_000_000L)
+        val orderedCandidates = PhotoBackupPipeline.sortCandidatesOldestFirst(listOf(cNewest, cOldest, cUndated))
+        assertEquals(listOf("c0", "c1", "c3"), orderedCandidates.map { it.id })
+    }
+
+    @Test
+    fun `ordered commit gate enforces oldest-to-newest gallery writes across out-of-order workers and skips`() = runBlocking {
+        val gate = OrderedCommitGate()
+        val committed = java.util.Collections.synchronizedList(mutableListOf<Int>())
+
+        val jobs = listOf(
+            // Index 3 finishes downloading first (5ms) -> must wait for 0, 1(skip), 2
+            launch {
+                delay(5)
+                assertTrue(gate.waitForTurn(3))
+                committed.add(3)
+                gate.completeTurn(3)
+            },
+            // Index 2 finishes second (15ms) -> must wait for 0, 1(skip)
+            launch {
+                delay(15)
+                assertTrue(gate.waitForTurn(2))
+                committed.add(2)
+                gate.completeTurn(2)
+            },
+            // Index 1 fails download (10ms) and skips without calling waitForTurn
+            launch {
+                delay(10)
+                gate.completeTurn(1)
+            },
+            // Index 0 finishes last (40ms, e.g. large old video) -> still commits FIRST!
+            launch {
+                delay(40)
+                assertTrue(gate.waitForTurn(0))
+                committed.add(0)
+                gate.completeTurn(0)
+            }
+        )
+        jobs.joinAll()
+
+        assertEquals(listOf(0, 2, 3), committed)
+    }
+
+    @Test
+    fun `backup storage mode parsing and onboarding defaults behave consistently`() {
+        assertEquals(BackupStorageMode.OPTIMIZE_STORAGE, BackupStorageMode.fromRaw("optimize_storage"))
+        assertEquals(BackupStorageMode.BACKUP_ONLY, BackupStorageMode.fromRaw("backup_only"))
+        assertEquals(BackupStorageMode.OPTIMIZE_STORAGE, BackupStorageMode.fromRaw("unknown_or_null"))
+        assertEquals(BackupStorageMode.OPTIMIZE_STORAGE, BackupStorageMode.fromRaw(null))
+
+        val freshState = AppSettingsState()
+        assertFalse(freshState.hasCompletedOnboarding)
+        assertFalse(freshState.isBackupOnlyMode)
+
+        val backupOnlyState = freshState.copy(
+            backupStorageMode = BackupStorageMode.BACKUP_ONLY,
+            hasCompletedOnboarding = true
+        )
+        assertTrue(backupOnlyState.hasCompletedOnboarding)
+        assertTrue(backupOnlyState.isBackupOnlyMode)
     }
 }

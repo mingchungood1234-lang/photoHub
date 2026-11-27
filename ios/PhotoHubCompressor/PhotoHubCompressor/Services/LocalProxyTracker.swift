@@ -31,6 +31,7 @@ final class LocalProxyTracker {
     private var restoredMasterHashes: Set<String>
     private var restoredAssetToMaster: [String: String]
     private var uploadedOriginalMasterToAsset: [String: String]
+    private var uploadedOriginalAssetIds: Set<String>
 
     private init() {
         self.assetIds = Set(defaults.stringArray(forKey: assetIdsKey) ?? [])
@@ -43,7 +44,9 @@ final class LocalProxyTracker {
         self.restoredAssetIds = Set(defaults.stringArray(forKey: restoredAssetIdsKey) ?? [])
         self.restoredMasterHashes = Set(defaults.stringArray(forKey: restoredMastersKey) ?? [])
         self.restoredAssetToMaster = defaults.dictionary(forKey: restoredAssetToMasterKey) as? [String: String] ?? [:]
-        self.uploadedOriginalMasterToAsset = defaults.dictionary(forKey: uploadedOriginalMasterToAssetKey) as? [String: String] ?? [:]
+        let uploadedMap = defaults.dictionary(forKey: uploadedOriginalMasterToAssetKey) as? [String: String] ?? [:]
+        self.uploadedOriginalMasterToAsset = uploadedMap
+        self.uploadedOriginalAssetIds = Set(uploadedMap.values.filter { !$0.isEmpty })
     }
 
     func isKnownProxy(assetId: String) -> Bool {
@@ -275,11 +278,20 @@ final class LocalProxyTracker {
         let cleanId = assetId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normMaster.isEmpty, !cleanId.isEmpty else { return }
         lock.lock()
+        uploadedOriginalAssetIds.insert(cleanId)
         if uploadedOriginalMasterToAsset[normMaster] != cleanId {
             uploadedOriginalMasterToAsset[normMaster] = cleanId
             defaults.set(uploadedOriginalMasterToAsset, forKey: uploadedOriginalMasterToAssetKey)
         }
         lock.unlock()
+    }
+
+    /// Returns `true` if `assetId` is a full-resolution original already verified/uploaded to the server.
+    /// Used in Backup Only mode so originals kept on the phone are not repeatedly queued for upload.
+    func isUploadedOriginal(assetId: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return uploadedOriginalAssetIds.contains(assetId)
     }
 
     /// Returns a live `PHAsset.localIdentifier` of an uploaded original still present in Apple Photos.
@@ -349,6 +361,7 @@ final class LocalProxyTracker {
         restoredMasterHashes.removeAll()
         restoredAssetToMaster.removeAll()
         uploadedOriginalMasterToAsset.removeAll()
+        uploadedOriginalAssetIds.removeAll()
         defaults.removeObject(forKey: assetIdsKey)
         defaults.removeObject(forKey: proxyHashesKey)
         defaults.removeObject(forKey: assetToMasterKey)

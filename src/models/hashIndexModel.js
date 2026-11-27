@@ -142,29 +142,38 @@ async function readJpegExifDateTime(fullPath) {
           return tags;
         };
 
-        const readAsciiTag = (tagEntry) => {
-          if (!tagEntry || tagEntry.type !== 2 || tagEntry.valCount < 19) return null;
+        const readAsciiTag = (tagEntry, minLen = 1) => {
+          if (!tagEntry || tagEntry.type !== 2 || tagEntry.valCount < minLen) return null;
           const byteCount = Math.min(tagEntry.valCount, 64);
           const dataOff =
             tagEntry.valCount <= 4
               ? tagEntry.valueOff
               : tiffStart + readU32(tagEntry.valueOff);
           if (dataOff < tiffStart || dataOff + byteCount > buf.length) return null;
-          return buf.toString('ascii', dataOff, dataOff + byteCount).replace(/\0.*$/, '');
+          return buf.toString('ascii', dataOff, dataOff + byteCount).replace(/\0.*$/, '').trim() || null;
         };
 
         const ifd0 = scanIfd(ifd0Rel);
+        const make = readAsciiTag(ifd0.get(0x010f), 2);
+        const model = readAsciiTag(ifd0.get(0x0110), 2);
+        const cameraModel = model
+          ? make && !model.toLowerCase().startsWith(make.toLowerCase())
+            ? `${make} ${model}`
+            : model
+          : make || null;
+
         if (ifd0.has(0x8769)) {
           const exifPtr = readU32(ifd0.get(0x8769).valueOff);
           const exifIfd = scanIfd(exifPtr);
           const rawOrig =
-            readAsciiTag(exifIfd.get(0x9003)) ||
-            readAsciiTag(exifIfd.get(0x9004));
+            readAsciiTag(exifIfd.get(0x9003), 19) ||
+            readAsciiTag(exifIfd.get(0x9004), 19);
           const parsedOrig = parseExifDateString(rawOrig);
-          if (parsedOrig) return parsedOrig;
+          if (parsedOrig) return { ...parsedOrig, cameraModel };
         }
-        const parsedIfd0 = parseExifDateString(readAsciiTag(ifd0.get(0x0132)));
-        if (parsedIfd0) return parsedIfd0;
+        const parsedIfd0 = parseExifDateString(readAsciiTag(ifd0.get(0x0132), 19));
+        if (parsedIfd0) return { ...parsedIfd0, cameraModel };
+        if (cameraModel) return { day: null, takenAt: null, cameraModel };
         return null;
       }
 
@@ -253,6 +262,8 @@ async function inferDiskMediaDates(relPath, fileName, stat, fullPath) {
   const fileDate = extractDateFromFilename(fileName);
   const mtimeDay = formatLocalYmd(stat.mtime);
 
+  const cameraModel = (exif && exif.cameraModel) || null;
+
   if (pathInfo.day) {
     let takenAt = null;
     if (exif && exif.day === pathInfo.day) {
@@ -262,26 +273,27 @@ async function inferDiskMediaDates(relPath, fileName, stat, fullPath) {
     } else if (mtimeDay === pathInfo.day) {
       takenAt = stat.mtime.toISOString();
     }
-    return { photoDate: pathInfo.day, takenAt };
+    return { photoDate: pathInfo.day, takenAt, cameraModel };
   }
 
-  if (exif) {
-    return { photoDate: exif.day, takenAt: exif.takenAt };
+  if (exif && exif.day) {
+    return { photoDate: exif.day, takenAt: exif.takenAt, cameraModel };
   }
 
   if (fileDate) {
     const takenAt =
       fileDate.takenAt || (mtimeDay === fileDate.day ? stat.mtime.toISOString() : null);
-    return { photoDate: fileDate.day, takenAt };
+    return { photoDate: fileDate.day, takenAt, cameraModel };
   }
 
   if (pathInfo.year && stat.mtime.getFullYear() !== pathInfo.year) {
-    return { photoDate: `${pathInfo.year}-01-01`, takenAt: null };
+    return { photoDate: `${pathInfo.year}-01-01`, takenAt: null, cameraModel };
   }
 
   return {
     photoDate: mtimeDay,
     takenAt: stat.mtime.toISOString(),
+    cameraModel,
   };
 }
 
@@ -444,6 +456,10 @@ class HashIndex {
                 entry.takenAt = inferred.takenAt;
                 changed = true;
               }
+              if (inferred.cameraModel && !entry.cameraModel) {
+                entry.cameraModel = inferred.cameraModel;
+                changed = true;
+              }
             }
           }
         } catch {
@@ -493,6 +509,7 @@ class HashIndex {
                   mtimeMs: stat.mtimeMs,
                   photoDate: inferred.photoDate,
                   takenAt: inferred.takenAt,
+                  cameraModel: inferred.cameraModel || null,
                   uploadedAt: (stat.birthtime || stat.mtime).toISOString(),
                 });
                 indexedPaths.add(relPath);
@@ -517,6 +534,31 @@ class HashIndex {
     } finally {
       this.syncPromise = null;
     }
+  }
+
+  /**
+   * Finds an active (non-trashed) master record whose canonical hash starts with an 8–64 hex prefix.
+   * Used to prevent compressed `PHOTOHUB_PROXY_<prefix>` copies from being re-uploaded as duplicates.
+   */
+  findByMasterHashPrefix(rawPrefix) {
+    if (!rawPrefix || typeof rawPrefix !== 'string') return null;
+    const prefix = rawPrefix.trim().toLowerCase().replace(/[^a-f0-9]/g, '');
+    if (prefix.length < 8) return null;
+    if (prefix.length === 64) {
+      const exact = this.records.get(prefix);
+      if (exact && !exact.deletedAt) {
+        return { masterHash: exact.diskHash || exact.hash || prefix, record: exact };
+      }
+      return null;
+    }
+    for (const [k, rec] of this.records.entries()) {
+      if (!rec || rec.deletedAt) continue;
+      const canonical = String(rec.diskHash || rec.hash || k).toLowerCase();
+      if (canonical.startsWith(prefix) || String(k).toLowerCase().startsWith(prefix)) {
+        return { masterHash: canonical, record: rec };
+      }
+    }
+    return null;
   }
 
   /**
@@ -576,9 +618,10 @@ class HashIndex {
       return { status: 'missing', record: null, masterHash: null };
     }
     const normalized = rawHash.trim().toLowerCase();
+    const includeTrashed = Boolean(options.includeTrashed);
 
     const masterRecord = await this.verifyExisting(normalized, options);
-    if (masterRecord) {
+    if (masterRecord && (includeTrashed || !masterRecord.deletedAt)) {
       return {
         status: 'master',
         record: masterRecord,
@@ -589,14 +632,16 @@ class HashIndex {
     const mappedMasterHash = this.proxyToMaster.get(normalized);
     if (mappedMasterHash) {
       const verifiedMaster = await this.verifyExisting(mappedMasterHash, options);
-      if (verifiedMaster) {
+      if (verifiedMaster && (includeTrashed || !verifiedMaster.deletedAt)) {
         return {
           status: 'proxy',
           record: verifiedMaster,
           masterHash: verifiedMaster.diskHash || verifiedMaster.hash || mappedMasterHash,
         };
       }
-      this.proxyToMaster.delete(normalized);
+      if (!verifiedMaster) {
+        this.proxyToMaster.delete(normalized);
+      }
     }
 
     return { status: 'missing', record: null, masterHash: null };
@@ -731,10 +776,133 @@ class HashIndex {
     return removedCount;
   }
 
+  async setFavorite(masterHash, isFavorite = true) {
+    const lookupResult = await this.lookup(masterHash, { allowStatFastPath: true });
+    if (lookupResult.status === 'missing' || !lookupResult.record) {
+      return null;
+    }
+    const normMaster = (lookupResult.masterHash || String(masterHash || '')).trim().toLowerCase();
+    const record = this.records.get(normMaster) || lookupResult.record;
+    record.isFavorite = Boolean(isFavorite);
+    record.favoritedAt = isFavorite ? new Date().toISOString() : null;
+    this.records.set(normMaster, record);
+    this._markDirty();
+    await this.persist();
+    return record;
+  }
+
+  /**
+   * Soft-deletes photos into the 30-day Trash bin by setting `deletedAt` across canonical & alias keys.
+   */
+  async moveToTrash(rawHashes) {
+    const nowIso = new Date().toISOString();
+    const trashed = [];
+    const missing = [];
+    const seenCanonical = new Set();
+    let changed = false;
+
+    for (const raw of rawHashes || []) {
+      const norm = String(raw || '').trim().toLowerCase();
+      if (!norm) continue;
+      const found = this.findMasterRecordKeys(norm);
+      if (!found || !found.record || found.record.deletedAt) {
+        missing.push(norm);
+        continue;
+      }
+      if (seenCanonical.has(found.canonicalHash)) continue;
+      seenCanonical.add(found.canonicalHash);
+
+      for (const k of found.keys) {
+        const entry = this.records.get(k);
+        if (entry) {
+          entry.deletedAt = nowIso;
+          changed = true;
+        }
+      }
+      trashed.push(found.canonicalHash);
+    }
+
+    if (changed) {
+      this._markDirty();
+      await this.persist();
+    }
+    return { trashed, missing };
+  }
+
+  /**
+   * Restores soft-deleted photos from Trash back into the active gallery.
+   */
+  async restoreFromTrash(rawHashes) {
+    const restored = [];
+    const missing = [];
+    const seenCanonical = new Set();
+    let changed = false;
+
+    for (const raw of rawHashes || []) {
+      const norm = String(raw || '').trim().toLowerCase();
+      if (!norm) continue;
+      const found = this.findMasterRecordKeys(norm);
+      if (!found || !found.record || !found.record.deletedAt) {
+        missing.push(norm);
+        continue;
+      }
+      if (seenCanonical.has(found.canonicalHash)) continue;
+      seenCanonical.add(found.canonicalHash);
+
+      for (const k of found.keys) {
+        const entry = this.records.get(k);
+        if (entry) {
+          entry.deletedAt = null;
+          changed = true;
+        }
+      }
+      restored.push(found.canonicalHash);
+    }
+
+    if (changed) {
+      this._markDirty();
+      await this.persist();
+    }
+    return { restored, missing };
+  }
+
+  getExpiredTrashRecords(retentionMs = 30 * 24 * 60 * 60 * 1000) {
+    const cutoff = Date.now() - retentionMs;
+    const expired = [];
+    for (const { canonicalHash, entry } of this._getUniqueMasterRecords({ onlyTrashed: true })) {
+      const delMs = Date.parse(entry.deletedAt || '');
+      if (!Number.isNaN(delMs) && delMs <= cutoff) {
+        const found = this.findMasterRecordKeys(canonicalHash);
+        if (found) expired.push(found);
+      }
+    }
+    return expired;
+  }
+
+  listTrashed(retentionDays = 30) {
+    const retentionMs = retentionDays * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const items = this._getUniqueMasterRecords({ onlyTrashed: true }).map(({ key, entry }) => {
+      const summary = this.formatMasterSummary(entry, key);
+      const deletedMs = Date.parse(entry.deletedAt || '') || now;
+      const expiresMs = deletedMs + retentionMs;
+      const daysRemaining = Math.max(0, Math.ceil((expiresMs - now) / (24 * 60 * 60 * 1000)));
+      return {
+        ...summary,
+        deletedAt: entry.deletedAt,
+        expiresAt: new Date(expiresMs).toISOString(),
+        daysRemaining,
+      };
+    });
+    items.sort((a, b) => String(b.deletedAt || '').localeCompare(String(a.deletedAt || '')));
+    return items;
+  }
+
   async set(hash, record) {
     const normalized = hash.trim().toLowerCase();
     this.records.set(normalized, {
       ...record,
+      deletedAt: null,
       // Keep the real on-disk hash so alias keys (e.g. pre-transcode HEIC hash) still verify
       diskHash: record.diskHash || record.hash || normalized,
       hash: normalized,
@@ -772,14 +940,20 @@ class HashIndex {
       hasVideoProxy: Boolean(entry.videoProxyRelativePath),
       videoProxySize: entry.videoProxySize || null,
       keepOriginalOnDevice: Boolean(entry.keepOriginalOnDevice),
+      isFavorite: Boolean(entry.isFavorite),
+      deletedAt: entry.deletedAt || null,
+      cameraModel: entry.cameraModel || null,
     };
   }
 
-  _getUniqueMasterRecords() {
+  _getUniqueMasterRecords({ includeTrashed = false, onlyTrashed = false } = {}) {
     const seenPaths = new Set();
     const list = [];
     for (const [key, entry] of this.records.entries()) {
       if (!entry || !entry.relativePath) continue;
+      const isTrashed = Boolean(entry.deletedAt);
+      if (onlyTrashed && !isTrashed) continue;
+      if (!includeTrashed && !onlyTrashed && isTrashed) continue;
       // Skip alias keys (where key != diskHash) so each photo appears once
       const canonicalHash = (entry.diskHash || entry.hash || key).toLowerCase();
       if (key !== canonicalHash && this.records.has(canonicalHash)) continue;
@@ -796,16 +970,28 @@ class HashIndex {
     }
     let mastersBytes = 0;
     let proxiesBytes = 0;
-    const unique = this._getUniqueMasterRecords();
+    let trashBytes = 0;
+    let activeItemCount = 0;
+    let trashItemCount = 0;
+    const unique = this._getUniqueMasterRecords({ includeTrashed: true });
     for (const { entry } of unique) {
-      mastersBytes += Number(entry.size) || 0;
-      proxiesBytes += Number(entry.proxySize) || 0;
-      proxiesBytes += Number(entry.videoProxySize) || 0;
+      const m = Number(entry.size) || 0;
+      const p = (Number(entry.proxySize) || 0) + (Number(entry.videoProxySize) || 0);
+      mastersBytes += m;
+      proxiesBytes += p;
+      if (entry.deletedAt) {
+        trashItemCount += 1;
+        trashBytes += m + p;
+      } else {
+        activeItemCount += 1;
+      }
     }
     this._cachedStorageUsage = {
-      itemCount: unique.length,
+      itemCount: activeItemCount,
+      trashItemCount,
       mastersBytes,
       proxiesBytes,
+      trashBytes,
       usedBytes: mastersBytes + proxiesBytes,
     };
     return { ...this._cachedStorageUsage };

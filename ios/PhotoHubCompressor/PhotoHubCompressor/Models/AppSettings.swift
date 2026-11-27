@@ -1,6 +1,36 @@
 import Foundation
 import SwiftUI
 
+enum BackupStorageMode: String, CaseIterable, Identifiable, Sendable {
+    case optimizeStorage = "optimize_storage"
+    case backupOnly = "backup_only"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .optimizeStorage: return "Optimize Phone Storage"
+        case .backupOnly: return "Backup Only"
+        }
+    }
+
+    var shortTitle: String {
+        switch self {
+        case .optimizeStorage: return "Optimize Storage"
+        case .backupOnly: return "Backup Only"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .optimizeStorage:
+            return "Back up full-res originals & keep lightweight previews on phone to save up to 90% space."
+        case .backupOnly:
+            return "Back up full-res photos & videos safely to cloud without deleting or modifying phone media."
+        }
+    }
+}
+
 enum UploadMode: String, CaseIterable, Identifiable {
     case directVPS = "direct_vps"
     case s3Presigned = "s3_presigned"
@@ -149,6 +179,8 @@ final class AppSettings: ObservableObject {
             .filter { !$0.isEmpty }
     }()
 
+    @AppStorage("backupStorageMode") var backupStorageModeRaw: String = BackupStorageMode.optimizeStorage.rawValue
+    @AppStorage("hasCompletedOnboarding") var hasCompletedOnboarding: Bool = false
     @AppStorage("uploadMode") var uploadModeRaw: String = UploadMode.directVPS.rawValue
     @AppStorage("serverS3Enabled") var serverS3Enabled: Bool = false
     @AppStorage("proxyFormat") var proxyFormatRaw: String = ProxyFormat.heic.rawValue
@@ -162,6 +194,7 @@ final class AppSettings: ObservableObject {
     @AppStorage("autoSaveProxiesToPhotosApp") var autoSaveProxiesToPhotosApp: Bool = false
     @AppStorage("nightlyAutoBackupEnabled") var nightlyAutoBackupEnabled: Bool = true
     @AppStorage("nightlyRequiresCharging") var nightlyRequiresCharging: Bool = false
+    @AppStorage("wifiOnlyBackup") var wifiOnlyBackup: Bool = false
     @AppStorage("notifyWhenBackgroundUploadFinishes") var notifyWhenBackgroundUploadFinishes: Bool = true
     @AppStorage("morningReminderHour") var morningReminderHour: Int = 8
     @AppStorage("candidateSortMode") var candidateSortModeRaw: String = CandidateSortMode.largestVideosFirst.rawValue
@@ -185,6 +218,32 @@ final class AppSettings: ObservableObject {
 
     var isSignedIn: Bool {
         !authToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var backupStorageMode: BackupStorageMode {
+        get { BackupStorageMode(rawValue: backupStorageModeRaw) ?? .optimizeStorage }
+        set { backupStorageModeRaw = newValue.rawValue }
+    }
+
+    var isBackupOnlyMode: Bool {
+        backupStorageMode == .backupOnly
+    }
+
+    @MainActor
+    func applyBackupStorageMode(_ mode: BackupStorageMode) {
+        backupStorageMode = mode
+        if mode == .backupOnly {
+            BackgroundBackupManager.shared.clearAllStagedItems()
+        }
+    }
+
+    @MainActor
+    func completeOnboarding(with mode: BackupStorageMode) {
+        applyBackupStorageMode(mode)
+        if mode == .optimizeStorage {
+            keepLocalProxyInPhotos = true
+        }
+        hasCompletedOnboarding = true
     }
 
     var allowSelfSignedHTTPS: Bool {

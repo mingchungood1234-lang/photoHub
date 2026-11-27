@@ -11,8 +11,10 @@ import androidx.lifecycle.viewModelScope
 import com.photohub.compressor.background.BackgroundBackupManager
 import com.photohub.compressor.data.*
 import com.photohub.compressor.media.MediaLibraryService
+import com.photohub.compressor.media.OrderedCommitGate
 import com.photohub.compressor.media.OriginalDownloadCache
 import com.photohub.compressor.media.OriginalMediaResolver
+import com.photohub.compressor.media.PhotoBackupPipeline
 import com.photohub.compressor.media.ProxyGenerator
 import com.photohub.compressor.network.ApiHttpException
 import com.photohub.compressor.network.PhotoHubApiClient
@@ -38,7 +40,9 @@ enum class ServerMediaTypeFilter(val title: String) {
     ALL("All"),
     PHOTOS("Photos"),
     VIDEOS("Videos"),
-    PROTECTED("Protected")
+    FAVORITES("Favorites"),
+    PROTECTED("Protected"),
+    TRASH("Trash")
 }
 
 enum class ServerTimelineGrouping(val title: String, val shortLabel: String) {
@@ -73,6 +77,34 @@ data class ServerTimelineData(
 )
 
 object ServerTimelineBuilder {
+    private val monthKeywords = listOf(
+        "january jan", "february feb", "march mar", "april apr",
+        "may", "june jun", "july jul", "august aug",
+        "september sept sep", "october oct", "november nov", "december dec"
+    )
+
+    private fun matchesSmartQuery(photo: ServerPhoto, tokens: List<String>): Boolean {
+        val dateStr = photo.photoDate.ifBlank { photo.takenAt?.take(10).orEmpty() }
+        val monthIdx = if (dateStr.length >= 7 && dateStr[4] == '-') {
+            dateStr.substring(5, 7).toIntOrNull()?.minus(1) ?: -1
+        } else {
+            -1
+        }
+        val monthWords = if (monthIdx in monthKeywords.indices) monthKeywords[monthIdx] else ""
+        val hay = buildString {
+            append(photo.originalName).append(' ')
+            append(photo.photoDate).append(' ')
+            append(photo.takenAt.orEmpty()).append(' ')
+            append(photo.savedPath).append(' ')
+            append(photo.cameraModel.orEmpty()).append(' ')
+            append(monthWords).append(' ')
+            append(if (photo.isVideo) "video videos movie clip" else "photo photos image picture").append(' ')
+            if (photo.isFavorited) append("favorite favorites fav heart ").append(' ')
+            if (photo.isProtectedOriginal) append("protected restored original")
+        }.lowercase(Locale.ROOT)
+        return tokens.all { hay.contains(it) }
+    }
+
     fun build(
         photos: List<ServerPhoto>,
         filterMode: ServerGalleryFilter,
@@ -82,23 +114,22 @@ object ServerTimelineBuilder {
         locallyProtectedHashes: Set<String> = emptySet(),
         nowMs: Long = System.currentTimeMillis()
     ): ServerTimelineData {
-        val trimmedQuery = searchQuery.trim().lowercase(Locale.ROOT)
+        val queryTokens = searchQuery.trim().lowercase(Locale.ROOT).split(Regex("\\s+")).filter { it.isNotEmpty() }
         val filtered = photos.filter { photo ->
-            if (filterMode == ServerGalleryFilter.NEEDS_PROXY && !photo.needsProxy) return@filter false
+            if (mediaTypeFilter != ServerMediaTypeFilter.TRASH && filterMode == ServerGalleryFilter.NEEDS_PROXY && !photo.needsProxy) {
+                return@filter false
+            }
             val passesMedia = when (mediaTypeFilter) {
                 ServerMediaTypeFilter.ALL -> true
                 ServerMediaTypeFilter.PHOTOS -> !photo.isVideo
                 ServerMediaTypeFilter.VIDEOS -> photo.isVideo
+                ServerMediaTypeFilter.FAVORITES -> photo.isFavorited
                 ServerMediaTypeFilter.PROTECTED ->
                     photo.isProtectedOriginal || locallyProtectedHashes.contains(photo.hash.lowercase(Locale.ROOT))
+                ServerMediaTypeFilter.TRASH -> true
             }
             if (!passesMedia) return@filter false
-            if (trimmedQuery.isNotEmpty()) {
-                val matchesName = photo.originalName.lowercase(Locale.ROOT).contains(trimmedQuery)
-                val matchesDate = photo.photoDate.lowercase(Locale.ROOT).contains(trimmedQuery)
-                val matchesPath = photo.savedPath.lowercase(Locale.ROOT).contains(trimmedQuery)
-                if (!matchesName && !matchesDate && !matchesPath) return@filter false
-            }
+            if (queryTokens.isNotEmpty() && !matchesSmartQuery(photo, queryTokens)) return@filter false
             true
         }
         if (filtered.isEmpty()) return ServerTimelineData()
@@ -355,41 +386,73 @@ object BatchRestoreExecutor {
         mediaService: MediaLibraryService,
         tracker: LocalProxyTracker,
         photo: ServerPhoto,
+        commitGate: OrderedCommitGate? = null,
+        commitIndex: Int? = null,
         onProgress: ((Long, Long?) -> Unit)? = null
     ): Pair<ServerPhoto?, Long> {
-        val (originalFile, _) = OriginalDownloadCache.getOrFetchOriginal(
-            context = context,
-            apiClient = client,
-            masterHash = photo.hash,
-            preferredFilename = photo.originalName,
-            expectedSizeBytes = photo.size,
-            onProgress = onProgress
-        )
-        val fileSize = originalFile.length()
-        val bgManager = BackgroundBackupManager.getInstance(context)
-        val wasAlreadyRestored = tracker.isRestoredMasterHash(photo.hash)
-        bgManager.beginRestorePause()
-        // Pre-mark master hash before writing into MediaStore to eliminate any race window.
-        tracker.markRestoredOriginal(null, photo.hash)
-        val savedId = try {
-            val id = mediaService.saveRestoredOriginalToGallery(
-                file = originalFile,
-                isVideo = photo.isVideo,
-                originalFilename = photo.originalName,
-                creationDateMs = photo.parsedCreationDateMs
-            )
-            tracker.markRestoredOriginal(id, photo.hash)
-            id
-        } catch (err: Exception) {
-            if (!wasAlreadyRestored) {
-                tracker.clearRestoredProtection(photo.hash)
+        var didCompleteTurn = false
+        suspend fun releaseTurnIfNeeded() {
+            if (!didCompleteTurn && commitGate != null && commitIndex != null) {
+                didCompleteTurn = true
+                commitGate.completeTurn(commitIndex)
             }
-            throw err
-        } finally {
-            bgManager.endRestorePause()
         }
-        val updated = runCatching { client.setOriginalProtected(photo.hash, true) }.getOrNull()
-        return updated to fileSize
+        try {
+            // Strict duplicate guard: if the full-resolution original ALREADY exists in Gallery,
+            // link and protect it without writing a duplicate copy into MediaStore.
+            val existingOrigUri = withContext(Dispatchers.IO) {
+                mediaService.findExistingLiveOriginalUri(photo, tracker)
+            }
+            if (existingOrigUri != null) {
+                releaseTurnIfNeeded()
+                tracker.markRestoredOriginal(existingOrigUri, photo.hash)
+                val updated = runCatching { client.setOriginalProtected(photo.hash, true) }.getOrNull()
+                return updated to photo.size.coerceAtLeast(0L)
+            }
+
+            val (originalFile, _) = OriginalDownloadCache.getOrFetchOriginal(
+                context = context,
+                apiClient = client,
+                masterHash = photo.hash,
+                preferredFilename = photo.originalName,
+                expectedSizeBytes = photo.size,
+                onProgress = onProgress
+            )
+            val fileSize = originalFile.length()
+            if (commitGate != null && commitIndex != null) {
+                val canCommit = commitGate.waitForTurn(commitIndex)
+                if (!canCommit) {
+                    throw CancellationException("Ordered restore commit cancelled")
+                }
+            }
+            val bgManager = BackgroundBackupManager.getInstance(context)
+            val wasAlreadyRestored = tracker.isRestoredMasterHash(photo.hash)
+            bgManager.beginRestorePause()
+            // Pre-mark master hash before writing into MediaStore to eliminate any race window.
+            tracker.markRestoredOriginal(null, photo.hash)
+            val savedId = try {
+                val id = mediaService.saveRestoredOriginalToGallery(
+                    file = originalFile,
+                    isVideo = photo.isVideo,
+                    originalFilename = photo.originalName,
+                    creationDateMs = photo.parsedCreationDateMs
+                )
+                tracker.markRestoredOriginal(id, photo.hash)
+                id
+            } catch (err: Exception) {
+                if (!wasAlreadyRestored) {
+                    tracker.clearRestoredProtection(photo.hash)
+                }
+                throw err
+            } finally {
+                releaseTurnIfNeeded()
+                bgManager.endRestorePause()
+            }
+            val updated = runCatching { client.setOriginalProtected(photo.hash, true) }.getOrNull()
+            return updated to fileSize
+        } finally {
+            releaseTurnIfNeeded()
+        }
     }
 
     suspend fun runBatchRestore(
@@ -407,9 +470,13 @@ object BatchRestoreExecutor {
     ) {
         val bgManager = BackgroundBackupManager.getInstance(context)
         bgManager.beginRestorePause()
-        val queue = Channel<ServerPhoto>(Channel.UNLIMITED)
-        targets.forEach { queue.trySend(it) }
+        // Insert restored originals chronologically oldest-first and newest LAST so third-party
+        // share pickers (WhatsApp, Telegram, Instagram, Android Photo Picker) show the newest photo first.
+        val orderedTargets = PhotoBackupPipeline.sortServerPhotosOldestFirst(targets)
+        val queue = Channel<Pair<Int, ServerPhoto>>(Channel.UNLIMITED)
+        orderedTargets.forEachIndexed { idx, photo -> queue.trySend(idx to photo) }
         queue.close()
+        val commitGate = OrderedCommitGate()
 
         val succeeded = AtomicInteger(0)
         val failed = AtomicInteger(0)
@@ -420,15 +487,19 @@ object BatchRestoreExecutor {
 
         try {
             coroutineScope {
-                val workerCount = minOf(3, targets.size)
+                val workerCount = minOf(3, orderedTargets.size)
                 val workers = List(workerCount) {
                     launch(Dispatchers.IO) {
-                        for (item in queue) {
-                            if (!isActive || lowStorageHit.get()) break
+                        for ((workIndex, item) in queue) {
+                            if (!isActive || lowStorageHit.get()) {
+                                commitGate.completeTurn(workIndex)
+                                break
+                            }
                             val freeBytes = DeviceStorageHelper.availableBytes()
                             val neededBytes = maxOf(250L * 1024L * 1024L, maxOf(0L, item.size) + 150L * 1024L * 1024L)
                             if (freeBytes != null && freeBytes < neededBytes) {
                                 lowStorageHit.set(true)
+                                commitGate.cancelAll()
                                 break
                             }
                             var updatedPhoto: ServerPhoto? = null
@@ -438,20 +509,24 @@ object BatchRestoreExecutor {
                                     client = client,
                                     mediaService = mediaService,
                                     tracker = tracker,
-                                    photo = item
+                                    photo = item,
+                                    commitGate = commitGate,
+                                    commitIndex = workIndex
                                 ).first
                                 succeeded.incrementAndGet()
                                 succeededHashes.add(item.hash)
                             } catch (c: CancellationException) {
+                                commitGate.cancelAll()
                                 throw c
                             } catch (_: Exception) {
+                                commitGate.completeTurn(workIndex)
                                 failed.incrementAndGet()
                             }
                             val done = completed.incrementAndGet()
                             onItemComplete(
                                 BatchRestoreProgress(
                                     completed = done,
-                                    total = targets.size,
+                                    total = orderedTargets.size,
                                     currentName = item.originalName,
                                     updatedPhoto = updatedPhoto
                                 )
@@ -463,8 +538,10 @@ object BatchRestoreExecutor {
             }
         } catch (c: CancellationException) {
             cancelled = true
+            commitGate.cancelAll()
             throw c
         } finally {
+            commitGate.cancelAll()
             val ok = succeeded.get()
             val errCount = failed.get()
             val stoppedLowStorage = lowStorageHit.get()
@@ -564,6 +641,10 @@ object BatchRestoreExecutor {
 
 data class ServerGalleryUiState(
     val photos: List<ServerPhoto> = emptyList(),
+    val trashPhotos: List<ServerPhoto> = emptyList(),
+    val trashCount: Int = 0,
+    val trashBytes: Long = 0L,
+    val isLoadingTrash: Boolean = false,
     val timeline: ServerTimelineData = ServerTimelineData(),
     val thumbnailCacheVersion: Long = 0L,
     val failedPreviewHashes: Set<String> = emptySet(),
@@ -593,14 +674,18 @@ data class ServerGalleryUiState(
     val isBatchDeleting: Boolean = false,
     val deleteBannerMessage: String? = null,
     val deleteConfirmTargets: List<ServerPhoto>? = null,
+    val deleteConfirmIsPermanent: Boolean = false,
     val isResolvingPick: Boolean = false,
     val pickStatusText: String = "Preparing original…",
     val pickerErrorMessage: String? = null,
     val shareFileReady: File? = null
 ) {
+    val isViewingTrash: Boolean get() = mediaTypeFilter == ServerMediaTypeFilter.TRASH
+    val activeSourcePhotos: List<ServerPhoto> get() = if (isViewingTrash) trashPhotos else photos
     val unproxiedCount: Int get() = photos.count { it.needsProxy }
     val videoCount: Int get() = photos.count { it.isVideo }
     val photoCount: Int get() = (photos.size - videoCount).coerceAtLeast(0)
+    val favoriteCount: Int get() = photos.count { it.isFavorited }
     val protectedCount: Int get() = photos.count { isRestoredOrProtected(it) }
     val totalServerBytes: Long get() = photos.sumOf { maxOf(0L, it.size) }
     val hasActiveFilter: Boolean
@@ -624,7 +709,8 @@ data class PhotoDetailUiState(
     val isBusy: Boolean = false,
     val busyLabel: String = "",
     val saveMessage: String? = null,
-    val shareFileReady: File? = null
+    val shareFileReady: File? = null,
+    val createdShareLink: ShareLinkResult? = null
 )
 
 class ServerGalleryViewModel(application: Application) : AndroidViewModel(application) {
@@ -742,7 +828,30 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
             val client = PhotoHubApiClient(context, settings)
             val whoamiDeferred = async { runCatching { client.whoami() }.getOrNull() }
             try {
-                val fetched = client.fetchAllServerPhotos(sync = true)
+                var latestTrashCount = _uiState.value.trashCount
+                val fetched = client.fetchAllServerPhotos(sync = true) { partial, trashCount ->
+                    latestTrashCount = trashCount
+                    if (partial.size >= 300) {
+                        _uiState.update { prev ->
+                            val source = if (prev.isViewingTrash) prev.trashPhotos else partial
+                            val rebuilt = rebuildTimelineData(
+                                source,
+                                prev.filterMode,
+                                prev.mediaTypeFilter,
+                                prev.timelineGrouping,
+                                prev.selectedYearAnchor,
+                                prev.searchQuery,
+                                prev.locallyProtectedHashes
+                            )
+                            prev.copy(
+                                photos = partial,
+                                trashCount = trashCount,
+                                timeline = rebuilt.first,
+                                selectedYearAnchor = rebuilt.second
+                            )
+                        }
+                    }
+                }
                 val cur = settings.current
                 store.savePhotos(fetched, cur.normalizedBaseUrl, cur.apiKeyCacheScope)
                 val protectedSet = withContext(Dispatchers.IO) {
@@ -760,8 +869,9 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                     )
                 }
                 _uiState.update { prev ->
+                    val source = if (prev.isViewingTrash) prev.trashPhotos else fetched
                     val rebuilt = rebuildTimelineData(
-                        fetched,
+                        source,
                         prev.filterMode,
                         prev.mediaTypeFilter,
                         prev.timelineGrouping,
@@ -774,6 +884,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                     }.toSet()
                     prev.copy(
                         photos = fetched,
+                        trashCount = latestTrashCount,
                         thumbnailCacheVersion = prev.thumbnailCacheVersion + 1L,
                         locallyProtectedHashes = protectedSet,
                         timeline = rebuilt.first,
@@ -813,8 +924,9 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
     fun setMediaTypeFilter(media: ServerMediaTypeFilter) {
         _uiState.update { prev ->
+            val source = if (media == ServerMediaTypeFilter.TRASH) prev.trashPhotos else prev.photos
             val rebuilt = rebuildTimelineData(
-                prev.photos,
+                source,
                 prev.filterMode,
                 media,
                 prev.timelineGrouping,
@@ -822,14 +934,62 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                 prev.searchQuery,
                 prev.locallyProtectedHashes
             )
-            prev.copy(mediaTypeFilter = media, timeline = rebuilt.first, selectedYearAnchor = rebuilt.second)
+            prev.copy(
+                mediaTypeFilter = media,
+                selectedHashes = emptySet(),
+                timeline = rebuilt.first,
+                selectedYearAnchor = rebuilt.second
+            )
+        }
+        if (media == ServerMediaTypeFilter.TRASH) {
+            loadTrashPhotos()
+        }
+    }
+
+    fun loadTrashPhotos() {
+        if (_uiState.value.isLoadingTrash) return
+        _uiState.update { it.copy(isLoadingTrash = true) }
+        viewModelScope.launch {
+            try {
+                val res = PhotoHubApiClient(context, settings).fetchTrashPhotos()
+                _uiState.update { prev ->
+                    val rebuilt = if (prev.isViewingTrash) {
+                        rebuildTimelineData(
+                            res.photos,
+                            prev.filterMode,
+                            prev.mediaTypeFilter,
+                            prev.timelineGrouping,
+                            prev.selectedYearAnchor,
+                            prev.searchQuery,
+                            prev.locallyProtectedHashes
+                        )
+                    } else {
+                        prev.timeline to prev.selectedYearAnchor
+                    }
+                    prev.copy(
+                        trashPhotos = res.photos,
+                        trashCount = res.total,
+                        trashBytes = res.trashBytes,
+                        isLoadingTrash = false,
+                        timeline = rebuilt.first,
+                        selectedYearAnchor = rebuilt.second
+                    )
+                }
+            } catch (err: Exception) {
+                _uiState.update {
+                    it.copy(
+                        isLoadingTrash = false,
+                        deleteBannerMessage = "Could not load Trash: ${err.localizedMessage}"
+                    )
+                }
+            }
         }
     }
 
     fun setTimelineGrouping(grouping: ServerTimelineGrouping) {
         _uiState.update { prev ->
             val rebuilt = rebuildTimelineData(
-                prev.photos,
+                prev.activeSourcePhotos,
                 prev.filterMode,
                 prev.mediaTypeFilter,
                 grouping,
@@ -844,7 +1004,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
     fun setSearchQuery(query: String) {
         _uiState.update { prev ->
             val rebuilt = rebuildTimelineData(
-                prev.photos,
+                prev.activeSourcePhotos,
                 prev.filterMode,
                 prev.mediaTypeFilter,
                 prev.timelineGrouping,
@@ -1224,6 +1384,91 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
         _detailState.update { it?.copy(shareFileReady = null) }
     }
 
+    fun clearCreatedShareLink() {
+        _detailState.update { it?.copy(createdShareLink = null) }
+    }
+
+    fun toggleFavoriteFromDetail() {
+        val photo = _detailState.value?.photo ?: return
+        val nextFav = !photo.isFavorited
+        viewModelScope.launch {
+            try {
+                val updated = PhotoHubApiClient(context, settings).setPhotoFavorite(photo.hash, nextFav)
+                applyUpdatedPhoto(updated)
+                _detailState.update { cur ->
+                    if (cur?.photo?.hash.equals(updated.hash, ignoreCase = true)) {
+                        cur?.copy(
+                            photo = updated,
+                            saveMessage = if (nextFav) "Added to Favorites ♥" else "Removed from Favorites"
+                        )
+                    } else {
+                        cur
+                    }
+                }
+            } catch (err: Exception) {
+                _detailState.update {
+                    it?.copy(saveMessage = "Favorite update failed: ${err.localizedMessage}")
+                }
+            }
+        }
+    }
+
+    fun createShareLinkFromDetail(title: String, expiresInHours: Int, passcode: String) {
+        val photo = _detailState.value?.photo ?: return
+        _detailState.update { it?.copy(isBusy = true, busyLabel = "Creating share link…", saveMessage = null, createdShareLink = null) }
+        viewModelScope.launch {
+            try {
+                val link = PhotoHubApiClient(context, settings).createShareLink(
+                    hashes = listOf(photo.hash),
+                    title = title.ifBlank { photo.originalName },
+                    expiresInHours = expiresInHours,
+                    passcode = passcode
+                )
+                _detailState.update {
+                    it?.copy(isBusy = false, busyLabel = "", createdShareLink = link)
+                }
+            } catch (err: Exception) {
+                _detailState.update {
+                    it?.copy(isBusy = false, busyLabel = "", saveMessage = "Share link failed: ${err.localizedMessage}")
+                }
+            }
+        }
+    }
+
+    fun restorePhotoFromTrashDetail() {
+        val photo = _detailState.value?.photo ?: return
+        _detailState.update { it?.copy(isBusy = true, busyLabel = "Restoring from Trash…", saveMessage = null) }
+        viewModelScope.launch {
+            try {
+                PhotoHubApiClient(context, settings).restoreServerPhotosFromTrash(listOf(photo.hash))
+                _detailState.value = null
+                _uiState.update { prev ->
+                    val nextTrash = prev.trashPhotos.filterNot { it.hash.equals(photo.hash, ignoreCase = true) }
+                    val rebuilt = if (prev.isViewingTrash) {
+                        rebuildTimelineData(
+                            nextTrash, prev.filterMode, prev.mediaTypeFilter, prev.timelineGrouping,
+                            prev.selectedYearAnchor, prev.searchQuery, prev.locallyProtectedHashes
+                        )
+                    } else {
+                        prev.timeline to prev.selectedYearAnchor
+                    }
+                    prev.copy(
+                        trashPhotos = nextTrash,
+                        trashCount = nextTrash.size,
+                        timeline = rebuilt.first,
+                        selectedYearAnchor = rebuilt.second,
+                        deleteBannerMessage = "Restored ${photo.originalName} to Cloud library."
+                    )
+                }
+                loadPhotos()
+            } catch (err: Exception) {
+                _detailState.update {
+                    it?.copy(isBusy = false, busyLabel = "", saveMessage = "Restore failed: ${err.localizedMessage}")
+                }
+            }
+        }
+    }
+
     private suspend fun prepareDetailVideoProxy(photo: ServerPhoto) {
         // 1. Play straight from Native Android Gallery if already on device (zero server video download!)
         val nativeVideoUri = mediaService.findLiveNativeVideoUri(photo.hash)
@@ -1435,7 +1680,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
     fun enterSelectionMode(initialHash: String? = null) {
         val prev = _uiState.value
-        if (prev.isBatchRestoring || prev.isBatchProxying || prev.isBatchDeleting || prev.photos.isEmpty()) return
+        if (prev.isBatchRestoring || prev.isBatchProxying || prev.isBatchDeleting || prev.activeSourcePhotos.isEmpty()) return
         val initial = initialHash?.let(::normHash)?.takeIf { it.isNotEmpty() }
         _uiState.update {
             it.copy(
@@ -1501,13 +1746,62 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
     fun requestDeleteSelected() {
         val state = _uiState.value
         if (state.isBatchRestoring || state.isBatchProxying || state.isBatchDeleting || state.selectedHashes.isEmpty()) return
-        val targets = state.photos.filter { normHash(it.hash) in state.selectedHashes }
+        val targets = state.activeSourcePhotos.filter { normHash(it.hash) in state.selectedHashes }
         if (targets.isEmpty()) return
-        _uiState.update { it.copy(deleteConfirmTargets = targets) }
+        _uiState.update {
+            it.copy(
+                deleteConfirmTargets = targets,
+                deleteConfirmIsPermanent = state.isViewingTrash
+            )
+        }
+    }
+
+    fun requestEmptyTrashAll() {
+        val trash = _uiState.value.trashPhotos
+        if (trash.isEmpty() || _uiState.value.isBatchDeleting) return
+        _uiState.update {
+            it.copy(
+                deleteConfirmTargets = trash,
+                deleteConfirmIsPermanent = true
+            )
+        }
+    }
+
+    fun restoreSelectedFromTrash() {
+        val state = _uiState.value
+        if (!state.isViewingTrash || state.selectedHashes.isEmpty() || state.isBatchDeleting) return
+        val hashes = state.selectedHashes.toList()
+        _uiState.update { it.copy(isBatchDeleting = true, isSelectionMode = false, selectedHashes = emptySet()) }
+        viewModelScope.launch {
+            try {
+                val restored = PhotoHubApiClient(context, settings).restoreServerPhotosFromTrash(hashes)
+                val restoredSet = restored.map { normHash(it) }.toSet()
+                _uiState.update { prev ->
+                    val nextTrash = prev.trashPhotos.filterNot { normHash(it.hash) in restoredSet }
+                    val rebuilt = rebuildTimelineData(
+                        nextTrash, prev.filterMode, prev.mediaTypeFilter, prev.timelineGrouping,
+                        prev.selectedYearAnchor, prev.searchQuery, prev.locallyProtectedHashes
+                    )
+                    prev.copy(
+                        trashPhotos = nextTrash,
+                        trashCount = nextTrash.size,
+                        isBatchDeleting = false,
+                        timeline = rebuilt.first,
+                        selectedYearAnchor = rebuilt.second,
+                        deleteBannerMessage = "Restored ${restored.size} item(s) to Cloud library."
+                    )
+                }
+                loadPhotos()
+            } catch (err: Exception) {
+                _uiState.update {
+                    it.copy(isBatchDeleting = false, deleteBannerMessage = "Restore failed: ${err.localizedMessage}")
+                }
+            }
+        }
     }
 
     fun dismissDeleteConfirm() {
-        _uiState.update { it.copy(deleteConfirmTargets = null) }
+        _uiState.update { it.copy(deleteConfirmTargets = null, deleteConfirmIsPermanent = false) }
     }
 
     fun dismissDeleteBanner() {
@@ -1516,10 +1810,12 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
     fun executeDeleteSelected() {
         val targets = _uiState.value.deleteConfirmTargets ?: return
+        val permanent = _uiState.value.deleteConfirmIsPermanent
         if (_uiState.value.isBatchDeleting || _uiState.value.isBatchRestoring || _uiState.value.isBatchProxying) return
         _uiState.update {
             it.copy(
                 deleteConfirmTargets = null,
+                deleteConfirmIsPermanent = false,
                 isBatchDeleting = true,
                 deleteBannerMessage = null,
                 isSelectionMode = false,
@@ -1529,21 +1825,43 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
         viewModelScope.launch {
             try {
-                val result = PhotoHubApiClient(context, settings).deleteServerPhotosBatch(targets.map { it.hash })
-                val removedSet = (result.deleted + result.missing).map { normHash(it) }.toSet()
-                applyDeletedHashes(removedSet)
-                val deletedCount = result.deleted.size
-                val freedStr = android.text.format.Formatter.formatFileSize(context, result.freedBytes)
-                val msg = when {
-                    deletedCount > 0 && result.success ->
-                        "Deleted $deletedCount photo(s) from server (freed ~$freedStr)."
-                    deletedCount > 0 ->
-                        "Deleted $deletedCount photo(s) from server; some items failed."
-                    result.missing.isNotEmpty() ->
-                        "Removed ${result.missing.size} missing item(s) from gallery."
-                    else -> "Delete failed on server."
+                val api = PhotoHubApiClient(context, settings)
+                if (permanent) {
+                    val result = api.emptyServerTrash(targets.map { it.hash })
+                    val removedSet = result.deleted.map { normHash(it) }.toSet()
+                    val freedStr = android.text.format.Formatter.formatFileSize(context, result.freedBytes)
+                    _uiState.update { prev ->
+                        val nextTrash = prev.trashPhotos.filterNot { normHash(it.hash) in removedSet }
+                        val rebuilt = if (prev.isViewingTrash) {
+                            rebuildTimelineData(
+                                nextTrash, prev.filterMode, prev.mediaTypeFilter, prev.timelineGrouping,
+                                prev.selectedYearAnchor, prev.searchQuery, prev.locallyProtectedHashes
+                            )
+                        } else {
+                            prev.timeline to prev.selectedYearAnchor
+                        }
+                        prev.copy(
+                            trashPhotos = nextTrash,
+                            trashCount = nextTrash.size,
+                            isBatchDeleting = false,
+                            timeline = rebuilt.first,
+                            selectedYearAnchor = rebuilt.second,
+                            deleteBannerMessage = "Permanently deleted ${result.deleted.size} item(s) (freed ~$freedStr)."
+                        )
+                    }
+                } else {
+                    val result = api.moveServerPhotosToTrash(targets.map { it.hash })
+                    val removedSet = (result.deleted + result.missing).map { normHash(it) }.toSet()
+                    applyDeletedHashes(removedSet)
+                    val count = result.deleted.size
+                    _uiState.update { prev ->
+                        prev.copy(
+                            trashCount = prev.trashCount + count,
+                            isBatchDeleting = false,
+                            deleteBannerMessage = "Moved $count item(s) to Trash (kept 30 days)."
+                        )
+                    }
                 }
-                _uiState.update { it.copy(isBatchDeleting = false, deleteBannerMessage = msg) }
             } catch (err: ApiHttpException) {
                 if (err.statusCode == 401) {
                     syncManager.cancel()
@@ -1565,16 +1883,50 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
     fun deletePhotoFromDetail() {
         val photo = _detailState.value?.photo ?: return
-        _detailState.update { it?.copy(isBusy = true, busyLabel = "Deleting from server…", saveMessage = null) }
+        val isTrash = _uiState.value.isViewingTrash || photo.isTrashed
+        _detailState.update {
+            it?.copy(
+                isBusy = true,
+                busyLabel = if (isTrash) "Deleting permanently…" else "Moving to Trash…",
+                saveMessage = null
+            )
+        }
         speculativePrefetchJob?.cancel()
 
         viewModelScope.launch {
             try {
-                PhotoHubApiClient(context, settings).deleteServerPhoto(photo.hash)
-                applyDeletedHashes(setOf(normHash(photo.hash)))
-                _detailState.value = null
-                _uiState.update {
-                    it.copy(deleteBannerMessage = "Deleted ${photo.originalName} from server.")
+                val api = PhotoHubApiClient(context, settings)
+                if (isTrash) {
+                    api.emptyServerTrash(listOf(photo.hash))
+                    _detailState.value = null
+                    _uiState.update { prev ->
+                        val nextTrash = prev.trashPhotos.filterNot { it.hash.equals(photo.hash, ignoreCase = true) }
+                        val rebuilt = if (prev.isViewingTrash) {
+                            rebuildTimelineData(
+                                nextTrash, prev.filterMode, prev.mediaTypeFilter, prev.timelineGrouping,
+                                prev.selectedYearAnchor, prev.searchQuery, prev.locallyProtectedHashes
+                            )
+                        } else {
+                            prev.timeline to prev.selectedYearAnchor
+                        }
+                        prev.copy(
+                            trashPhotos = nextTrash,
+                            trashCount = nextTrash.size,
+                            timeline = rebuilt.first,
+                            selectedYearAnchor = rebuilt.second,
+                            deleteBannerMessage = "Permanently deleted ${photo.originalName}."
+                        )
+                    }
+                } else {
+                    api.moveServerPhotosToTrash(listOf(photo.hash))
+                    applyDeletedHashes(setOf(normHash(photo.hash)))
+                    _detailState.value = null
+                    _uiState.update { prev ->
+                        prev.copy(
+                            trashCount = prev.trashCount + 1,
+                            deleteBannerMessage = "Moved ${photo.originalName} to Trash (kept 30 days)."
+                        )
+                    }
                 }
             } catch (err: ApiHttpException) {
                 if (err.statusCode == 401) {

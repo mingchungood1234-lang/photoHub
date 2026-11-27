@@ -37,7 +37,8 @@ data class ResolvedMasterMedia(
     val masterHash: String,
     val originalName: String?,
     val expectedSizeBytes: Long?,
-    val sourceDisplayName: String?
+    val sourceDisplayName: String?,
+    val creationDateMs: Long? = null
 )
 
 data class FetchedOriginalResult(
@@ -46,7 +47,8 @@ data class FetchedOriginalResult(
     val originalName: String,
     val mimeType: String,
     val sizeBytes: Long,
-    val fromCache: Boolean
+    val fromCache: Boolean,
+    val creationDateMs: Long? = null
 )
 
 /**
@@ -274,7 +276,8 @@ class OriginalMediaResolver(
                 masterHash = trackerMatch.masterHash,
                 originalName = trackerMatch.originalName ?: cachedMatch?.originalName ?: displayName,
                 expectedSizeBytes = cachedMatch?.size,
-                sourceDisplayName = displayName
+                sourceDisplayName = displayName,
+                creationDateMs = cachedMatch?.parsedCreationDateMs
             )
         }
 
@@ -302,7 +305,8 @@ class OriginalMediaResolver(
                     masterHash = cached?.hash ?: norm,
                     originalName = cached?.originalName,
                     expectedSizeBytes = cached?.size,
-                    sourceDisplayName = displayName
+                    sourceDisplayName = displayName,
+                    creationDateMs = cached?.parsedCreationDateMs
                 )
             } else if (shortPrefix == null) {
                 shortPrefix = embeddedMarker
@@ -317,7 +321,8 @@ class OriginalMediaResolver(
                     masterHash = resolvedFromPrefix.hash,
                     originalName = resolvedFromPrefix.originalName,
                     expectedSizeBytes = resolvedFromPrefix.size,
-                    sourceDisplayName = displayName
+                    sourceDisplayName = displayName,
+                    creationDateMs = resolvedFromPrefix.parsedCreationDateMs
                 )
             }
         }
@@ -332,7 +337,8 @@ class OriginalMediaResolver(
                 masterHash = trackedMaster,
                 originalName = cached?.originalName ?: displayName,
                 expectedSizeBytes = cached?.size,
-                sourceDisplayName = displayName
+                sourceDisplayName = displayName,
+                creationDateMs = cached?.parsedCreationDateMs
             )
         }
 
@@ -340,14 +346,15 @@ class OriginalMediaResolver(
         if (check.exists) {
             val resolvedHash = check.masterHash ?: streamSha
             val cached = cachedPhotos.firstOrNull { it.hash.equals(resolvedHash, ignoreCase = true) }
+            val resolvedServer = cached ?: resolveMasterByPrefix(resolvedHash.take(16), cachedPhotos, client)
             val resolvedName = check.originalName
-                ?: cached?.originalName
-                ?: resolveMasterByPrefix(resolvedHash.take(16), cachedPhotos, client)?.originalName
+                ?: resolvedServer?.originalName
             return@withContext ResolvedMasterMedia(
                 masterHash = resolvedHash,
                 originalName = resolvedName,
-                expectedSizeBytes = check.size ?: cached?.size,
-                sourceDisplayName = displayName
+                expectedSizeBytes = check.size ?: resolvedServer?.size,
+                sourceDisplayName = displayName,
+                creationDateMs = resolvedServer?.parsedCreationDateMs
             )
         }
 
@@ -391,7 +398,8 @@ class OriginalMediaResolver(
             originalName = finalName,
             mimeType = mime,
             sizeBytes = file.length(),
-            fromCache = fromCache
+            fromCache = fromCache,
+            creationDateMs = resolved.creationDateMs
         )
     }
 

@@ -72,6 +72,14 @@ object AssetUploadCoordinator {
         }
     }
 
+    fun isMasterHashActive(sha256: String): Boolean {
+        val norm = sha256.trim().lowercase()
+        if (norm.isEmpty()) return false
+        return synchronized(lock) {
+            activeMasterHashes.contains(norm)
+        }
+    }
+
     fun releaseMasterHash(sha256: String) {
         val norm = sha256.trim().lowercase()
         if (norm.isEmpty()) return

@@ -41,7 +41,9 @@ const { createCheckController } = require('./controllers/checkController');
 const { createUploadController } = require('./controllers/uploadController');
 const { createProxyController } = require('./controllers/proxyController');
 const { createPhotoController } = require('./controllers/photoController');
+const { createShareController } = require('./controllers/shareController');
 const { createAdminController } = require('./controllers/adminController');
+const { ShareStore } = require('./services/shareService');
 const { mountRoutes } = require('./routes');
 
 async function createApp(configOverrides = {}) {
@@ -60,6 +62,9 @@ async function createApp(configOverrides = {}) {
 
   const contextService = createContextService(config, { userDirectory });
   await contextService.init();
+
+  const shareStore = new ShareStore(config.dataDir);
+  await shareStore.init();
 
   const nodeAllocationService = createNodeAllocationService({
     config,
@@ -110,6 +115,7 @@ async function createApp(configOverrides = {}) {
     uploadController: createUploadController({ config, contextService }),
     proxyController: createProxyController({ config }),
     photoController: createPhotoController({ config }),
+    shareController: createShareController({ config, shareStore, contextService }),
     adminController: createAdminController({ config, contextService, userDirectory, nodeAllocationService }),
   };
 
@@ -161,7 +167,7 @@ async function createApp(configOverrides = {}) {
       res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
       res.setHeader(
         'Access-Control-Allow-Headers',
-        'Authorization,Content-Type,X-API-Key,If-None-Match,X-File-Name,X-File-Sha256,X-File-Hash,X-Created-At,X-Photo-Date,X-Verify-Checksum'
+        'Authorization,Content-Type,X-API-Key,If-None-Match,X-File-Name,X-File-Sha256,X-File-Hash,X-Created-At,X-Photo-Date,X-Verify-Checksum,X-Share-Passcode'
       );
       res.setHeader('Access-Control-Expose-Headers', 'ETag,X-Photo-Variant,X-Master-Sha256,Content-Disposition');
       if (req.method === 'OPTIONS') {
@@ -174,7 +180,7 @@ async function createApp(configOverrides = {}) {
   // Same-origin Gateway proxy for web gallery users assigned to a remote STORAGE_NODE
   // (eliminates CORS, HTTPS->HTTP mixed-content blocks, and private LAN/Tailscale node reachability issues).
   const WEB_PROXY_ALLOWED_PATH_RE =
-    /^\/(whoami|storage|photos|photos\/delete|photo\/[^/]+(?:\/(?:preview|video-proxy|protect-original))?|upload|check(?:\/[^/]+)?)$/;
+    /^\/(whoami|storage|photos(?:\/(?:delete|trash|trash\/restore|trash\/empty|download-zip))?|photo\/[^/]+(?:\/(?:preview|video-proxy|protect-original|favorite))?|shares(?:\/[^/]+)?|upload|check(?:\/[^/]+)?)$/;
   app.use(async (req, res, next) => {
     if (!req.path.startsWith('/api/web-node/')) return next();
     const subPath = req.path.slice('/api/web-node'.length);
@@ -329,6 +335,18 @@ async function createApp(configOverrides = {}) {
     return next();
   });
   const sendWebApp = (req, res) => res.sendFile(webIndexPath, { dotfiles: 'allow' });
+  app.get('/manifest.webmanifest', (req, res) => {
+    res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache');
+    return res.sendFile(path.join(webDir, 'manifest.webmanifest'), { dotfiles: 'allow' });
+  });
+  app.get('/sw.js', (req, res) => {
+    res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+    res.setHeader('Service-Worker-Allowed', '/');
+    res.setHeader('Cache-Control', 'no-cache');
+    return res.sendFile(path.join(webDir, 'sw.js'), { dotfiles: 'allow' });
+  });
+  app.get('/s/:token', controllers.shareController.getSharePage);
   app.get('/', sendWebApp);
   app.get('/auth/callback', sendWebApp);
   app.get('/gallery', sendWebApp);

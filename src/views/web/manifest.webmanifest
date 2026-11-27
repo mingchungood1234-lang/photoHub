@@ -1,0 +1,18 @@
+{
+  "name": "PhotoHub — Private Photo Cloud",
+  "short_name": "PhotoHub",
+  "description": "Full-resolution self-hosted photo & video cloud backup with lightweight phone previews.",
+  "start_url": "/gallery",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#FFF9F5",
+  "theme_color": "#F97316",
+  "icons": [
+    {
+      "src": "/web/icon.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

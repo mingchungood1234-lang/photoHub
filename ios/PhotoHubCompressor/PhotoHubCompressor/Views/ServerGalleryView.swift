@@ -13,7 +13,9 @@ private enum ServerMediaTypeFilter: String, CaseIterable, Identifiable {
     case all = "All"
     case photos = "Photos"
     case videos = "Videos"
+    case favorites = "♥ Favorites"
     case protectedOnly = "Protected"
+    case trash = "Trash"
 
     var id: String { rawValue }
 }
@@ -49,6 +51,7 @@ private enum BatchProxyOutcome: Sendable {
 private struct DeleteConfirmPrompt {
     let targets: [ServerPhoto]
     let totalBytes: Int64
+    let isPermanent: Bool
 }
 
 struct ServerGalleryView: View {
@@ -61,6 +64,10 @@ struct ServerGalleryView: View {
     }
 
     @State private var photos: [ServerPhoto] = []
+    @State private var trashPhotos: [ServerPhoto] = []
+    @State private var trashCount: Int = 0
+    @State private var trashBytes: Int64 = 0
+    @State private var isLoadingTrash: Bool = false
     @State private var isLoading: Bool = false
     @State private var errorMessage: String?
     @State private var selectedPhoto: ServerPhoto?
@@ -103,8 +110,22 @@ struct ServerGalleryView: View {
         GridItem(.adaptive(minimum: 102, maximum: 145), spacing: 6)
     ]
 
+    private var isViewingTrash: Bool {
+        mediaTypeFilter == .trash
+    }
+
+    private var activeSourcePhotos: [ServerPhoto] {
+        isViewingTrash ? trashPhotos : photos
+    }
+
     private var unproxiedPhotos: [ServerPhoto] {
         photos.filter { $0.needsProxy }
+    }
+
+    private var favoriteCount: Int {
+        photos.reduce(into: 0) { count, p in
+            if p.isFavorited { count += 1 }
+        }
     }
 
     private var protectedCount: Int {
@@ -159,7 +180,7 @@ struct ServerGalleryView: View {
 
     private var selectedPhotos: [ServerPhoto] {
         guard !selectedPhotoHashes.isEmpty else { return [] }
-        return photos.filter { selectedPhotoHashes.contains($0.hash.lowercased()) }
+        return activeSourcePhotos.filter { selectedPhotoHashes.contains($0.hash.lowercased()) }
     }
 
     var body: some View {
@@ -198,7 +219,7 @@ struct ServerGalleryView: View {
                         )
                         .padding(.horizontal, 24)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    } else if photos.isEmpty {
+                    } else if photos.isEmpty && !isViewingTrash && trashCount == 0 {
                         VStack(spacing: 14) {
                             SunnyMascotView(mood: .sleeping, size: 120)
                             Text("No Cloud Backups Yet")
@@ -277,6 +298,12 @@ struct ServerGalleryView: View {
 
                                     if isBatchDeleting || deleteBannerMessage != nil {
                                         deleteBannerView
+                                            .padding(.horizontal, 12)
+                                            .padding(.bottom, 8)
+                                    }
+
+                                    if isViewingTrash {
+                                        trashInfoBannerView
                                             .padding(.horizontal, 12)
                                             .padding(.bottom, 8)
                                     }
@@ -442,7 +469,7 @@ struct ServerGalleryView: View {
                         Button("Select") {
                             enterSelectionMode()
                         }
-                        .disabled(photos.isEmpty || isBatchRestoring || isBatchProxying || isBatchDeleting)
+                        .disabled(activeSourcePhotos.isEmpty || isBatchRestoring || isBatchProxying || isBatchDeleting)
 
                         Menu {
                             if !photos.isEmpty {
@@ -498,8 +525,12 @@ struct ServerGalleryView: View {
             .onChange(of: filterMode) { _ in
                 rebuildTimeline()
             }
-            .onChange(of: mediaTypeFilter) { _ in
+            .onChange(of: mediaTypeFilter) { newFilter in
+                selectedPhotoHashes.removeAll()
                 rebuildTimeline()
+                if newFilter == .trash {
+                    Task { await loadTrashPhotos() }
+                }
             }
             .onChange(of: timelineGrouping) { _ in
                 rebuildTimeline()
@@ -515,20 +546,35 @@ struct ServerGalleryView: View {
                 loadFromLocalStore()
             }
             .sheet(item: $selectedPhoto) { photo in
-                let cachedPreviewData = LocalProxyStore.shared.previewData(forHash: photo.hash)
-                let initialDetailImage = cachedPreviewData.flatMap { UIImage(data: $0) }
-                    ?? ThumbnailMemoryCache.shared.image(forHash: photo.hash)
+                let galleryList = visiblePhotos.isEmpty ? [photo] : visiblePhotos
                 ServerPhotoDetailView(
                     photo: photo,
+                    allPhotos: galleryList,
+                    isTrashMode: isViewingTrash || photo.isTrashed,
                     settings: settings,
-                    initialImage: initialDetailImage,
-                    initialCompressedData: cachedPreviewData,
                     onPhotoUpdated: { updated in
                         applyUpdatedPhoto(updated)
                     },
-                    onPhotoDeleted: { deletedHash, deletedName in
-                        applyDeletedHashes([deletedHash])
-                        deleteBannerMessage = "Deleted \(deletedName) from server."
+                    onPhotoDeleted: { deletedHash, deletedName, wasPermanent in
+                        if wasPermanent {
+                            let norm = deletedHash.lowercased()
+                            trashPhotos.removeAll { $0.hash.lowercased() == norm }
+                            trashCount = trashPhotos.count
+                            if isViewingTrash { rebuildTimeline() }
+                            deleteBannerMessage = "Permanently deleted \(deletedName)."
+                        } else {
+                            applyDeletedHashes([deletedHash])
+                            trashCount += 1
+                            deleteBannerMessage = "Moved \(deletedName) to Trash (kept 30 days)."
+                        }
+                    },
+                    onPhotoRestoredFromTrash: { restoredHash, restoredName in
+                        let norm = restoredHash.lowercased()
+                        trashPhotos.removeAll { $0.hash.lowercased() == norm }
+                        trashCount = trashPhotos.count
+                        if isViewingTrash { rebuildTimeline() }
+                        deleteBannerMessage = "Restored \(restoredName) to Cloud library."
+                        Task { await loadPhotos() }
                     }
                 )
             }
@@ -536,7 +582,7 @@ struct ServerGalleryView: View {
                 startBatchRestore(targets: targets, exitSelectionAfter: !prompt.isRestoreAll)
             }
             .alert(
-                "Delete from Server?",
+                deleteConfirmPrompt?.isPermanent == true ? "Delete Permanently?" : "Move to Trash?",
                 isPresented: Binding(
                     get: { deleteConfirmPrompt != nil },
                     set: { if !$0 { deleteConfirmPrompt = nil } }
@@ -544,19 +590,27 @@ struct ServerGalleryView: View {
                 presenting: deleteConfirmPrompt
             ) { prompt in
                 Button(
-                    "Delete \(prompt.targets.count) Photo\(prompt.targets.count == 1 ? "" : "s")",
+                    prompt.isPermanent
+                        ? "Delete Forever (\(prompt.targets.count))"
+                        : "Move to Trash (\(prompt.targets.count))",
                     role: .destructive
                 ) {
-                    startBatchDelete(targets: prompt.targets)
+                    startBatchDelete(targets: prompt.targets, permanent: prompt.isPermanent)
                 }
                 Button("Cancel", role: .cancel) {
                     deleteConfirmPrompt = nil
                 }
             } message: { prompt in
                 let sizeStr = ByteCountFormatter.string(fromByteCount: max(0, prompt.totalBytes), countStyle: .file)
-                Text(
-                    "Permanently delete \(prompt.targets.count) backed-up original(s) (~\(sizeStr)) and their server proxies from your PhotoHub server? This cannot be undone."
-                )
+                if prompt.isPermanent {
+                    Text(
+                        "Permanently delete \(prompt.targets.count) item(s) (~\(sizeStr)) from your server? This cannot be undone."
+                    )
+                } else {
+                    Text(
+                        "Move \(prompt.targets.count) item(s) (~\(sizeStr)) to Trash? You can restore them anytime within 30 days."
+                    )
+                }
             }
         }
     }
@@ -776,12 +830,64 @@ struct ServerGalleryView: View {
     }
 
     @ViewBuilder
+    private var trashInfoBannerView: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "trash.circle.fill")
+                .font(.title3)
+                .foregroundColor(PhotoHubPalette.rose)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Trash · 30-Day Safety Bin")
+                    .font(.caption.weight(.heavy))
+                    .foregroundColor(PhotoHubPalette.ink)
+                if isLoadingTrash {
+                    Text("Loading deleted items…")
+                        .font(.caption2)
+                        .foregroundColor(PhotoHubPalette.muted)
+                } else if trashPhotos.isEmpty {
+                    Text("No deleted items.")
+                        .font(.caption2)
+                        .foregroundColor(PhotoHubPalette.muted)
+                } else {
+                    let sz = ByteCountFormatter.string(fromByteCount: max(0, trashBytes), countStyle: .file)
+                    Text("\(trashPhotos.count) item(s) · ~\(sz) · Auto-removed after 30 days")
+                        .font(.caption2)
+                        .foregroundColor(PhotoHubPalette.muted)
+                }
+            }
+            Spacer()
+            if !trashPhotos.isEmpty {
+                Button {
+                    requestEmptyTrashAll()
+                } label: {
+                    Text("Empty")
+                        .font(.caption.weight(.bold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(PhotoHubPalette.rose, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .disabled(isBatchDeleting)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(PhotoHubPalette.rose.opacity(0.08), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(PhotoHubPalette.rose.opacity(0.28), lineWidth: 1)
+        )
+    }
+
+    @ViewBuilder
     private var selectionRestoreBottomBar: some View {
         let selectedList = selectedPhotos
         let unrestored = selectedList.filter { !isRestoredOrProtected($0) }
-        let targetBytes = unrestored.isEmpty
+        let targetBytes = isViewingTrash
             ? selectedList.reduce(into: Int64(0)) { $0 += max(0, $1.size) }
-            : unrestored.reduce(into: Int64(0)) { $0 += max(0, $1.size) }
+            : (unrestored.isEmpty
+                ? selectedList.reduce(into: Int64(0)) { $0 += max(0, $1.size) }
+                : unrestored.reduce(into: Int64(0)) { $0 += max(0, $1.size) })
         let sizeStr = ByteCountFormatter.string(fromByteCount: targetBytes, countStyle: .file)
         let actionsDisabled = selectedList.isEmpty || isBatchRestoring || isBatchProxying || isBatchDeleting
 
@@ -791,15 +897,22 @@ struct ServerGalleryView: View {
                     .font(.subheadline.weight(.heavy).monospacedDigit())
                     .foregroundColor(PhotoHubPalette.ink)
                 if !selectedList.isEmpty {
-                    let alreadyCount = selectedList.count - unrestored.count
-                    Text(
-                        alreadyCount > 0
-                        ? "~\(sizeStr) · \(unrestored.count) new"
-                        : "~\(sizeStr) · \(unrestored.count) original\(unrestored.count == 1 ? "" : "s")"
-                    )
-                    .font(.caption2.weight(.semibold).monospacedDigit())
-                    .foregroundColor(PhotoHubPalette.muted)
-                    .lineLimit(1)
+                    if isViewingTrash {
+                        Text("~\(sizeStr) in Trash")
+                            .font(.caption2.weight(.semibold).monospacedDigit())
+                            .foregroundColor(PhotoHubPalette.muted)
+                            .lineLimit(1)
+                    } else {
+                        let alreadyCount = selectedList.count - unrestored.count
+                        Text(
+                            alreadyCount > 0
+                            ? "~\(sizeStr) · \(unrestored.count) new"
+                            : "~\(sizeStr) · \(unrestored.count) original\(unrestored.count == 1 ? "" : "s")"
+                        )
+                        .font(.caption2.weight(.semibold).monospacedDigit())
+                        .foregroundColor(PhotoHubPalette.muted)
+                        .lineLimit(1)
+                    }
                 }
             }
             Spacer(minLength: 4)
@@ -810,7 +923,7 @@ struct ServerGalleryView: View {
                 HStack(spacing: 5) {
                     Image(systemName: "trash")
                         .font(.caption.weight(.bold))
-                    Text("Delete")
+                    Text(isViewingTrash ? "Delete" : "Trash")
                         .font(.caption.weight(.bold))
                 }
                 .foregroundColor(PhotoHubPalette.rose)
@@ -824,10 +937,14 @@ struct ServerGalleryView: View {
             .disabled(actionsDisabled)
 
             Button {
-                requestRestoreSelected()
+                if isViewingTrash {
+                    restoreSelectedFromTrash()
+                } else {
+                    requestRestoreSelected()
+                }
             } label: {
                 HStack(spacing: 5) {
-                    Image(systemName: "icloud.and.arrow.down")
+                    Image(systemName: isViewingTrash ? "arrow.uturn.backward" : "icloud.and.arrow.down")
                         .font(.caption.weight(.bold))
                     Text("Restore")
                         .font(.caption.weight(.bold))
@@ -855,7 +972,7 @@ struct ServerGalleryView: View {
     }
 
     private func enterSelectionMode(initialPhoto: ServerPhoto? = nil) {
-        guard !isBatchRestoring, !isBatchProxying, !isBatchDeleting, !photos.isEmpty else { return }
+        guard !isBatchRestoring, !isBatchProxying, !isBatchDeleting, !activeSourcePhotos.isEmpty else { return }
         if let initialPhoto {
             selectedPhotoHashes = [initialPhoto.hash.lowercased()]
         } else {
@@ -892,10 +1009,59 @@ struct ServerGalleryView: View {
         let targets = selectedPhotos
         guard !isBatchRestoring, !isBatchProxying, !isBatchDeleting, !targets.isEmpty else { return }
         let totalBytes = targets.reduce(into: Int64(0)) { $0 += max(0, $1.size) }
-        deleteConfirmPrompt = DeleteConfirmPrompt(targets: targets, totalBytes: totalBytes)
+        deleteConfirmPrompt = DeleteConfirmPrompt(targets: targets, totalBytes: totalBytes, isPermanent: isViewingTrash)
     }
 
-    private func startBatchDelete(targets: [ServerPhoto]) {
+    private func requestEmptyTrashAll() {
+        guard !trashPhotos.isEmpty, !isBatchDeleting else { return }
+        let totalBytes = trashPhotos.reduce(into: Int64(0)) { $0 += max(0, $1.size) }
+        deleteConfirmPrompt = DeleteConfirmPrompt(targets: trashPhotos, totalBytes: totalBytes, isPermanent: true)
+    }
+
+    private func loadTrashPhotos() async {
+        guard !isLoadingTrash else { return }
+        isLoadingTrash = true
+        defer { isLoadingTrash = false }
+        do {
+            let res = try await PhotoHubAPIClient(settings: settings).fetchTrashPhotos()
+            trashPhotos = res.photos
+            trashCount = res.total
+            trashBytes = res.trashBytes
+            if isViewingTrash {
+                rebuildTimeline()
+            }
+        } catch {
+            deleteBannerMessage = "Could not load Trash: \(error.localizedDescription)"
+        }
+    }
+
+    private func restoreSelectedFromTrash() {
+        let targets = selectedPhotos
+        guard isViewingTrash, !targets.isEmpty, !isBatchDeleting else { return }
+        exitSelectionMode()
+        isBatchDeleting = true
+        deleteBannerMessage = nil
+        let targetHashes = targets.map(\.hash)
+        let settings = self.settings
+        Task {
+            do {
+                let restored = try await PhotoHubAPIClient(settings: settings).restoreServerPhotosFromTrash(hashes: targetHashes)
+                let restoredSet = Set(restored.map { $0.lowercased() })
+                trashPhotos.removeAll { restoredSet.contains($0.hash.lowercased()) }
+                trashCount = trashPhotos.count
+                trashBytes = trashPhotos.reduce(0) { $0 + max(0, $1.size) }
+                isBatchDeleting = false
+                if isViewingTrash { rebuildTimeline() }
+                deleteBannerMessage = "Restored \(restored.count) item(s) to Cloud library."
+                await loadPhotos()
+            } catch {
+                isBatchDeleting = false
+                deleteBannerMessage = "Restore failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func startBatchDelete(targets: [ServerPhoto], permanent: Bool) {
         guard !isBatchDeleting, !isBatchRestoring, !isBatchProxying, !targets.isEmpty else { return }
         deleteConfirmPrompt = nil
         exitSelectionMode()
@@ -907,22 +1073,24 @@ struct ServerGalleryView: View {
         Task {
             do {
                 let client = PhotoHubAPIClient(settings: settings)
-                let result = try await client.deleteServerPhotosBatch(hashes: targetHashes)
-                let removed = (result.deleted ?? []) + (result.missing ?? [])
-                applyDeletedHashes(removed)
-
-                let deletedCount = result.deleted?.count ?? 0
-                let missingCount = result.missing?.count ?? 0
-                let freedStr = ByteCountFormatter.string(fromByteCount: max(0, result.freedBytes ?? 0), countStyle: .file)
-                isBatchDeleting = false
-                if deletedCount > 0 && result.success {
-                    deleteBannerMessage = "Deleted \(deletedCount) photo(s) from server (freed ~\(freedStr))."
-                } else if deletedCount > 0 {
-                    deleteBannerMessage = "Deleted \(deletedCount) photo(s) from server; some items failed."
-                } else if missingCount > 0 {
-                    deleteBannerMessage = "Removed \(missingCount) missing item(s) from gallery."
+                if permanent {
+                    let result = try await client.emptyServerTrash(hashes: targetHashes)
+                    let removedSet = Set((result.deleted ?? []).map { $0.lowercased() })
+                    trashPhotos.removeAll { removedSet.contains($0.hash.lowercased()) }
+                    trashCount = trashPhotos.count
+                    trashBytes = trashPhotos.reduce(0) { $0 + max(0, $1.size) }
+                    if isViewingTrash { rebuildTimeline() }
+                    let freedStr = ByteCountFormatter.string(fromByteCount: max(0, result.freedBytes ?? 0), countStyle: .file)
+                    isBatchDeleting = false
+                    deleteBannerMessage = "Permanently deleted \(result.deleted?.count ?? 0) item(s) (freed ~\(freedStr))."
                 } else {
-                    deleteBannerMessage = "Delete failed on server."
+                    let result = try await client.moveServerPhotosToTrash(hashes: targetHashes)
+                    let removed = (result.deleted ?? []) + (result.missing ?? [])
+                    applyDeletedHashes(removed)
+                    let count = result.deleted?.count ?? 0
+                    trashCount += count
+                    isBatchDeleting = false
+                    deleteBannerMessage = "Moved \(count) item(s) to Trash (kept 30 days)."
                 }
             } catch APIClientError.httpError(401, _) {
                 isBatchDeleting = false
@@ -1130,8 +1298,12 @@ struct ServerGalleryView: View {
             return "No photos match the current filter."
         case .videos:
             return "No videos match the current filter."
+        case .favorites:
+            return "Tap the ♥ heart on any photo in the viewer to add it to Favorites."
         case .protectedOnly:
             return "No restored originals are protected yet."
+        case .trash:
+            return "Your Trash is empty. Deleted items stay here for 30 days."
         }
     }
 
@@ -1257,7 +1429,7 @@ struct ServerGalleryView: View {
                     Image(systemName: "magnifyingglass")
                         .font(.caption.weight(.bold))
                         .foregroundColor(PhotoHubPalette.muted)
-                    TextField("Search name or date…", text: $searchQuery)
+                    TextField("Search name, date, month, camera…", text: $searchQuery)
                         .font(.caption.weight(.medium))
                         .foregroundColor(PhotoHubPalette.ink)
                         .compatibleAutocorrectionDisabled()
@@ -1308,17 +1480,25 @@ struct ServerGalleryView: View {
                 .overlay(Capsule().stroke(PhotoHubPalette.cardBorder, lineWidth: 1))
             }
 
-            // Filter Pills (`All`, `Photos`, `Videos`, `Protected`, + `Needs Proxy`)
+            // Filter Pills (`All`, `Photos`, `Videos`, `♥ Favorites`, `Protected`, `Trash`, + `Needs Proxy`)
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
                     ForEach(ServerMediaTypeFilter.allCases) { media in
                         let isSelected = (mediaTypeFilter == media && filterMode == .all)
+                        let isTrashPill = (media == .trash)
                         let label: String = {
+                            if media == .favorites && favoriteCount > 0 {
+                                return "\(media.rawValue) (\(favoriteCount))"
+                            }
                             if media == .protectedOnly && protectedCount > 0 {
                                 return "\(media.rawValue) (\(protectedCount))"
                             }
+                            if media == .trash && trashCount > 0 {
+                                return "\(media.rawValue) (\(trashCount))"
+                            }
                             return media.rawValue
                         }()
+                        let activeBg = isTrashPill ? PhotoHubPalette.rose : PhotoHubPalette.orange
                         Button {
                             withAnimation(.easeInOut(duration: 0.18)) {
                                 filterMode = .all
@@ -1327,16 +1507,16 @@ struct ServerGalleryView: View {
                         } label: {
                             Text(label)
                                 .font(.caption.weight(.bold))
-                                .foregroundColor(isSelected ? .white : PhotoHubPalette.muted)
+                                .foregroundColor(isSelected ? .white : (isTrashPill && trashCount > 0 ? PhotoHubPalette.rose : PhotoHubPalette.muted))
                                 .padding(.horizontal, 13)
                                 .padding(.vertical, 6)
                                 .background(
-                                    isSelected ? PhotoHubPalette.orange : PhotoHubPalette.canvas,
+                                    isSelected ? activeBg : PhotoHubPalette.canvas,
                                     in: Capsule()
                                 )
                                 .overlay(
                                     Capsule()
-                                        .stroke(isSelected ? PhotoHubPalette.orange : PhotoHubPalette.cardBorder, lineWidth: 1)
+                                        .stroke(isSelected ? activeBg : PhotoHubPalette.cardBorder, lineWidth: 1)
                                 )
                         }
                         .buttonStyle(.plain)
@@ -1534,7 +1714,7 @@ struct ServerGalleryView: View {
 
     private func rebuildTimeline() {
         let built = ServerTimelineBuilder.build(
-            photos: photos,
+            photos: activeSourcePhotos,
             filterMode: filterMode,
             mediaTypeFilter: mediaTypeFilter,
             grouping: timelineGrouping,
@@ -1589,7 +1769,15 @@ struct ServerGalleryView: View {
         let client = PhotoHubAPIClient(settings: settings)
         async let whoamiTask: WhoAmIResponse? = try? await client.whoami()
         do {
-            let fetched = try await client.fetchAllServerPhotos(sync: true)
+            let fetched = try await client.fetchAllServerPhotos(sync: true) { partial, tc in
+                Task { @MainActor in
+                    trashCount = tc
+                    if partial.count >= 300 {
+                        photos = partial
+                        if !isViewingTrash { rebuildTimeline() }
+                    }
+                }
+            }
             LocalProxyStore.shared.savePhotos(
                 fetched,
                 baseURL: settings.normalizedBaseURL,
@@ -1736,6 +1924,13 @@ private enum ServerTimelineBuilder {
         return f
     }()
 
+    private static let monthFullSearchFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "MMMM MMM yyyy"
+        return f
+    }()
+
     static func build(
         photos: [ServerPhoto],
         filterMode: ServerGalleryFilter,
@@ -1744,28 +1939,42 @@ private enum ServerTimelineBuilder {
         searchQuery: String = "",
         locallyProtectedHashes: Set<String> = []
     ) -> ServerTimelineData {
-        let trimmedQuery = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let tokens = searchQuery
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .split(whereSeparator: { $0.isWhitespace })
+            .map(String.init)
         let filtered = photos.filter { photo in
             if filterMode == .needsProxy && !photo.needsProxy {
                 return false
             }
+            let isProtected = photo.isProtectedOriginal || locallyProtectedHashes.contains(photo.hash.lowercased())
             switch mediaTypeFilter {
-            case .all:
+            case .all, .trash:
                 break
             case .photos:
                 if photo.isVideo { return false }
             case .videos:
                 if !photo.isVideo { return false }
+            case .favorites:
+                if !photo.isFavorited { return false }
             case .protectedOnly:
-                let isProtected = photo.isProtectedOriginal || locallyProtectedHashes.contains(photo.hash.lowercased())
                 if !isProtected { return false }
             }
-            if !trimmedQuery.isEmpty {
-                let matchesName = photo.originalName.lowercased().contains(trimmedQuery)
-                let matchesDate = photo.photoDate.lowercased().contains(trimmedQuery)
-                let matchesPath = photo.savedPath.lowercased().contains(trimmedQuery)
-                if !matchesName && !matchesDate && !matchesPath {
-                    return false
+            if !tokens.isEmpty {
+                let monthMeta = photo.parsedCreationDate.map { monthFullSearchFormatter.string(from: $0).lowercased() } ?? ""
+                let haystack = [
+                    photo.originalName.lowercased(),
+                    photo.photoDate.lowercased(),
+                    photo.savedPath.lowercased(),
+                    (photo.cameraModel ?? "").lowercased(),
+                    monthMeta,
+                    photo.isVideo ? "video videos clip" : "photo photos image picture",
+                    photo.isFavorited ? "fav favorite favorites heart" : "",
+                    isProtected ? "protected original" : "",
+                ].joined(separator: " ")
+                for tok in tokens {
+                    if !haystack.contains(tok) { return false }
                 }
             }
             return true
@@ -1996,6 +2205,17 @@ private struct ServerThumbnailCell: View {
                     .padding(6)
                 }
             }
+            .overlay(alignment: .bottomTrailing) {
+                if photo.isFavorited {
+                    Image(systemName: "heart.fill")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(.white)
+                        .padding(5)
+                        .background(PhotoHubPalette.rose.opacity(0.92), in: Circle())
+                        .shadow(color: Color.black.opacity(0.28), radius: 2, y: 1)
+                        .padding(6)
+                }
+            }
             .overlay(alignment: .topLeading) {
                 if isSelectionMode {
                     ZStack {
@@ -2014,6 +2234,15 @@ private struct ServerThumbnailCell: View {
                     }
                     .shadow(color: Color.black.opacity(0.35), radius: 3, y: 1)
                     .padding(7)
+                } else if photo.isTrashed {
+                    let days = photo.daysRemaining ?? 30
+                    Text("\(days)d")
+                        .font(.system(size: 9.5, weight: .heavy).monospacedDigit())
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(PhotoHubPalette.rose.opacity(0.92), in: Capsule())
+                        .padding(6)
                 }
             }
             .overlay(alignment: .topTrailing) {
@@ -2047,43 +2276,56 @@ private struct ServerThumbnailCell: View {
 }
 
 private struct ServerPhotoDetailView: View {
-    @State private var currentPhoto: ServerPhoto
+    @State private var photosList: [ServerPhoto]
+    @State private var currentIndex: Int
+    let isTrashMode: Bool
     @ObservedObject var settings: AppSettings
-    let initialImage: UIImage?
-    let initialCompressedData: Data?
     let onPhotoUpdated: (ServerPhoto) -> Void
-    let onPhotoDeleted: (String, String) -> Void
+    let onPhotoDeleted: (String, String, Bool) -> Void
+    let onPhotoRestoredFromTrash: (String, String) -> Void
 
     init(
         photo: ServerPhoto,
+        allPhotos: [ServerPhoto],
+        isTrashMode: Bool,
         settings: AppSettings,
-        initialImage: UIImage?,
-        initialCompressedData: Data?,
         onPhotoUpdated: @escaping (ServerPhoto) -> Void,
-        onPhotoDeleted: @escaping (String, String) -> Void
+        onPhotoDeleted: @escaping (String, String, Bool) -> Void,
+        onPhotoRestoredFromTrash: @escaping (String, String) -> Void
     ) {
-        self._currentPhoto = State(initialValue: photo)
+        let list = allPhotos.isEmpty ? [photo] : allPhotos
+        let idx = list.firstIndex(where: { $0.hash.lowercased() == photo.hash.lowercased() }) ?? 0
+        self._photosList = State(initialValue: list)
+        self._currentIndex = State(initialValue: idx)
+        self.isTrashMode = isTrashMode
         self.settings = settings
-        self.initialImage = initialImage
-        self.initialCompressedData = initialCompressedData
         self.onPhotoUpdated = onPhotoUpdated
         self.onPhotoDeleted = onPhotoDeleted
+        self.onPhotoRestoredFromTrash = onPhotoRestoredFromTrash
     }
 
     @Environment(\.dismiss) private var dismiss
-    @State private var previewImage: UIImage?
-    @State private var compressedData: Data?
+    @State private var previewImagesByHash: [String: UIImage] = [:]
+    @State private var compressedDataByHash: [String: Data] = [:]
     @State private var player: AVPlayer?
     @State private var localVideoProxyURL: URL?
     @State private var isLoadingVideo: Bool = false
     @State private var videoUnavailableNote: String?
 
+    @State private var showChrome: Bool = true
+    @State private var showInfoSheet: Bool = false
+    @State private var showShareLinkSheet: Bool = false
     @State private var isBusy: Bool = false
     @State private var busyLabel: String = ""
     @State private var saveMessage: String?
     @State private var shareSheetItem: ShareSheetItem?
     @State private var showDeleteConfirm: Bool = false
     @State private var prefetchTask: Task<Void, Never>? = nil
+
+    private var currentPhoto: ServerPhoto {
+        let safeIdx = min(max(0, currentIndex), max(0, photosList.count - 1))
+        return photosList[safeIdx]
+    }
 
     private static let detailDateFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -2100,6 +2342,10 @@ private struct ServerPhotoDetailView: View {
         currentPhoto.isProtectedOriginal || LocalProxyTracker.shared.isRestoredMasterHash(currentPhoto.hash)
     }
 
+    private var isActiveItemTrashed: Bool {
+        isTrashMode || currentPhoto.isTrashed
+    }
+
     private let lightboxBg = Color(red: 0.055, green: 0.039, blue: 0.031) // #0E0A08 deep warm espresso
     private let lightboxCardBg = Color(red: 0.125, green: 0.094, blue: 0.078) // #201814
     private let lightboxBorder = Color.white.opacity(0.12)
@@ -2110,380 +2356,592 @@ private struct ServerPhotoDetailView: View {
         ZStack {
             lightboxBg.ignoresSafeArea()
 
-            VStack(spacing: 10) {
-                // Cinematic Lightbox Header (matches webpage `.lightbox-top`)
-                HStack(spacing: 12) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(currentPhoto.originalName)
-                            .font(.subheadline.weight(.heavy))
-                            .foregroundColor(lightboxInk)
-                            .lineLimit(1)
-                        let dateStr = currentPhoto.parsedCreationDate.map { Self.detailDateFormatter.string(from: $0) }
-                            ?? (currentPhoto.photoDate.isEmpty ? "Undated" : currentPhoto.photoDate)
-                        let masterSizeStr = ByteCountFormatter.string(fromByteCount: currentPhoto.size, countStyle: .file)
-                        Text("\(dateStr) · Original \(masterSizeStr)")
-                            .font(.caption2.weight(.semibold).monospacedDigit())
-                            .foregroundColor(lightboxMuted)
-                            .lineLimit(1)
-                    }
-                    Spacer()
-                    Button {
-                        dismiss()
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.caption.weight(.heavy))
-                            .foregroundColor(lightboxInk)
-                            .frame(width: 34, height: 34)
-                            .background(Color.white.opacity(0.12), in: Circle())
-                            .overlay(Circle().stroke(lightboxBorder, lineWidth: 1))
-                    }
-                    .buttonStyle(.plain)
-                }
-                .padding(.horizontal, 16)
-                .padding(.top, 14)
-
-                // Media Stage
-                ZStack {
-                    if let player {
-                        VideoPlayer(player: player)
-                            .aspectRatio(16 / 9, contentMode: .fit)
-                            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                            .padding(.horizontal, 14)
-                    } else if let img = previewImage ?? initialImage {
-                        ZStack(alignment: .bottom) {
-                            Image(uiImage: img)
-                                .resizable()
-                                .scaledToFit()
-                                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                                .padding(.horizontal, 12)
-
-                            if isLoadingVideo {
-                                HStack(spacing: 8) {
-                                    ProgressView()
-                                        .tint(PhotoHubPalette.orange)
-                                        .scaleEffect(0.85)
-                                    Text("Loading video proxy…")
-                                        .font(.caption.weight(.semibold))
-                                        .foregroundColor(lightboxInk)
-                                }
+            // Full-bleed Swipeable Pager Stage
+            TabView(selection: $currentIndex) {
+                ForEach(Array(photosList.enumerated()), id: \.element.hash) { idx, item in
+                    let isCurrent = (idx == currentIndex)
+                    ZStack {
+                        if isCurrent, let player {
+                            VideoPlayer(player: player)
+                                .aspectRatio(16 / 9, contentMode: .fit)
+                                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                                 .padding(.horizontal, 14)
-                                .padding(.vertical, 8)
-                                .background(lightboxCardBg.opacity(0.92), in: Capsule())
-                                .overlay(Capsule().stroke(lightboxBorder, lineWidth: 1))
-                                .padding(.bottom, 12)
-                            }
-                        }
-                    } else if currentPhoto.isVideo && currentPhoto.needsProxy {
-                        VStack(spacing: 12) {
-                            SunnyMascotView(mood: .happy, size: 78)
-                            Text("No Video Proxy Yet")
-                                .font(.headline.weight(.bold))
-                                .foregroundColor(lightboxInk)
-                            Text("Tap Create Video Proxy below to generate a lightweight playable MP4 & thumbnail.")
-                                .font(.caption)
-                                .foregroundColor(lightboxMuted)
-                                .multilineTextAlignment(.center)
-                                .padding(.horizontal, 28)
-                        }
-                    } else {
-                        VStack(spacing: 12) {
-                            SunnyMascotView(mood: .uploading, size: 74)
-                            Text("Loading preview…")
-                                .font(.caption.weight(.bold))
-                                .foregroundColor(lightboxMuted)
-                        }
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        } else if let img = previewImagesByHash[item.hash]
+                            ?? ThumbnailMemoryCache.shared.image(forHash: item.hash) {
+                            ZStack(alignment: .bottom) {
+                                ZoomableLightboxImageView(
+                                    image: img,
+                                    onSingleTap: {
+                                        withAnimation(.easeInOut(duration: 0.2)) {
+                                            showChrome.toggle()
+                                        }
+                                    }
+                                )
 
-                if let videoUnavailableNote {
-                    Text(videoUnavailableNote)
-                        .font(.caption)
-                        .foregroundColor(PhotoHubPalette.warmAmber)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 20)
-                }
-
-                if isBusy && !busyLabel.isEmpty {
-                    HStack(spacing: 8) {
-                        ProgressView()
-                            .tint(PhotoHubPalette.orange)
-                            .scaleEffect(0.85)
-                        Text(busyLabel)
-                            .font(.caption.weight(.semibold))
-                            .foregroundColor(lightboxInk)
-                    }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 7)
-                    .background(lightboxCardBg, in: Capsule())
-                    .overlay(Capsule().stroke(PhotoHubPalette.orange.opacity(0.4), lineWidth: 1))
-                }
-
-                if let saveMessage {
-                    Text(saveMessage)
-                        .font(.caption.weight(.semibold))
-                        .foregroundColor(PhotoHubPalette.mint)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 20)
-                }
-
-                // Frosted Dark Bottom Control Sheet (matches webpage `.lightbox-bottom`)
-                VStack(alignment: .leading, spacing: 11) {
-                    let localVideoBytes: Int64? = {
-                        guard let url = localVideoProxyURL,
-                              let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
-                            return nil
-                        }
-                        return Int64(size)
-                    }()
-                    let dataBytes = (compressedData ?? initialCompressedData).map { Int64($0.count) }
-                    let previewBytes = localVideoBytes ?? dataBytes ?? currentPhoto.videoProxySize ?? currentPhoto.proxySize
-                    let smallStr = previewBytes.map {
-                        ByteCountFormatter.string(fromByteCount: $0, countStyle: .file)
-                    }
-
-                    // Pill Badges Row
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 6) {
-                            if currentPhoto.isVideo {
-                                Text("Video")
-                                    .font(.caption2.weight(.bold))
-                                    .foregroundColor(PhotoHubPalette.orange)
-                                    .padding(.horizontal, 9)
-                                    .padding(.vertical, 4)
-                                    .background(PhotoHubPalette.orange.opacity(0.18), in: Capsule())
-                            }
-
-                            if isOriginalProtected {
-                                HStack(spacing: 4) {
-                                    Image(systemName: "checkmark.shield.fill")
-                                        .font(.caption2)
-                                    Text("Protected Original")
-                                        .font(.caption2.weight(.bold))
+                                if isCurrent && isLoadingVideo {
+                                    HStack(spacing: 8) {
+                                        ProgressView()
+                                            .tint(PhotoHubPalette.orange)
+                                            .scaleEffect(0.85)
+                                        Text("Loading video proxy…")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundColor(lightboxInk)
+                                    }
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 8)
+                                    .background(lightboxCardBg.opacity(0.92), in: Capsule())
+                                    .overlay(Capsule().stroke(lightboxBorder, lineWidth: 1))
+                                    .padding(.bottom, 12)
                                 }
-                                .foregroundColor(PhotoHubPalette.mint)
-                                .padding(.horizontal, 9)
-                                .padding(.vertical, 4)
-                                .background(PhotoHubPalette.mint.opacity(0.18), in: Capsule())
                             }
-
-                            let proxyTint = currentPhoto.needsProxy ? PhotoHubPalette.warmAmber : PhotoHubPalette.mint
-                            Text(currentPhoto.needsProxy ? "Needs Proxy" : (smallStr.map { "Proxy \($0)" } ?? "Proxy Ready"))
-                                .font(.caption2.weight(.bold).monospacedDigit())
-                                .foregroundColor(proxyTint)
-                                .padding(.horizontal, 9)
-                                .padding(.vertical, 4)
-                                .background(proxyTint.opacity(0.18), in: Capsule())
-
-                            HStack(spacing: 4) {
-                                Image(systemName: "checkmark.seal.fill")
-                                    .font(.caption2)
-                                    .foregroundColor(PhotoHubPalette.mint)
-                                Text("SHA-256 \(String(currentPhoto.hash.prefix(8)))…")
-                                    .font(.caption2.weight(.semibold).monospacedDigit())
+                        } else if item.isVideo && item.needsProxy {
+                            VStack(spacing: 12) {
+                                SunnyMascotView(mood: .happy, size: 78)
+                                Text("No Video Proxy Yet")
+                                    .font(.headline.weight(.bold))
+                                    .foregroundColor(lightboxInk)
+                                Text("Tap Create Video Proxy below to generate a lightweight playable MP4 & thumbnail.")
+                                    .font(.caption)
+                                    .foregroundColor(lightboxMuted)
+                                    .multilineTextAlignment(.center)
+                                    .padding(.horizontal, 28)
+                            }
+                            .onTapGesture {
+                                withAnimation(.easeInOut(duration: 0.2)) { showChrome.toggle() }
+                            }
+                        } else {
+                            VStack(spacing: 12) {
+                                SunnyMascotView(mood: .uploading, size: 74)
+                                Text("Loading preview…")
+                                    .font(.caption.weight(.bold))
                                     .foregroundColor(lightboxMuted)
                             }
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 4)
-                            .background(Color.white.opacity(0.08), in: Capsule())
-                        }
-                    }
-
-                    if isOriginalProtected {
-                        HStack(spacing: 8) {
-                            Image(systemName: "lock.shield.fill")
-                                .font(.caption)
-                                .foregroundColor(PhotoHubPalette.mint)
-                            Text("Protected from auto re-compression.")
-                                .font(.caption2.weight(.medium))
-                                .foregroundColor(lightboxMuted)
-                            Spacer()
-                            Button("Allow Re-Proxy") {
-                                Task { await updateOriginalProtection(false) }
+                            .onTapGesture {
+                                withAnimation(.easeInOut(duration: 0.2)) { showChrome.toggle() }
                             }
-                            .font(.caption2.weight(.bold))
-                            .foregroundColor(PhotoHubPalette.orange)
-                            .disabled(isBusy)
                         }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 8)
-                        .background(PhotoHubPalette.mint.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
-
-                    if needsProxyAction {
-                        Button {
-                            Task { await createProxyForCurrentItem() }
-                        } label: {
-                            HStack(spacing: 6) {
-                                Image(systemName: "wand.and.stars")
-                                Text(currentPhoto.isVideo ? "Create Video Proxy" : "Create Proxy")
-                            }
-                            .font(.caption.weight(.bold))
-                            .foregroundColor(PhotoHubPalette.warmAmber)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 10)
-                            .background(PhotoHubPalette.warmAmber.opacity(0.14), in: Capsule())
-                            .overlay(Capsule().stroke(PhotoHubPalette.warmAmber.opacity(0.38), lineWidth: 1))
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(isBusy)
-                    }
-
-                    // Primary Sunset Gradient CTA (`Share Original`)
-                    Button {
-                        Task { await shareFullMasterOriginal() }
-                    } label: {
-                        HStack(spacing: 7) {
-                            Image(systemName: "square.and.arrow.up")
-                                .font(.subheadline.weight(.bold))
-                            Text("Share Original")
-                                .font(.subheadline.weight(.bold))
-                        }
-                        .foregroundColor(.white)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
-                        .background(PhotoHubPalette.orangeGradient, in: Capsule())
-                        .shadow(color: PhotoHubPalette.orange.opacity(0.32), radius: 10, y: 4)
-                    }
-                    .buttonStyle(.plain)
-                    .opacity(isBusy ? 0.5 : 1.0)
-                    .disabled(isBusy)
-
-                    // Secondary Action Pills (`Save Proxy`, `Restore`, `Delete`)
-                    HStack(spacing: 8) {
-                        Button {
-                            Task { await saveCompressedProxyToPhotos() }
-                        } label: {
-                            HStack(spacing: 5) {
-                                Image(systemName: currentPhoto.isVideo ? "video" : "photo")
-                                    .font(.caption.weight(.bold))
-                                Text("Save Proxy")
-                                    .font(.caption.weight(.bold))
-                            }
-                            .foregroundColor(lightboxInk)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 10)
-                            .background(Color.white.opacity(0.10), in: Capsule())
-                            .overlay(Capsule().stroke(lightboxBorder, lineWidth: 1))
-                        }
-                        .buttonStyle(.plain)
-                        .opacity((isBusy || (!currentPhoto.isVideo && (compressedData ?? initialCompressedData) == nil && previewImage == nil)) ? 0.45 : 1.0)
-                        .disabled(isBusy || (!currentPhoto.isVideo && (compressedData ?? initialCompressedData) == nil && previewImage == nil))
-
-                        Button {
-                            Task { await restoreFullMasterToPhotos() }
-                        } label: {
-                            HStack(spacing: 5) {
-                                Image(systemName: "arrow.down.circle")
-                                    .font(.caption.weight(.bold))
-                                Text("Restore")
-                                    .font(.caption.weight(.bold))
-                            }
-                            .foregroundColor(lightboxInk)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 10)
-                            .background(Color.white.opacity(0.10), in: Capsule())
-                            .overlay(Capsule().stroke(lightboxBorder, lineWidth: 1))
-                        }
-                        .buttonStyle(.plain)
-                        .opacity(isBusy ? 0.45 : 1.0)
-                        .disabled(isBusy)
-
-                        Button {
-                            showDeleteConfirm = true
-                        } label: {
-                            Image(systemName: "trash")
-                                .font(.caption.weight(.bold))
-                                .foregroundColor(PhotoHubPalette.rose)
-                                .frame(width: 44, height: 36)
-                                .background(PhotoHubPalette.rose.opacity(0.16), in: Capsule())
-                                .overlay(Capsule().stroke(PhotoHubPalette.rose.opacity(0.36), lineWidth: 1))
-                        }
-                        .buttonStyle(.plain)
-                        .opacity(isBusy ? 0.45 : 1.0)
-                        .disabled(isBusy)
-                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .tag(idx)
                 }
-                .padding(14)
-                .background(lightboxCardBg.opacity(0.94), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 22, style: .continuous)
-                        .stroke(lightboxBorder, lineWidth: 1)
-                )
-                .padding(.horizontal, 12)
-                .padding(.bottom, 10)
+            }
+            .tabViewStyle(.page(indexDisplayMode: .never))
+            .ignoresSafeArea()
+
+            // Chrome Overlay (Top Header + Bottom Control Sheet; fades smoothly on single tap)
+            VStack(spacing: 10) {
+                if showChrome {
+                    HStack(spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(currentPhoto.originalName)
+                                .font(.subheadline.weight(.heavy))
+                                .foregroundColor(lightboxInk)
+                                .lineLimit(1)
+                            let dateStr = currentPhoto.parsedCreationDate.map { Self.detailDateFormatter.string(from: $0) }
+                                ?? (currentPhoto.photoDate.isEmpty ? "Undated" : currentPhoto.photoDate)
+                            let masterSizeStr = ByteCountFormatter.string(fromByteCount: currentPhoto.size, countStyle: .file)
+                            let posStr = photosList.count > 1 ? " · \(currentIndex + 1)/\(photosList.count)" : ""
+                            Text("\(dateStr) · \(masterSizeStr)\(posStr)")
+                                .font(.caption2.weight(.semibold).monospacedDigit())
+                                .foregroundColor(lightboxMuted)
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 4)
+
+                        if !isActiveItemTrashed {
+                            Button {
+                                Task { await toggleFavoriteCurrentItem() }
+                            } label: {
+                                Image(systemName: currentPhoto.isFavorited ? "heart.fill" : "heart")
+                                    .font(.caption.weight(.heavy))
+                                    .foregroundColor(currentPhoto.isFavorited ? PhotoHubPalette.rose : lightboxInk)
+                                    .frame(width: 34, height: 34)
+                                    .background(Color.white.opacity(0.12), in: Circle())
+                                    .overlay(Circle().stroke(lightboxBorder, lineWidth: 1))
+                            }
+                            .buttonStyle(.plain)
+                        }
+
+                        Button {
+                            showInfoSheet = true
+                        } label: {
+                            Image(systemName: "info")
+                                .font(.caption.weight(.heavy))
+                                .foregroundColor(lightboxInk)
+                                .frame(width: 34, height: 34)
+                                .background(Color.white.opacity(0.12), in: Circle())
+                                .overlay(Circle().stroke(lightboxBorder, lineWidth: 1))
+                        }
+                        .buttonStyle(.plain)
+
+                        Button {
+                            dismiss()
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.caption.weight(.heavy))
+                                .foregroundColor(lightboxInk)
+                                .frame(width: 34, height: 34)
+                                .background(Color.white.opacity(0.12), in: Circle())
+                                .overlay(Circle().stroke(lightboxBorder, lineWidth: 1))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+                    .background(
+                        LinearGradient(
+                            colors: [lightboxBg.opacity(0.88), lightboxBg.opacity(0.0)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                    .transition(.opacity)
+                }
+
+                Spacer()
+
+                if showChrome {
+                    VStack(spacing: 8) {
+                        if let videoUnavailableNote {
+                            Text(videoUnavailableNote)
+                                .font(.caption)
+                                .foregroundColor(PhotoHubPalette.warmAmber)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal, 20)
+                        }
+
+                        if isBusy && !busyLabel.isEmpty {
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                    .tint(PhotoHubPalette.orange)
+                                    .scaleEffect(0.85)
+                                Text(busyLabel)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundColor(lightboxInk)
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 7)
+                            .background(lightboxCardBg, in: Capsule())
+                            .overlay(Capsule().stroke(PhotoHubPalette.orange.opacity(0.4), lineWidth: 1))
+                        }
+
+                        if let saveMessage {
+                            Text(saveMessage)
+                                .font(.caption.weight(.semibold))
+                                .foregroundColor(PhotoHubPalette.mint)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal, 20)
+                        }
+
+                        // Frosted Dark Bottom Control Sheet
+                        VStack(alignment: .leading, spacing: 11) {
+                            let localVideoBytes: Int64? = {
+                                guard let url = localVideoProxyURL,
+                                      let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
+                                    return nil
+                                }
+                                return Int64(size)
+                            }()
+                            let dataBytes = compressedDataByHash[currentPhoto.hash].map { Int64($0.count) }
+                            let previewBytes = localVideoBytes ?? dataBytes ?? currentPhoto.videoProxySize ?? currentPhoto.proxySize
+                            let smallStr = previewBytes.map {
+                                ByteCountFormatter.string(fromByteCount: $0, countStyle: .file)
+                            }
+
+                            // Clean Pill Badges Row (SHA-256 & technical EXIF tucked into `(i)` Details sheet)
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 6) {
+                                    if currentPhoto.isVideo {
+                                        Text("Video")
+                                            .font(.caption2.weight(.bold))
+                                            .foregroundColor(PhotoHubPalette.orange)
+                                            .padding(.horizontal, 9)
+                                            .padding(.vertical, 4)
+                                            .background(PhotoHubPalette.orange.opacity(0.18), in: Capsule())
+                                    }
+
+                                    if currentPhoto.isFavorited {
+                                        Text("♥ Favorite")
+                                            .font(.caption2.weight(.bold))
+                                            .foregroundColor(PhotoHubPalette.rose)
+                                            .padding(.horizontal, 9)
+                                            .padding(.vertical, 4)
+                                            .background(PhotoHubPalette.rose.opacity(0.18), in: Capsule())
+                                    }
+
+                                    if isOriginalProtected {
+                                        HStack(spacing: 4) {
+                                            Image(systemName: "checkmark.shield.fill")
+                                                .font(.caption2)
+                                            Text("Protected")
+                                                .font(.caption2.weight(.bold))
+                                        }
+                                        .foregroundColor(PhotoHubPalette.mint)
+                                        .padding(.horizontal, 9)
+                                        .padding(.vertical, 4)
+                                        .background(PhotoHubPalette.mint.opacity(0.18), in: Capsule())
+                                    }
+
+                                    if isActiveItemTrashed {
+                                        let days = currentPhoto.daysRemaining ?? 30
+                                        Text("In Trash · \(days)d left")
+                                            .font(.caption2.weight(.bold))
+                                            .foregroundColor(PhotoHubPalette.rose)
+                                            .padding(.horizontal, 9)
+                                            .padding(.vertical, 4)
+                                            .background(PhotoHubPalette.rose.opacity(0.18), in: Capsule())
+                                    } else {
+                                        let proxyTint = currentPhoto.needsProxy ? PhotoHubPalette.warmAmber : PhotoHubPalette.mint
+                                        Text(currentPhoto.needsProxy ? "Needs Proxy" : (smallStr.map { "Proxy \($0)" } ?? "Proxy Ready"))
+                                            .font(.caption2.weight(.bold).monospacedDigit())
+                                            .foregroundColor(proxyTint)
+                                            .padding(.horizontal, 9)
+                                            .padding(.vertical, 4)
+                                            .background(proxyTint.opacity(0.18), in: Capsule())
+                                    }
+                                }
+                            }
+
+                            if isActiveItemTrashed {
+                                HStack(spacing: 10) {
+                                    Button {
+                                        Task { await restoreCurrentItemFromTrash() }
+                                    } label: {
+                                        HStack(spacing: 6) {
+                                            Image(systemName: "arrow.uturn.backward")
+                                            Text("Restore to Cloud")
+                                        }
+                                        .font(.subheadline.weight(.bold))
+                                        .foregroundColor(.white)
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 12)
+                                        .background(PhotoHubPalette.orangeGradient, in: Capsule())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .disabled(isBusy)
+
+                                    Button {
+                                        showDeleteConfirm = true
+                                    } label: {
+                                        HStack(spacing: 6) {
+                                            Image(systemName: "trash.fill")
+                                            Text("Delete")
+                                        }
+                                        .font(.subheadline.weight(.bold))
+                                        .foregroundColor(PhotoHubPalette.rose)
+                                        .padding(.horizontal, 16)
+                                        .padding(.vertical, 12)
+                                        .background(PhotoHubPalette.rose.opacity(0.16), in: Capsule())
+                                        .overlay(Capsule().stroke(PhotoHubPalette.rose.opacity(0.36), lineWidth: 1))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .disabled(isBusy)
+                                }
+                            } else {
+                                if isOriginalProtected {
+                                    HStack(spacing: 8) {
+                                        Image(systemName: "lock.shield.fill")
+                                            .font(.caption)
+                                            .foregroundColor(PhotoHubPalette.mint)
+                                        Text("Protected from auto re-compression.")
+                                            .font(.caption2.weight(.medium))
+                                            .foregroundColor(lightboxMuted)
+                                        Spacer()
+                                        Button("Allow Re-Proxy") {
+                                            Task { await updateOriginalProtection(false) }
+                                        }
+                                        .font(.caption2.weight(.bold))
+                                        .foregroundColor(PhotoHubPalette.orange)
+                                        .disabled(isBusy)
+                                    }
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 8)
+                                    .background(PhotoHubPalette.mint.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                }
+
+                                if needsProxyAction {
+                                    Button {
+                                        Task { await createProxyForCurrentItem() }
+                                    } label: {
+                                        HStack(spacing: 6) {
+                                            Image(systemName: "wand.and.stars")
+                                            Text(currentPhoto.isVideo ? "Create Video Proxy" : "Create Proxy")
+                                        }
+                                        .font(.caption.weight(.bold))
+                                        .foregroundColor(PhotoHubPalette.warmAmber)
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 10)
+                                        .background(PhotoHubPalette.warmAmber.opacity(0.14), in: Capsule())
+                                        .overlay(Capsule().stroke(PhotoHubPalette.warmAmber.opacity(0.38), lineWidth: 1))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .disabled(isBusy)
+                                }
+
+                                // Primary Sunset Gradient CTA (`Share Original`)
+                                Button {
+                                    Task { await shareFullMasterOriginal() }
+                                } label: {
+                                    HStack(spacing: 7) {
+                                        Image(systemName: "square.and.arrow.up")
+                                            .font(.subheadline.weight(.bold))
+                                        Text("Share Original")
+                                            .font(.subheadline.weight(.bold))
+                                    }
+                                    .foregroundColor(.white)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 12)
+                                    .background(PhotoHubPalette.orangeGradient, in: Capsule())
+                                    .shadow(color: PhotoHubPalette.orange.opacity(0.32), radius: 10, y: 4)
+                                }
+                                .buttonStyle(.plain)
+                                .opacity(isBusy ? 0.5 : 1.0)
+                                .disabled(isBusy)
+
+                                // Secondary Action Pills (`Link`, `Save Proxy`, `Restore`, `Trash`)
+                                HStack(spacing: 8) {
+                                    Button {
+                                        showShareLinkSheet = true
+                                    } label: {
+                                        HStack(spacing: 4) {
+                                            Image(systemName: "link")
+                                                .font(.caption.weight(.bold))
+                                            Text("Link")
+                                                .font(.caption.weight(.bold))
+                                        }
+                                        .foregroundColor(lightboxInk)
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 10)
+                                        .background(Color.white.opacity(0.10), in: Capsule())
+                                        .overlay(Capsule().stroke(lightboxBorder, lineWidth: 1))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .disabled(isBusy)
+
+                                    Button {
+                                        Task { await saveCompressedProxyToPhotos() }
+                                    } label: {
+                                        HStack(spacing: 4) {
+                                            Image(systemName: currentPhoto.isVideo ? "video" : "photo")
+                                                .font(.caption.weight(.bold))
+                                            Text("Proxy")
+                                                .font(.caption.weight(.bold))
+                                        }
+                                        .foregroundColor(lightboxInk)
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 10)
+                                        .background(Color.white.opacity(0.10), in: Capsule())
+                                        .overlay(Capsule().stroke(lightboxBorder, lineWidth: 1))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .opacity(isBusy ? 0.45 : 1.0)
+                                    .disabled(isBusy)
+
+                                    Button {
+                                        Task { await restoreFullMasterToPhotos() }
+                                    } label: {
+                                        HStack(spacing: 4) {
+                                            Image(systemName: "arrow.down.circle")
+                                                .font(.caption.weight(.bold))
+                                            Text("Restore")
+                                                .font(.caption.weight(.bold))
+                                        }
+                                        .foregroundColor(lightboxInk)
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 10)
+                                        .background(Color.white.opacity(0.10), in: Capsule())
+                                        .overlay(Capsule().stroke(lightboxBorder, lineWidth: 1))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .opacity(isBusy ? 0.45 : 1.0)
+                                    .disabled(isBusy)
+
+                                    Button {
+                                        showDeleteConfirm = true
+                                    } label: {
+                                        Image(systemName: "trash")
+                                            .font(.caption.weight(.bold))
+                                            .foregroundColor(PhotoHubPalette.rose)
+                                            .frame(width: 42, height: 36)
+                                            .background(PhotoHubPalette.rose.opacity(0.16), in: Capsule())
+                                            .overlay(Capsule().stroke(PhotoHubPalette.rose.opacity(0.36), lineWidth: 1))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .opacity(isBusy ? 0.45 : 1.0)
+                                    .disabled(isBusy)
+                                }
+                            }
+                        }
+                        .padding(14)
+                        .background(lightboxCardBg.opacity(0.94), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                                .stroke(lightboxBorder, lineWidth: 1)
+                        )
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 10)
+                    }
+                    .transition(.opacity)
+                }
             }
         }
         .preferredColorScheme(.dark)
-        .task {
-                // 1. Prefer crisp preview straight from Native Apple Photos (zero server fetch!)
-                if let nativeImg = await PhotoLibraryService.loadNativeGalleryPreviewImage(forMasterHash: currentPhoto.hash, maxPixelSize: 1600) {
-                    previewImage = nativeImg
-                } else if previewImage == nil {
-                    if let initialImage, let initialCompressedData {
-                        previewImage = initialImage
-                        compressedData = initialCompressedData
-                    } else if let cachedData = LocalProxyStore.shared.previewData(forHash: currentPhoto.hash),
-                              let cachedImg = UIImage(data: cachedData) {
-                        previewImage = cachedImg
-                        compressedData = cachedData
-                    } else if !(currentPhoto.isVideo && currentPhoto.needsProxy) {
-                        let client = PhotoHubAPIClient(settings: settings)
-                        if let rawData = try? await client.downloadPhotoPreviewData(hash: currentPhoto.hash),
-                           let (smallImg, smallJpg) = LocalProxyStore.shared.cacheDownloadedPreview(rawData, forHash: currentPhoto.hash) {
-                            previewImage = smallImg
-                            compressedData = smallJpg
-                        }
-                    }
-                }
+        .task(id: currentPhoto.hash) {
+            await loadCurrentItemMediaAndNeighbors()
+        }
+        .onChange(of: currentIndex) { _ in
+            player?.pause()
+            player = nil
+            localVideoProxyURL = nil
+            videoUnavailableNote = nil
+            saveMessage = nil
+        }
+        .onDisappear {
+            prefetchTask?.cancel()
+            prefetchTask = nil
+            player?.pause()
+            player = nil
+        }
+        .sheet(item: $shareSheetItem) { item in
+            ShareSheet(activityItems: item.fileURLs) {
+                scheduleTempShareCleanup(item.fileURLs)
+                shareSheetItem = nil
+            }
+        }
+        .sheet(isPresented: $showInfoSheet) {
+            PhotoInfoDetailSheet(
+                photo: currentPhoto,
+                isProtected: isOriginalProtected
+            )
+        }
+        .sheet(isPresented: $showShareLinkSheet) {
+            ShareLinkModalSheet(
+                photo: currentPhoto,
+                settings: settings
+            )
+        }
+        .alert(
+            isActiveItemTrashed ? "Delete Permanently?" : "Move to Trash?",
+            isPresented: $showDeleteConfirm
+        ) {
+            Button(isActiveItemTrashed ? "Delete Forever" : "Move to Trash", role: .destructive) {
+                Task { await deleteCurrentItemFromServer() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            let masterStr = ByteCountFormatter.string(fromByteCount: currentPhoto.size, countStyle: .file)
+            if isActiveItemTrashed {
+                Text("Permanently delete \(currentPhoto.originalName) (~\(masterStr)) from your server? This cannot be undone.")
+            } else {
+                Text("Move \(currentPhoto.originalName) (~\(masterStr)) to Trash? You can restore it anytime within 30 days.")
+            }
+        }
+    }
 
-                prefetchTask?.cancel()
-                let photoSnapshot = currentPhoto
-                let detailClient = PhotoHubAPIClient(settings: settings)
-                let prefetchLimit: Int64 = photoSnapshot.isVideo ? 15 * 1024 * 1024 : 40 * 1024 * 1024
-                prefetchTask = Task(priority: .utility) {
-                    await detailClient.warmConnectionIfNeeded()
-                    guard !Task.isCancelled,
-                          photoSnapshot.size > 0,
-                          photoSnapshot.size <= prefetchLimit else {
-                        return
-                    }
-                    _ = try? await OriginalDownloadCache.shared.getOrFetchOriginal(
-                        hash: photoSnapshot.hash,
-                        preferredFilename: photoSnapshot.originalName,
-                        expectedSizeBytes: photoSnapshot.size,
-                        isVideo: photoSnapshot.isVideo,
-                        client: detailClient
-                    )
-                }
+    private func replaceCurrentPhoto(_ updated: ServerPhoto) {
+        if photosList.indices.contains(currentIndex) {
+            photosList[currentIndex] = updated
+        }
+        onPhotoUpdated(updated)
+    }
 
-                if currentPhoto.isVideo {
-                    await prepareVideoProxyIfNeeded()
-                }
+    private func loadPreviewForPhoto(_ item: ServerPhoto) async {
+        let hash = item.hash
+        if previewImagesByHash[hash] != nil { return }
+
+        if let nativeImg = await PhotoLibraryService.loadNativeGalleryPreviewImage(forMasterHash: hash, maxPixelSize: 1600) {
+            previewImagesByHash[hash] = nativeImg
+            return
+        }
+        if let cachedData = LocalProxyStore.shared.previewData(forHash: hash),
+           let cachedImg = UIImage(data: cachedData) {
+            previewImagesByHash[hash] = cachedImg
+            compressedDataByHash[hash] = cachedData
+            return
+        }
+        if !(item.isVideo && item.needsProxy) {
+            let client = PhotoHubAPIClient(settings: settings)
+            if let rawData = try? await client.downloadPhotoPreviewData(hash: hash),
+               let (smallImg, smallJpg) = LocalProxyStore.shared.cacheDownloadedPreview(rawData, forHash: hash) {
+                previewImagesByHash[hash] = smallImg
+                compressedDataByHash[hash] = smallJpg
             }
-            .onDisappear {
-                prefetchTask?.cancel()
-                prefetchTask = nil
-                player?.pause()
-                player = nil
+        }
+    }
+
+    private func loadCurrentItemMediaAndNeighbors() async {
+        let photoSnapshot = currentPhoto
+        await loadPreviewForPhoto(photoSnapshot)
+
+        // Preload adjacent items (±1) for silky-smooth swipe transitions
+        let prevIdx = currentIndex - 1
+        let nextIdx = currentIndex + 1
+        if photosList.indices.contains(nextIdx) {
+            let nextItem = photosList[nextIdx]
+            Task { await loadPreviewForPhoto(nextItem) }
+        }
+        if photosList.indices.contains(prevIdx) {
+            let prevItem = photosList[prevIdx]
+            Task { await loadPreviewForPhoto(prevItem) }
+        }
+
+        prefetchTask?.cancel()
+        let detailClient = PhotoHubAPIClient(settings: settings)
+        let prefetchLimit: Int64 = photoSnapshot.isVideo ? 15 * 1024 * 1024 : 40 * 1024 * 1024
+        prefetchTask = Task(priority: .utility) {
+            await detailClient.warmConnectionIfNeeded()
+            guard !Task.isCancelled,
+                  photoSnapshot.size > 0,
+                  photoSnapshot.size <= prefetchLimit else {
+                return
             }
-            .sheet(item: $shareSheetItem) { item in
-                ShareSheet(activityItems: item.fileURLs) {
-                    scheduleTempShareCleanup(item.fileURLs)
-                    shareSheetItem = nil
-                }
-            }
-            .alert("Delete from Server?", isPresented: $showDeleteConfirm) {
-                Button("Delete", role: .destructive) {
-                    Task { await deleteCurrentItemFromServer() }
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                let masterStr = ByteCountFormatter.string(fromByteCount: currentPhoto.size, countStyle: .file)
-                Text(
-                    "Permanently delete \(currentPhoto.originalName) (~\(masterStr)) and its compressed proxies from your PhotoHub server? This cannot be undone."
-                )
-            }
+            _ = try? await OriginalDownloadCache.shared.getOrFetchOriginal(
+                hash: photoSnapshot.hash,
+                preferredFilename: photoSnapshot.originalName,
+                expectedSizeBytes: photoSnapshot.size,
+                isVideo: photoSnapshot.isVideo,
+                client: detailClient
+            )
+        }
+
+        if photoSnapshot.isVideo {
+            await prepareVideoProxyIfNeeded()
+        }
+    }
+
+    private func toggleFavoriteCurrentItem() async {
+        let nextFav = !currentPhoto.isFavorited
+        do {
+            let updated = try await PhotoHubAPIClient(settings: settings).setPhotoFavorite(
+                masterHash: currentPhoto.hash,
+                favorite: nextFav
+            )
+            replaceCurrentPhoto(updated)
+            saveMessage = nextFav ? "Added to Favorites ♥" : "Removed from Favorites"
+        } catch {
+            saveMessage = "Favorite update failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func restoreCurrentItemFromTrash() async {
+        isBusy = true
+        busyLabel = "Restoring from Trash…"
+        saveMessage = nil
+        defer {
+            isBusy = false
+            busyLabel = ""
+        }
+        do {
+            let targetHash = currentPhoto.hash
+            let targetName = currentPhoto.originalName
+            _ = try await PhotoHubAPIClient(settings: settings).restoreServerPhotosFromTrash(hashes: [targetHash])
+            player?.pause()
+            player = nil
+            onPhotoRestoredFromTrash(targetHash, targetName)
+            dismiss()
+        } catch {
+            saveMessage = "Restore failed: \(error.localizedDescription)"
+        }
     }
 
     private func createProxyForCurrentItem() async {
@@ -2501,12 +2959,12 @@ private struct ServerPhotoDetailView: View {
         do {
             let client = PhotoHubAPIClient(settings: settings)
             let updated = try await client.createAndRegisterProxy(for: currentPhoto)
-            currentPhoto = updated
+            replaceCurrentPhoto(updated)
 
             if let cachedData = LocalProxyStore.shared.previewData(forHash: updated.hash),
                let cachedImg = UIImage(data: cachedData) {
-                previewImage = cachedImg
-                compressedData = cachedData
+                previewImagesByHash[updated.hash] = cachedImg
+                compressedDataByHash[updated.hash] = cachedData
             }
             if updated.isVideo,
                let videoURL = LocalProxyStore.shared.videoProxyURLIfExists(forHash: updated.hash) {
@@ -2516,7 +2974,6 @@ private struct ServerPhotoDetailView: View {
                 avPlayer.play()
             }
 
-            onPhotoUpdated(updated)
             saveMessage = "Compressed proxy created and stored on server & local cache."
         } catch {
             saveMessage = "Proxy creation failed: \(error.localizedDescription)"
@@ -2524,7 +2981,6 @@ private struct ServerPhotoDetailView: View {
     }
 
     private func prepareVideoProxyIfNeeded() async {
-        // 1. Play straight from Native Apple Photos if already on device (zero server video download!)
         if let nativePlayerItem = await PhotoLibraryService.loadNativeGalleryAVPlayerItem(forMasterHash: currentPhoto.hash) {
             let avPlayer = AVPlayer(playerItem: nativePlayerItem)
             player = avPlayer
@@ -2555,7 +3011,7 @@ private struct ServerPhotoDetailView: View {
                 avPlayer.play()
             }
         } catch {
-            videoUnavailableNote = "No compressed video proxy on server yet. Tap Create Compressed Video Proxy above, or Share Original."
+            videoUnavailableNote = "No compressed video proxy on server yet. Tap Create Video Proxy below, or Share Original."
         }
     }
 
@@ -2599,22 +3055,23 @@ private struct ServerPhotoDetailView: View {
             return
         }
 
-        let alreadyInNativePhotos = await Task.detached(priority: .userInitiated) { [currentPhoto] in
-            if LocalProxyTracker.shared.hasAnyLiveGalleryAsset(forMasterHash: currentPhoto.hash) {
+        let photo = currentPhoto
+        let alreadyInNativePhotos = await Task.detached(priority: .userInitiated) {
+            if LocalProxyTracker.shared.hasAnyLiveGalleryAsset(forMasterHash: photo.hash) {
                 return true
             }
-            let prefix = ProxyGenerator.proxyPrefixTag(forMasterHash: currentPhoto.hash)
+            let prefix = ProxyGenerator.proxyPrefixTag(forMasterHash: photo.hash)
             if !prefix.isEmpty, let existingProxyId = PhotoLibraryService.scanExistingProxyPrefixesInPhotos()[prefix] {
                 LocalProxyTracker.shared.markAsProxy(
                     assetId: existingProxyId,
-                    proxySha256: currentPhoto.proxyHash ?? "",
-                    masterHash: currentPhoto.hash,
-                    originalName: currentPhoto.originalName
+                    proxySha256: photo.proxyHash ?? "",
+                    masterHash: photo.hash,
+                    originalName: photo.originalName
                 )
                 return true
             }
-            if let existingOrigId = PhotoLibraryService.findMatchingOriginalAssetIdInPhotos(for: currentPhoto) {
-                LocalProxyTracker.shared.markUploadedOriginal(assetId: existingOrigId, masterHash: currentPhoto.hash)
+            if let existingOrigId = PhotoLibraryService.findMatchingOriginalAssetIdInPhotos(for: photo) {
+                LocalProxyTracker.shared.markUploadedOriginal(assetId: existingOrigId, masterHash: photo.hash)
                 return true
             }
             return false
@@ -2626,8 +3083,8 @@ private struct ServerPhotoDetailView: View {
         }
 
         do {
-            if currentPhoto.isVideo {
-                var videoURL = localVideoProxyURL ?? LocalProxyStore.shared.videoProxyURLIfExists(forHash: currentPhoto.hash)
+            if photo.isVideo {
+                var videoURL = localVideoProxyURL ?? LocalProxyStore.shared.videoProxyURLIfExists(forHash: photo.hash)
                 var tempDownloadURL: URL?
                 defer {
                     if let tempDownloadURL {
@@ -2635,11 +3092,11 @@ private struct ServerPhotoDetailView: View {
                     }
                 }
 
-                if videoURL == nil, !currentPhoto.needsProxy {
+                if videoURL == nil, !photo.needsProxy {
                     busyLabel = "Downloading compressed MP4 proxy..."
                     let client = PhotoHubAPIClient(settings: settings)
-                    let downloaded = try await client.downloadVideoProxyToTempFile(hash: currentPhoto.hash)
-                    if let cached = LocalProxyStore.shared.copyVideoProxy(from: downloaded, forHash: currentPhoto.hash) {
+                    let downloaded = try await client.downloadVideoProxyToTempFile(hash: photo.hash)
+                    if let cached = LocalProxyStore.shared.copyVideoProxy(from: downloaded, forHash: photo.hash) {
                         videoURL = cached
                         localVideoProxyURL = cached
                         try? FileManager.default.removeItem(at: downloaded)
@@ -2652,7 +3109,7 @@ private struct ServerPhotoDetailView: View {
                 if let videoURL {
                     busyLabel = "Saving video proxy to Photos..."
                     _ = try await PhotoLibraryService.saveServerProxyToPhotosAsync(
-                        photo: currentPhoto,
+                        photo: photo,
                         videoURL: videoURL
                     )
                     let sizeBytes = (try? videoURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { Int64($0) } ?? 0
@@ -2662,14 +3119,14 @@ private struct ServerPhotoDetailView: View {
                 }
             }
 
-            var dataToSave = compressedData ?? initialCompressedData
+            var dataToSave = compressedDataByHash[photo.hash]
             if dataToSave == nil {
-                if let cached = LocalProxyStore.shared.previewData(forHash: currentPhoto.hash) {
+                if let cached = LocalProxyStore.shared.previewData(forHash: photo.hash) {
                     dataToSave = LocalProxyStore.makeSmallCompressedPreview(from: cached, maxPixelSize: 800, quality: 0.65)?.1 ?? cached
                 } else {
                     busyLabel = "Downloading compressed preview..."
                     let client = PhotoHubAPIClient(settings: settings)
-                    if let raw = try? await client.downloadPhotoPreviewData(hash: currentPhoto.hash) {
+                    if let raw = try? await client.downloadPhotoPreviewData(hash: photo.hash) {
                         dataToSave = LocalProxyStore.makeSmallCompressedPreview(from: raw, maxPixelSize: 800, quality: 0.65)?.1 ?? raw
                     }
                 }
@@ -2682,7 +3139,7 @@ private struct ServerPhotoDetailView: View {
 
             busyLabel = "Saving proxy to Photos..."
             _ = try await PhotoLibraryService.saveServerProxyToPhotosAsync(
-                photo: currentPhoto,
+                photo: photo,
                 imageData: dataToSave
             )
             let sizeStr = ByteCountFormatter.string(fromByteCount: Int64(dataToSave.count), countStyle: .file)
@@ -2714,8 +3171,7 @@ private struct ServerPhotoDetailView: View {
                 client: client
             )
             if let updated {
-                currentPhoto = updated
-                onPhotoUpdated(updated)
+                replaceCurrentPhoto(updated)
             }
 
             let sizeStr = ByteCountFormatter.string(fromByteCount: fileSize, countStyle: .file)
@@ -2740,8 +3196,7 @@ private struct ServerPhotoDetailView: View {
         do {
             let client = PhotoHubAPIClient(settings: settings)
             let updated = try await client.setOriginalProtected(masterHash: currentPhoto.hash, protected: protected)
-            currentPhoto = updated
-            onPhotoUpdated(updated)
+            replaceCurrentPhoto(updated)
             saveMessage = protected
                 ? "Protected: this original won't be auto re-proxied."
                 : "Unlocked: this photo can be compressed into a proxy again."
@@ -2751,8 +3206,9 @@ private struct ServerPhotoDetailView: View {
     }
 
     private func deleteCurrentItemFromServer() async {
+        let permanent = isActiveItemTrashed
         isBusy = true
-        busyLabel = "Deleting from server..."
+        busyLabel = permanent ? "Deleting permanently..." : "Moving to Trash..."
         saveMessage = nil
         defer {
             isBusy = false
@@ -2761,12 +3217,16 @@ private struct ServerPhotoDetailView: View {
 
         do {
             let client = PhotoHubAPIClient(settings: settings)
-            try await client.deleteServerPhoto(hash: currentPhoto.hash)
-            player?.pause()
-            player = nil
             let deletedHash = currentPhoto.hash
             let deletedName = currentPhoto.originalName
-            onPhotoDeleted(deletedHash, deletedName)
+            if permanent {
+                _ = try await client.emptyServerTrash(hashes: [deletedHash])
+            } else {
+                _ = try await client.moveServerPhotosToTrash(hashes: [deletedHash])
+            }
+            player?.pause()
+            player = nil
+            onPhotoDeleted(deletedHash, deletedName, permanent)
             dismiss()
         } catch APIClientError.httpError(401, _) {
             LocalProxySyncManager.shared.cancel()
@@ -2774,6 +3234,276 @@ private struct ServerPhotoDetailView: View {
             dismiss()
         } catch {
             saveMessage = "Delete failed: \(error.localizedDescription)"
+        }
+    }
+}
+
+private struct ZoomableLightboxImageView: View {
+    let image: UIImage
+    let onSingleTap: () -> Void
+
+    @State private var scale: CGFloat = 1.0
+    @State private var lastScale: CGFloat = 1.0
+    @State private var offset: CGSize = .zero
+    @State private var lastOffset: CGSize = .zero
+
+    var body: some View {
+        GeometryReader { geo in
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFit()
+                .frame(width: geo.size.width, height: geo.size.height)
+                .scaleEffect(scale)
+                .offset(offset)
+                .gesture(
+                    MagnificationGesture()
+                        .onChanged { value in
+                            let next = min(4.0, max(1.0, lastScale * value))
+                            scale = next
+                            if next <= 1.01 {
+                                offset = .zero
+                                lastOffset = .zero
+                            }
+                        }
+                        .onEnded { _ in
+                            if scale < 1.05 {
+                                withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+                                    scale = 1.0
+                                    lastScale = 1.0
+                                    offset = .zero
+                                    lastOffset = .zero
+                                }
+                            } else {
+                                lastScale = scale
+                            }
+                        }
+                )
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: scale > 1.02 ? 4 : 9999)
+                        .onChanged { value in
+                            guard scale > 1.02 else { return }
+                            let maxX = geo.size.width * (scale - 1.0) / 2.0
+                            let maxY = geo.size.height * (scale - 1.0) / 2.0
+                            let nx = min(maxX, max(-maxX, lastOffset.width + value.translation.width))
+                            let ny = min(maxY, max(-maxY, lastOffset.height + value.translation.height))
+                            offset = CGSize(width: nx, height: ny)
+                        }
+                        .onEnded { _ in
+                            lastOffset = offset
+                        }
+                )
+                .onTapGesture(count: 2) {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.8)) {
+                        if scale > 1.2 {
+                            scale = 1.0
+                            lastScale = 1.0
+                            offset = .zero
+                            lastOffset = .zero
+                        } else {
+                            scale = 2.5
+                            lastScale = 2.5
+                        }
+                    }
+                }
+                .onTapGesture(count: 1) {
+                    onSingleTap()
+                }
+        }
+    }
+}
+
+private struct PhotoInfoDetailSheet: View {
+    let photo: ServerPhoto
+    let isProtected: Bool
+    @Environment(\.dismiss) private var dismiss
+    @State private var copiedHash: Bool = false
+
+    private static let infoDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .long
+        f.timeStyle = .medium
+        return f
+    }()
+
+    var body: some View {
+        AdaptiveNavigationStack {
+            List {
+                Section("Media") {
+                    LabeledContent("Filename", value: photo.originalName)
+                    LabeledContent("Type", value: photo.isVideo ? "Video" : "Photo")
+                    let takenText = photo.parsedCreationDate.map { Self.infoDateFormatter.string(from: $0) }
+                        ?? (photo.photoDate.isEmpty ? "Undated" : photo.photoDate)
+                    LabeledContent("Date Taken", value: takenText)
+                    if let camera = photo.cameraModel, !camera.isEmpty {
+                        LabeledContent("Camera", value: camera)
+                    }
+                    LabeledContent(
+                        "Original Size",
+                        value: ByteCountFormatter.string(fromByteCount: max(0, photo.size), countStyle: .file)
+                    )
+                    if let proxySz = photo.videoProxySize ?? photo.proxySize, proxySz > 0 {
+                        LabeledContent(
+                            "Proxy Size",
+                            value: ByteCountFormatter.string(fromByteCount: proxySz, countStyle: .file)
+                        )
+                    }
+                    LabeledContent("Original Protection", value: isProtected ? "Protected on Device" : "Standard")
+                }
+
+                Section("Verification") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("SHA-256 Checksum")
+                            .font(.caption.weight(.semibold))
+                            .foregroundColor(.secondary)
+                        Text(photo.hash)
+                            .font(.caption2.monospaced())
+                            .textSelection(.enabled)
+                        Button(copiedHash ? "Copied SHA-256" : "Copy SHA-256") {
+                            UIPasteboard.general.string = photo.hash
+                            copiedHash = true
+                        }
+                        .font(.caption.weight(.bold))
+                        .foregroundColor(PhotoHubPalette.orange)
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+            .navigationTitle("Details")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+private struct ShareLinkModalSheet: View {
+    let photo: ServerPhoto
+    @ObservedObject var settings: AppSettings
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var titleText: String
+    @State private var expiresHours: Int = 168
+    @State private var passcodeText: String = ""
+    @State private var isCreating: Bool = false
+    @State private var createdLink: ShareLinkResult?
+    @State private var errorText: String?
+    @State private var copiedLink: Bool = false
+    @State private var showActivityShare: Bool = false
+
+    init(photo: ServerPhoto, settings: AppSettings) {
+        self.photo = photo
+        self.settings = settings
+        self._titleText = State(initialValue: photo.originalName)
+    }
+
+    var body: some View {
+        AdaptiveNavigationStack {
+            Form {
+                if let link = createdLink {
+                    Section("Public Share Link Ready") {
+                        Text(link.url)
+                            .font(.caption.monospaced())
+                            .textSelection(.enabled)
+                        if link.hasPasscode == true {
+                            Label("Protected with passcode", systemImage: "lock.fill")
+                                .font(.caption)
+                                .foregroundColor(PhotoHubPalette.mint)
+                        }
+                        HStack(spacing: 10) {
+                            Button {
+                                UIPasteboard.general.string = link.url
+                                copiedLink = true
+                            } label: {
+                                Label(copiedLink ? "Copied!" : "Copy Link", systemImage: "doc.on.doc")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PhotoHubSoftButtonStyle())
+
+                            Button {
+                                showActivityShare = true
+                            } label: {
+                                Label("Share", systemImage: "square.and.arrow.up")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PhotoHubPrimaryButtonStyle())
+                        }
+                        .listRowBackground(Color.clear)
+                    }
+                } else {
+                    Section("Link Options") {
+                        TextField("Title", text: $titleText)
+                        Picker("Expires In", selection: $expiresHours) {
+                            Text("24 Hours").tag(24)
+                            Text("7 Days").tag(168)
+                            Text("30 Days").tag(720)
+                        }
+                        SecureField("Optional Passcode", text: $passcodeText)
+                    }
+
+                    if let errorText {
+                        Section {
+                            Text(errorText)
+                                .font(.caption)
+                                .foregroundColor(PhotoHubPalette.rose)
+                        }
+                    }
+
+                    Section {
+                        Button {
+                            Task { await createLink() }
+                        } label: {
+                            HStack {
+                                if isCreating {
+                                    ProgressView().tint(.white)
+                                } else {
+                                    Image(systemName: "link.badge.plus")
+                                }
+                                Text(isCreating ? "Creating…" : "Create Share Link")
+                                    .font(.headline.weight(.bold))
+                            }
+                            .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(PhotoHubPrimaryButtonStyle())
+                        .disabled(isCreating)
+                        .listRowBackground(Color.clear)
+                    }
+                }
+            }
+            .navigationTitle("Share Link")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            .sheet(isPresented: $showActivityShare) {
+                if let urlStr = createdLink?.url {
+                    let items: [Any] = URL(string: urlStr).map { [$0] } ?? [urlStr]
+                    ShareSheet(activityItems: items) {
+                        showActivityShare = false
+                    }
+                }
+            }
+        }
+    }
+
+    private func createLink() async {
+        isCreating = true
+        errorText = nil
+        defer { isCreating = false }
+        do {
+            let link = try await PhotoHubAPIClient(settings: settings).createShareLink(
+                hashes: [photo.hash],
+                title: titleText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? photo.originalName : titleText,
+                expiresInHours: expiresHours,
+                passcode: passcodeText
+            )
+            createdLink = link
+        } catch {
+            errorText = error.localizedDescription
         }
     }
 }

@@ -4,6 +4,8 @@ import android.content.Context
 import com.photohub.compressor.data.AppSettings
 import com.photohub.compressor.data.ServerPhoto
 import com.photohub.compressor.media.MediaLibraryService
+import com.photohub.compressor.media.OrderedCommitGate
+import com.photohub.compressor.media.PhotoBackupPipeline
 import com.photohub.compressor.media.ProxyGenerator
 import com.photohub.compressor.network.PhotoHubApiClient
 import kotlinx.coroutines.*
@@ -190,7 +192,7 @@ class LocalProxySyncManager private constructor(context: Context) {
             // Detect any matching original already sitting in native Android Gallery (prevents duplicate downloads & saves!)
             var matchedOriginalAssetId: String? = null
             if (existingOriginalsMap.isNotEmpty()) {
-                val keys = mediaService.originalMatchKeys(photo.originalName, photo.parsedCreationDateMs, photo.size)
+                val keys = mediaService.originalMatchKeys(photo.originalName, photo.parsedCreationDateMs, photo.size, photo.isVideo)
                 for (key in keys) {
                     val found = existingOriginalsMap[key]
                     if (found != null) {
@@ -201,9 +203,11 @@ class LocalProxySyncManager private constructor(context: Context) {
                 }
             }
 
+            val isActiveUpload = com.photohub.compressor.background.AssetUploadCoordinator.isMasterHashActive(photo.hash)
             val hasLiveNativeGalleryAsset = tracker.hasAnyLiveGalleryAsset(photo.hash) ||
                 syncedAssetId != null ||
-                matchedOriginalAssetId != null
+                matchedOriginalAssetId != null ||
+                isActiveUpload
 
             // Skip downloading into LocalProxyStore whenever a live copy already exists in native Gallery
             // (Cloud tab loads thumbnails & plays videos straight from MediaStore with zero duplication!).
@@ -251,6 +255,16 @@ class LocalProxySyncManager private constructor(context: Context) {
         }
 
         val galleryTargets = workItems.count { it.saveToPhotosApp }
+        if (galleryTargets > 1) {
+            // Insert oldest photos into Android MediaStore first and newest photos LAST so
+            // third-party share pickers (WhatsApp, Telegram, Instagram, Android Photo Picker)
+            // show the newest photo first — matching the native Gallery timeline.
+            val orderedHashes = PhotoBackupPipeline
+                .sortServerPhotosOldestFirst(workItems.map { it.photo })
+                .withIndex()
+                .associate { it.value.hash.lowercase() to it.index }
+            workItems.sortBy { orderedHashes[it.photo.hash.lowercase()] ?: Int.MAX_VALUE }
+        }
         val total = workItems.size
         val completed = AtomicInteger(0)
         val savedCount = AtomicInteger(0)
@@ -266,73 +280,82 @@ class LocalProxySyncManager private constructor(context: Context) {
             }
         )
 
-        val channel = Channel<PrefetchWorkItem>(Channel.UNLIMITED)
-        workItems.forEach { channel.trySend(it) }
+        val channel = Channel<Pair<Int, PrefetchWorkItem>>(Channel.UNLIMITED)
+        workItems.forEachIndexed { idx, item -> channel.trySend(idx to item) }
         channel.close()
+        val commitGate = if (galleryTargets > 0) OrderedCommitGate() else null
 
-        coroutineScope {
-            val workerCount = minOf(4, workItems.size)
-            val workers = List(workerCount) {
-                launch {
-                    for (item in channel) {
-                        if (!isActive) break
-                        val photo = item.photo
+        try {
+            coroutineScope {
+                val workerCount = minOf(4, workItems.size)
+                val workers = List(workerCount) {
+                    launch {
+                        for ((workIndex, item) in channel) {
+                            if (!isActive) break
+                            val photo = item.photo
 
-                        var imageBytes = store.previewData(photo.hash)
-                        if (imageBytes == null && (item.cachePreviewLocally || (!photo.isVideo && item.saveToPhotosApp))) {
-                            runCatching { client.downloadPhotoPreviewData(photo.hash) }.getOrNull()?.let { raw ->
-                                imageBytes = if (item.cachePreviewLocally) {
-                                    store.cacheDownloadedPreviewData(raw, photo.hash)
-                                } else {
-                                    store.makeSmallCompressedPreview(raw)?.second ?: raw
-                                }
-                            }
-                        }
-
-                        var videoFile = store.videoProxyFileIfExists(photo.hash)
-                        var tempVideo: File? = null
-                        try {
-                            if (videoFile == null && (item.cacheVideoLocally || (photo.isVideo && item.saveToPhotosApp))) {
-                                runCatching { client.downloadVideoProxyToTempFile(photo.hash) }.getOrNull()?.let { downloaded ->
-                                    if (item.cacheVideoLocally) {
-                                        videoFile = store.copyVideoProxy(downloaded, photo.hash)
-                                        downloaded.delete()
+                            var imageBytes = store.previewData(photo.hash)
+                            if (imageBytes == null && (item.cachePreviewLocally || (!photo.isVideo && item.saveToPhotosApp))) {
+                                runCatching { client.downloadPhotoPreviewData(photo.hash) }.getOrNull()?.let { raw ->
+                                    imageBytes = if (item.cachePreviewLocally) {
+                                        store.cacheDownloadedPreviewData(raw, photo.hash)
                                     } else {
-                                        videoFile = downloaded
-                                        tempVideo = downloaded
+                                        store.makeSmallCompressedPreview(raw)?.second ?: raw
                                     }
                                 }
                             }
 
-                            var savedNow = false
-                            if (item.saveToPhotosApp) {
-                                val res = runCatching {
-                                    mediaService.saveServerProxyToGallery(photo, imageBytes, videoFile)
-                                }.getOrNull()
-                                if (res != null) savedNow = true
-                            }
-
-                            val done = completed.incrementAndGet()
-                            val saved = if (savedNow) savedCount.incrementAndGet() else savedCount.get()
-                            _state.value = LocalSyncUiState(
-                                isSyncing = true,
-                                completedCount = done,
-                                totalCount = total,
-                                savedToPhotosCount = saved,
-                                statusText = if (galleryTargets > 0) {
-                                    "Downloading proxies to Gallery ($done/$total)…"
-                                } else {
-                                    "Auto-downloading local proxies ($done/$total)…"
+                            var videoFile = store.videoProxyFileIfExists(photo.hash)
+                            var tempVideo: File? = null
+                            try {
+                                if (videoFile == null && (item.cacheVideoLocally || (photo.isVideo && item.saveToPhotosApp))) {
+                                    runCatching { client.downloadVideoProxyToTempFile(photo.hash) }.getOrNull()?.let { downloaded ->
+                                        if (item.cacheVideoLocally) {
+                                            videoFile = store.copyVideoProxy(downloaded, photo.hash)
+                                            downloaded.delete()
+                                        } else {
+                                            videoFile = downloaded
+                                            tempVideo = downloaded
+                                        }
+                                    }
                                 }
-                            )
-                            if (done % 4 == 0) store.notifyChanged()
-                        } finally {
-                            tempVideo?.delete()
+
+                                var savedNow = false
+                                if (item.saveToPhotosApp) {
+                                    val canCommit = commitGate?.waitForTurn(workIndex) ?: true
+                                    if (canCommit) {
+                                        val res = runCatching {
+                                            mediaService.saveServerProxyToGallery(photo, imageBytes, videoFile)
+                                        }.getOrNull()
+                                        if (res != null) savedNow = true
+                                    }
+                                }
+
+                                val done = completed.incrementAndGet()
+                                val saved = if (savedNow) savedCount.incrementAndGet() else savedCount.get()
+                                _state.value = LocalSyncUiState(
+                                    isSyncing = true,
+                                    completedCount = done,
+                                    totalCount = total,
+                                    savedToPhotosCount = saved,
+                                    statusText = if (galleryTargets > 0) {
+                                        "Downloading proxies to Gallery ($done/$total)…"
+                                    } else {
+                                        "Auto-downloading local proxies ($done/$total)…"
+                                    }
+                                )
+                                if (done % 4 == 0) store.notifyChanged()
+                            } finally {
+                                commitGate?.completeTurn(workIndex)
+                                tempVideo?.delete()
+                            }
                         }
                     }
                 }
+                workers.joinAll()
             }
-            workers.joinAll()
+        } finally {
+            commitGate?.cancelAll()
         }
 
         store.notifyChanged()

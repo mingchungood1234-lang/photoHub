@@ -40,6 +40,20 @@ fun PhotoHubApp() {
     val settingsState by settings.state.collectAsStateWithLifecycle()
     val bgState by bgManager.state.collectAsStateWithLifecycle()
 
+    if (!settingsState.hasCompletedOnboarding) {
+        OnboardingScreen(
+            initialMode = settingsState.backupStorageMode,
+            isReplay = false,
+            onComplete = { chosenMode ->
+                settings.completeOnboarding(chosenMode)
+                if (chosenMode == com.photohub.compressor.data.BackupStorageMode.BACKUP_ONLY) {
+                    bgManager.clearAllStagedItems()
+                }
+            }
+        )
+        return
+    }
+
     if (!settingsState.isSignedIn) {
         SignInScreen(settingsState = settingsState, authManager = authManager)
         return

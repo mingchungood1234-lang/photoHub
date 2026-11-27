@@ -31,6 +31,9 @@ class LocalProxyTracker private constructor(context: Context) {
     private val restoredMasterHashes = loadSet(KEY_RESTORED_MASTERS)
     private val restoredAssetToMaster = loadMap(KEY_RESTORED_ASSET_TO_MASTER)
     private val uploadedOriginalMasterToAsset = loadMap(KEY_UPLOADED_ORIGINAL_MASTER_TO_ASSET)
+    private val uploadedOriginalAssetIds = uploadedOriginalMasterToAsset.values
+        .filter { it.isNotBlank() }
+        .toMutableSet()
 
     fun isKnownProxy(assetId: String): Boolean = synchronized(lock) {
         assetIds.contains(assetId)
@@ -223,11 +226,20 @@ class LocalProxyTracker private constructor(context: Context) {
         val cleanId = assetId.trim()
         if (normMaster.isEmpty() || cleanId.isEmpty()) return
         synchronized(lock) {
+            uploadedOriginalAssetIds.add(cleanId)
             if (uploadedOriginalMasterToAsset[normMaster] != cleanId) {
                 uploadedOriginalMasterToAsset[normMaster] = cleanId
                 saveMap(KEY_UPLOADED_ORIGINAL_MASTER_TO_ASSET, uploadedOriginalMasterToAsset)
             }
         }
+    }
+
+    /**
+     * Returns true if [assetId] is a full-resolution original already verified/uploaded to the server.
+     * Used in Backup Only mode so originals kept on the phone are not repeatedly queued for upload.
+     */
+    fun isUploadedOriginal(assetId: String): Boolean = synchronized(lock) {
+        uploadedOriginalAssetIds.contains(assetId)
     }
 
     private fun isLiveMediaStoreUri(rawUri: String): Boolean {

@@ -18,7 +18,10 @@ struct ContentView: View {
 
     var body: some View {
         Group {
-            if settings.isSignedIn {
+            if !settings.hasCompletedOnboarding {
+                OnboardingView(settings: settings)
+                    .transition(.opacity)
+            } else if settings.isSignedIn {
                 TabView(selection: $selectedTab) {
                     LibraryView(viewModel: viewModel)
                         .tabItem {

@@ -35,6 +35,8 @@ enum PhotoDeleteOutcome {
 }
 
 final class PhotoLibraryService {
+    static let galleryWriteSemaphore = AsyncSemaphore(value: 1)
+
     func requestAuthorization(completion: @escaping (PHAuthorizationStatus) -> Void) {
         let current = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         if current == .authorized || current == .limited {
@@ -121,63 +123,130 @@ final class PhotoLibraryService {
         return f
     }()
 
-    /// Builds normalized lookup keys (`filename|yyyy-MM-dd` and `filename`) for deduplicating
-    /// against originals already sitting in Apple Photos (zero iCloud download).
-    static func originalMatchKeys(filename: String, creationDate: Date?) -> [String] {
+    private static func normalizeFilenameStem(_ rawName: String) -> String {
+        let base = URL(fileURLWithPath: rawName).lastPathComponent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let noExt = (base as NSString).deletingPathExtension
+        let cleaned = noExt.replacingOccurrences(
+            of: #"(?:\s*\(\d+\)|\s+copy|\s*-\s*copy)$"#,
+            with: "",
+            options: .regularExpression
+        )
+        return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func resourceFileSizeBytes(for asset: PHAsset) -> Int64? {
+        let resources = PHAssetResource.assetResources(for: asset)
+        for resource in resources where resource.type == .photo || resource.type == .video || resource.type == .fullSizePhoto || resource.type == .fullSizeVideo {
+            if let num = resource.value(forKey: "fileSize") as? NSNumber, num.int64Value > 0 {
+                return num.int64Value
+            }
+        }
+        return nil
+    }
+
+    /// Builds normalized lookup keys (`sz:base|size`, `szs:stem|size`, `szd:kind|size|day`, `dt:base|day`, `dts:stem|day`)
+    /// for deduplicating against originals already sitting in Apple Photos (zero iCloud download),
+    /// handling HEIC/JPG re-extensions, timezone boundary shifts, and duplicate filename suffixes.
+    static func originalMatchKeys(
+        filename: String,
+        creationDate: Date?,
+        sizeBytes: Int64? = nil,
+        isVideo: Bool? = nil
+    ) -> [String] {
         let base = URL(fileURLWithPath: filename).lastPathComponent
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         guard !base.isEmpty, !base.hasPrefix(ProxyGenerator.proxyFilenamePrefix.lowercased()) else {
             return []
         }
+        let stem = normalizeFilenameStem(base)
         var keys: [String] = []
+        if let sizeBytes, sizeBytes > 0 {
+            keys.append("sz:\(base)|\(sizeBytes)")
+            if !stem.isEmpty {
+                keys.append("szs:\(stem)|\(sizeBytes)")
+            }
+        }
         if let creationDate {
             let dayStr = originalDayKeyFormatter.string(from: creationDate)
-            keys.append("\(base)|\(dayStr)")
-            // Also accept +-1 day boundary for timezone shifts between EXIF and UTC
-            if let prevDay = Calendar(identifier: .gregorian).date(byAdding: .day, value: -1, to: creationDate) {
-                keys.append("\(base)|\(originalDayKeyFormatter.string(from: prevDay))")
+            let prevDayStr = Calendar(identifier: .gregorian).date(byAdding: .day, value: -1, to: creationDate)
+                .map { originalDayKeyFormatter.string(from: $0) }
+            let nextDayStr = Calendar(identifier: .gregorian).date(byAdding: .day, value: 1, to: creationDate)
+                .map { originalDayKeyFormatter.string(from: $0) }
+            let dayList = [dayStr, prevDayStr, nextDayStr].compactMap { $0 }
+
+            if let sizeBytes, sizeBytes > 0, let isVideo {
+                let kind = isVideo ? "v" : "i"
+                for d in dayList {
+                    keys.append("szd:\(kind)|\(sizeBytes)|\(d)")
+                }
             }
-            if let nextDay = Calendar(identifier: .gregorian).date(byAdding: .day, value: 1, to: creationDate) {
-                keys.append("\(base)|\(originalDayKeyFormatter.string(from: nextDay))")
+            for d in dayList {
+                keys.append("dt:\(base)|\(d)")
+                if !stem.isEmpty {
+                    keys.append("dts:\(stem)|\(d)")
+                }
             }
         } else {
-            keys.append(base)
+            keys.append("nm:\(base)")
+            if !stem.isEmpty {
+                keys.append("nms:\(stem)")
+            }
         }
         return keys
     }
 
     /// Scans local Apple Photos metadata (zero iCloud download) for existing non-proxy originals,
-    /// returning `matchKey -> PHAsset.localIdentifier` so proxies are never duplicated alongside originals.
+    /// returning `matchKey -> PHAsset.localIdentifier` so proxies and restores never duplicate originals.
     static func scanExistingOriginalMapInPhotos() -> [String: String] {
         let auth = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         guard auth == .authorized || auth == .limited else { return [:] }
 
+        let tracker = LocalProxyTracker.shared
         let options = PHFetchOptions()
         options.includeHiddenAssets = false
         let assets = PHAsset.fetchAssets(with: options)
         var map: [String: String] = [:]
-        map.reserveCapacity(assets.count)
+        map.reserveCapacity(assets.count * 3)
 
         for i in 0..<assets.count {
             autoreleasepool {
                 let asset = assets.object(at: i)
+                if tracker.isKnownProxy(assetId: asset.localIdentifier) { return }
                 let info = inspectAssetResources(for: asset)
                 guard info.proxyMatch == nil, let name = info.originalFilename else { return }
                 let base = URL(fileURLWithPath: name).lastPathComponent
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                     .lowercased()
                 guard !base.isEmpty else { return }
-                if let created = asset.creationDate {
-                    let dayStr = originalDayKeyFormatter.string(from: created)
-                    let datedKey = "\(base)|\(dayStr)"
-                    if map[datedKey] == nil {
-                        map[datedKey] = asset.localIdentifier
+                let stem = normalizeFilenameStem(base)
+                let sizeBytes = resourceFileSizeBytes(for: asset)
+                let kind = (asset.mediaType == .video) ? "v" : "i"
+                let localId = asset.localIdentifier
+
+                if let sizeBytes, sizeBytes > 0 {
+                    if map["sz:\(base)|\(sizeBytes)"] == nil { map["sz:\(base)|\(sizeBytes)"] = localId }
+                    if !stem.isEmpty && map["szs:\(stem)|\(sizeBytes)"] == nil {
+                        map["szs:\(stem)|\(sizeBytes)"] = localId
                     }
                 }
-                if map[base] == nil {
-                    map[base] = asset.localIdentifier
+                if let created = asset.creationDate {
+                    let dayStr = originalDayKeyFormatter.string(from: created)
+                    if let sizeBytes, sizeBytes > 0 {
+                        let szdKey = "szd:\(kind)|\(sizeBytes)|\(dayStr)"
+                        if map[szdKey] == nil { map[szdKey] = localId }
+                    }
+                    let datedKey = "dt:\(base)|\(dayStr)"
+                    if map[datedKey] == nil { map[datedKey] = localId }
+                    if !stem.isEmpty {
+                        let stemDatedKey = "dts:\(stem)|\(dayStr)"
+                        if map[stemDatedKey] == nil { map[stemDatedKey] = localId }
+                    }
                 }
+                if map["nm:\(base)"] == nil { map["nm:\(base)"] = localId }
+                if !stem.isEmpty && map["nms:\(stem)"] == nil { map["nms:\(stem)"] = localId }
             }
         }
         return map
@@ -185,13 +254,37 @@ final class PhotoLibraryService {
 
     /// Checks whether a server photo already has a matching non-proxy original physically in Apple Photos.
     static func findMatchingOriginalAssetIdInPhotos(for photo: ServerPhoto) -> String? {
-        let keys = originalMatchKeys(filename: photo.originalName, creationDate: photo.parsedCreationDate)
+        let keys = originalMatchKeys(
+            filename: photo.originalName,
+            creationDate: photo.parsedCreationDate,
+            sizeBytes: photo.size > 0 ? photo.size : nil,
+            isVideo: photo.isVideo
+        )
         guard !keys.isEmpty else { return nil }
         let existing = scanExistingOriginalMapInPhotos()
         for key in keys {
             if let found = existing[key] {
                 return found
             }
+        }
+        return nil
+    }
+
+    /// Checks if a live full-resolution original (never a compressed proxy) for `photo` already exists
+    /// in Apple Photos, so Restore never inserts a duplicate original copy.
+    static func findExistingLiveOriginalAssetId(for photo: ServerPhoto) -> String? {
+        let tracker = LocalProxyTracker.shared
+        if let restoredId = tracker.liveRestoredAssetId(forMasterHash: photo.hash),
+           !tracker.isKnownProxy(assetId: restoredId) {
+            return restoredId
+        }
+        if let uploadedId = tracker.liveUploadedOriginalAssetId(forMasterHash: photo.hash),
+           !tracker.isKnownProxy(assetId: uploadedId) {
+            return uploadedId
+        }
+        if let matchedId = findMatchingOriginalAssetIdInPhotos(for: photo),
+           !tracker.isKnownProxy(assetId: matchedId) {
+            return matchedId
         }
         return nil
     }
@@ -220,7 +313,12 @@ final class PhotoLibraryService {
                 )
                 continue
             }
-            let keys = originalMatchKeys(filename: photo.originalName, creationDate: photo.parsedCreationDate)
+            let keys = originalMatchKeys(
+                filename: photo.originalName,
+                creationDate: photo.parsedCreationDate,
+                sizeBytes: photo.size > 0 ? photo.size : nil,
+                isVideo: photo.isVideo
+            )
             for key in keys {
                 if let origAssetId = originalsMap[key] {
                     tracker.markUploadedOriginal(assetId: origAssetId, masterHash: photo.hash)
@@ -417,7 +515,9 @@ final class PhotoLibraryService {
         tracker: LocalProxyTracker,
         knownServerPhotos: [ServerPhoto] = [],
         maxResults: Int? = nil,
-        maxInspect: Int? = nil
+        maxInspect: Int? = nil,
+        oldestFirst: Bool = false,
+        skipBackedUpOriginals: Bool = false
     ) -> [PhotoCandidate] {
         let fetchOptions = PHFetchOptions()
         fetchOptions.predicate = NSPredicate(
@@ -425,8 +525,8 @@ final class PhotoLibraryService {
             PHAssetMediaType.image.rawValue,
             PHAssetMediaType.video.rawValue
         )
-        fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        if let maxInspect, maxInspect > 0 {
+        fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: oldestFirst)]
+        if let maxInspect, maxInspect > 0, !oldestFirst {
             fetchOptions.fetchLimit = maxInspect
         }
         let assets = PHAsset.fetchAssets(with: fetchOptions)
@@ -452,9 +552,13 @@ final class PhotoLibraryService {
         }
 
         var eligibleCount = 0
+        var inspectedNonTracked = 0
 
         for i in 0..<totalCount {
             if let maxResults, eligibleCount >= maxResults {
+                break
+            }
+            if let maxInspect, maxInspect > 0, inspectedNonTracked >= maxInspect {
                 break
             }
             autoreleasepool {
@@ -473,6 +577,13 @@ final class PhotoLibraryService {
                 if tracker.isRestoredOriginal(assetId: localId) {
                     return
                 }
+
+                // 2b. In Backup Only mode, originals already verified/uploaded to the server stay on device untouched
+                if skipBackedUpOriginals && tracker.isUploadedOriginal(assetId: localId) {
+                    return
+                }
+
+                inspectedNonTracked += 1
 
                 // 3. Filename tag PHOTOHUB_PROXY_<prefix16> from local or iCloud PHAssetResource
                 let resourceInfo = Self.inspectAssetResources(for: asset)
@@ -693,16 +804,38 @@ final class PhotoLibraryService {
     func saveCompressedProxyToPhotosAsync(
         originalAsset: PHAsset,
         mediaType: PHAssetMediaType,
-        proxyFileURL: URL
+        proxyFileURL: URL,
+        masterHash: String? = nil
     ) async throws -> String {
-        try await withCheckedThrowingContinuation { continuation in
-            saveCompressedProxyToPhotos(
-                originalAsset: originalAsset,
-                mediaType: mediaType,
-                proxyFileURL: proxyFileURL
-            ) { result in
-                continuation.resume(with: result)
+        await Self.galleryWriteSemaphore.acquire()
+        do {
+            if let masterHash, !masterHash.isEmpty {
+                let tracker = LocalProxyTracker.shared
+                if let existingId = tracker.liveProxyAssetId(forMasterHash: masterHash) {
+                    await Self.galleryWriteSemaphore.release()
+                    return existingId
+                }
+                let prefix = ProxyGenerator.proxyPrefixTag(forMasterHash: masterHash)
+                if !prefix.isEmpty, let existingPrefixId = Self.scanExistingProxyPrefixesInPhotos()[prefix] {
+                    tracker.markMasterHandledForPhotos(masterHash)
+                    await Self.galleryWriteSemaphore.release()
+                    return existingPrefixId
+                }
             }
+            let createdId: String = try await withCheckedThrowingContinuation { continuation in
+                saveCompressedProxyToPhotos(
+                    originalAsset: originalAsset,
+                    mediaType: mediaType,
+                    proxyFileURL: proxyFileURL
+                ) { result in
+                    continuation.resume(with: result)
+                }
+            }
+            await Self.galleryWriteSemaphore.release()
+            return createdId
+        } catch {
+            await Self.galleryWriteSemaphore.release()
+            throw error
         }
     }
 
@@ -897,7 +1030,27 @@ final class PhotoLibraryService {
         imageData: Data? = nil,
         videoURL: URL? = nil
     ) async throws -> String {
-        // Strict duplicate guard: never insert a second copy into Apple Photos if ANY live copy
+        await Self.galleryWriteSemaphore.acquire()
+        do {
+            let resultId = try await saveServerProxyToPhotosLocked(
+                photo: photo,
+                imageData: imageData,
+                videoURL: videoURL
+            )
+            await Self.galleryWriteSemaphore.release()
+            return resultId
+        } catch {
+            await Self.galleryWriteSemaphore.release()
+            throw error
+        }
+    }
+
+    private static func saveServerProxyToPhotosLocked(
+        photo: ServerPhoto,
+        imageData: Data? = nil,
+        videoURL: URL? = nil
+    ) async throws -> String {
+        // Strict serialized duplicate guard: never insert a second copy into Apple Photos if ANY live copy
         // (restored original, uploaded original, synced proxy, or matching original) already exists.
         let tracker = LocalProxyTracker.shared
         if let existingAsset = tracker.liveGalleryAsset(forMasterHash: photo.hash) {
@@ -936,6 +1089,7 @@ final class PhotoLibraryService {
         }
 
         let resolvedFileURL = tempTaggedURL
+        let taggedFilename = "\(ProxyGenerator.proxyFilenamePrefix)\(prefixTag.isEmpty ? String(photo.hash.prefix(12)) : prefixTag).jpg"
 
         return try await withCheckedThrowingContinuation { continuation in
             var createdLocalId: String?
@@ -947,13 +1101,12 @@ final class PhotoLibraryService {
                           let fileReq = PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: targetImageURL) {
                     createRequest = fileReq
                 } else if let imageData {
-                    if let img = UIImage(data: imageData) {
-                        createRequest = PHAssetChangeRequest.creationRequestForAsset(from: img)
-                    } else {
-                        let req = PHAssetCreationRequest.forAsset()
-                        req.addResource(with: .photo, data: imageData, options: nil)
-                        createRequest = req
-                    }
+                    // Always preserve PHOTOHUB_PROXY_<prefix16> originalFilename so proxies are never mistaken for new originals.
+                    let req = PHAssetCreationRequest.forAsset()
+                    let opts = PHAssetResourceCreationOptions()
+                    opts.originalFilename = taggedFilename
+                    req.addResource(with: .photo, data: imageData, options: opts)
+                    createRequest = req
                 } else {
                     createRequest = nil
                 }
@@ -1029,20 +1182,44 @@ final class PhotoLibraryService {
     }
 
     /// Downloads the master original for `photo`, saves it into Apple Photos (optionally throttled
-    /// via `photoWriteSemaphore` for batch jobs), marks it restored locally, and protects it on the server.
+    /// via `photoWriteSemaphore` or ordered chronologically via `commitGate` for batch jobs),
+    /// marks it restored locally, and protects it on the server.
     static func restoreMasterToPhotos(
         photo: ServerPhoto,
         client: PhotoHubAPIClient,
-        photoWriteSemaphore: AsyncSemaphore? = nil
+        photoWriteSemaphore: AsyncSemaphore? = nil,
+        commitGate: OrderedCommitGate? = nil,
+        commitIndex: Int? = nil
     ) async throws -> (updatedPhoto: ServerPhoto?, savedBytes: Int64) {
+        func releaseCommitTurnIfNeeded() async {
+            if let commitGate, let commitIndex {
+                await commitGate.completeTurn(commitIndex)
+            }
+        }
+
+        // Strict duplicate guard: if the full-resolution original ALREADY exists in Apple Photos,
+        // link and protect it immediately without downloading or writing a second duplicate copy.
+        if let existingOriginalId = findExistingLiveOriginalAssetId(for: photo) {
+            await releaseCommitTurnIfNeeded()
+            LocalProxyTracker.shared.markRestoredOriginal(assetId: existingOriginalId, masterHash: photo.hash)
+            let updated = try? await client.setOriginalProtected(masterHash: photo.hash, protected: true)
+            return (updated, max(0, photo.size))
+        }
+
         await client.warmConnectionIfNeeded()
-        let tempURL = try await OriginalDownloadCache.shared.getOrFetchShareCopy(
-            hash: photo.hash,
-            preferredFilename: photo.originalName,
-            expectedSizeBytes: photo.size > 0 ? photo.size : nil,
-            isVideo: photo.isVideo,
-            client: client
-        )
+        let tempURL: URL
+        do {
+            tempURL = try await OriginalDownloadCache.shared.getOrFetchShareCopy(
+                hash: photo.hash,
+                preferredFilename: photo.originalName,
+                expectedSizeBytes: photo.size > 0 ? photo.size : nil,
+                isVideo: photo.isVideo,
+                client: client
+            )
+        } catch {
+            await releaseCommitTurnIfNeeded()
+            throw error
+        }
         defer {
             let parent = tempURL.deletingLastPathComponent()
             if parent.lastPathComponent.hasPrefix("photohub_share_") {
@@ -1054,6 +1231,14 @@ final class PhotoLibraryService {
 
         let fileSize = (try? tempURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { Int64($0) } ?? photo.size
         let wasAlreadyRestored = LocalProxyTracker.shared.isRestoredMasterHash(photo.hash)
+
+        if let commitGate, let commitIndex {
+            let canCommit = await commitGate.waitForTurn(commitIndex)
+            if !canCommit {
+                await releaseCommitTurnIfNeeded()
+                throw CancellationError()
+            }
+        }
 
         // Pause background auto-upload observer and pre-mark the master hash BEFORE writing to Photos
         // so there is zero race window where the newly saved original could be scanned for re-upload.
@@ -1069,10 +1254,12 @@ final class PhotoLibraryService {
             if let sem = photoWriteSemaphore {
                 await sem.release()
             }
+            await releaseCommitTurnIfNeeded()
         } catch {
             if let sem = photoWriteSemaphore {
                 await sem.release()
             }
+            await releaseCommitTurnIfNeeded()
             if !wasAlreadyRestored {
                 LocalProxyTracker.shared.clearRestoredProtection(masterHash: photo.hash)
             }
@@ -1184,6 +1371,7 @@ struct ResolvedOriginalDownload: Identifiable, Sendable {
     let originalName: String
     let sizeBytes: Int64
     let isVideo: Bool
+    let creationDate: Date?
 }
 
 private enum BatchOriginalFetchItemOutcome: Sendable {
@@ -2019,6 +2207,11 @@ enum OriginalMediaResolver {
             let ext = tempMasterURL.pathExtension.lowercased()
             let isVid = input.isVideo || ["mp4", "mov", "m4v", "3gp", "avi"].contains(ext)
 
+            let matchedPhoto = cachedPhotos.first(where: {
+                $0.hash.caseInsensitiveCompare(resolved.masterHash) == .orderedSame
+            })
+            let resolvedCreationDate = matchedPhoto?.parsedCreationDate ?? input.creationDateHint
+
             return .resolved(
                 index: work.index,
                 download: ResolvedOriginalDownload(
@@ -2026,7 +2219,8 @@ enum OriginalMediaResolver {
                     fileURL: tempMasterURL,
                     originalName: finalName,
                     sizeBytes: bytes,
-                    isVideo: isVid
+                    isVideo: isVid,
+                    creationDate: resolvedCreationDate
                 )
             )
         } catch APIClientError.httpError(401, _) {

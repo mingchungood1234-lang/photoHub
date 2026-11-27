@@ -204,7 +204,9 @@ final class LocalProxySyncManager: ObservableObject {
             if !existingOriginalsMap.isEmpty {
                 let matchKeys = PhotoLibraryService.originalMatchKeys(
                     filename: photo.originalName,
-                    creationDate: photo.parsedCreationDate
+                    creationDate: photo.parsedCreationDate,
+                    sizeBytes: photo.size > 0 ? photo.size : nil,
+                    isVideo: photo.isVideo
                 )
                 for key in matchKeys {
                     if let foundId = existingOriginalsMap[key] {
@@ -215,9 +217,12 @@ final class LocalProxySyncManager: ObservableObject {
                 }
             }
 
+            let isActiveUpload = AssetUploadCoordinator.shared.isMasterHashActive(photo.hash)
+                || BackgroundUploadTransport.shared.activeMasterHashes().contains(photo.hash.lowercased())
             let hasLiveNativeGalleryAsset = tracker.hasAnyLiveGalleryAsset(forMasterHash: photo.hash)
                 || iCloudSyncedProxyAssetId != nil
                 || matchedOriginalAssetId != nil
+                || isActiveUpload
 
             let isRestoredProtected = (photo.keepOriginalOnDevice == true)
                 || tracker.isRestoredMasterHash(photo.hash)
@@ -280,6 +285,14 @@ final class LocalProxySyncManager: ObservableObject {
         }
 
         let photosTargetsCount = workItems.filter { $0.saveToPhotosApp }.count
+        if photosTargetsCount > 1 {
+            // Insert oldest photos into Apple Photos first and newest photos LAST so
+            // Apple Photos "Recents" and third-party share pickers (WhatsApp, Instagram, etc.)
+            // show the newest photo first — matching the native Library timeline.
+            workItems.sort {
+                PhotoChronologicalOrder.areServerPhotosOldestFirst($0.photo, $1.photo)
+            }
+        }
         await MainActor.run {
             self.isSyncing = true
             self.completedCount = 0
@@ -290,14 +303,17 @@ final class LocalProxySyncManager: ObservableObject {
                 : "Auto-downloading local proxies (0/\(workItems.count))..."
         }
 
-        let queue = AsyncWorkQueue(workItems)
-        let photosSemaphore = AsyncSemaphore(value: 1)
+        let indexedWork = workItems.enumerated().map { (index: $0.offset, item: $0.element) }
+        let queue = AsyncWorkQueue(indexedWork)
+        let commitGate = photosTargetsCount > 0 ? OrderedCommitGate() : nil
         let workerCount = min(4, workItems.count)
 
         await withTaskGroup(of: Void.self) { group in
             for _ in 0..<workerCount {
                 group.addTask { [weak self] in
-                    while !Task.isCancelled, let item = await queue.next() {
+                    while !Task.isCancelled, let work = await queue.next() {
+                        let workIndex = work.index
+                        let item = work.item
                         let photo = item.photo
 
                         var imageData = LocalProxyStore.shared.previewData(forHash: photo.hash)
@@ -333,18 +349,29 @@ final class LocalProxySyncManager: ObservableObject {
 
                         var savedPhotoNow = false
                         if item.saveToPhotosApp {
-                            await photosSemaphore.acquire()
-                            do {
-                                _ = try await PhotoLibraryService.saveServerProxyToPhotosAsync(
-                                    photo: photo,
-                                    imageData: imageData,
-                                    videoURL: videoURL
-                                )
-                                await photosSemaphore.release()
-                                savedPhotoNow = true
-                            } catch {
-                                await photosSemaphore.release()
+                            let canCommit: Bool
+                            if let commitGate {
+                                canCommit = await commitGate.waitForTurn(workIndex)
+                            } else {
+                                canCommit = true
                             }
+                            if canCommit {
+                                do {
+                                    _ = try await PhotoLibraryService.saveServerProxyToPhotosAsync(
+                                        photo: photo,
+                                        imageData: imageData,
+                                        videoURL: videoURL
+                                    )
+                                    savedPhotoNow = true
+                                } catch {
+                                    // Continue remaining items
+                                }
+                            }
+                            if let commitGate {
+                                await commitGate.completeTurn(workIndex)
+                            }
+                        } else if let commitGate {
+                            await commitGate.completeTurn(workIndex)
                         }
 
                         await MainActor.run {
@@ -362,6 +389,9 @@ final class LocalProxySyncManager: ObservableObject {
                                 NotificationCenter.default.post(name: .localProxyStoreDidChange, object: nil)
                             }
                         }
+                    }
+                    if Task.isCancelled, let commitGate {
+                        await commitGate.cancelAll()
                     }
                 }
             }
@@ -554,9 +584,14 @@ enum BatchRestoreRunner {
         ) -> Void
     ) async -> Summary {
         await MainActor.run { BackgroundBackupManager.shared.beginRestorePause() }
-        let queue = AsyncWorkQueue(targets)
+        // Insert restored originals chronologically (oldest first, newest LAST) so Apple Photos
+        // "Recents" and share sheets show the newest photo first — matching the native Library tab.
+        let orderedTargets = PhotoChronologicalOrder.sortServerPhotosOldestFirst(targets)
+        let indexedTargets = orderedTargets.enumerated().map { (index: $0.offset, photo: $0.element) }
+        let queue = AsyncWorkQueue(indexedTargets)
         let photosWriteSemaphore = AsyncSemaphore(value: 1)
-        let workerCount = min(3, targets.count)
+        let commitGate = OrderedCommitGate()
+        let workerCount = min(3, orderedTargets.count)
 
         var succeeded = 0
         var failed = 0
@@ -570,7 +605,8 @@ enum BatchRestoreRunner {
                     await processNextItem(
                         queue: queue,
                         client: client,
-                        photoWriteSemaphore: photosWriteSemaphore
+                        photoWriteSemaphore: photosWriteSemaphore,
+                        commitGate: commitGate
                     )
                 }
             }
@@ -587,22 +623,25 @@ enum BatchRestoreRunner {
                     failed += 1
                 case .lowStorage:
                     hitLowStorage = true
+                    await commitGate.cancelAll()
                     group.cancelAll()
                 }
                 completed += 1
-                await onProgress(completed, targets.count, outcome.displayName, updatedPhoto)
+                await onProgress(completed, orderedTargets.count, outcome.displayName, updatedPhoto)
 
                 if !Task.isCancelled && !hitLowStorage {
                     group.addTask {
                         await processNextItem(
                             queue: queue,
                             client: client,
-                            photoWriteSemaphore: photosWriteSemaphore
+                            photoWriteSemaphore: photosWriteSemaphore,
+                            commitGate: commitGate
                         )
                     }
                 }
             }
         }
+        await commitGate.cancelAll()
 
         let cancelled = Task.isCancelled
         var deletedProxyCount = 0
@@ -655,16 +694,19 @@ enum BatchRestoreRunner {
     }
 
     private static func processNextItem(
-        queue: AsyncWorkQueue<ServerPhoto>,
+        queue: AsyncWorkQueue<(index: Int, photo: ServerPhoto)>,
         client: PhotoHubAPIClient,
-        photoWriteSemaphore: AsyncSemaphore
+        photoWriteSemaphore: AsyncSemaphore,
+        commitGate: OrderedCommitGate
     ) async -> BatchRestoreOutcome? {
-        guard !Task.isCancelled, let item = await queue.next() else {
+        guard !Task.isCancelled, let work = await queue.next() else {
             return nil
         }
+        let item = work.photo
         if let freeBytes = DeviceStorageHelper.availableBytes() {
             let needed = max(Int64(250 * 1024 * 1024), max(0, item.size) + 150 * 1024 * 1024)
             if freeBytes < needed {
+                await commitGate.completeTurn(work.index)
                 return .lowStorage(item.originalName)
             }
         }
@@ -672,10 +714,13 @@ enum BatchRestoreRunner {
             let (updated, _) = try await PhotoLibraryService.restoreMasterToPhotos(
                 photo: item,
                 client: client,
-                photoWriteSemaphore: photoWriteSemaphore
+                photoWriteSemaphore: photoWriteSemaphore,
+                commitGate: commitGate,
+                commitIndex: work.index
             )
             return .restored(updated, item.hash, item.originalName)
         } catch {
+            await commitGate.completeTurn(work.index)
             return .failed(item.originalName)
         }
     }

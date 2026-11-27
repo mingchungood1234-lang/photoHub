@@ -23,6 +23,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -47,6 +49,8 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
     var showFormatMenu by remember { mutableStateOf(false) }
     var showResMenu by remember { mutableStateOf(false) }
     var showDetailMenu by remember { mutableStateOf(false) }
+    var showDiagnostics by remember { mutableStateOf(false) }
+    var showOnboardingReplay by remember { mutableStateOf(false) }
     var pendingRestoreIncludeProtected by remember { mutableStateOf<Boolean?>(null) }
 
     val testTrashLauncher = rememberLauncherForActivityResult(
@@ -118,6 +122,26 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
         }
     }
 
+    if (showOnboardingReplay) {
+        Dialog(
+            onDismissRequest = { showOnboardingReplay = false },
+            properties = DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            OnboardingScreen(
+                initialMode = settingsState.backupStorageMode,
+                isReplay = true,
+                onComplete = { chosenMode ->
+                    viewModel.settings.completeOnboarding(chosenMode)
+                    if (chosenMode == BackupStorageMode.BACKUP_ONLY) {
+                        viewModel.bgManager.clearAllStagedItems()
+                    }
+                    showOnboardingReplay = false
+                },
+                onDismissReplay = { showOnboardingReplay = false }
+            )
+        }
+    }
+
     uiState.restoreOriginalsConfirmRequest?.let { req ->
         BatchRestoreConfirmDialog(
             request = req,
@@ -175,20 +199,12 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
                                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
+                                val isOnline = uiState.connectionStatus?.startsWith("Offline") != true
                                 WarmStatChip(
-                                    text = settingsState.assignedNodeId,
-                                    tint = PhotoHubMint,
-                                    icon = Icons.Rounded.Dns
+                                    text = if (isOnline) "Online · Synced" else "Offline",
+                                    tint = if (isOnline) PhotoHubMint else PhotoHubRed,
+                                    icon = if (isOnline) Icons.Rounded.CloudDone else Icons.Rounded.CloudOff
                                 )
-                                uiState.connectionStatus?.let { status ->
-                                    val ok = status.startsWith("Connected")
-                                    Text(
-                                        text = if (ok) "Online" else "Offline",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = if (ok) PhotoHubMint else PhotoHubRed,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                }
                             }
                         }
                     }
@@ -305,6 +321,55 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
                 }
             }
 
+            // 2b. Backup Mode Card (Optimize Storage vs Backup Only + Replay Tutorial)
+            item {
+                SectionBlock(title = "Backup Mode", icon = Icons.Rounded.VerifiedUser) {
+                    SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                        SegmentedButton(
+                            selected = !settingsState.isBackupOnlyMode,
+                            onClick = { viewModel.setBackupStorageMode(BackupStorageMode.OPTIMIZE_STORAGE) },
+                            shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2)
+                        ) {
+                            Text("Optimize Storage", style = MaterialTheme.typography.labelMedium, maxLines = 1)
+                        }
+                        SegmentedButton(
+                            selected = settingsState.isBackupOnlyMode,
+                            onClick = { viewModel.setBackupStorageMode(BackupStorageMode.BACKUP_ONLY) },
+                            shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2)
+                        ) {
+                            Text("Backup Only", style = MaterialTheme.typography.labelMedium, maxLines = 1)
+                        }
+                    }
+
+                    Row(
+                        verticalAlignment = Alignment.Top,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(
+                            imageVector = if (settingsState.isBackupOnlyMode) Icons.Rounded.Lock else Icons.Rounded.AutoAwesome,
+                            contentDescription = null,
+                            tint = if (settingsState.isBackupOnlyMode) PhotoHubMint else PhotoHubOrange,
+                            modifier = Modifier
+                                .padding(top = 2.dp)
+                                .size(16.dp)
+                        )
+                        Text(
+                            text = settingsState.backupStorageMode.subtitle,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+
+                    SoftOrangeButton(
+                        text = "Replay Welcome Tutorial",
+                        icon = Icons.Rounded.PlayCircle,
+                        onClick = { showOnboardingReplay = true },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            }
+
             // 3. Auto Backup Card
             item {
                 SectionBlock(title = "Auto Backup", icon = Icons.Rounded.CloudUpload) {
@@ -313,29 +378,46 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
                         viewModel.bgManager.scheduleBackgroundWorkersIfEnabled()
                         if (enabled) viewModel.bgManager.triggerSilentAutoUpload(isMovingToBackground = false)
                     }
-                    SwitchRow("Silent Delete", settingsState.silentAutoDeleteOriginals) { enabled ->
-                        viewModel.setSilentAutoDeleteOriginals(enabled)
-                        if (enabled && !uiState.hasAllFilesAccess) {
-                            openAllFilesAccessSettings(context)
-                        }
-                    }
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text("All Files Access", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-                            WarmStatChip(
-                                text = if (uiState.hasAllFilesAccess) "Allowed" else "Needed",
-                                tint = if (uiState.hasAllFilesAccess) PhotoHubMint else PhotoHubAmber
-                            )
-                            TextButton(onClick = { openAllFilesAccessSettings(context) }) {
-                                Text(if (uiState.hasAllFilesAccess) "Manage" else "Grant")
+                    if (!settingsState.isBackupOnlyMode) {
+                        SwitchRow("Silent Delete", settingsState.silentAutoDeleteOriginals) { enabled ->
+                            viewModel.setSilentAutoDeleteOriginals(enabled)
+                            if (enabled && !uiState.hasAllFilesAccess) {
+                                openAllFilesAccessSettings(context)
                             }
                         }
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("All Files Access", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                                WarmStatChip(
+                                    text = if (uiState.hasAllFilesAccess) "Allowed" else "Needed",
+                                    tint = if (uiState.hasAllFilesAccess) PhotoHubMint else PhotoHubAmber
+                                )
+                                TextButton(onClick = { openAllFilesAccessSettings(context) }) {
+                                    Text(if (uiState.hasAllFilesAccess) "Manage" else "Grant")
+                                }
+                            }
+                        }
+                        SwitchRow("Delete Alerts", settingsState.notifyWhenBackgroundUploadFinishes) {
+                            viewModel.settings.setNotifyWhenBackgroundUploadFinishes(it)
+                        }
+                    } else {
+                        WarmStatChip(
+                            text = "Originals stay untouched on phone",
+                            tint = PhotoHubMint,
+                            icon = Icons.Rounded.VerifiedUser
+                        )
                     }
-                    SwitchRow("Delete Alerts", settingsState.notifyWhenBackgroundUploadFinishes) {
-                        viewModel.settings.setNotifyWhenBackgroundUploadFinishes(it)
+                    SwitchRow(
+                        label = "Wi-Fi Only",
+                        checked = settingsState.wifiOnlyBackup,
+                        enabled = settingsState.nightlyAutoBackupEnabled
+                    ) {
+                        viewModel.settings.setWifiOnlyBackup(it)
+                        viewModel.bgManager.scheduleBackgroundWorkersIfEnabled()
+                        viewModel.bgManager.scheduleMediaContentTriggerIfEnabled(replaceExisting = true)
                     }
                     SwitchRow(
                         label = "Charger Only",
@@ -346,45 +428,47 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
                         viewModel.bgManager.scheduleBackgroundWorkersIfEnabled()
                     }
 
-                    Box {
+                    if (!settingsState.isBackupOnlyMode) {
+                        Box {
+                            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Text("Reminder", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                                TextButton(
+                                    onClick = { showHourMenu = true },
+                                    enabled = settingsState.nightlyAutoBackupEnabled
+                                ) {
+                                    Text("${settingsState.morningReminderHour}:00 AM", fontWeight = FontWeight.SemiBold)
+                                }
+                            }
+                            DropdownMenu(expanded = showHourMenu, onDismissRequest = { showHourMenu = false }) {
+                                (6..11).forEach { hr ->
+                                    DropdownMenuItem(
+                                        text = { Text("$hr:00 AM") },
+                                        onClick = {
+                                            viewModel.settings.setMorningReminderHour(hr)
+                                            showHourMenu = false
+                                        }
+                                    )
+                                }
+                            }
+                        }
+
                         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                            Text("Reminder", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-                            TextButton(
-                                onClick = { showHourMenu = true },
-                                enabled = settingsState.nightlyAutoBackupEnabled
-                            ) {
-                                Text("${settingsState.morningReminderHour}:00 AM", fontWeight = FontWeight.SemiBold)
-                            }
+                            Text("Alerts", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                            val allowed = bgState.notificationPermissionLabel == "Allowed"
+                            WarmStatChip(
+                                text = if (allowed) "Allowed" else "Off",
+                                tint = if (allowed) PhotoHubMint else PhotoHubAmber
+                            )
                         }
-                        DropdownMenu(expanded = showHourMenu, onDismissRequest = { showHourMenu = false }) {
-                            (6..11).forEach { hr ->
-                                DropdownMenuItem(
-                                    text = { Text("$hr:00 AM") },
-                                    onClick = {
-                                        viewModel.settings.setMorningReminderHour(hr)
-                                        showHourMenu = false
-                                    }
-                                )
-                            }
+
+                        if (bgState.stagedItems.isNotEmpty()) {
+                            val sz = Formatter.formatFileSize(context, bgState.stagedSavedBytes)
+                            WarmStatChip(
+                                text = "${bgState.stagedItems.size} ready · ~$sz",
+                                tint = PhotoHubOrange,
+                                icon = Icons.Rounded.DeleteOutline
+                            )
                         }
-                    }
-
-                    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Text("Alerts", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-                        val allowed = bgState.notificationPermissionLabel == "Allowed"
-                        WarmStatChip(
-                            text = if (allowed) "Allowed" else "Off",
-                            tint = if (allowed) PhotoHubMint else PhotoHubAmber
-                        )
-                    }
-
-                    if (bgState.stagedItems.isNotEmpty()) {
-                        val sz = Formatter.formatFileSize(context, bgState.stagedSavedBytes)
-                        WarmStatChip(
-                            text = "${bgState.stagedItems.size} ready · ~$sz",
-                            tint = PhotoHubOrange,
-                            icon = Icons.Rounded.DeleteOutline
-                        )
                     }
 
                     if (bgState.lastRunSummary.isNotBlank()) {
@@ -394,13 +478,6 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
-
-                    SoftOrangeButton(
-                        text = "Test Alert (5s)",
-                        icon = Icons.Rounded.NotificationsActive,
-                        onClick = { viewModel.bgManager.sendTestMorningAlert() },
-                        modifier = Modifier.fillMaxWidth()
-                    )
                 }
             }
 
@@ -410,8 +487,10 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
                     SwitchRow("Auto Scan", settingsState.autoCompressOnOpen) {
                         viewModel.settings.setAutoCompressOnOpen(it)
                     }
-                    SwitchRow("Keep Proxy", settingsState.keepLocalProxyInPhotos) {
-                        viewModel.settings.setKeepLocalProxyInPhotos(it)
+                    if (!settingsState.isBackupOnlyMode) {
+                        SwitchRow("Keep Proxy", settingsState.keepLocalProxyInPhotos) {
+                            viewModel.settings.setKeepLocalProxyInPhotos(it)
+                        }
                     }
 
                     Box {
@@ -638,7 +717,7 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
                 }
             }
 
-            // 7. Photos Access Card
+            // 7. Photos Access & Collapsible Advanced Diagnostics Card
             item {
                 SectionBlock(title = "Photos Access", icon = Icons.Rounded.PhotoLibrary) {
                     Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -649,28 +728,63 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
                         )
                     }
 
-                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-                        SoftOrangeButton(
-                            text = if (uiState.isTestingDelete) "Testing…" else "Test Trash",
-                            enabled = !uiState.isTestingDelete,
-                            onClick = { viewModel.runDeleteDiagnostic() },
-                            modifier = Modifier.weight(1f)
+                    SoftOrangeButton(
+                        text = "App Settings",
+                        icon = Icons.Rounded.Settings,
+                        onClick = {
+                            val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                                data = Uri.fromParts("package", context.packageName, null)
+                                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                            }
+                            context.startActivity(intent)
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            }
+
+            item {
+                SectionBlock(title = "Advanced & Diagnostics", icon = Icons.Rounded.Build) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "Diagnostic Tools",
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold
                         )
-                        SoftOrangeButton(
-                            text = "App Settings",
-                            onClick = {
-                                val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                                    data = Uri.fromParts("package", context.packageName, null)
-                                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
-                                }
-                                context.startActivity(intent)
-                            },
-                            modifier = Modifier.weight(1f)
-                        )
+                        TextButton(onClick = { showDiagnostics = !showDiagnostics }) {
+                            Text(if (showDiagnostics) "Hide" else "Show")
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Icon(
+                                imageVector = if (showDiagnostics) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
                     }
 
-                    uiState.deleteDiagResult?.let { msg ->
-                        Text(msg, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (showDiagnostics) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                            SoftOrangeButton(
+                                text = "Test Alert (5s)",
+                                icon = Icons.Rounded.NotificationsActive,
+                                onClick = { viewModel.bgManager.sendTestMorningAlert() },
+                                modifier = Modifier.weight(1f)
+                            )
+                            SoftOrangeButton(
+                                text = if (uiState.isTestingDelete) "Testing…" else "Test Trash",
+                                enabled = !uiState.isTestingDelete,
+                                onClick = { viewModel.runDeleteDiagnostic() },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+
+                        uiState.deleteDiagResult?.let { msg ->
+                            Text(msg, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
                     }
                 }
             }

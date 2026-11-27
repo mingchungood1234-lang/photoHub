@@ -24,6 +24,8 @@ struct SettingsView: View {
     @State private var photosAuthText: String = PhotoLibraryService.currentReadWriteAuthLabel()
     @State private var localProxyCacheBytes: Int64 = LocalProxyStore.shared.totalStorageBytes()
     @State private var copiedShortcutURLNotice: Bool = false
+    @State private var showAdvancedDiagnostics: Bool = false
+    @State private var showingOnboardingReplay: Bool = false
 
     private var detailBinding: Binding<ProxyDetailPreset> {
         Binding(
@@ -48,12 +50,14 @@ struct SettingsView: View {
                     VStack(spacing: 14) {
                         accountCard
                         storageCard
+                        backupModeCard
                         autoBackupCard
                         proxyCard
                         restoreCard
                         cacheCard
                         shareOriginalCard
-                        diagnosticsCard
+                        photosAccessCard
+                        advancedDiagnosticsCard
                     }
                     .padding(.horizontal, 16)
                     .padding(.vertical, 12)
@@ -82,6 +86,12 @@ struct SettingsView: View {
             .onChange(of: settings.nightlyRequiresCharging) { _ in
                 bgManager.scheduleNightlyBackupIfEnabled(settings: settings)
             }
+            .onChange(of: settings.wifiOnlyBackup) { _ in
+                bgManager.scheduleNightlyBackupIfEnabled(settings: settings)
+                if settings.nightlyAutoBackupEnabled {
+                    bgManager.triggerSilentAutoUpload(settings: settings, isMovingToBackground: false)
+                }
+            }
             .onChange(of: settings.notifyWhenBackgroundUploadFinishes) { enabled in
                 if enabled {
                     bgManager.requestNotificationPermissionIfNeeded()
@@ -107,6 +117,15 @@ struct SettingsView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
+            .fullScreenCover(isPresented: $showingOnboardingReplay) {
+                OnboardingView(
+                    settings: settings,
+                    isReplay: true,
+                    onDismissReplay: {
+                        showingOnboardingReplay = false
+                    }
+                )
+            }
         }
     }
 
@@ -161,12 +180,12 @@ struct SettingsView: View {
                             .lineLimit(1)
                     }
                     HStack(spacing: 6) {
-                        WarmStatPill(icon: "server.rack", text: settings.assignedNodeId, tint: PhotoHubPalette.mint)
-                        if let status = connectionStatus {
-                            Text(status.hasPrefix("Connected") ? "Online" : "Offline")
-                                .font(.caption2.weight(.bold))
-                                .foregroundColor(status.hasPrefix("Connected") ? PhotoHubPalette.mint : PhotoHubPalette.rose)
-                        }
+                        let isOffline = (connectionStatus == "Offline")
+                        WarmStatPill(
+                            icon: isOffline ? "wifi.slash" : "checkmark.circle.fill",
+                            text: isOffline ? "Offline" : "Online · Synced",
+                            tint: isOffline ? PhotoHubPalette.rose : PhotoHubPalette.mint
+                        )
                     }
                 }
                 Spacer()
@@ -274,50 +293,94 @@ struct SettingsView: View {
         }
     }
 
+    private var backupModeCard: some View {
+        card(title: "Backup Mode", icon: "checkmark.shield.fill") {
+            Picker("Backup Mode", selection: Binding(
+                get: { settings.backupStorageMode },
+                set: { settings.applyBackupStorageMode($0) }
+            )) {
+                Text("Optimize Storage").tag(BackupStorageMode.optimizeStorage)
+                Text("Backup Only").tag(BackupStorageMode.backupOnly)
+            }
+            .pickerStyle(.segmented)
+
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: settings.isBackupOnlyMode ? "lock.shield.fill" : "sparkles")
+                    .font(.caption.weight(.bold))
+                    .foregroundColor(settings.isBackupOnlyMode ? PhotoHubPalette.mint : PhotoHubPalette.orange)
+                    .padding(.top, 2)
+                Text(settings.backupStorageMode.subtitle)
+                    .font(.caption)
+                    .foregroundColor(PhotoHubPalette.muted)
+            }
+
+            Button {
+                showingOnboardingReplay = true
+            } label: {
+                Label("Replay Welcome Tutorial", systemImage: "play.circle.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(PhotoHubSoftButtonStyle())
+        }
+    }
+
     private var autoBackupCard: some View {
         card(title: "Auto Backup", icon: "icloud.and.arrow.up.fill") {
             Toggle("Background Upload", isOn: $settings.nightlyAutoBackupEnabled)
                 .tint(PhotoHubPalette.orange)
-            Toggle("Delete Alerts", isOn: $settings.notifyWhenBackgroundUploadFinishes)
-                .tint(PhotoHubPalette.orange)
+            if !settings.isBackupOnlyMode {
+                Toggle("Delete Alerts", isOn: $settings.notifyWhenBackgroundUploadFinishes)
+                    .tint(PhotoHubPalette.orange)
+            }
             Toggle("Charger Only", isOn: $settings.nightlyRequiresCharging)
                 .tint(PhotoHubPalette.orange)
                 .disabled(!settings.nightlyAutoBackupEnabled)
-
-            HStack {
-                Text("Reminder")
-                    .font(.subheadline)
-                    .foregroundColor(PhotoHubPalette.ink)
-                Spacer()
-                Picker("Reminder", selection: $settings.morningReminderHour) {
-                    ForEach(6...11, id: \.self) { hr in
-                        Text("\(hr):00 AM").tag(hr)
-                    }
-                }
-                .labelsHidden()
+            Toggle("Wi-Fi Only", isOn: $settings.wifiOnlyBackup)
                 .tint(PhotoHubPalette.orange)
                 .disabled(!settings.nightlyAutoBackupEnabled)
-            }
 
-            HStack {
-                Text("Alerts")
-                    .font(.subheadline)
-                    .foregroundColor(PhotoHubPalette.ink)
-                Spacer()
-                let allowed = bgManager.notificationPermissionLabel == "Allowed"
-                WarmStatPill(
-                    icon: allowed ? "bell.fill" : "bell.slash",
-                    text: allowed ? "Allowed" : "Off",
-                    tint: allowed ? PhotoHubPalette.mint : PhotoHubPalette.warmAmber
-                )
-            }
+            if !settings.isBackupOnlyMode {
+                HStack {
+                    Text("Reminder")
+                        .font(.subheadline)
+                        .foregroundColor(PhotoHubPalette.ink)
+                    Spacer()
+                    Picker("Reminder", selection: $settings.morningReminderHour) {
+                        ForEach(6...11, id: \.self) { hr in
+                            Text("\(hr):00 AM").tag(hr)
+                        }
+                    }
+                    .labelsHidden()
+                    .tint(PhotoHubPalette.orange)
+                    .disabled(!settings.nightlyAutoBackupEnabled)
+                }
 
-            if !bgManager.stagedItems.isEmpty {
-                let bytesStr = formatBytes(bgManager.stagedSavedBytes)
+                HStack {
+                    Text("Alerts")
+                        .font(.subheadline)
+                        .foregroundColor(PhotoHubPalette.ink)
+                    Spacer()
+                    let allowed = bgManager.notificationPermissionLabel == "Allowed"
+                    WarmStatPill(
+                        icon: allowed ? "bell.fill" : "bell.slash",
+                        text: allowed ? "Allowed" : "Off",
+                        tint: allowed ? PhotoHubPalette.mint : PhotoHubPalette.warmAmber
+                    )
+                }
+
+                if !bgManager.stagedItems.isEmpty {
+                    let bytesStr = formatBytes(bgManager.stagedSavedBytes)
+                    WarmStatPill(
+                        icon: "trash",
+                        text: "\(bgManager.stagedItems.count) ready · ~\(bytesStr)",
+                        tint: PhotoHubPalette.orange
+                    )
+                }
+            } else {
                 WarmStatPill(
-                    icon: "trash",
-                    text: "\(bgManager.stagedItems.count) ready · ~\(bytesStr)",
-                    tint: PhotoHubPalette.orange
+                    icon: "checkmark.shield.fill",
+                    text: "Originals stay untouched on iPhone",
+                    tint: PhotoHubPalette.mint
                 )
             }
 
@@ -326,14 +389,6 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundColor(PhotoHubPalette.muted)
             }
-
-            Button {
-                bgManager.sendTestMorningAlert(settings: settings)
-            } label: {
-                Label("Test Alert (5s)", systemImage: "bell.badge")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(PhotoHubSoftButtonStyle())
         }
     }
 
@@ -341,8 +396,10 @@ struct SettingsView: View {
         card(title: "Proxy", icon: "sparkles") {
             Toggle("Auto Scan", isOn: $settings.autoCompressOnOpen)
                 .tint(PhotoHubPalette.orange)
-            Toggle("Keep Proxy", isOn: $settings.keepLocalProxyInPhotos)
-                .tint(PhotoHubPalette.orange)
+            if !settings.isBackupOnlyMode {
+                Toggle("Keep Proxy", isOn: $settings.keepLocalProxyInPhotos)
+                    .tint(PhotoHubPalette.orange)
+            }
 
             pickerRow("Format") {
                 Picker("Format", selection: $settings.proxyFormatRaw) {
@@ -574,7 +631,7 @@ struct SettingsView: View {
         }
     }
 
-    private var diagnosticsCard: some View {
+    private var photosAccessCard: some View {
         card(title: "Photos Access", icon: "photo.fill") {
             HStack {
                 Text("Permission")
@@ -588,36 +645,72 @@ struct SettingsView: View {
                 )
             }
 
-            HStack(spacing: 10) {
-                Button {
-                    runDeleteDiagnostic()
-                } label: {
-                    HStack(spacing: 6) {
-                        if isTestingDelete { ProgressView().tint(PhotoHubPalette.deepOrange) }
-                        Text("Test Delete")
-                    }
+            Button {
+                if let url = URL(string: UIApplication.openSettingsURLString) {
+                    UIApplication.shared.open(url)
+                }
+            } label: {
+                Label("Open iOS Settings", systemImage: "gearshape")
                     .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(PhotoHubSoftButtonStyle())
-                .disabled(isTestingDelete)
-
-                Button {
-                    if let url = URL(string: UIApplication.openSettingsURLString) {
-                        UIApplication.shared.open(url)
-                    }
-                } label: {
-                    Text("iOS Settings")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(PhotoHubSoftButtonStyle())
             }
-
-            if let deleteDiagResult {
-                Text(deleteDiagResult)
-                    .font(.caption)
-                    .foregroundColor(PhotoHubPalette.muted)
-            }
+            .buttonStyle(PhotoHubSoftButtonStyle())
         }
+    }
+
+    private var advancedDiagnosticsCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            DisclosureGroup(isExpanded: $showAdvancedDiagnostics) {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 10) {
+                        Button {
+                            bgManager.sendTestMorningAlert(settings: settings)
+                        } label: {
+                            Label("Test Alert (5s)", systemImage: "bell.badge")
+                                .font(.caption.weight(.bold))
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(PhotoHubSoftButtonStyle())
+
+                        Button {
+                            runDeleteDiagnostic()
+                        } label: {
+                            HStack(spacing: 6) {
+                                if isTestingDelete { ProgressView().tint(PhotoHubPalette.deepOrange) }
+                                Text("Test Delete")
+                                    .font(.caption.weight(.bold))
+                            }
+                            .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(PhotoHubSoftButtonStyle())
+                        .disabled(isTestingDelete)
+                    }
+
+                    if let deleteDiagResult {
+                        Text(deleteDiagResult)
+                            .font(.caption)
+                            .foregroundColor(PhotoHubPalette.muted)
+                    }
+                }
+                .padding(.top, 10)
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "wrench.and.screwdriver.fill")
+                        .font(.caption.weight(.bold))
+                        .foregroundColor(PhotoHubPalette.muted)
+                    Text("Advanced & Diagnostics")
+                        .font(.subheadline.weight(.bold))
+                        .foregroundColor(PhotoHubPalette.ink)
+                }
+            }
+            .tint(PhotoHubPalette.orange)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(PhotoHubPalette.card, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(PhotoHubPalette.cardBorder, lineWidth: 1)
+        )
     }
 
     @ViewBuilder

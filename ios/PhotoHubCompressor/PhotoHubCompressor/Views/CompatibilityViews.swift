@@ -211,6 +211,7 @@ struct MultiPhotoPickerSheet: UIViewControllerRepresentable {
     func makeUIViewController(context: Context) -> PHPickerViewController {
         var config = PHPickerConfiguration(photoLibrary: .shared())
         config.selectionLimit = selectionLimit
+        config.selection = .ordered
         config.filter = .any(of: [.images, .videos])
         config.preferredAssetRepresentationMode = .current
         let picker = PHPickerViewController(configuration: config)
@@ -1271,14 +1272,22 @@ final class IncomingShareCoordinator: ObservableObject {
             }
 
             let client = PhotoHubAPIClient(settings: settings)
+            let orderedToSave = resolved.sorted { lhs, rhs in
+                switch (lhs.creationDate, rhs.creationDate) {
+                case let (ld?, rd?) where ld != rd: return ld < rd
+                case (.none, .some): return true
+                case (.some, .none): return false
+                default: return lhs.masterHash < rhs.masterHash
+                }
+            }
             var savedCount = 0
             var firstError: String?
-            for item in resolved {
+            for item in orderedToSave {
                 do {
                     let savedId = try await PhotoLibraryService.saveRestoredOriginalToPhotosAsync(
                         isVideo: item.isVideo,
                         originalFilename: item.originalName,
-                        creationDate: nil,
+                        creationDate: item.creationDate,
                         fileURL: item.fileURL
                     )
                     LocalProxyTracker.shared.markRestoredOriginal(

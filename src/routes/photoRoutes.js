@@ -15,17 +15,30 @@
 
 const express = require('express');
 
-function createPhotoRoutes({ photoController }) {
+function createPhotoRoutes({ photoController, shareController }) {
   const router = express.Router();
 
   router.get('/photos', photoController.listPhotos);
+  router.get('/photos/trash', photoController.listTrash);
+  router.post('/photos/trash', photoController.moveToTrash);
+  router.post('/photos/trash/restore', photoController.restoreFromTrash);
+  router.post('/photos/trash/empty', photoController.emptyTrash);
+  router.post('/photos/download-zip', photoController.downloadZip);
   router.post('/photos/delete', photoController.deletePhotosBatch);
   router.delete('/photos', photoController.deletePhotosBatch);
+
   router.get('/photo/:hash/preview', photoController.streamPreview);
   router.get('/photo/:hash/video-proxy', photoController.streamVideoProxy);
   router.post('/photo/:hash/protect-original', photoController.setProtectOriginal);
+  router.post('/photo/:hash/favorite', photoController.setFavorite);
   router.delete('/photo/:hash', photoController.deletePhoto);
   router.get('/photo/:hash', photoController.downloadMaster);
+
+  if (shareController) {
+    router.post('/shares', shareController.createShare);
+    router.get('/shares', shareController.listShares);
+    router.delete('/shares/:token', shareController.revokeShare);
+  }
 
   return router;
 }

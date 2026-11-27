@@ -173,10 +173,20 @@ data class ServerPhoto(
     val proxySize: Long?,
     val hasVideoProxy: Boolean?,
     val videoProxySize: Long?,
-    val keepOriginalOnDevice: Boolean?
+    val keepOriginalOnDevice: Boolean?,
+    val isFavorite: Boolean? = null,
+    val deletedAt: String? = null,
+    val daysRemaining: Int? = null,
+    val cameraModel: String? = null
 ) {
     val isProtectedOriginal: Boolean
         get() = keepOriginalOnDevice == true
+
+    val isFavorited: Boolean
+        get() = isFavorite == true
+
+    val isTrashed: Boolean
+        get() = !deletedAt.isNullOrBlank()
 
     val isVideo: Boolean
         get() {
@@ -208,6 +218,10 @@ data class ServerPhoto(
         if (hasVideoProxy != null) put("hasVideoProxy", hasVideoProxy)
         if (videoProxySize != null) put("videoProxySize", videoProxySize)
         if (keepOriginalOnDevice != null) put("keepOriginalOnDevice", keepOriginalOnDevice)
+        if (isFavorite != null) put("isFavorite", isFavorite)
+        if (deletedAt != null) put("deletedAt", deletedAt)
+        if (daysRemaining != null) put("daysRemaining", daysRemaining)
+        if (cameraModel != null) put("cameraModel", cameraModel)
     }
 
     companion object {
@@ -227,7 +241,11 @@ data class ServerPhoto(
             proxySize = if (obj.has("proxySize") && !obj.isNull("proxySize")) obj.optLong("proxySize") else null,
             hasVideoProxy = if (obj.has("hasVideoProxy") && !obj.isNull("hasVideoProxy")) obj.optBoolean("hasVideoProxy") else null,
             videoProxySize = if (obj.has("videoProxySize") && !obj.isNull("videoProxySize")) obj.optLong("videoProxySize") else null,
-            keepOriginalOnDevice = if (obj.has("keepOriginalOnDevice") && !obj.isNull("keepOriginalOnDevice")) obj.optBoolean("keepOriginalOnDevice") else null
+            keepOriginalOnDevice = if (obj.has("keepOriginalOnDevice") && !obj.isNull("keepOriginalOnDevice")) obj.optBoolean("keepOriginalOnDevice") else null,
+            isFavorite = if (obj.has("isFavorite") && !obj.isNull("isFavorite")) obj.optBoolean("isFavorite") else null,
+            deletedAt = obj.optString("deletedAt", "").takeIf { it.isNotBlank() && !obj.isNull("deletedAt") },
+            daysRemaining = if (obj.has("daysRemaining") && !obj.isNull("daysRemaining")) obj.optInt("daysRemaining") else null,
+            cameraModel = obj.optString("cameraModel", "").takeIf { it.isNotBlank() && !obj.isNull("cameraModel") }
         )
 
         fun listFromJsonArray(arr: JSONArray?): List<ServerPhoto> {
@@ -302,8 +320,12 @@ sealed class PhotoCompressionState {
             "Backed Up · Ready to Delete Original (Free $formatted)"
         }
         is Completed -> {
-            val formatted = Formatter.formatFileSize(context, savedBytes.coerceAtLeast(0L))
-            "Verified & Saved $formatted"
+            if (savedBytes <= 0L) {
+                "Backed Up · Original Kept"
+            } else {
+                val formatted = Formatter.formatFileSize(context, savedBytes.coerceAtLeast(0L))
+                "Verified & Saved $formatted"
+            }
         }
         is Skipped -> reason
         is Failed -> "Error: $message"
@@ -376,6 +398,21 @@ data class PhotoCandidate(
             return String.format(Locale.US, "%.1f MP (%d×%d)", mp, pixelWidth, pixelHeight)
         }
 }
+
+data class ShareLinkResult(
+    val token: String,
+    val shareUrl: String,
+    val title: String,
+    val expiresAt: String,
+    val hasPasscode: Boolean
+)
+
+data class TrashListResult(
+    val photos: List<ServerPhoto>,
+    val total: Int,
+    val trashBytes: Long,
+    val retentionDays: Int
+)
 
 data class StagedCleanupItem(
     val id: String,

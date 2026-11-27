@@ -6,7 +6,13 @@ struct LibraryView: View {
     @ObservedObject var viewModel: CompressorViewModel
     @ObservedObject private var bgManager: BackgroundBackupManager
     @AppStorage("keepLocalProxyInPhotos") private var keepLocalProxyInPhotos: Bool = true
+    @AppStorage("backupStorageMode") private var backupStorageModeRaw: String = BackupStorageMode.optimizeStorage.rawValue
     @State private var showingProxyDetectorPicker: Bool = false
+    @State private var showingCleanupPreviewSheet: Bool = false
+
+    private var isBackupOnlyMode: Bool {
+        (BackupStorageMode(rawValue: backupStorageModeRaw) ?? .optimizeStorage) == .backupOnly
+    }
 
     init(viewModel: CompressorViewModel) {
         self.viewModel = viewModel
@@ -58,7 +64,7 @@ struct LibraryView: View {
                             }
                         }
 
-                        if !bgManager.stagedItems.isEmpty && !viewModel.isProcessing && !viewModel.isAwaitingDeleteConfirmation {
+                        if !isBackupOnlyMode && !bgManager.stagedItems.isEmpty && !viewModel.isProcessing && !viewModel.isAwaitingDeleteConfirmation {
                             overnightReadyBanner
                         }
 
@@ -201,6 +207,19 @@ struct LibraryView: View {
                 if viewModel.selectedCount > 0 {
                     actionBar
                 }
+            }
+            .sheet(isPresented: $showingCleanupPreviewSheet) {
+                CleanupPreviewSheet(
+                    stagedItems: bgManager.stagedItems,
+                    totalSavedBytes: bgManager.stagedSavedBytes,
+                    onConfirmDelete: {
+                        showingCleanupPreviewSheet = false
+                        viewModel.triggerStagedOvernightCleanupPrompt()
+                    },
+                    onCancel: {
+                        showingCleanupPreviewSheet = false
+                    }
+                )
             }
             .sheet(isPresented: $showingProxyDetectorPicker) {
                 MultiPhotoPickerSheet(
@@ -410,8 +429,8 @@ struct LibraryView: View {
                     .foregroundColor(PhotoHubPalette.muted)
             }
             Spacer()
-            Button("Delete") {
-                viewModel.triggerStagedOvernightCleanupPrompt()
+            Button("Review & Free") {
+                showingCleanupPreviewSheet = true
             }
             .font(.caption.weight(.bold))
             .padding(.horizontal, 12)
@@ -506,11 +525,26 @@ struct LibraryView: View {
                 }
             }
 
-            Picker("Mode", selection: $keepLocalProxyInPhotos) {
-                Text("Keep Proxy").tag(true)
-                Text("Delete Only").tag(false)
+            if isBackupOnlyMode {
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.shield.fill")
+                        .font(.caption.weight(.bold))
+                        .foregroundColor(PhotoHubPalette.mint)
+                    Text("Backup Only · Full originals stay untouched on iPhone")
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(PhotoHubPalette.ink)
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(PhotoHubPalette.mint.opacity(0.12), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            } else {
+                Picker("Mode", selection: $keepLocalProxyInPhotos) {
+                    Text("Keep Proxy").tag(true)
+                    Text("Delete Only").tag(false)
+                }
+                .pickerStyle(.segmented)
             }
-            .pickerStyle(.segmented)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -522,11 +556,11 @@ struct LibraryView: View {
             viewModel.startProcessingSelectedPhotos()
         } label: {
             HStack(spacing: 8) {
-                Image(systemName: keepLocalProxyInPhotos ? "sparkles" : "icloud.and.arrow.up.fill")
+                Image(systemName: (!isBackupOnlyMode && keepLocalProxyInPhotos) ? "sparkles" : "icloud.and.arrow.up.fill")
                 Text(
-                    keepLocalProxyInPhotos
-                    ? "Compress \(viewModel.selectedCount)"
-                    : "Backup \(viewModel.selectedCount)"
+                    isBackupOnlyMode
+                    ? "Back Up \(viewModel.selectedCount) (Keep Originals)"
+                    : (keepLocalProxyInPhotos ? "Compress \(viewModel.selectedCount)" : "Backup \(viewModel.selectedCount)")
                 )
                 .font(.headline.weight(.bold))
             }
@@ -778,27 +812,127 @@ private struct GalleryProxyInspectionSheet: View {
     }
 }
 
+private struct CleanupPreviewSheet: View {
+    let stagedItems: [StagedCleanupItem]
+    let totalSavedBytes: Int64
+    let onConfirmDelete: () -> Void
+    let onCancel: () -> Void
+
+    private let columns = [
+        GridItem(.flexible(), spacing: 8),
+        GridItem(.flexible(), spacing: 8),
+        GridItem(.flexible(), spacing: 8),
+    ]
+
+    var body: some View {
+        let sizeStr = ByteCountFormatter.string(fromByteCount: max(0, totalSavedBytes), countStyle: .file)
+        AdaptiveNavigationStack {
+            VStack(spacing: 0) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "checkmark.seal.fill")
+                            .font(.title2)
+                            .foregroundColor(PhotoHubPalette.mint)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Free Up ~\(sizeStr)")
+                                .font(.headline.weight(.heavy))
+                                .foregroundColor(PhotoHubPalette.ink)
+                            Text("\(stagedItems.count) backed-up original\(stagedItems.count == 1 ? "" : "s") SHA-256 verified on server")
+                                .font(.caption)
+                                .foregroundColor(PhotoHubPalette.muted)
+                        }
+                        Spacer()
+                    }
+                    Text("Review the verified items below before Apple Photos asks to remove the local copies.")
+                        .font(.caption)
+                        .foregroundColor(PhotoHubPalette.muted)
+                }
+                .padding(16)
+                .background(PhotoHubPalette.card)
+
+                Divider()
+
+                ScrollView {
+                    LazyVGrid(columns: columns, spacing: 10) {
+                        ForEach(stagedItems) { item in
+                            let ext = URL(fileURLWithPath: item.filename).pathExtension.lowercased()
+                            let isVid = ["mov", "mp4", "m4v", "3gp", "avi"].contains(ext)
+                            VStack(spacing: 4) {
+                                ZStack(alignment: .topTrailing) {
+                                    PHAssetThumbView(assetId: item.id, isVideo: isVid, size: 96)
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .font(.caption)
+                                        .foregroundColor(PhotoHubPalette.mint)
+                                        .background(Color.white, in: Circle())
+                                        .padding(5)
+                                }
+                                Text(item.filename)
+                                    .font(.caption2.weight(.medium))
+                                    .foregroundColor(PhotoHubPalette.ink)
+                                    .lineLimit(1)
+                                Text(ByteCountFormatter.string(fromByteCount: max(0, item.savedBytes), countStyle: .file))
+                                    .font(.caption2.weight(.bold).monospacedDigit())
+                                    .foregroundColor(PhotoHubPalette.mint)
+                            }
+                        }
+                    }
+                    .padding(16)
+                }
+                .background(PhotoHubPalette.canvas)
+
+                VStack(spacing: 8) {
+                    Button {
+                        onConfirmDelete()
+                    } label: {
+                        Label("Free ~\(sizeStr) Now", systemImage: "trash")
+                            .font(.headline.weight(.bold))
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(PhotoHubPrimaryButtonStyle())
+
+                    Button("Keep on iPhone for Now") {
+                        onCancel()
+                    }
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundColor(PhotoHubPalette.muted)
+                    .padding(.vertical, 4)
+                }
+                .padding(16)
+                .background(PhotoHubPalette.card)
+            }
+            .navigationTitle("Ready to Free Space")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Cancel") { onCancel() }
+                }
+            }
+        }
+    }
+}
+
 private struct PHAssetThumbView: View {
     let assetId: String?
     let isVideo: Bool
+    var size: CGFloat = 48
     @State private var image: UIImage?
 
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(PhotoHubPalette.softPeach)
             if let image {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFill()
-                    .frame(width: 48, height: 48)
-                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .frame(width: size, height: size)
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             } else {
                 Image(systemName: isVideo ? "video.fill" : "photo.fill")
                     .foregroundColor(PhotoHubPalette.orange.opacity(0.7))
             }
         }
-        .frame(width: 48, height: 48)
+        .frame(width: size, height: size)
         .task(id: assetId ?? "") {
             guard image == nil, let assetId else { return }
             guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [assetId], options: nil).firstObject else {
@@ -808,9 +942,10 @@ private struct PHAssetThumbView: View {
             opts.deliveryMode = .opportunistic
             opts.resizeMode = .fast
             opts.isNetworkAccessAllowed = true
+            let px = max(120, size * 2)
             PHImageManager.default().requestImage(
                 for: asset,
-                targetSize: CGSize(width: 120, height: 120),
+                targetSize: CGSize(width: px, height: px),
                 contentMode: .aspectFill,
                 options: opts
             ) { img, _ in

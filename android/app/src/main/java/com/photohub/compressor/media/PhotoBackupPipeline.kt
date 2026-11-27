@@ -6,11 +6,82 @@ import com.photohub.compressor.data.*
 import com.photohub.compressor.network.PhotoHubApiClient
 import com.photohub.compressor.sync.LocalProxyStore
 import com.photohub.compressor.sync.LocalProxyTracker
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.time.Instant
 import java.time.format.DateTimeFormatter
+
+/**
+ * Ensures bounded concurrent workers commit assets into Android MediaStore in strict sequential
+ * index order (0, 1, 2, ...). Writing chronologically oldest-first means the newest photo is
+ * always inserted LAST (highest DATE_ADDED and _id), so third-party share pickers (WhatsApp,
+ * Telegram, Instagram, Android Photo Picker) show the newest photo first — matching Gallery.
+ */
+class OrderedCommitGate {
+    private val mutex = Mutex()
+    private var nextIndex = 0
+    private val skipped = HashSet<Int>()
+    private val waiters = HashMap<Int, CompletableDeferred<Boolean>>()
+    private var cancelled = false
+
+    suspend fun waitForTurn(index: Int): Boolean {
+        val deferred: CompletableDeferred<Boolean>? = mutex.withLock {
+            drainSkippedLocked()
+            if (cancelled || index < nextIndex) {
+                return false
+            }
+            if (index == nextIndex) {
+                return true
+            }
+            waiters.getOrPut(index) { CompletableDeferred() }
+        }
+        return try {
+            deferred?.await() ?: false
+        } catch (c: CancellationException) {
+            cancelAll()
+            throw c
+        }
+    }
+
+    suspend fun completeTurn(index: Int) {
+        withContext(NonCancellable) {
+            mutex.withLock {
+                if (index < nextIndex) return@withLock
+                if (index == nextIndex) {
+                    nextIndex++
+                } else {
+                    skipped.add(index)
+                }
+                drainSkippedLocked()
+                waiters.remove(nextIndex)?.complete(!cancelled)
+            }
+        }
+    }
+
+    suspend fun cancelAll() {
+        withContext(NonCancellable) {
+            mutex.withLock {
+                cancelled = true
+                val pending = waiters.values.toList()
+                waiters.clear()
+                pending.forEach { it.complete(false) }
+            }
+        }
+    }
+
+    private fun drainSkippedLocked() {
+        while (skipped.remove(nextIndex)) {
+            nextIndex++
+        }
+    }
+}
 
 data class BackupPipelineOutcome(
     val masterSha256: String,
@@ -64,6 +135,25 @@ object PhotoBackupPipeline {
         }
     }
 
+    private fun compareDatesAsc(lhsMs: Long?, rhsMs: Long?, lhsId: String, rhsId: String): Int {
+        return when {
+            lhsMs != null && rhsMs != null && lhsMs != rhsMs -> lhsMs.compareTo(rhsMs)
+            lhsMs == null && rhsMs != null -> -1
+            lhsMs != null && rhsMs == null -> 1
+            else -> lhsId.compareTo(rhsId)
+        }
+    }
+
+    fun sortCandidatesOldestFirst(items: List<PhotoCandidate>): List<PhotoCandidate> =
+        items.sortedWith { lhs, rhs ->
+            compareDatesAsc(lhs.creationDateMs, rhs.creationDateMs, lhs.id, rhs.id)
+        }
+
+    fun sortServerPhotosOldestFirst(items: List<ServerPhoto>): List<ServerPhoto> =
+        items.sortedWith { lhs, rhs ->
+            compareDatesAsc(lhs.parsedCreationDateMs, rhs.parsedCreationDateMs, lhs.hash, rhs.hash)
+        }
+
     suspend fun backupAndProxyAsset(
         context: Context,
         candidate: PhotoCandidate,
@@ -79,6 +169,61 @@ object PhotoBackupPipeline {
         cacheScopeKey: String,
         videoSemaphore: Semaphore,
         gallerySaveSemaphore: Semaphore,
+        commitGate: OrderedCommitGate? = null,
+        commitIndex: Int? = null,
+        onStageChange: (PhotoCompressionState) -> Unit
+    ): BackupPipelineResult {
+        var didCompleteCommitTurn = false
+        suspend fun releaseCommitTurnIfNeeded() {
+            if (!didCompleteCommitTurn && commitGate != null && commitIndex != null) {
+                didCompleteCommitTurn = true
+                commitGate.completeTurn(commitIndex)
+            }
+        }
+        try {
+            return backupAndProxyAssetInternal(
+                context = context,
+                candidate = candidate,
+                mediaService = mediaService,
+                apiClient = apiClient,
+                tracker = tracker,
+                format = format,
+                maxPixelSize = maxPixelSize,
+                quality = quality,
+                uploadMode = uploadMode,
+                keepLocalProxy = keepLocalProxy,
+                normalizedBaseUrl = normalizedBaseUrl,
+                cacheScopeKey = cacheScopeKey,
+                videoSemaphore = videoSemaphore,
+                gallerySaveSemaphore = gallerySaveSemaphore,
+                commitGate = commitGate,
+                commitIndex = commitIndex,
+                markCommitTurnCompleted = { didCompleteCommitTurn = true },
+                onStageChange = onStageChange
+            )
+        } finally {
+            releaseCommitTurnIfNeeded()
+        }
+    }
+
+    private suspend fun backupAndProxyAssetInternal(
+        context: Context,
+        candidate: PhotoCandidate,
+        mediaService: MediaLibraryService,
+        apiClient: PhotoHubApiClient,
+        tracker: LocalProxyTracker,
+        format: ProxyFormat,
+        maxPixelSize: Int,
+        quality: Float,
+        uploadMode: UploadMode,
+        keepLocalProxy: Boolean,
+        normalizedBaseUrl: String?,
+        cacheScopeKey: String,
+        videoSemaphore: Semaphore,
+        gallerySaveSemaphore: Semaphore,
+        commitGate: OrderedCommitGate?,
+        commitIndex: Int?,
+        markCommitTurnCompleted: () -> Unit,
         onStageChange: (PhotoCompressionState) -> Unit
     ): BackupPipelineResult {
         val prefixFromName = ProxyGenerator.extractMasterHashPrefix(candidate.filename)
@@ -283,22 +428,39 @@ object PhotoBackupPipeline {
 
                     if (keepLocalProxy) {
                         val existingPrefix = ProxyGenerator.proxyPrefixTag(master.sha256)
-                        val alreadyHasProxyInGallery = tracker.liveProxyAssetId(master.sha256) != null ||
-                            mediaService.scanExistingProxyPrefixesInGallery()[existingPrefix] != null
-                        if (alreadyHasProxyInGallery) {
-                            tracker.markMasterHandledForPhotos(master.sha256)
-                        } else {
-                            onStageChange(PhotoCompressionState.ReplacingInPhotos)
-                            val newAssetId = gallerySaveSemaphore.withPermit {
-                                mediaService.saveCompressedProxyToGallery(candidate, proxy.file)
+                        onStageChange(PhotoCompressionState.ReplacingInPhotos)
+                        if (commitGate != null && commitIndex != null) {
+                            val canCommit = commitGate.waitForTurn(commitIndex)
+                            if (!canCommit) {
+                                throw CancellationException("Ordered gallery commit cancelled")
                             }
-                            if (newAssetId != candidate.id) {
-                                tracker.markAsProxy(
-                                    assetId = newAssetId,
-                                    proxySha256 = proxy.sha256,
-                                    masterHash = master.sha256,
-                                    originalName = master.filename
-                                )
+                        }
+                        try {
+                            gallerySaveSemaphore.withPermit {
+                                val alreadyHasProxyInGallery = tracker.liveProxyAssetId(master.sha256) != null ||
+                                    mediaService.scanExistingProxyPrefixesInGallery()[existingPrefix] != null
+                                if (alreadyHasProxyInGallery) {
+                                    tracker.markMasterHandledForPhotos(master.sha256)
+                                } else {
+                                    val newAssetId = mediaService.saveCompressedProxyToGallery(
+                                        originalCandidate = candidate,
+                                        proxyFile = proxy.file,
+                                        masterHash = master.sha256
+                                    )
+                                    if (newAssetId != candidate.id) {
+                                        tracker.markAsProxy(
+                                            assetId = newAssetId,
+                                            proxySha256 = proxy.sha256,
+                                            masterHash = master.sha256,
+                                            originalName = master.filename
+                                        )
+                                    }
+                                }
+                            }
+                        } finally {
+                            if (commitGate != null && commitIndex != null) {
+                                markCommitTurnCompleted()
+                                commitGate.completeTurn(commitIndex)
                             }
                         }
                     } else {

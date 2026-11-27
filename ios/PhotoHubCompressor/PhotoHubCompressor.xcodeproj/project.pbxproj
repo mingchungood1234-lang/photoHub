@@ -18,6 +18,7 @@
 		AA0001090000000000000001 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0001090000000000000001 /* ContentView.swift */; };
 		AA0001100000000000000001 /* LibraryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0001100000000000000001 /* LibraryView.swift */; };
 		AA0001110000000000000001 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0001110000000000000001 /* SettingsView.swift */; };
+		AA0001140000000000000001 /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0001140000000000000001 /* OnboardingView.swift */; };
 		AA0001120000000000000001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = BB0001120000000000000001 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
@@ -34,6 +35,7 @@
 		BB0001090000000000000001 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		BB0001100000000000000001 /* LibraryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryView.swift; sourceTree = "<group>"; };
 		BB0001110000000000000001 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		BB0001140000000000000001 /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingView.swift; sourceTree = "<group>"; };
 		BB0001120000000000000001 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		BB0001130000000000000001 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -113,6 +115,7 @@
 				BB0001090000000000000001 /* ContentView.swift */,
 				BB0001100000000000000001 /* LibraryView.swift */,
 				BB0001110000000000000001 /* SettingsView.swift */,
+				BB0001140000000000000001 /* OnboardingView.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -197,6 +200,7 @@
 				AA0001090000000000000001 /* ContentView.swift in Sources */,
 				AA00011000000000000001 /* LibraryView.swift in Sources */,
 				AA0001110000000000000001 /* SettingsView.swift in Sources */,
+				AA0001140000000000000001 /* OnboardingView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -245,7 +249,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = PhotoHubCompressor/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
@@ -253,7 +257,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.photohub.compressor;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_VERSION = 5.9;
@@ -267,7 +271,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = PhotoHubCompressor/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
@@ -275,7 +279,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.photohub.compressor;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_VERSION = 5.9;

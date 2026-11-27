@@ -26,10 +26,73 @@ struct PendingBackgroundUploadJob: Codable, Sendable {
     let proxyMaxPixelSize: Int
     let proxyQuality: Double
     let keepLocalProxyInPhotos: Bool
+    let backupOnly: Bool
     let serverBaseURLString: String
     let cacheScopeKey: String
     let notifyOnComplete: Bool
     let morningHour: Int
+
+    init(
+        jobId: String,
+        assetId: String,
+        masterSha256: String,
+        masterBytes: Int64,
+        filename: String,
+        mimeType: String,
+        creationDate: Date?,
+        stagedFilePath: String,
+        isVideo: Bool,
+        proxyFormatRaw: String,
+        proxyMaxPixelSize: Int,
+        proxyQuality: Double,
+        keepLocalProxyInPhotos: Bool,
+        backupOnly: Bool = false,
+        serverBaseURLString: String,
+        cacheScopeKey: String,
+        notifyOnComplete: Bool,
+        morningHour: Int
+    ) {
+        self.jobId = jobId
+        self.assetId = assetId
+        self.masterSha256 = masterSha256
+        self.masterBytes = masterBytes
+        self.filename = filename
+        self.mimeType = mimeType
+        self.creationDate = creationDate
+        self.stagedFilePath = stagedFilePath
+        self.isVideo = isVideo
+        self.proxyFormatRaw = proxyFormatRaw
+        self.proxyMaxPixelSize = proxyMaxPixelSize
+        self.proxyQuality = proxyQuality
+        self.keepLocalProxyInPhotos = keepLocalProxyInPhotos
+        self.backupOnly = backupOnly
+        self.serverBaseURLString = serverBaseURLString
+        self.cacheScopeKey = cacheScopeKey
+        self.notifyOnComplete = notifyOnComplete
+        self.morningHour = morningHour
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        jobId = try c.decode(String.self, forKey: .jobId)
+        assetId = try c.decode(String.self, forKey: .assetId)
+        masterSha256 = try c.decode(String.self, forKey: .masterSha256)
+        masterBytes = try c.decode(Int64.self, forKey: .masterBytes)
+        filename = try c.decode(String.self, forKey: .filename)
+        mimeType = try c.decode(String.self, forKey: .mimeType)
+        creationDate = try c.decodeIfPresent(Date.self, forKey: .creationDate)
+        stagedFilePath = try c.decode(String.self, forKey: .stagedFilePath)
+        isVideo = try c.decode(Bool.self, forKey: .isVideo)
+        proxyFormatRaw = try c.decode(String.self, forKey: .proxyFormatRaw)
+        proxyMaxPixelSize = try c.decode(Int.self, forKey: .proxyMaxPixelSize)
+        proxyQuality = try c.decode(Double.self, forKey: .proxyQuality)
+        keepLocalProxyInPhotos = try c.decode(Bool.self, forKey: .keepLocalProxyInPhotos)
+        backupOnly = try c.decodeIfPresent(Bool.self, forKey: .backupOnly) ?? false
+        serverBaseURLString = try c.decode(String.self, forKey: .serverBaseURLString)
+        cacheScopeKey = try c.decode(String.self, forKey: .cacheScopeKey)
+        notifyOnComplete = try c.decode(Bool.self, forKey: .notifyOnComplete)
+        morningHour = try c.decode(Int.self, forKey: .morningHour)
+    }
 }
 
 struct BackgroundUploadConfig: Sendable {
@@ -39,9 +102,11 @@ struct BackgroundUploadConfig: Sendable {
     let proxyMaxPixelSize: Int
     let proxyQuality: Double
     let keepLocalProxyInPhotos: Bool
+    let backupOnly: Bool
     let cacheScopeKey: String
     let notifyOnComplete: Bool
     let morningHour: Int
+    let wifiOnlyBackup: Bool
 
     @MainActor
     init?(settings: AppSettings) {
@@ -49,15 +114,18 @@ struct BackgroundUploadConfig: Sendable {
         guard !token.isEmpty, let url = settings.normalizedBaseURL else {
             return nil
         }
+        let isBackupOnly = settings.isBackupOnlyMode
         self.authToken = token
         self.baseURL = url
         self.proxyFormatRaw = settings.proxyFormat.rawValue
         self.proxyMaxPixelSize = settings.proxyMaxPixelSize
         self.proxyQuality = settings.proxyQuality
-        self.keepLocalProxyInPhotos = settings.keepLocalProxyInPhotos
+        self.keepLocalProxyInPhotos = !isBackupOnly && settings.keepLocalProxyInPhotos
+        self.backupOnly = isBackupOnly
         self.cacheScopeKey = settings.apiKey
-        self.notifyOnComplete = settings.notifyWhenBackgroundUploadFinishes
+        self.notifyOnComplete = !isBackupOnly && settings.notifyWhenBackgroundUploadFinishes
         self.morningHour = settings.morningReminderHour
+        self.wifiOnlyBackup = settings.wifiOnlyBackup
     }
 }
 
@@ -143,6 +211,12 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
         return Set(jobsByTaskId.values.map { $0.assetId })
     }
 
+    func activeMasterHashes() -> Set<String> {
+        lock.lock()
+        defer { lock.unlock() }
+        return Set(jobsByTaskId.values.map { $0.masterSha256.lowercased() })
+    }
+
     func handleEventsForBackgroundURLSession(
         identifier: String,
         completionHandler: @escaping () -> Void
@@ -203,6 +277,10 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
             }
 
             let resolvedMasterHash = check.masterHash ?? master.sha256
+            if activeMasterHashes().contains(resolvedMasterHash.lowercased()) {
+                try? FileManager.default.removeItem(at: master.fileURL)
+                return .skippedAlreadyHandled
+            }
             guard AssetUploadCoordinator.shared.tryClaimMasterHash(resolvedMasterHash) else {
                 try? FileManager.default.removeItem(at: master.fileURL)
                 return .skippedAlreadyHandled
@@ -234,6 +312,7 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
                 proxyMaxPixelSize: config.proxyMaxPixelSize,
                 proxyQuality: config.proxyQuality,
                 keepLocalProxyInPhotos: config.keepLocalProxyInPhotos,
+                backupOnly: config.backupOnly,
                 serverBaseURLString: config.baseURL.absoluteString,
                 cacheScopeKey: config.cacheScopeKey,
                 notifyOnComplete: config.notifyOnComplete,
@@ -243,11 +322,16 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
             // If this master is already verified on server (e.g. another upload completed),
             // never re-upload the full original — finalize local proxy/staging right here.
             if check.exists && check.isMaster == true && check.canReplaceWithProxy == true {
+                tracker.markUploadedOriginal(assetId: assetId, masterHash: resolvedMasterHash)
                 let serverHasProxy = (check.hasProxy == true)
                 let localProxyPresent = tracker.liveProxyAssetId(forMasterHash: resolvedMasterHash) != nil
                     || tracker.isMasterHandledForPhotos(resolvedMasterHash)
-                if serverHasProxy && (!config.keepLocalProxyInPhotos || localProxyPresent) {
+                if serverHasProxy && (config.backupOnly || !config.keepLocalProxyInPhotos || localProxyPresent) {
                     try? FileManager.default.removeItem(at: master.fileURL)
+                    if config.backupOnly {
+                        tracker.markMasterHandledForPhotos(resolvedMasterHash)
+                        return .finalizedLocally
+                    }
                     let knownProxyBytes = check.proxySize ?? 0
                     let savedBytes = config.keepLocalProxyInPhotos
                         ? max(0, master.sizeBytes - knownProxyBytes)
@@ -282,6 +366,8 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
             let uploadURL = config.baseURL.appendingPathComponent("api/upload")
             var request = URLRequest(url: uploadURL)
             request.httpMethod = "POST"
+            request.allowsCellularAccess = !config.wifiOnlyBackup
+            request.allowsExpensiveNetworkAccess = !config.wifiOnlyBackup
             request.setValue("Bearer \(config.authToken)", forHTTPHeaderField: "Authorization")
             request.setValue(master.mimeType, forHTTPHeaderField: "Content-Type")
             request.setValue(
@@ -308,6 +394,7 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
                 proxyMaxPixelSize: job.proxyMaxPixelSize,
                 proxyQuality: job.proxyQuality,
                 keepLocalProxyInPhotos: job.keepLocalProxyInPhotos,
+                backupOnly: job.backupOnly,
                 serverBaseURLString: job.serverBaseURLString,
                 cacheScopeKey: job.cacheScopeKey,
                 notifyOnComplete: job.notifyOnComplete,
@@ -566,17 +653,20 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
             }
 
             tracker.markUploadedOriginal(assetId: job.assetId, masterHash: job.masterSha256)
+            let isBackupOnlyNow = job.backupOnly || (await MainActor.run { settings.isBackupOnlyMode })
             let existingProxyPrefix = ProxyGenerator.proxyPrefixTag(forMasterHash: job.masterSha256)
             let alreadyHasProxyInPhotos = tracker.liveProxyAssetId(forMasterHash: job.masterSha256) != nil
                 || PhotoLibraryService.scanExistingProxyPrefixesInPhotos()[existingProxyPrefix] != nil
 
-            if job.keepLocalProxyInPhotos,
+            if !isBackupOnlyNow,
+               job.keepLocalProxyInPhotos,
                !alreadyHasProxyInPhotos,
                let liveAsset = PhotoLibraryService.fetchLiveAssets(forLocalIdentifiers: [job.assetId]).first {
                 if let newAssetId = try? await photoService.saveCompressedProxyToPhotosAsync(
                     originalAsset: liveAsset,
                     mediaType: job.isVideo ? .video : .image,
-                    proxyFileURL: proxy.fileURL
+                    proxyFileURL: proxy.fileURL,
+                    masterHash: job.masterSha256
                 ), newAssetId != job.assetId {
                     tracker.markAsProxy(
                         assetId: newAssetId,
@@ -588,6 +678,14 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
             } else {
                 tracker.markMasterHandledForPhotos(job.masterSha256)
             }
+        }
+
+        let isBackupOnlyMode = job.backupOnly || (await MainActor.run { settings.isBackupOnlyMode })
+        if isBackupOnlyMode {
+            await MainActor.run {
+                BackgroundBackupManager.shared.updateSummary("Backed up · Originals kept on phone")
+            }
+            return
         }
 
         let savedBytes = job.keepLocalProxyInPhotos ? max(0, job.masterBytes - proxyBytes) : job.masterBytes
