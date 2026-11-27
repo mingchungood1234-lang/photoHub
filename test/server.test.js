@@ -1891,6 +1891,33 @@ test('Ordered node allocation prefers node1 and spills new users to node2 when n
   assert.equal(webFileNode2.status, 200);
   assert.equal(await webFileNode2.text(), 'ordered-spillover-node2-bytes');
 
+  // Invisible webpage drag-and-drop streaming upload via `/api/web-node/upload` -> remote HTTP node2 & `/api/web-node/check/:hash`
+  const droppedBytes = Buffer.from('web-drag-drop-photo-bytes-to-node2');
+  const droppedSha = crypto.createHash('sha256').update(droppedBytes).digest('hex');
+  const webUpNode2 = await fetch(`${gwBaseUrl}/api/web-node/upload`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${res2.session.token}`,
+      'Content-Type': 'image/jpeg',
+      'X-File-Name': encodeURIComponent('WEB_DROP_NODE2.JPG'),
+      'X-File-Sha256': droppedSha,
+      'X-Created-At': '2026-11-27T10:00:00.000Z',
+    },
+    body: droppedBytes,
+  });
+  assert.equal(webUpNode2.status, 200);
+  const webUpNode2Json = await webUpNode2.json();
+  assert.equal(webUpNode2Json.success, true);
+  assert.equal(webUpNode2Json.hash, droppedSha);
+
+  const webCheckNode2 = await fetch(`${gwBaseUrl}/api/web-node/check/${droppedSha}`, {
+    headers: { Authorization: `Bearer ${res2.session.token}` },
+  });
+  assert.equal(webCheckNode2.status, 200);
+  const webCheckNode2Json = await webCheckNode2.json();
+  assert.equal(webCheckNode2Json.exists, true);
+  assert.equal(webCheckNode2Json.isMaster, true);
+
   // 3. User 3 exceeds both node1 (1/1) and node2 (1/1) -> signup blocked with clear reason
   const res3 = await oauthSignInViaGateway({
     sub: 'sub-order-3',

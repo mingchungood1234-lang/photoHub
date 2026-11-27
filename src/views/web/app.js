@@ -1348,6 +1348,468 @@
     document.querySelectorAll('.reveal').forEach((el) => revealObs.observe(el));
   }
 
+  // ==================== INVISIBLE WHOLE-PAGE DRAG & DROP UPLOAD ====================
+  const MEDIA_UPLOAD_EXTS = new Set([
+    'jpg', 'jpeg', 'png', 'heic', 'heif', 'webp', 'gif', 'bmp', 'tif', 'tiff', 'avif',
+    'dng', 'raw', 'cr2', 'nef', 'arw',
+    'mov', 'mp4', 'm4v', '3gp', 'avi', 'mkv', 'webm',
+  ]);
+  const UPLOAD_CONCURRENCY = 3;
+  const CLIENT_HASH_MAX_BYTES = 120 * 1024 * 1024; // 120 MB browser SubtleCrypto pre-check cap
+
+  const uploadState = {
+    queue: [],
+    activeXhrs: new Set(),
+    inFlightBytes: new Map(),
+    isRunning: false,
+    cancelled: false,
+    quotaExceeded: false,
+    totalCount: 0,
+    completedCount: 0,
+    uploadedCount: 0,
+    duplicateCount: 0,
+    failedCount: 0,
+    totalBytes: 0,
+    completedBytes: 0,
+    currentFilename: '',
+    hideTimer: null,
+  };
+
+  function isSupportedMediaFile(file) {
+    if (!file || !file.name || file.size <= 0) return false;
+    if (file.name.startsWith('.') || /^thumbs\.db$/i.test(file.name)) return false;
+    const type = String(file.type || '').toLowerCase();
+    if (type.startsWith('image/') || type.startsWith('video/')) return true;
+    const dot = file.name.lastIndexOf('.');
+    if (dot < 0) return false;
+    return MEDIA_UPLOAD_EXTS.has(file.name.slice(dot + 1).toLowerCase());
+  }
+
+  function readAllDirectoryEntries(dirReader) {
+    return new Promise((resolve) => {
+      const all = [];
+      const readNext = () => {
+        dirReader.readEntries(
+          (batch) => {
+            if (!batch || batch.length === 0) {
+              resolve(all);
+            } else {
+              all.push(...batch);
+              readNext();
+            }
+          },
+          () => resolve(all)
+        );
+      };
+      readNext();
+    });
+  }
+
+  async function collectFilesFromEntry(entry) {
+    if (!entry) return [];
+    if (entry.isFile) {
+      return new Promise((resolve) => {
+        entry.file(
+          (f) => resolve(f ? [f] : []),
+          () => resolve([])
+        );
+      });
+    }
+    if (entry.isDirectory) {
+      const entries = await readAllDirectoryEntries(entry.createReader());
+      const out = [];
+      for (const child of entries) {
+        const nested = await collectFilesFromEntry(child);
+        out.push(...nested);
+      }
+      return out;
+    }
+    return [];
+  }
+
+  async function extractDroppedFiles(dataTransfer) {
+    if (!dataTransfer) return [];
+    const items = dataTransfer.items ? Array.from(dataTransfer.items) : [];
+    const entries = [];
+    for (const item of items) {
+      if (item && item.kind === 'file' && typeof item.webkitGetAsEntry === 'function') {
+        const entry = item.webkitGetAsEntry();
+        if (entry) entries.push(entry);
+      }
+    }
+    if (entries.length > 0) {
+      const collected = [];
+      for (const entry of entries) {
+        const files = await collectFilesFromEntry(entry);
+        collected.push(...files);
+      }
+      if (collected.length > 0) return collected;
+    }
+    return dataTransfer.files ? Array.from(dataTransfer.files) : [];
+  }
+
+  async function computeFileSha256Hex(file) {
+    if (!window.crypto || !window.crypto.subtle || file.size > CLIENT_HASH_MAX_BYTES) {
+      return '';
+    }
+    try {
+      const buf = await file.arrayBuffer();
+      const digest = await window.crypto.subtle.digest('SHA-256', buf);
+      return Array.from(new Uint8Array(digest))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    } catch {
+      return '';
+    }
+  }
+
+  function renderUploadTray() {
+    const tray = $('uploadTray');
+    if (!tray) return;
+    tray.classList.remove('hidden');
+
+    let inFlightLoaded = 0;
+    for (const v of uploadState.inFlightBytes.values()) inFlightLoaded += v;
+    const loadedBytes = Math.min(uploadState.totalBytes, uploadState.completedBytes + inFlightLoaded);
+    const pct =
+      uploadState.totalBytes > 0
+        ? Math.min(100, Math.round((loadedBytes / uploadState.totalBytes) * 100))
+        : uploadState.totalCount > 0
+          ? Math.min(100, Math.round((uploadState.completedCount / uploadState.totalCount) * 100))
+          : 0;
+
+    $('uploadTrayFill').style.width = `${Math.max(3, pct)}%`;
+
+    if (uploadState.isRunning) {
+      const idx = Math.min(uploadState.totalCount, uploadState.completedCount + 1);
+      $('uploadTrayTitle').textContent = `Backing up ${idx} of ${uploadState.totalCount} (${pct}%)`;
+      $('uploadTraySub').textContent = uploadState.currentFilename
+        ? `${uploadState.currentFilename} · ${formatBytes(loadedBytes)} / ${formatBytes(uploadState.totalBytes)}`
+        : `${formatBytes(loadedBytes)} / ${formatBytes(uploadState.totalBytes)}`;
+      $('uploadCancelBtn').classList.remove('hidden');
+    } else {
+      $('uploadCancelBtn').classList.add('hidden');
+    }
+  }
+
+  function uploadFileWithProgress(file, sha256, onProgress) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      uploadState.activeXhrs.add(xhr);
+
+      xhr.open('POST', apiUrlFor('/api/upload'), true);
+      const token = state.session && state.session.token;
+      if (token) {
+        xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+      }
+      xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+      xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
+      if (file.lastModified) {
+        xhr.setRequestHeader('X-Created-At', new Date(file.lastModified).toISOString());
+      }
+      if (sha256) {
+        xhr.setRequestHeader('X-File-Sha256', sha256);
+      }
+
+      xhr.upload.onprogress = (ev) => {
+        if (ev.lengthComputable && typeof onProgress === 'function') {
+          onProgress(ev.loaded);
+        }
+      };
+
+      const cleanup = () => uploadState.activeXhrs.delete(xhr);
+
+      xhr.onload = () => {
+        cleanup();
+        let data = {};
+        try {
+          data = JSON.parse(xhr.responseText || '{}');
+        } catch {
+          data = {};
+        }
+        resolve({ status: xhr.status, ok: xhr.status >= 200 && xhr.status < 300, data });
+      };
+      xhr.onerror = () => {
+        cleanup();
+        reject(new Error('Network error during upload'));
+      };
+      xhr.onabort = () => {
+        cleanup();
+        const err = new Error('Cancelled');
+        err.isAbort = true;
+        reject(err);
+      };
+
+      xhr.send(file);
+    });
+  }
+
+  async function processOneDroppedFile(file) {
+    if (uploadState.cancelled || uploadState.quotaExceeded) return;
+    uploadState.currentFilename = file.name;
+    uploadState.inFlightBytes.set(file, 0);
+    renderUploadTray();
+
+    try {
+      const sha256 = await computeFileSha256Hex(file);
+      if (uploadState.cancelled || uploadState.quotaExceeded) return;
+
+      // Fast pre-upload duplicate check so already-backed-up files finish instantly with zero upload bandwidth
+      if (sha256) {
+        try {
+          const checkRes = await apiFetch(`/api/check/${encodeURIComponent(sha256)}`);
+          if (checkRes.ok) {
+            const checkData = await checkRes.json().catch(() => ({}));
+            if (checkData.exists && checkData.isMaster) {
+              uploadState.duplicateCount++;
+              return;
+            }
+          }
+        } catch (err) {
+          if (err && err.isUnauthorized) {
+            uploadState.cancelled = true;
+            return;
+          }
+        }
+      }
+
+      const res = await uploadFileWithProgress(file, sha256, (loaded) => {
+        uploadState.inFlightBytes.set(file, Math.min(file.size, loaded));
+        renderUploadTray();
+      });
+
+      if (res.status === 401) {
+        uploadState.cancelled = true;
+        signOut(false);
+        showToast('Session expired — please sign in again.', 'rose');
+        openLoginModal();
+        return;
+      }
+      if (res.status === 507) {
+        uploadState.quotaExceeded = true;
+        uploadState.failedCount++;
+        showToast(res.data.error || 'Server storage quota exceeded.', 'rose');
+        return;
+      }
+      if (!res.ok || !res.data.success) {
+        uploadState.failedCount++;
+        return;
+      }
+
+      if (res.data.isDuplicate || res.data.status === 'duplicate_verified') {
+        uploadState.duplicateCount++;
+      } else {
+        uploadState.uploadedCount++;
+      }
+    } catch (err) {
+      if (!err || !err.isAbort) {
+        uploadState.failedCount++;
+      }
+    } finally {
+      uploadState.inFlightBytes.delete(file);
+      uploadState.completedBytes += file.size;
+      uploadState.completedCount++;
+      renderUploadTray();
+    }
+  }
+
+  async function drainUploadQueue() {
+    uploadState.isRunning = true;
+    setMascotMood($('uploadTrayMascot'), 'uploading');
+    renderUploadTray();
+
+    const worker = async () => {
+      while (!uploadState.cancelled && !uploadState.quotaExceeded) {
+        const nextFile = uploadState.queue.shift();
+        if (!nextFile) break;
+        await processOneDroppedFile(nextFile);
+      }
+    };
+
+    const workers = [];
+    const n = Math.min(UPLOAD_CONCURRENCY, Math.max(1, uploadState.queue.length));
+    for (let i = 0; i < n; i++) workers.push(worker());
+    await Promise.all(workers);
+
+    uploadState.isRunning = false;
+    uploadState.queue.length = 0;
+    uploadState.inFlightBytes.clear();
+
+    const parts = [];
+    if (uploadState.uploadedCount > 0) parts.push(`${uploadState.uploadedCount} uploaded`);
+    if (uploadState.duplicateCount > 0) parts.push(`${uploadState.duplicateCount} already backed up`);
+    if (uploadState.failedCount > 0) parts.push(`${uploadState.failedCount} failed`);
+
+    if (uploadState.cancelled) {
+      setMascotMood($('uploadTrayMascot'), 'sleeping');
+      $('uploadTrayTitle').textContent = 'Upload cancelled';
+      $('uploadTraySub').textContent = parts.join(' · ') || 'Stopped';
+      showToast('Upload cancelled.', 'amber');
+    } else if (uploadState.quotaExceeded) {
+      setMascotMood($('uploadTrayMascot'), 'alert');
+      $('uploadTrayTitle').textContent = 'Storage quota reached';
+      $('uploadTraySub').textContent = parts.join(' · ') || 'Free up space on server';
+    } else if (uploadState.failedCount > 0 && uploadState.uploadedCount === 0 && uploadState.duplicateCount === 0) {
+      setMascotMood($('uploadTrayMascot'), 'alert');
+      $('uploadTrayTitle').textContent = 'Upload failed';
+      $('uploadTraySub').textContent = 'Check your server connection and retry.';
+      showToast('Could not upload dropped file(s).', 'rose');
+    } else {
+      setMascotMood($('uploadTrayMascot'), 'celebrate');
+      $('uploadTrayTitle').textContent = 'Backup complete!';
+      $('uploadTraySub').textContent = parts.join(' · ') || 'All items synced';
+      $('uploadTrayFill').style.width = '100%';
+      showToast(parts.join(' · ') || 'Backup complete!', uploadState.failedCount > 0 ? 'amber' : 'mint');
+    }
+
+    renderUploadTray();
+
+    if (uploadState.uploadedCount > 0 && state.session) {
+      state.photosEtag = null;
+      if (state.activeView !== 'gallery') {
+        switchView('gallery');
+      }
+      loadGallery(false);
+    }
+
+    clearTimeout(uploadState.hideTimer);
+    uploadState.hideTimer = setTimeout(() => {
+      if (!uploadState.isRunning) {
+        $('uploadTray').classList.add('hidden');
+      }
+    }, 2800);
+  }
+
+  function enqueueWebUploads(files) {
+    if (!files || files.length === 0) return;
+    clearTimeout(uploadState.hideTimer);
+
+    if (!uploadState.isRunning) {
+      uploadState.cancelled = false;
+      uploadState.quotaExceeded = false;
+      uploadState.totalCount = 0;
+      uploadState.completedCount = 0;
+      uploadState.uploadedCount = 0;
+      uploadState.duplicateCount = 0;
+      uploadState.failedCount = 0;
+      uploadState.totalBytes = 0;
+      uploadState.completedBytes = 0;
+      uploadState.currentFilename = '';
+    }
+
+    for (const f of files) {
+      uploadState.queue.push(f);
+      uploadState.totalCount++;
+      uploadState.totalBytes += f.size;
+    }
+
+    if (!uploadState.isRunning) {
+      drainUploadQueue();
+    } else {
+      renderUploadTray();
+      showToast(`Added ${files.length} more item(s) to upload queue.`, 'orange');
+    }
+  }
+
+  function cancelActiveWebUploads() {
+    uploadState.cancelled = true;
+    uploadState.queue.length = 0;
+    for (const xhr of uploadState.activeXhrs) {
+      try {
+        xhr.abort();
+      } catch {
+        // ignore
+      }
+    }
+    uploadState.activeXhrs.clear();
+  }
+
+  function initInvisibleDragAndDrop() {
+    const overlay = $('dropUploadOverlay');
+    if (!overlay) return;
+
+    let dragDepth = 0;
+
+    const isFileDrag = (e) => {
+      const dt = e.dataTransfer;
+      if (!dt || !dt.types) return false;
+      return Array.from(dt.types).includes('Files');
+    };
+
+    const showOverlay = () => {
+      if (state.session) {
+        $('dropOverlayTitle').textContent = 'Drop photos & videos to back up';
+        $('dropOverlaySub').textContent = 'Full-resolution originals · SHA-256 verified · Folders supported';
+      } else {
+        $('dropOverlayTitle').textContent = 'Sign in to back up photos';
+        $('dropOverlaySub').textContent = 'Drop files after signing in with Google';
+      }
+      overlay.classList.remove('hidden');
+    };
+
+    const hideOverlay = () => {
+      dragDepth = 0;
+      overlay.classList.add('hidden');
+    };
+
+    window.addEventListener('dragenter', (e) => {
+      if (!isFileDrag(e)) return;
+      e.preventDefault();
+      dragDepth++;
+      showOverlay();
+    });
+
+    window.addEventListener('dragover', (e) => {
+      if (!isFileDrag(e)) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+      if (overlay.classList.contains('hidden')) {
+        showOverlay();
+      }
+    });
+
+    window.addEventListener('dragleave', (e) => {
+      if (dragDepth <= 0) return;
+      dragDepth--;
+      if (dragDepth <= 0 || (e.clientX === 0 && e.clientY === 0)) {
+        hideOverlay();
+      }
+    });
+
+    window.addEventListener('dragend', hideOverlay);
+    window.addEventListener('blur', hideOverlay);
+
+    window.addEventListener('drop', async (e) => {
+      if (!isFileDrag(e)) return;
+      e.preventDefault();
+      hideOverlay();
+
+      if (!state.session) {
+        openLoginModal('Sign in with Google first to upload photos.');
+        return;
+      }
+
+      const rawFiles = await extractDroppedFiles(e.dataTransfer);
+      const mediaFiles = rawFiles.filter(isSupportedMediaFile);
+      const skipped = rawFiles.length - mediaFiles.length;
+
+      if (mediaFiles.length === 0) {
+        showToast('No supported photos or videos found in dropped files.', 'amber');
+        return;
+      }
+
+      if (skipped > 0) {
+        showToast(`Uploading ${mediaFiles.length} media file(s) (skipped ${skipped} non-media file(s)).`, 'orange');
+      }
+      enqueueWebUploads(mediaFiles);
+    });
+
+    const cancelBtn = $('uploadCancelBtn');
+    if (cancelBtn) {
+      cancelBtn.addEventListener('click', cancelActiveWebUploads);
+    }
+  }
+
   // ==================== WIRE EVENTS & BOOT ====================
   function bindEvents() {
     $('themeToggleBtn').addEventListener('click', toggleTheme);
@@ -1488,6 +1950,7 @@
     }, { passive: true });
 
     loadMoreObserver.observe($('loadMoreWrap'));
+    initInvisibleDragAndDrop();
   }
 
   async function boot() {

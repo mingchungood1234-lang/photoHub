@@ -159,7 +159,10 @@ async function createApp(configOverrides = {}) {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Vary', 'Origin');
       res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Authorization,Content-Type,X-API-Key,If-None-Match');
+      res.setHeader(
+        'Access-Control-Allow-Headers',
+        'Authorization,Content-Type,X-API-Key,If-None-Match,X-File-Name,X-File-Sha256,X-File-Hash,X-Created-At,X-Photo-Date,X-Verify-Checksum'
+      );
       res.setHeader('Access-Control-Expose-Headers', 'ETag,X-Photo-Variant,X-Master-Sha256,Content-Disposition');
       if (req.method === 'OPTIONS') {
         return res.status(204).end();
@@ -171,7 +174,7 @@ async function createApp(configOverrides = {}) {
   // Same-origin Gateway proxy for web gallery users assigned to a remote STORAGE_NODE
   // (eliminates CORS, HTTPS->HTTP mixed-content blocks, and private LAN/Tailscale node reachability issues).
   const WEB_PROXY_ALLOWED_PATH_RE =
-    /^\/(whoami|storage|photos|photos\/delete|photo\/[^/]+(?:\/(?:preview|video-proxy|protect-original))?)$/;
+    /^\/(whoami|storage|photos|photos\/delete|photo\/[^/]+(?:\/(?:preview|video-proxy|protect-original))?|upload|check(?:\/[^/]+)?)$/;
   app.use(async (req, res, next) => {
     if (!req.path.startsWith('/api/web-node/')) return next();
     const subPath = req.path.slice('/api/web-node'.length);
@@ -217,17 +220,39 @@ async function createApp(configOverrides = {}) {
     const upstreamHeaders = {
       Authorization: `Bearer ${token}`,
     };
-    if (req.headers.accept) upstreamHeaders.Accept = req.headers.accept;
-    if (req.headers['if-none-match']) upstreamHeaders['If-None-Match'] = req.headers['if-none-match'];
-    if (req.headers.range) upstreamHeaders.Range = req.headers.range;
+    const forwardReqHeaders = [
+      'accept',
+      'if-none-match',
+      'range',
+      'x-file-name',
+      'x-file-sha256',
+      'x-file-hash',
+      'x-created-at',
+      'x-photo-date',
+      'x-verify-checksum',
+    ];
+    for (const h of forwardReqHeaders) {
+      if (req.headers[h] !== undefined) upstreamHeaders[h] = String(req.headers[h]);
+    }
 
     const fetchOpts = {
       method: req.method,
       headers: upstreamHeaders,
     };
     if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
-      upstreamHeaders['Content-Type'] = 'application/json';
-      fetchOpts.body = JSON.stringify(req.body || {});
+      const contentType = String(req.headers['content-type'] || '').toLowerCase();
+      if (contentType.includes('application/json')) {
+        upstreamHeaders['Content-Type'] = 'application/json';
+        fetchOpts.body = JSON.stringify(req.body || {});
+      } else {
+        // Stream raw binary upload straight through to the remote storage node with zero RAM buffering
+        upstreamHeaders['Content-Type'] = req.headers['content-type'] || 'application/octet-stream';
+        if (req.headers['content-length']) {
+          upstreamHeaders['Content-Length'] = String(req.headers['content-length']);
+        }
+        fetchOpts.body = Readable.toWeb(req);
+        fetchOpts.duplex = 'half';
+      }
     }
 
     const abortController = new AbortController();
@@ -235,7 +260,7 @@ async function createApp(configOverrides = {}) {
     const onClientClose = () => {
       if (!res.writableEnded) abortController.abort();
     };
-    req.on('close', onClientClose);
+    res.on('close', onClientClose);
 
     try {
       const upstreamRes = await fetch(upstreamUrl, fetchOpts);
@@ -257,7 +282,7 @@ async function createApp(configOverrides = {}) {
       }
 
       if (upstreamRes.status === 204 || upstreamRes.status === 304 || !upstreamRes.body) {
-        req.off('close', onClientClose);
+        res.off('close', onClientClose);
         return res.end();
       }
 
@@ -269,10 +294,10 @@ async function createApp(configOverrides = {}) {
           res.end();
         }
       });
-      res.on('finish', () => req.off('close', onClientClose));
+      res.on('finish', () => res.off('close', onClientClose));
       return nodeStream.pipe(res);
     } catch (err) {
-      req.off('close', onClientClose);
+      res.off('close', onClientClose);
       if (abortController.signal.aborted) return;
       console.warn(`[WebProxy] Failed to reach storage node ${targetNode.id} (${targetNode.url}):`, err.message);
       if (!res.headersSent) {

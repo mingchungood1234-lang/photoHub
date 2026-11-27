@@ -321,6 +321,8 @@ body {
   font-weight: 800;
   font-size: 1.1rem;
   letter-spacing: -0.02em;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .brand-icon {
@@ -368,6 +370,7 @@ body {
 .nav-tab {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 6px;
   border: none;
   background: transparent;
@@ -378,6 +381,8 @@ body {
   padding: 7px 14px;
   border-radius: 999px;
   cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
   transition: all 0.2s ease;
 }
 
@@ -546,6 +551,7 @@ body {
 
 .btn-lg { padding: 13px 24px; font-size: 0.96rem; }
 .btn-sm { padding: 7px 14px; font-size: 0.82rem; }
+.btn-xs { padding: 5px 11px; font-size: 0.74rem; }
 .btn-full { width: 100%; padding: 12px 20px; }
 
 button:disabled {
@@ -1844,6 +1850,117 @@ button:disabled {
   gap: 8px;
 }
 
+/* ==================== INVISIBLE DRAG & DROP OVERLAY & UPLOAD TRAY ==================== */
+
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 180;
+  background: rgba(20, 14, 10, 0.56);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  pointer-events: none;
+  animation: fadeQuick 0.16s ease;
+}
+
+.drop-overlay-frame {
+  width: min(520px, 100%);
+  padding: 36px 28px;
+  border-radius: 28px;
+  border: 2.5px dashed var(--orange);
+  background: var(--card-glass);
+  box-shadow: 0 24px 64px rgba(249, 115, 22, 0.28);
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  animation: popIn 0.2s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.drop-overlay-frame h2 {
+  margin: 4px 0 0;
+  font-size: 1.3rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+}
+
+.drop-overlay-frame p {
+  margin: 0;
+  font-size: 0.86rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.upload-tray {
+  position: fixed;
+  right: 18px;
+  bottom: 20px;
+  z-index: 170;
+  width: min(360px, calc(100vw - 24px));
+  background: var(--card);
+  border: 1.5px solid var(--orange);
+  border-radius: 20px;
+  padding: 12px 14px;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.26);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  animation: popIn 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.upload-tray-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.upload-tray-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.upload-tray-info strong {
+  font-size: 0.85rem;
+  font-weight: 800;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.upload-tray-info span {
+  font-size: 0.74rem;
+  font-weight: 600;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
+}
+
+.upload-tray-track {
+  height: 7px;
+  border-radius: 999px;
+  background: var(--soft-peach);
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+
+.upload-tray-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--amber), var(--orange), var(--deep-orange));
+  transition: width 0.18s ease;
+}
+
 /* ==================== TOASTS & FOOTER ==================== */
 
 .toast-stack {
@@ -1903,16 +2020,6 @@ button:disabled {
   border-radius: 6px;
 }
 
-.footer-link {
-  color: var(--muted);
-  text-decoration: none;
-  font-weight: 700;
-}
-
-.footer-link:hover {
-  color: var(--orange);
-}
-
 /* ==================== SCROLL REVEAL ==================== */
 
 .reveal {
@@ -1929,6 +2036,9 @@ button:disabled {
 /* ==================== RESPONSIVE BREAKPOINTS ==================== */
 
 @media (max-width: 960px) {
+  .server-pill {
+    display: none;
+  }
   .hero-grid {
     grid-template-columns: 1fr;
     gap: 32px;
@@ -1946,21 +2056,56 @@ button:disabled {
   }
 }
 
-@media (max-width: 680px) {
+@media (max-width: 760px) {
   .nav-inner {
-    padding: 8px 12px;
-    gap: 8px;
+    flex-wrap: wrap;
+    padding: 8px 12px 10px;
+    column-gap: 8px;
+    row-gap: 8px;
   }
-  .server-pill,
+  .brand-link {
+    gap: 8px;
+    font-size: 1rem;
+  }
+  .brand-icon {
+    width: 30px;
+    height: 30px;
+    border-radius: 9px;
+  }
+  .nav-actions {
+    gap: 6px;
+    margin-left: auto;
+  }
+  .icon-btn {
+    width: 34px;
+    height: 34px;
+    border-radius: 10px;
+  }
+  .user-chip {
+    padding: 3px;
+    gap: 0;
+  }
+  .user-avatar {
+    width: 28px;
+    height: 28px;
+  }
   .user-chip-name {
     display: none;
   }
+  .nav-tabs {
+    order: 3;
+    width: 100%;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    padding: 3px;
+  }
   .nav-tab {
-    padding: 6px 11px;
-    font-size: 0.8rem;
+    width: 100%;
+    padding: 7px 10px;
+    font-size: 0.82rem;
   }
   .main-shell {
-    padding: 18px 12px 90px;
+    padding: 16px 12px 90px;
   }
   .hero-metrics {
     grid-template-columns: repeat(3, 1fr);
@@ -1972,15 +2117,15 @@ button:disabled {
   .photo-grid,
   .skeleton-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 4px;
+    gap: 5px;
   }
   .photo-tile,
   .skeleton-tile {
     border-radius: 10px;
   }
   .gallery-toolbar {
-    top: 54px;
-    padding: 8px 10px;
+    position: static;
+    padding: 10px;
   }
   .search-wrap {
     flex: 1;
@@ -2002,6 +2147,16 @@ button:disabled {
     justify-content: space-between;
     border-radius: 20px;
     padding: 10px 12px;
+  }
+  .upload-tray {
+    left: 12px;
+    right: 12px;
+    bottom: 14px;
+    width: auto;
+  }
+  .footer-inner {
+    justify-content: center;
+    text-align: center;
   }
 }
 

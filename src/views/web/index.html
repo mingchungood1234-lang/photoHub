@@ -10,7 +10,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/web/styles.css?v=2" />
+  <link rel="stylesheet" href="/web/styles.css?v=4" />
 </head>
 <body>
   <!-- Animated Sunny Boot Splash Screen -->
@@ -460,6 +460,30 @@
     </div>
   </div>
 
+  <!-- Invisible Whole-Page Drag & Drop Upload Overlay (only appears while dragging files) -->
+  <div id="dropUploadOverlay" class="drop-overlay hidden" aria-hidden="true">
+    <div class="drop-overlay-frame">
+      <div class="sunny-stage sunny-stage--md" data-sunny-mood="uploading"></div>
+      <h2 id="dropOverlayTitle">Drop photos &amp; videos to back up</h2>
+      <p id="dropOverlaySub">Full-resolution originals · SHA-256 verified · Folders supported</p>
+    </div>
+  </div>
+
+  <!-- Floating Upload Progress Tray (only visible while uploading dropped files) -->
+  <div id="uploadTray" class="upload-tray hidden" role="status" aria-live="polite">
+    <div class="upload-tray-top">
+      <div class="sunny-stage sunny-stage--xs" id="uploadTrayMascot" data-sunny-mood="uploading"></div>
+      <div class="upload-tray-info">
+        <strong id="uploadTrayTitle">Uploading photos…</strong>
+        <span id="uploadTraySub">Preparing files…</span>
+      </div>
+      <button type="button" class="btn-soft btn-xs" id="uploadCancelBtn">Cancel</button>
+    </div>
+    <div class="upload-tray-track">
+      <div class="upload-tray-fill" id="uploadTrayFill" style="width: 0%"></div>
+    </div>
+  </div>
+
   <!-- Toast Stack -->
   <div id="toastStack" class="toast-stack" aria-live="polite"></div>
 
@@ -470,10 +494,9 @@
         PhotoHub
       </span>
       <span class="footer-note">Private self-hosted photo cloud · iOS &amp; Android</span>
-      <a href="/admin" class="footer-link">Admin</a>
     </div>
   </footer>
 
-  <script src="/web/app.js?v=2" defer></script>
+  <script src="/web/app.js?v=3" defer></script>
 </body>
 </html>
