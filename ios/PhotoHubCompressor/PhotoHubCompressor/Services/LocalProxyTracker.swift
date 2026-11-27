@@ -18,6 +18,7 @@ final class LocalProxyTracker {
     private let restoredAssetIdsKey = "photohub_restored_asset_ids"
     private let restoredMastersKey = "photohub_restored_master_hashes"
     private let restoredAssetToMasterKey = "photohub_restored_asset_to_master"
+    private let uploadedOriginalMasterToAssetKey = "photohub_uploaded_original_master_to_asset"
 
     private var assetIds: Set<String>
     private var proxyHashes: Set<String>
@@ -29,6 +30,7 @@ final class LocalProxyTracker {
     private var restoredAssetIds: Set<String>
     private var restoredMasterHashes: Set<String>
     private var restoredAssetToMaster: [String: String]
+    private var uploadedOriginalMasterToAsset: [String: String]
 
     private init() {
         self.assetIds = Set(defaults.stringArray(forKey: assetIdsKey) ?? [])
@@ -41,6 +43,7 @@ final class LocalProxyTracker {
         self.restoredAssetIds = Set(defaults.stringArray(forKey: restoredAssetIdsKey) ?? [])
         self.restoredMasterHashes = Set(defaults.stringArray(forKey: restoredMastersKey) ?? [])
         self.restoredAssetToMaster = defaults.dictionary(forKey: restoredAssetToMasterKey) as? [String: String] ?? [:]
+        self.uploadedOriginalMasterToAsset = defaults.dictionary(forKey: uploadedOriginalMasterToAssetKey) as? [String: String] ?? [:]
     }
 
     func isKnownProxy(assetId: String) -> Bool {
@@ -265,6 +268,73 @@ final class LocalProxyTracker {
         lock.unlock()
     }
 
+    /// Records a live original `PHAsset.localIdentifier` that was verified/uploaded to the server,
+    /// allowing Cloud browsing to fetch thumbnails/playback directly from Apple Photos without duplicating media.
+    func markUploadedOriginal(assetId: String, masterHash: String) {
+        let normMaster = masterHash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let cleanId = assetId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normMaster.isEmpty, !cleanId.isEmpty else { return }
+        lock.lock()
+        if uploadedOriginalMasterToAsset[normMaster] != cleanId {
+            uploadedOriginalMasterToAsset[normMaster] = cleanId
+            defaults.set(uploadedOriginalMasterToAsset, forKey: uploadedOriginalMasterToAssetKey)
+        }
+        lock.unlock()
+    }
+
+    /// Returns a live `PHAsset.localIdentifier` of an uploaded original still present in Apple Photos.
+    func liveUploadedOriginalAssetId(forMasterHash masterHash: String) -> String? {
+        let normMaster = masterHash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normMaster.isEmpty else { return nil }
+        lock.lock()
+        let savedId = uploadedOriginalMasterToAsset[normMaster]
+        lock.unlock()
+        guard let savedId, !savedId.isEmpty else { return nil }
+        let fetched = PHAsset.fetchAssets(withLocalIdentifiers: [savedId], options: nil)
+        return fetched.firstObject?.localIdentifier
+    }
+
+    /// Returns the best live `PHAsset` currently in Apple Photos for `masterHash`,
+    /// preferring restored original -> still-present uploaded original -> local compressed proxy.
+    func liveGalleryAsset(forMasterHash masterHash: String) -> PHAsset? {
+        let auth = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard auth == .authorized || auth == .limited else { return nil }
+        let normMaster = masterHash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normMaster.isEmpty else { return nil }
+
+        lock.lock()
+        var orderedIds: [String] = []
+        for (assetId, mapped) in restoredAssetToMaster where mapped == normMaster {
+            if !assetId.isEmpty { orderedIds.append(assetId) }
+        }
+        if let origId = uploadedOriginalMasterToAsset[normMaster], !origId.isEmpty, !orderedIds.contains(origId) {
+            orderedIds.append(origId)
+        }
+        if let proxyId = masterToAssetId[normMaster], !proxyId.isEmpty, !orderedIds.contains(proxyId) {
+            orderedIds.append(proxyId)
+        }
+        lock.unlock()
+
+        guard !orderedIds.isEmpty else { return nil }
+        let fetched = PHAsset.fetchAssets(withLocalIdentifiers: orderedIds, options: nil)
+        guard fetched.count > 0 else { return nil }
+        var byId: [String: PHAsset] = [:]
+        for i in 0..<fetched.count {
+            let a = fetched.object(at: i)
+            byId[a.localIdentifier] = a
+        }
+        for candidateId in orderedIds {
+            if let asset = byId[candidateId] {
+                return asset
+            }
+        }
+        return fetched.firstObject
+    }
+
+    func hasAnyLiveGalleryAsset(forMasterHash masterHash: String) -> Bool {
+        liveGalleryAsset(forMasterHash: masterHash) != nil
+    }
+
     func clearAll() {
         lock.lock()
         defer { lock.unlock() }
@@ -278,6 +348,7 @@ final class LocalProxyTracker {
         restoredAssetIds.removeAll()
         restoredMasterHashes.removeAll()
         restoredAssetToMaster.removeAll()
+        uploadedOriginalMasterToAsset.removeAll()
         defaults.removeObject(forKey: assetIdsKey)
         defaults.removeObject(forKey: proxyHashesKey)
         defaults.removeObject(forKey: assetToMasterKey)
@@ -288,5 +359,6 @@ final class LocalProxyTracker {
         defaults.removeObject(forKey: restoredAssetIdsKey)
         defaults.removeObject(forKey: restoredMastersKey)
         defaults.removeObject(forKey: restoredAssetToMasterKey)
+        defaults.removeObject(forKey: uploadedOriginalMasterToAssetKey)
     }
 }

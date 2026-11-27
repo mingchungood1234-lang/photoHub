@@ -121,6 +121,7 @@ enum PhotoBackupPipeline {
         }
 
         let resolvedMasterHash = checkResult.masterHash ?? master.sha256
+        tracker.markUploadedOriginal(assetId: candidate.id, masterHash: resolvedMasterHash)
         guard AssetUploadCoordinator.shared.tryClaimMasterHash(resolvedMasterHash) else {
             return .skippedInFlight
         }
@@ -294,28 +295,35 @@ enum PhotoBackupPipeline {
             : master.sizeBytes
 
         if keepLocalProxy {
-            onStageChange(.replacingInPhotos)
-            await photosSaveSemaphore.acquire()
-            let newAssetId: String
-            do {
-                newAssetId = try await photoService.saveCompressedProxyToPhotosAsync(
-                    originalAsset: candidate.asset,
-                    mediaType: candidate.mediaType,
-                    proxyFileURL: proxy.fileURL
-                )
-                await photosSaveSemaphore.release()
-            } catch {
-                await photosSaveSemaphore.release()
-                throw error
-            }
+            let existingProxyPrefix = ProxyGenerator.proxyPrefixTag(forMasterHash: master.sha256)
+            let alreadyHasProxyInPhotos = tracker.liveProxyAssetId(forMasterHash: master.sha256) != nil
+                || PhotoLibraryService.scanExistingProxyPrefixesInPhotos()[existingProxyPrefix] != nil
+            if alreadyHasProxyInPhotos {
+                tracker.markMasterHandledForPhotos(master.sha256)
+            } else {
+                onStageChange(.replacingInPhotos)
+                await photosSaveSemaphore.acquire()
+                let newAssetId: String
+                do {
+                    newAssetId = try await photoService.saveCompressedProxyToPhotosAsync(
+                        originalAsset: candidate.asset,
+                        mediaType: candidate.mediaType,
+                        proxyFileURL: proxy.fileURL
+                    )
+                    await photosSaveSemaphore.release()
+                } catch {
+                    await photosSaveSemaphore.release()
+                    throw error
+                }
 
-            if newAssetId != candidate.id {
-                tracker.markAsProxy(
-                    assetId: newAssetId,
-                    proxySha256: proxy.sha256,
-                    masterHash: master.sha256,
-                    originalName: master.filename
-                )
+                if newAssetId != candidate.id {
+                    tracker.markAsProxy(
+                        assetId: newAssetId,
+                        proxySha256: proxy.sha256,
+                        masterHash: master.sha256,
+                        originalName: master.filename
+                    )
+                }
             }
         } else {
             tracker.markMasterHandledForPhotos(master.sha256)

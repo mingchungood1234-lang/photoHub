@@ -620,6 +620,7 @@ data class PhotoDetailUiState(
     val isLocallyProtected: Boolean = false,
     val previewBitmap: Bitmap? = null,
     val videoFile: File? = null,
+    val videoUri: Uri? = null,
     val isLoadingVideo: Boolean = false,
     val videoUnavailableNote: String? = null,
     val isBusy: Boolean = false,
@@ -748,7 +749,10 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                 val fetched = client.fetchAllServerPhotos(sync = true)
                 val cur = settings.current
                 store.savePhotos(fetched, cur.normalizedBaseUrl, cur.apiKeyCacheScope)
-                val protectedSet = withContext(Dispatchers.IO) { computeLocallyProtectedHashes(fetched) }
+                val protectedSet = withContext(Dispatchers.IO) {
+                    mediaService.reconcileExistingNativeGalleryAssets(fetched)
+                    computeLocallyProtectedHashes(fetched)
+                }
                 whoamiDeferred.await()?.let { who ->
                     settings.updateServerCapabilities(who.storage, who.s3Enabled)
                     settings.updateResolvedNode(
@@ -770,10 +774,11 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                         protectedSet
                     )
                     val clearedFailed = prev.failedPreviewHashes.filterNot { h ->
-                        fetched.any { it.hash == h && !it.needsProxy }
+                        fetched.any { it.hash == h && !it.needsProxy } || tracker.hasAnyLiveGalleryAsset(h)
                     }.toSet()
                     prev.copy(
                         photos = fetched,
+                        thumbnailCacheVersion = prev.thumbnailCacheVersion + 1L,
                         locallyProtectedHashes = protectedSet,
                         timeline = rebuilt.first,
                         selectedYearAnchor = rebuilt.second,
@@ -911,6 +916,22 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
         }
         viewModelScope.launch(Dispatchers.IO) {
             try {
+                // 1. Check Native Android Gallery FIRST (zero network download, zero duplicate app cache!)
+                val nativeBmp = mediaService.loadNativeGalleryThumbnail(photo.hash, photo.isVideo, maxPixelSize = 320)
+                if (nativeBmp != null) {
+                    putCachedThumbnail(photo.hash, nativeBmp)
+                    withContext(Dispatchers.Main) {
+                        _uiState.update { prev ->
+                            prev.copy(
+                                thumbnailCacheVersion = prev.thumbnailCacheVersion + 1L,
+                                failedPreviewHashes = prev.failedPreviewHashes - photo.hash
+                            )
+                        }
+                    }
+                    return@launch
+                }
+
+                // 2. Check app disk preview cache
                 val cachedBmp = store.decodeGridThumbnailBitmap(photo.hash, maxPixelSize = 320)
                 if (cachedBmp != null) {
                     putCachedThumbnail(photo.hash, cachedBmp)
@@ -934,6 +955,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                     return@launch
                 }
 
+                // 3. On-demand fallback to server preview (only for cloud-only items not in phone Gallery)
                 val client = PhotoHubApiClient(context, settings)
                 val raw = runCatching { client.downloadPhotoPreviewData(photo.hash) }.getOrNull()
                 val compressed = raw?.let { store.cacheDownloadedPreview(it, photo.hash) }
@@ -1151,7 +1173,11 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
         speculativePrefetchJob?.cancel()
 
         viewModelScope.launch(Dispatchers.IO) {
-            if (!(photo.isVideo && photo.needsProxy)) {
+            // 1. Prefer crisp preview directly from Native Android Gallery (zero server fetch!)
+            val nativeBmp = mediaService.loadNativeGalleryPreviewBitmap(photo.hash, photo.isVideo, maxPixelSize = 1600)
+            if (nativeBmp != null) {
+                _detailState.update { it?.copy(previewBitmap = nativeBmp) }
+            } else if (!(photo.isVideo && photo.needsProxy)) {
                 val cached = store.previewData(photo.hash)?.let {
                     BitmapFactory.decodeByteArray(it, 0, it.size)
                 }
@@ -1168,7 +1194,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                 }
             }
 
-            if (photo.isVideo && !photo.needsProxy) {
+            if (photo.isVideo) {
                 prepareDetailVideoProxy(photo)
             }
         }
@@ -1203,11 +1229,19 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
     }
 
     private suspend fun prepareDetailVideoProxy(photo: ServerPhoto) {
+        // 1. Play straight from Native Android Gallery if already on device (zero server video download!)
+        val nativeVideoUri = mediaService.findLiveNativeVideoUri(photo.hash)
+        if (nativeVideoUri != null) {
+            _detailState.update { it?.copy(videoUri = nativeVideoUri) }
+            return
+        }
+
         val existing = store.videoProxyFileIfExists(photo.hash)
         if (existing != null) {
             _detailState.update { it?.copy(videoFile = existing) }
             return
         }
+        if (photo.needsProxy) return
         _detailState.update { it?.copy(isLoadingVideo = true) }
         try {
             val temp = PhotoHubApiClient(context, settings).downloadVideoProxyToTempFile(photo.hash)
@@ -1307,9 +1341,29 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                 }
                 return@launch
             }
-            if (tracker.liveProxyAssetId(photo.hash) != null) {
+            val alreadyInNativeGallery = withContext(Dispatchers.IO) {
+                if (tracker.hasAnyLiveGalleryAsset(photo.hash)) return@withContext true
+                val prefix = ProxyGenerator.proxyPrefixTag(photo.hash)
+                val existingProxy = if (prefix.isNotEmpty()) mediaService.scanExistingProxyPrefixesInGallery()[prefix] else null
+                if (existingProxy != null) {
+                    tracker.markAsProxy(
+                        assetId = existingProxy,
+                        proxySha256 = photo.proxyHash.orEmpty(),
+                        masterHash = photo.hash,
+                        originalName = photo.originalName
+                    )
+                    return@withContext true
+                }
+                val existingOrig = mediaService.findMatchingOriginalAssetIdInGallery(photo)
+                if (existingOrig != null) {
+                    tracker.markUploadedOriginal(existingOrig, photo.hash)
+                    return@withContext true
+                }
+                false
+            }
+            if (alreadyInNativeGallery) {
                 _detailState.update {
-                    it?.copy(isBusy = false, busyLabel = "", saveMessage = "Already saved in phone Gallery.")
+                    it?.copy(isBusy = false, busyLabel = "", saveMessage = "Already in phone Gallery (duplicate avoided).")
                 }
                 return@launch
             }

@@ -135,6 +135,8 @@ object PhotoBackupPipeline {
                     return BackupPipelineResult.SkippedProtectedOriginal(resolvedMasterHash)
                 }
 
+                tracker.markUploadedOriginal(candidate.id, resolvedMasterHash)
+
                 val needsUpload = !(check.exists && check.isMaster && check.canReplaceWithProxy)
                 val serverHasProxy = check.hasProxy
                 val localProxyPresent = tracker.liveProxyAssetId(resolvedMasterHash) != null ||
@@ -280,17 +282,24 @@ object PhotoBackupPipeline {
                     }
 
                     if (keepLocalProxy) {
-                        onStageChange(PhotoCompressionState.ReplacingInPhotos)
-                        val newAssetId = gallerySaveSemaphore.withPermit {
-                            mediaService.saveCompressedProxyToGallery(candidate, proxy.file)
-                        }
-                        if (newAssetId != candidate.id) {
-                            tracker.markAsProxy(
-                                assetId = newAssetId,
-                                proxySha256 = proxy.sha256,
-                                masterHash = master.sha256,
-                                originalName = master.filename
-                            )
+                        val existingPrefix = ProxyGenerator.proxyPrefixTag(master.sha256)
+                        val alreadyHasProxyInGallery = tracker.liveProxyAssetId(master.sha256) != null ||
+                            mediaService.scanExistingProxyPrefixesInGallery()[existingPrefix] != null
+                        if (alreadyHasProxyInGallery) {
+                            tracker.markMasterHandledForPhotos(master.sha256)
+                        } else {
+                            onStageChange(PhotoCompressionState.ReplacingInPhotos)
+                            val newAssetId = gallerySaveSemaphore.withPermit {
+                                mediaService.saveCompressedProxyToGallery(candidate, proxy.file)
+                            }
+                            if (newAssetId != candidate.id) {
+                                tracker.markAsProxy(
+                                    assetId = newAssetId,
+                                    proxySha256 = proxy.sha256,
+                                    masterHash = master.sha256,
+                                    originalName = master.filename
+                                )
+                            }
                         }
                     } else {
                         tracker.markMasterHandledForPhotos(master.sha256)

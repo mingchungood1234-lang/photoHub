@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import Photos
 import UIKit
@@ -110,6 +111,201 @@ final class PhotoLibraryService {
     /// `PHOTOHUB_PROXY_<prefix>` assets, returning `prefix16 -> PHAsset.localIdentifier`.
     static func scanExistingProxyPrefixesInPhotos() -> [String: String] {
         scanAllProxyPrefixesInPhotos().compactMapValues { $0.first }
+    }
+
+    private static let originalDayKeyFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.calendar = Calendar(identifier: .gregorian)
+        f.timeZone = TimeZone(secondsFromGMT: 0)
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    /// Builds normalized lookup keys (`filename|yyyy-MM-dd` and `filename`) for deduplicating
+    /// against originals already sitting in Apple Photos (zero iCloud download).
+    static func originalMatchKeys(filename: String, creationDate: Date?) -> [String] {
+        let base = URL(fileURLWithPath: filename).lastPathComponent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !base.isEmpty, !base.hasPrefix(ProxyGenerator.proxyFilenamePrefix.lowercased()) else {
+            return []
+        }
+        var keys: [String] = []
+        if let creationDate {
+            let dayStr = originalDayKeyFormatter.string(from: creationDate)
+            keys.append("\(base)|\(dayStr)")
+            // Also accept +-1 day boundary for timezone shifts between EXIF and UTC
+            if let prevDay = Calendar(identifier: .gregorian).date(byAdding: .day, value: -1, to: creationDate) {
+                keys.append("\(base)|\(originalDayKeyFormatter.string(from: prevDay))")
+            }
+            if let nextDay = Calendar(identifier: .gregorian).date(byAdding: .day, value: 1, to: creationDate) {
+                keys.append("\(base)|\(originalDayKeyFormatter.string(from: nextDay))")
+            }
+        } else {
+            keys.append(base)
+        }
+        return keys
+    }
+
+    /// Scans local Apple Photos metadata (zero iCloud download) for existing non-proxy originals,
+    /// returning `matchKey -> PHAsset.localIdentifier` so proxies are never duplicated alongside originals.
+    static func scanExistingOriginalMapInPhotos() -> [String: String] {
+        let auth = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard auth == .authorized || auth == .limited else { return [:] }
+
+        let options = PHFetchOptions()
+        options.includeHiddenAssets = false
+        let assets = PHAsset.fetchAssets(with: options)
+        var map: [String: String] = [:]
+        map.reserveCapacity(assets.count)
+
+        for i in 0..<assets.count {
+            autoreleasepool {
+                let asset = assets.object(at: i)
+                let info = inspectAssetResources(for: asset)
+                guard info.proxyMatch == nil, let name = info.originalFilename else { return }
+                let base = URL(fileURLWithPath: name).lastPathComponent
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                guard !base.isEmpty else { return }
+                if let created = asset.creationDate {
+                    let dayStr = originalDayKeyFormatter.string(from: created)
+                    let datedKey = "\(base)|\(dayStr)"
+                    if map[datedKey] == nil {
+                        map[datedKey] = asset.localIdentifier
+                    }
+                }
+                if map[base] == nil {
+                    map[base] = asset.localIdentifier
+                }
+            }
+        }
+        return map
+    }
+
+    /// Checks whether a server photo already has a matching non-proxy original physically in Apple Photos.
+    static func findMatchingOriginalAssetIdInPhotos(for photo: ServerPhoto) -> String? {
+        let keys = originalMatchKeys(filename: photo.originalName, creationDate: photo.parsedCreationDate)
+        guard !keys.isEmpty else { return nil }
+        let existing = scanExistingOriginalMapInPhotos()
+        for key in keys {
+            if let found = existing[key] {
+                return found
+            }
+        }
+        return nil
+    }
+
+    /// Reconciles server photos against local Apple Photos metadata (zero iCloud download) so
+    /// already-present originals & proxies link immediately to `LocalProxyTracker` for zero-download browsing.
+    static func reconcileExistingNativeGalleryAssets(for photos: [ServerPhoto]) {
+        let auth = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard auth == .authorized || auth == .limited, !photos.isEmpty else { return }
+
+        let tracker = LocalProxyTracker.shared
+        let unresolved = photos.filter { !tracker.hasAnyLiveGalleryAsset(forMasterHash: $0.hash) }
+        guard !unresolved.isEmpty else { return }
+
+        let proxyPrefixes = scanExistingProxyPrefixesInPhotos()
+        let originalsMap = scanExistingOriginalMapInPhotos()
+
+        for photo in unresolved {
+            let prefix = ProxyGenerator.proxyPrefixTag(forMasterHash: photo.hash)
+            if !prefix.isEmpty, let proxyAssetId = proxyPrefixes[prefix] {
+                tracker.markAsProxy(
+                    assetId: proxyAssetId,
+                    proxySha256: photo.proxyHash ?? "",
+                    masterHash: photo.hash,
+                    originalName: photo.originalName
+                )
+                continue
+            }
+            let keys = originalMatchKeys(filename: photo.originalName, creationDate: photo.parsedCreationDate)
+            for key in keys {
+                if let origAssetId = originalsMap[key] {
+                    tracker.markUploadedOriginal(assetId: origAssetId, masterHash: photo.hash)
+                    break
+                }
+            }
+        }
+    }
+
+    /// Loads a fast local thumbnail directly from Apple Photos (zero network, zero app cache duplication)
+    /// when a live copy (restored original, uploaded original, or saved proxy) already exists on this phone.
+    static func loadNativeGalleryThumbnail(forMasterHash masterHash: String, maxPixelSize: CGFloat = 360) async -> UIImage? {
+        guard let asset = LocalProxyTracker.shared.liveGalleryAsset(forMasterHash: masterHash) else {
+            return nil
+        }
+        return await requestLocalGalleryImage(for: asset, maxPixelSize: maxPixelSize, fastResize: true)
+    }
+
+    /// Loads a crisp preview directly from Apple Photos for the Cloud Lightbox without hitting the server.
+    static func loadNativeGalleryPreviewImage(forMasterHash masterHash: String, maxPixelSize: CGFloat = 1600) async -> UIImage? {
+        guard let asset = LocalProxyTracker.shared.liveGalleryAsset(forMasterHash: masterHash) else {
+            return nil
+        }
+        return await requestLocalGalleryImage(for: asset, maxPixelSize: maxPixelSize, fastResize: false)
+    }
+
+    /// Loads a local `AVPlayerItem` directly from Apple Photos for instant video playback with zero server download.
+    static func loadNativeGalleryAVPlayerItem(forMasterHash masterHash: String) async -> AVPlayerItem? {
+        guard let asset = LocalProxyTracker.shared.liveGalleryAsset(forMasterHash: masterHash),
+              asset.mediaType == .video else {
+            return nil
+        }
+        return await withCheckedContinuation { continuation in
+            let options = PHVideoRequestOptions()
+            options.isNetworkAccessAllowed = false
+            options.deliveryMode = .automatic
+            let lock = NSLock()
+            var resumed = false
+            PHImageManager.default().requestPlayerItem(forVideo: asset, options: options) { item, _ in
+                lock.lock()
+                let shouldResume = !resumed
+                resumed = true
+                lock.unlock()
+                if shouldResume {
+                    continuation.resume(returning: item)
+                }
+            }
+        }
+    }
+
+    private static func requestLocalGalleryImage(
+        for asset: PHAsset,
+        maxPixelSize: CGFloat,
+        fastResize: Bool
+    ) async -> UIImage? {
+        await withCheckedContinuation { continuation in
+            let options = PHImageRequestOptions()
+            options.isNetworkAccessAllowed = false
+            options.deliveryMode = .highQualityFormat
+            options.resizeMode = fastResize ? .fast : .exact
+            options.isSynchronous = false
+            let targetSize = CGSize(width: maxPixelSize, height: maxPixelSize)
+            let lock = NSLock()
+            var resumed = false
+            PHImageManager.default().requestImage(
+                for: asset,
+                targetSize: targetSize,
+                contentMode: .aspectFill,
+                options: options
+            ) { image, info in
+                let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+                let isCancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
+                let hasError = info?[PHImageErrorKey] != nil
+                if isDegraded && !isCancelled && !hasError {
+                    return
+                }
+                lock.lock()
+                let shouldResume = !resumed
+                resumed = true
+                lock.unlock()
+                if shouldResume {
+                    continuation.resume(returning: image)
+                }
+            }
+        }
     }
 
     /// Finds live compressed proxy `PHAsset`s in Apple Photos matching the provided master hashes,
@@ -701,6 +897,29 @@ final class PhotoLibraryService {
         imageData: Data? = nil,
         videoURL: URL? = nil
     ) async throws -> String {
+        // Strict duplicate guard: never insert a second copy into Apple Photos if ANY live copy
+        // (restored original, uploaded original, synced proxy, or matching original) already exists.
+        let tracker = LocalProxyTracker.shared
+        if let existingAsset = tracker.liveGalleryAsset(forMasterHash: photo.hash) {
+            tracker.markMasterHandledForPhotos(photo.hash)
+            return existingAsset.localIdentifier
+        }
+        let prefixTag = ProxyGenerator.proxyPrefixTag(forMasterHash: photo.hash)
+        if !prefixTag.isEmpty, let existingProxyId = scanExistingProxyPrefixesInPhotos()[prefixTag] {
+            tracker.markAsProxy(
+                assetId: existingProxyId,
+                proxySha256: photo.proxyHash ?? "",
+                masterHash: photo.hash,
+                originalName: photo.originalName
+            )
+            return existingProxyId
+        }
+        if let existingOrigId = findMatchingOriginalAssetIdInPhotos(for: photo) {
+            tracker.markUploadedOriginal(assetId: existingOrigId, masterHash: photo.hash)
+            tracker.markMasterHandledForPhotos(photo.hash)
+            return existingOrigId
+        }
+
         if photo.isVideo && videoURL == nil && imageData == nil {
             throw PhotoLibraryError.proxyReplacementFailed("Missing video proxy file to save.")
         }

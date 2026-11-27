@@ -64,7 +64,7 @@ fun ServerPhotoDetailDialog(
     val context = LocalContext.current
     val photo = detail.photo
     val needsProxyAction = photo.needsProxy ||
-        (photo.isVideo && detail.videoFile == null && photo.hasVideoProxy != true && !detail.isLoadingVideo)
+        (photo.isVideo && detail.videoUri == null && detail.videoFile == null && photo.hasVideoProxy != true && !detail.isLoadingVideo)
     val isOriginalProtected = photo.isProtectedOriginal || detail.isLocallyProtected
     var showDeleteConfirm by remember(photo.hash) { mutableStateOf(false) }
 
@@ -173,10 +173,11 @@ fun ServerPhotoDetailDialog(
                     .padding(horizontal = 12.dp),
                 contentAlignment = Alignment.Center
             ) {
-                val videoFile = detail.videoFile
+                val playbackUri = detail.videoUri
+                    ?: detail.videoFile?.takeIf { it.exists() }?.let { Uri.fromFile(it) }
                 when {
-                    videoFile != null && videoFile.exists() -> {
-                        VideoProxyPlayerView(videoFile = videoFile)
+                    playbackUri != null -> {
+                        VideoProxyPlayerView(videoUri = playbackUri)
                     }
                     detail.previewBitmap != null -> {
                         Box(contentAlignment = Alignment.BottomCenter) {
@@ -555,11 +556,11 @@ private fun LightboxBadgePill(
 }
 
 @Composable
-private fun VideoProxyPlayerView(videoFile: File) {
+private fun VideoProxyPlayerView(videoUri: Uri) {
     val context = LocalContext.current
-    val player = remember(videoFile.absolutePath) {
+    val player = remember(videoUri.toString()) {
         ExoPlayer.Builder(context).build().apply {
-            setMediaItem(MediaItem.fromUri(Uri.fromFile(videoFile)))
+            setMediaItem(MediaItem.fromUri(videoUri))
             prepare()
             playWhenReady = true
         }

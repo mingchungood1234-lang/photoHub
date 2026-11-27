@@ -157,9 +157,15 @@ class LocalProxySyncManager private constructor(context: Context) {
         forceAllMissingInPhotos: Boolean
     ) {
         val mediaService = MediaLibraryService(appContext)
+        val canReadGallery = mediaService.currentAccessLevel() != com.photohub.compressor.media.MediaAccessLevel.DENIED
         val canWriteGallery = saveToPhotosApp && mediaService.canWriteGallery()
-        val existingProxyPrefixes = if (canWriteGallery) {
+        val existingProxyPrefixes = if (canReadGallery) {
             mediaService.scanExistingProxyPrefixesInGallery()
+        } else {
+            emptyMap()
+        }
+        val existingOriginalsMap = if (canReadGallery) {
+            mediaService.scanExistingOriginalMapInGallery()
         } else {
             emptyMap()
         }
@@ -169,13 +175,6 @@ class LocalProxySyncManager private constructor(context: Context) {
             val hasServerPreview = (photo.hasPreview == true) ||
                 (photo.hasPreview == null && photo.hasProxy == true && !photo.isVideo)
             val hasServerVideoProxy = photo.isVideo && photo.hasVideoProxy == true
-
-            val needCachePreview = cachePreviewsLocally &&
-                hasServerPreview &&
-                store.previewData(photo.hash) == null
-            val needCacheVideo = cacheVideosLocally &&
-                hasServerVideoProxy &&
-                store.videoProxyFileIfExists(photo.hash) == null
 
             val prefixTag = ProxyGenerator.proxyPrefixTag(photo.hash)
             val syncedAssetId = existingProxyPrefixes[prefixTag]
@@ -188,12 +187,40 @@ class LocalProxySyncManager private constructor(context: Context) {
                 )
             }
 
+            // Detect any matching original already sitting in native Android Gallery (prevents duplicate downloads & saves!)
+            var matchedOriginalAssetId: String? = null
+            if (existingOriginalsMap.isNotEmpty()) {
+                val keys = mediaService.originalMatchKeys(photo.originalName, photo.parsedCreationDateMs, photo.size)
+                for (key in keys) {
+                    val found = existingOriginalsMap[key]
+                    if (found != null) {
+                        matchedOriginalAssetId = found
+                        tracker.markUploadedOriginal(found, photo.hash)
+                        break
+                    }
+                }
+            }
+
+            val hasLiveNativeGalleryAsset = tracker.hasAnyLiveGalleryAsset(photo.hash) ||
+                syncedAssetId != null ||
+                matchedOriginalAssetId != null
+
+            // Skip downloading into LocalProxyStore whenever a live copy already exists in native Gallery
+            // (Cloud tab loads thumbnails & plays videos straight from MediaStore with zero duplication!).
+            val needCachePreview = cachePreviewsLocally &&
+                !hasLiveNativeGalleryAsset &&
+                hasServerPreview &&
+                store.previewData(photo.hash) == null
+            val needCacheVideo = cacheVideosLocally &&
+                !hasLiveNativeGalleryAsset &&
+                hasServerVideoProxy &&
+                store.videoProxyFileIfExists(photo.hash) == null
+
             val isProtected = photo.keepOriginalOnDevice == true || tracker.isRestoredMasterHash(photo.hash)
             val alreadyInGallery = when {
-                isProtected -> true
-                syncedAssetId != null -> true
-                forceAllMissingInPhotos -> tracker.liveProxyAssetId(photo.hash) != null
-                else -> tracker.isMasterHandledForPhotos(photo.hash) || tracker.liveProxyAssetId(photo.hash) != null
+                isProtected || hasLiveNativeGalleryAsset -> true
+                forceAllMissingInPhotos -> false
+                else -> tracker.isMasterHandledForPhotos(photo.hash)
             }
 
             val canSupplyMedia = if (photo.isVideo) {

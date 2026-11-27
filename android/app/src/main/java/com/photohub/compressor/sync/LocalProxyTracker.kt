@@ -30,6 +30,7 @@ class LocalProxyTracker private constructor(context: Context) {
     private val restoredAssetIds = loadSet(KEY_RESTORED_IDS)
     private val restoredMasterHashes = loadSet(KEY_RESTORED_MASTERS)
     private val restoredAssetToMaster = loadMap(KEY_RESTORED_ASSET_TO_MASTER)
+    private val uploadedOriginalMasterToAsset = loadMap(KEY_UPLOADED_ORIGINAL_MASTER_TO_ASSET)
 
     fun isKnownProxy(assetId: String): Boolean = synchronized(lock) {
         assetIds.contains(assetId)
@@ -217,6 +218,71 @@ class LocalProxyTracker private constructor(context: Context) {
         }
     }
 
+    fun markUploadedOriginal(assetId: String, masterHash: String) {
+        val normMaster = masterHash.trim().lowercase()
+        val cleanId = assetId.trim()
+        if (normMaster.isEmpty() || cleanId.isEmpty()) return
+        synchronized(lock) {
+            if (uploadedOriginalMasterToAsset[normMaster] != cleanId) {
+                uploadedOriginalMasterToAsset[normMaster] = cleanId
+                saveMap(KEY_UPLOADED_ORIGINAL_MASTER_TO_ASSET, uploadedOriginalMasterToAsset)
+            }
+        }
+    }
+
+    private fun isLiveMediaStoreUri(rawUri: String): Boolean {
+        if (rawUri.isBlank()) return false
+        val uri = runCatching { Uri.parse(rawUri) }.getOrNull() ?: return false
+        return runCatching {
+            val cols = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.IS_TRASHED)
+            } else {
+                arrayOf(MediaStore.MediaColumns._ID)
+            }
+            appContext.contentResolver.query(uri, cols, null, null, null)?.use { cursor ->
+                if (!cursor.moveToFirst()) return@use false
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                    val trashedIdx = cursor.getColumnIndex(MediaStore.MediaColumns.IS_TRASHED)
+                    if (trashedIdx >= 0 && cursor.getInt(trashedIdx) != 0) return@use false
+                }
+                true
+            } ?: false
+        }.getOrDefault(false)
+    }
+
+    fun liveUploadedOriginalAssetId(masterHash: String): String? {
+        val normMaster = masterHash.trim().lowercase()
+        if (normMaster.isEmpty()) return null
+        val savedId = synchronized(lock) { uploadedOriginalMasterToAsset[normMaster] } ?: return null
+        return if (isLiveMediaStoreUri(savedId)) savedId else null
+    }
+
+    /**
+     * Returns the best live MediaStore content URI currently in the phone's native Gallery for [masterHash],
+     * preferring restored original -> still-present uploaded original -> local compressed proxy.
+     */
+    fun liveGalleryAssetUri(masterHash: String): Uri? {
+        val normMaster = masterHash.trim().lowercase()
+        if (normMaster.isEmpty()) return null
+        val orderedCandidates = synchronized(lock) {
+            val list = linkedSetOf<String>()
+            for ((assetId, mapped) in restoredAssetToMaster) {
+                if (mapped == normMaster && assetId.isNotBlank()) list.add(assetId)
+            }
+            uploadedOriginalMasterToAsset[normMaster]?.takeIf { it.isNotBlank() }?.let { list.add(it) }
+            masterToAssetId[normMaster]?.takeIf { it.isNotBlank() }?.let { list.add(it) }
+            list.toList()
+        }
+        for (raw in orderedCandidates) {
+            if (isLiveMediaStoreUri(raw)) {
+                return Uri.parse(raw)
+            }
+        }
+        return null
+    }
+
+    fun hasAnyLiveGalleryAsset(masterHash: String): Boolean = liveGalleryAssetUri(masterHash) != null
+
     fun clearRestoredProtection(masterHash: String) {
         val normMaster = masterHash.trim().lowercase()
         if (normMaster.isEmpty()) return
@@ -286,6 +352,7 @@ class LocalProxyTracker private constructor(context: Context) {
         private const val KEY_RESTORED_IDS = "photohub_restored_asset_ids"
         private const val KEY_RESTORED_MASTERS = "photohub_restored_master_hashes"
         private const val KEY_RESTORED_ASSET_TO_MASTER = "photohub_restored_asset_to_master"
+        private const val KEY_UPLOADED_ORIGINAL_MASTER_TO_ASSET = "photohub_uploaded_original_master_to_asset"
 
         @Volatile
         private var instance: LocalProxyTracker? = null

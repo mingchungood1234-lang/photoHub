@@ -565,7 +565,13 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
                 LocalProxyStore.shared.copyVideoProxy(from: proxy.fileURL, forHash: job.masterSha256)
             }
 
+            tracker.markUploadedOriginal(assetId: job.assetId, masterHash: job.masterSha256)
+            let existingProxyPrefix = ProxyGenerator.proxyPrefixTag(forMasterHash: job.masterSha256)
+            let alreadyHasProxyInPhotos = tracker.liveProxyAssetId(forMasterHash: job.masterSha256) != nil
+                || PhotoLibraryService.scanExistingProxyPrefixesInPhotos()[existingProxyPrefix] != nil
+
             if job.keepLocalProxyInPhotos,
+               !alreadyHasProxyInPhotos,
                let liveAsset = PhotoLibraryService.fetchLiveAssets(forLocalIdentifiers: [job.assetId]).first {
                 if let newAssetId = try? await photoService.saveCompressedProxyToPhotosAsync(
                     originalAsset: liveAsset,

@@ -173,9 +173,13 @@ final class LocalProxySyncManager: ObservableObject {
     ) async {
         let store = LocalProxyStore.shared
         let tracker = LocalProxyTracker.shared
-        let canWritePhotos = saveToPhotosApp && PhotoLibraryService.canWriteToPhotosLibrary()
-        let existingProxyPrefixes = canWritePhotos
+        let canReadPhotos = PhotoLibraryService.canWriteToPhotosLibrary()
+        let canWritePhotos = saveToPhotosApp && canReadPhotos
+        let existingProxyPrefixes = canReadPhotos
             ? PhotoLibraryService.scanExistingProxyPrefixesInPhotos()
+            : [:]
+        let existingOriginalsMap = canReadPhotos
+            ? PhotoLibraryService.scanExistingOriginalMapInPhotos()
             : [:]
 
         var workItems: [LocalPrefetchWorkItem] = []
@@ -183,13 +187,6 @@ final class LocalProxySyncManager: ObservableObject {
         for photo in photos {
             let hasServerImagePreview = (photo.hasPreview == true) || (photo.hasPreview == nil && photo.hasProxy == true && !photo.isVideo)
             let hasServerVideoProxy = photo.isVideo && photo.hasVideoProxy == true
-
-            let needCachePreview = cachePreviewsLocally
-                && hasServerImagePreview
-                && store.previewData(forHash: photo.hash) == nil
-            let needCacheVideo = cacheVideosLocally
-                && hasServerVideoProxy
-                && store.videoProxyURLIfExists(forHash: photo.hash) == nil
 
             let prefixTag = ProxyGenerator.proxyPrefixTag(forMasterHash: photo.hash)
             let iCloudSyncedProxyAssetId = existingProxyPrefixes[prefixTag]
@@ -202,19 +199,47 @@ final class LocalProxySyncManager: ObservableObject {
                 )
             }
 
+            // Detect any matching original already sitting in Apple Photos (prevents duplicate downloads & saves!)
+            var matchedOriginalAssetId: String? = nil
+            if !existingOriginalsMap.isEmpty {
+                let matchKeys = PhotoLibraryService.originalMatchKeys(
+                    filename: photo.originalName,
+                    creationDate: photo.parsedCreationDate
+                )
+                for key in matchKeys {
+                    if let foundId = existingOriginalsMap[key] {
+                        matchedOriginalAssetId = foundId
+                        tracker.markUploadedOriginal(assetId: foundId, masterHash: photo.hash)
+                        break
+                    }
+                }
+            }
+
+            let hasLiveNativeGalleryAsset = tracker.hasAnyLiveGalleryAsset(forMasterHash: photo.hash)
+                || iCloudSyncedProxyAssetId != nil
+                || matchedOriginalAssetId != nil
+
             let isRestoredProtected = (photo.keepOriginalOnDevice == true)
                 || tracker.isRestoredMasterHash(photo.hash)
 
+            // Skip downloading into LocalProxyStore whenever a live copy already exists in native Apple Photos
+            // (Cloud tab reads thumbnails & plays videos straight from Apple Photos with zero duplication!).
+            let needCachePreview = cachePreviewsLocally
+                && !hasLiveNativeGalleryAsset
+                && hasServerImagePreview
+                && store.previewData(forHash: photo.hash) == nil
+            let needCacheVideo = cacheVideosLocally
+                && !hasLiveNativeGalleryAsset
+                && hasServerVideoProxy
+                && store.videoProxyURLIfExists(forHash: photo.hash) == nil
+
             let alreadyInPhotos: Bool
-            if isRestoredProtected {
-                alreadyInPhotos = true
-            } else if iCloudSyncedProxyAssetId != nil {
+            if isRestoredProtected || hasLiveNativeGalleryAsset {
                 alreadyInPhotos = true
             } else if forceAllMissingInPhotos {
-                alreadyInPhotos = tracker.liveProxyAssetId(forMasterHash: photo.hash) != nil
+                alreadyInPhotos = false
             } else {
                 alreadyInPhotos = tracker.isMasterHandledForPhotos(photo.hash)
-                    || tracker.liveProxyAssetId(forMasterHash: photo.hash) != nil
             }
 
             let canSupplyMediaForPhotos: Bool = {

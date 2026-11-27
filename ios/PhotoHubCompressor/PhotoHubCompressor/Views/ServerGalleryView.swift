@@ -1618,9 +1618,15 @@ struct ServerGalleryView: View {
                 baseURL: settings.normalizedBaseURL,
                 apiKey: settings.apiKey
             )
+            // Link any already-present Apple Photos assets by local metadata (zero iCloud download)
+            // so grid thumbnails & videos load directly from native Photos without server downloads.
+            await Task.detached(priority: .utility) {
+                PhotoLibraryService.reconcileExistingNativeGalleryAssets(for: fetched)
+            }.value
             photos = fetched
             refreshLocallyProtectedHashes()
             rebuildTimeline()
+            thumbCacheRevision &+= 1
             for photo in fetched where !photo.needsProxy {
                 failedPreviewHashes.remove(photo.hash)
             }
@@ -1648,6 +1654,16 @@ struct ServerGalleryView: View {
         guard ThumbnailMemoryCache.shared.image(forHash: photo.hash) == nil else { return }
 
         let targetHash = photo.hash
+
+        // 1. Check Native Apple Photos FIRST (zero network download, zero duplicate app cache!)
+        if let nativeThumb = await PhotoLibraryService.loadNativeGalleryThumbnail(forMasterHash: targetHash, maxPixelSize: 360) {
+            ThumbnailMemoryCache.shared.setImage(nativeThumb, forHash: targetHash)
+            failedPreviewHashes.remove(targetHash)
+            thumbCacheRevision &+= 1
+            return
+        }
+
+        // 2. Check local app preview cache (for items not currently in this phone's Photos library)
         let decodedLocal: UIImage? = await Task.detached(priority: .utility) {
             guard let cachedData = LocalProxyStore.shared.previewData(forHash: targetHash) else {
                 return nil
@@ -1668,6 +1684,7 @@ struct ServerGalleryView: View {
             return
         }
 
+        // 3. On-demand fallback to server preview (only for cloud-only items not on this phone)
         let client = PhotoHubAPIClient(settings: settings)
         if let rawData = try? await client.downloadPhotoPreviewData(hash: targetHash) {
             let thumb: UIImage? = await Task.detached(priority: .utility) {
@@ -2422,7 +2439,10 @@ private struct ServerPhotoDetailView: View {
         }
         .preferredColorScheme(.dark)
         .task {
-                if previewImage == nil {
+                // 1. Prefer crisp preview straight from Native Apple Photos (zero server fetch!)
+                if let nativeImg = await PhotoLibraryService.loadNativeGalleryPreviewImage(forMasterHash: currentPhoto.hash, maxPixelSize: 1600) {
+                    previewImage = nativeImg
+                } else if previewImage == nil {
                     if let initialImage, let initialCompressedData {
                         previewImage = initialImage
                         compressedData = initialCompressedData
@@ -2460,7 +2480,7 @@ private struct ServerPhotoDetailView: View {
                     )
                 }
 
-                if currentPhoto.isVideo && !currentPhoto.needsProxy {
+                if currentPhoto.isVideo {
                     await prepareVideoProxyIfNeeded()
                 }
             }
@@ -2527,6 +2547,14 @@ private struct ServerPhotoDetailView: View {
     }
 
     private func prepareVideoProxyIfNeeded() async {
+        // 1. Play straight from Native Apple Photos if already on device (zero server video download!)
+        if let nativePlayerItem = await PhotoLibraryService.loadNativeGalleryAVPlayerItem(forMasterHash: currentPhoto.hash) {
+            let avPlayer = AVPlayer(playerItem: nativePlayerItem)
+            player = avPlayer
+            avPlayer.play()
+            return
+        }
+
         if let cachedURL = LocalProxyStore.shared.videoProxyURLIfExists(forHash: currentPhoto.hash) {
             localVideoProxyURL = cachedURL
             let avPlayer = AVPlayer(url: cachedURL)
@@ -2534,6 +2562,8 @@ private struct ServerPhotoDetailView: View {
             avPlayer.play()
             return
         }
+
+        guard !currentPhoto.needsProxy else { return }
 
         isLoadingVideo = true
         defer { isLoadingVideo = false }
@@ -2592,8 +2622,29 @@ private struct ServerPhotoDetailView: View {
             return
         }
 
-        if LocalProxyTracker.shared.liveProxyAssetId(forMasterHash: currentPhoto.hash) != nil {
-            saveMessage = "Already saved in iPhone Photos."
+        let alreadyInNativePhotos = await Task.detached(priority: .userInitiated) { [currentPhoto] in
+            if LocalProxyTracker.shared.hasAnyLiveGalleryAsset(forMasterHash: currentPhoto.hash) {
+                return true
+            }
+            let prefix = ProxyGenerator.proxyPrefixTag(forMasterHash: currentPhoto.hash)
+            if !prefix.isEmpty, let existingProxyId = PhotoLibraryService.scanExistingProxyPrefixesInPhotos()[prefix] {
+                LocalProxyTracker.shared.markAsProxy(
+                    assetId: existingProxyId,
+                    proxySha256: currentPhoto.proxyHash ?? "",
+                    masterHash: currentPhoto.hash,
+                    originalName: currentPhoto.originalName
+                )
+                return true
+            }
+            if let existingOrigId = PhotoLibraryService.findMatchingOriginalAssetIdInPhotos(for: currentPhoto) {
+                LocalProxyTracker.shared.markUploadedOriginal(assetId: existingOrigId, masterHash: currentPhoto.hash)
+                return true
+            }
+            return false
+        }.value
+
+        if alreadyInNativePhotos {
+            saveMessage = "Already in iPhone Photos (duplicate avoided)."
             return
         }
 

@@ -157,9 +157,9 @@ final class AppSettings: ObservableObject {
     @AppStorage("minimumOriginalSizeKB") var minimumOriginalSizeKB: Int = 500
     @AppStorage("keepLocalProxyInPhotos") var keepLocalProxyInPhotos: Bool = true
     @AppStorage("autoCompressOnOpen") var autoCompressOnOpen: Bool = false
-    @AppStorage("autoDownloadLocalProxies") var autoDownloadLocalProxies: Bool = true
-    @AppStorage("autoDownloadLocalVideos") var autoDownloadLocalVideos: Bool = true
-    @AppStorage("autoSaveProxiesToPhotosApp") var autoSaveProxiesToPhotosApp: Bool = true
+    @AppStorage("autoDownloadLocalProxies") var autoDownloadLocalProxies: Bool = false
+    @AppStorage("autoDownloadLocalVideos") var autoDownloadLocalVideos: Bool = false
+    @AppStorage("autoSaveProxiesToPhotosApp") var autoSaveProxiesToPhotosApp: Bool = false
     @AppStorage("nightlyAutoBackupEnabled") var nightlyAutoBackupEnabled: Bool = true
     @AppStorage("nightlyRequiresCharging") var nightlyRequiresCharging: Bool = false
     @AppStorage("notifyWhenBackgroundUploadFinishes") var notifyWhenBackgroundUploadFinishes: Bool = true
