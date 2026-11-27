@@ -596,6 +596,8 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
         }
 
         let settings = await MainActor.run { AppSettings() }
+        let settingsBackupOnly = await MainActor.run { settings.isBackupOnlyMode }
+        let isBackupOnlyMode = job.backupOnly || settingsBackupOnly
         let apiClient = PhotoHubAPIClient(settings: settings)
         let tracker = LocalProxyTracker.shared
         let photoService = PhotoLibraryService()
@@ -653,12 +655,11 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
             }
 
             tracker.markUploadedOriginal(assetId: job.assetId, masterHash: job.masterSha256)
-            let isBackupOnlyNow = job.backupOnly || (await MainActor.run { settings.isBackupOnlyMode })
             let existingProxyPrefix = ProxyGenerator.proxyPrefixTag(forMasterHash: job.masterSha256)
             let alreadyHasProxyInPhotos = tracker.liveProxyAssetId(forMasterHash: job.masterSha256) != nil
                 || PhotoLibraryService.scanExistingProxyPrefixesInPhotos()[existingProxyPrefix] != nil
 
-            if !isBackupOnlyNow,
+            if !isBackupOnlyMode,
                job.keepLocalProxyInPhotos,
                !alreadyHasProxyInPhotos,
                let liveAsset = PhotoLibraryService.fetchLiveAssets(forLocalIdentifiers: [job.assetId]).first {
@@ -680,7 +681,6 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
             }
         }
 
-        let isBackupOnlyMode = job.backupOnly || (await MainActor.run { settings.isBackupOnlyMode })
         if isBackupOnlyMode {
             await MainActor.run {
                 BackgroundBackupManager.shared.updateSummary("Backed up · Originals kept on phone")

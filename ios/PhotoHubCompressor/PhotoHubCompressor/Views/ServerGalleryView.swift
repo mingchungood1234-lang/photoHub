@@ -3325,29 +3325,32 @@ private struct PhotoInfoDetailSheet: View {
         return f
     }()
 
+    private var takenText: String {
+        photo.parsedCreationDate.map { Self.infoDateFormatter.string(from: $0) }
+            ?? (photo.photoDate.isEmpty ? "Undated" : photo.photoDate)
+    }
+
     var body: some View {
         AdaptiveNavigationStack {
             List {
                 Section("Media") {
-                    LabeledContent("Filename", value: photo.originalName)
-                    LabeledContent("Type", value: photo.isVideo ? "Video" : "Photo")
-                    let takenText = photo.parsedCreationDate.map { Self.infoDateFormatter.string(from: $0) }
-                        ?? (photo.photoDate.isEmpty ? "Undated" : photo.photoDate)
-                    LabeledContent("Date Taken", value: takenText)
+                    infoRow("Filename", photo.originalName)
+                    infoRow("Type", photo.isVideo ? "Video" : "Photo")
+                    infoRow("Date Taken", takenText)
                     if let camera = photo.cameraModel, !camera.isEmpty {
-                        LabeledContent("Camera", value: camera)
+                        infoRow("Camera", camera)
                     }
-                    LabeledContent(
+                    infoRow(
                         "Original Size",
-                        value: ByteCountFormatter.string(fromByteCount: max(0, photo.size), countStyle: .file)
+                        ByteCountFormatter.string(fromByteCount: max(0, photo.size), countStyle: .file)
                     )
                     if let proxySz = photo.videoProxySize ?? photo.proxySize, proxySz > 0 {
-                        LabeledContent(
+                        infoRow(
                             "Proxy Size",
-                            value: ByteCountFormatter.string(fromByteCount: proxySz, countStyle: .file)
+                            ByteCountFormatter.string(fromByteCount: proxySz, countStyle: .file)
                         )
                     }
-                    LabeledContent("Original Protection", value: isProtected ? "Protected on Device" : "Standard")
+                    infoRow("Original Protection", isProtected ? "Protected on Device" : "Standard")
                 }
 
                 Section("Verification") {
@@ -3356,7 +3359,7 @@ private struct PhotoInfoDetailSheet: View {
                             .font(.caption.weight(.semibold))
                             .foregroundColor(.secondary)
                         Text(photo.hash)
-                            .font(.caption2.monospaced())
+                            .font(.system(.caption2, design: .monospaced))
                             .textSelection(.enabled)
                         Button(copiedHash ? "Copied SHA-256" : "Copy SHA-256") {
                             UIPasteboard.general.string = photo.hash
@@ -3375,6 +3378,18 @@ private struct PhotoInfoDetailSheet: View {
                     Button("Done") { dismiss() }
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private func infoRow(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(label)
+                .foregroundColor(.primary)
+            Spacer()
+            Text(value)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.trailing)
         }
     }
 }
@@ -3405,7 +3420,7 @@ private struct ShareLinkModalSheet: View {
                 if let link = createdLink {
                     Section("Public Share Link Ready") {
                         Text(link.url)
-                            .font(.caption.monospaced())
+                            .font(.system(.caption, design: .monospaced))
                             .textSelection(.enabled)
                         if link.hasPasscode == true {
                             Label("Protected with passcode", systemImage: "lock.fill")

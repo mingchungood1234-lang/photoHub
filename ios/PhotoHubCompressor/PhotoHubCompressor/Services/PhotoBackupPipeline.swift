@@ -126,7 +126,7 @@ enum PhotoBackupPipeline {
         }
 
         // Step 2: Check server & upload original if not already verified on server
-        let checkResult: CheckHashResponse
+        let checkResult: CheckResponse
         do {
             checkResult = try await apiClient.checkHash(master.sha256)
         } catch {
