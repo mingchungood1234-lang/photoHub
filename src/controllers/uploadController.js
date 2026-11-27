@@ -23,7 +23,38 @@ const {
   verifyS3ObjectChecksum,
 } = require('../services/s3Service');
 
-function createUploadController({ config, contextService }) {
+function createUploadController({ config, contextService, proxyQueue = null, chunkedUploadService = null }) {
+  function maybeEnqueueAutoProxy({ req, result, hashIndex, storageDir, folderName, source = 'upload' }) {
+    if (!proxyQueue || !result || !result.success || result.isProxy || !result.hash) {
+      return false;
+    }
+    const skipHeader = String((req && req.headers && req.headers['x-skip-auto-proxy']) || '').trim();
+    if (skipHeader === '1' || skipHeader.toLowerCase() === 'true') {
+      return false;
+    }
+    // Auto-generate server proxies for Web & Chunked Web uploads (or when explicitly requested);
+    // mobile apps (iOS/Android) already generate & register their own optimized proxies.
+    const explicitSource = String((req && req.headers && req.headers['x-upload-source']) || '').trim().toLowerCase();
+    const explicitAuto = String((req && req.headers && req.headers['x-auto-proxy']) || '').trim().toLowerCase();
+    const isWebUpload =
+      explicitSource === 'web' ||
+      explicitSource === 'chunked-web' ||
+      source === 'chunked-web' ||
+      explicitAuto === '1' ||
+      explicitAuto === 'true';
+    if (!isWebUpload) {
+      return false;
+    }
+    return proxyQueue.enqueue({
+      hashIndex,
+      storageDir,
+      folderName,
+      masterHash: result.serverSha256 || result.hash,
+      originalName: result.originalName || '',
+      source: explicitSource || source,
+    });
+  }
+
   return {
     async uploadDirect(req, res) {
       try {
@@ -49,6 +80,11 @@ function createUploadController({ config, contextService }) {
               .trim()
               .toLowerCase() === 'strict' ||
             String(req.query.strictChecksum ?? '').trim().toLowerCase() === 'true';
+          const gpsLat = req.headers['x-gps-lat'] !== undefined ? Number(req.headers['x-gps-lat']) : null;
+          const gpsLng = req.headers['x-gps-lng'] !== undefined ? Number(req.headers['x-gps-lng']) : null;
+          const locationLabel = req.headers['x-location-label']
+            ? decodeURIComponent(String(req.headers['x-location-label']))
+            : null;
 
           const { storageDir, hashIndex, folderName } = req.userContext;
           const quotaBytes = contextService.getQuotaBytesForContext(req.userContext);
@@ -65,9 +101,20 @@ function createUploadController({ config, contextService }) {
             quotaBytes,
             minFreeDiskBytes: config.minFreeDiskBytes,
             maxFileSizeBytes: config.maxFileSizeBytes,
+            gpsLat,
+            gpsLng,
+            locationLabel,
           });
 
           result.userFolder = folderName;
+          result.proxyQueued = maybeEnqueueAutoProxy({
+            req,
+            result,
+            hashIndex,
+            storageDir,
+            folderName,
+            source: 'web',
+          });
           const displayPath = folderName
             ? `${folderName}/${result.savedPath}`
             : result.savedPath;
@@ -192,9 +239,20 @@ function createUploadController({ config, contextService }) {
           hashIndex,
           quotaBytes,
           minFreeDiskBytes: config.minFreeDiskBytes,
+          gpsLat: bodyFields.gpsLat !== undefined ? Number(bodyFields.gpsLat) : null,
+          gpsLng: bodyFields.gpsLng !== undefined ? Number(bodyFields.gpsLng) : null,
+          locationLabel: bodyFields.locationLabel || null,
         });
 
         result.userFolder = folderName;
+        result.proxyQueued = maybeEnqueueAutoProxy({
+          req,
+          result,
+          hashIndex,
+          storageDir,
+          folderName,
+          source: 'multipart',
+        });
         const displayPath = folderName
           ? `${folderName}/${result.savedPath}`
           : result.savedPath;
@@ -359,6 +417,149 @@ function createUploadController({ config, contextService }) {
           error: err.message,
           ...(err.storage ? { storage: err.storage } : {}),
         });
+      }
+    },
+
+    async initChunkedUpload(req, res) {
+      try {
+        if (!chunkedUploadService) {
+          return res.status(501).json({ success: false, error: 'Chunked uploads are not enabled.' });
+        }
+        const { storageDir, hashIndex, folderName } = req.userContext;
+        const quotaBytes = contextService.getQuotaBytesForContext(req.userContext);
+        const body = req.body || {};
+        const result = await chunkedUploadService.initSession({
+          storageDir,
+          hashIndex,
+          folderName,
+          quotaBytes,
+          minFreeDiskBytes: config.minFreeDiskBytes,
+          maxFileSizeBytes: config.maxFileSizeBytes,
+          fileName: body.fileName || body.filename || '',
+          mimeType: body.mimeType || 'application/octet-stream',
+          fileSize: body.fileSize,
+          chunkSize: body.chunkSize,
+          expectedHash: body.expectedHash || body.sha256 || '',
+          strictChecksum: Boolean(body.strictChecksum),
+          createdAt: body.createdAt || body.photoDate || '',
+          gpsLat: body.gpsLat,
+          gpsLng: body.gpsLng,
+          locationLabel: body.locationLabel,
+          resumeUploadId: body.resumeUploadId || null,
+        });
+        return res.status(result.alreadyExists ? 200 : 201).json({
+          success: true,
+          ...result,
+        });
+      } catch (err) {
+        return res.status(err.statusCode || 500).json({
+          success: false,
+          error: err.message,
+          ...(err.storage ? { storage: err.storage } : {}),
+        });
+      }
+    },
+
+    async getChunkedUploadStatus(req, res) {
+      try {
+        if (!chunkedUploadService) {
+          return res.status(501).json({ success: false, error: 'Chunked uploads are not enabled.' });
+        }
+        const { storageDir, folderName } = req.userContext;
+        const status = await chunkedUploadService.getSessionStatus({
+          uploadId: req.params.uploadId,
+          storageDir,
+          folderName,
+        });
+        if (!status) {
+          return res.status(404).json({ success: false, error: 'Upload session not found.' });
+        }
+        return res.json({ success: true, ...status });
+      } catch (err) {
+        return res.status(err.statusCode || 500).json({ success: false, error: err.message });
+      }
+    },
+
+    async uploadChunkPart(req, res) {
+      try {
+        if (!chunkedUploadService) {
+          return res.status(501).json({ success: false, error: 'Chunked uploads are not enabled.' });
+        }
+        const { storageDir, folderName } = req.userContext;
+        const expectedChunkSha256 = String(req.headers['x-chunk-sha256'] || '').trim();
+        const result = await chunkedUploadService.writeChunkStream({
+          uploadId: req.params.uploadId,
+          chunkIndex: req.params.chunkIndex,
+          req,
+          storageDir,
+          folderName,
+          expectedChunkSha256,
+        });
+        return res.json({ success: true, ...result });
+      } catch (err) {
+        if (res.headersSent || res.writableEnded) return;
+        return res.status(err.statusCode || 500).json({ success: false, error: err.message });
+      }
+    },
+
+    async completeChunkedUpload(req, res) {
+      try {
+        if (!chunkedUploadService) {
+          return res.status(501).json({ success: false, error: 'Chunked uploads are not enabled.' });
+        }
+        const { storageDir, hashIndex, folderName } = req.userContext;
+        const quotaBytes = contextService.getQuotaBytesForContext(req.userContext);
+        const body = req.body || {};
+        const result = await chunkedUploadService.completeSession({
+          uploadId: req.params.uploadId,
+          storageDir,
+          hashIndex,
+          folderName,
+          quotaBytes,
+          minFreeDiskBytes: config.minFreeDiskBytes,
+          expectedHash: body.expectedHash || body.sha256 || '',
+          strictChecksum: Boolean(body.strictChecksum),
+        });
+        result.userFolder = folderName;
+        result.proxyQueued = maybeEnqueueAutoProxy({
+          req,
+          result,
+          hashIndex,
+          storageDir,
+          folderName,
+          source: 'chunked-web',
+        });
+        const displayPath = folderName
+          ? `${folderName}/${result.savedPath}`
+          : result.savedPath;
+        console.log(
+          `[${new Date().toISOString()}] CHUNKED_${result.status.toUpperCase()}${folderName ? ` [${folderName}]` : ''}: ${displayPath} (${result.hash.slice(0, 12)}..., ${result.size} bytes)`
+        );
+        return res.json(result);
+      } catch (err) {
+        return res.status(err.statusCode || 500).json({
+          success: false,
+          error: err.message,
+          ...(err.missingChunks ? { missingChunks: err.missingChunks } : {}),
+          ...(err.storage ? { storage: err.storage } : {}),
+        });
+      }
+    },
+
+    async abortChunkedUpload(req, res) {
+      try {
+        if (!chunkedUploadService) {
+          return res.status(501).json({ success: false, error: 'Chunked uploads are not enabled.' });
+        }
+        const { storageDir, folderName } = req.userContext;
+        const ok = await chunkedUploadService.abortSession({
+          uploadId: req.params.uploadId,
+          storageDir,
+          folderName,
+        });
+        return res.json({ success: true, aborted: ok });
+      } catch (err) {
+        return res.status(err.statusCode || 500).json({ success: false, error: err.message });
       }
     },
   };

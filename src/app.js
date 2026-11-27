@@ -42,8 +42,12 @@ const { createUploadController } = require('./controllers/uploadController');
 const { createProxyController } = require('./controllers/proxyController');
 const { createPhotoController } = require('./controllers/photoController');
 const { createShareController } = require('./controllers/shareController');
+const { createAlbumController } = require('./controllers/albumController');
 const { createAdminController } = require('./controllers/adminController');
 const { ShareStore } = require('./services/shareService');
+const { AlbumStore } = require('./services/albumService');
+const { ProxyQueueService } = require('./services/proxyQueueService');
+const { ChunkedUploadService } = require('./services/chunkedUploadService');
 const { mountRoutes } = require('./routes');
 
 async function createApp(configOverrides = {}) {
@@ -66,6 +70,12 @@ async function createApp(configOverrides = {}) {
   const shareStore = new ShareStore(config.dataDir);
   await shareStore.init();
 
+  const albumStore = new AlbumStore(config.dataDir);
+  await albumStore.init();
+
+  const proxyQueue = new ProxyQueueService({ concurrency: 2 });
+  const chunkedUploadService = new ChunkedUploadService();
+
   const nodeAllocationService = createNodeAllocationService({
     config,
     sessionSecret,
@@ -80,6 +90,7 @@ async function createApp(configOverrides = {}) {
   app.locals.hashIndex = contextService.defaultHashIndex;
   app.locals.folderContexts = contextService.folderContexts;
   app.locals.flushAllIndexes = contextService.flushAllIndexes;
+  app.locals.proxyQueue = proxyQueue;
   app.locals.sessionSecret = sessionSecret;
 
   // Middleware: parsers transform incoming bytes into `req.body` or `req.files`
@@ -112,11 +123,21 @@ async function createApp(configOverrides = {}) {
     }),
     accountController: createAccountController({ config, contextService }),
     checkController: createCheckController(),
-    uploadController: createUploadController({ config, contextService }),
+    uploadController: createUploadController({ config, contextService, proxyQueue, chunkedUploadService }),
     proxyController: createProxyController({ config }),
     photoController: createPhotoController({ config }),
-    shareController: createShareController({ config, shareStore, contextService }),
-    adminController: createAdminController({ config, contextService, userDirectory, nodeAllocationService }),
+    albumController: createAlbumController({ albumStore }),
+    shareController: createShareController({ config, shareStore, contextService, albumStore }),
+    adminController: createAdminController({
+      config,
+      contextService,
+      userDirectory,
+      nodeAllocationService,
+      shareStore,
+      albumStore,
+      proxyQueue,
+      chunkedUploadService,
+    }),
   };
 
   // Allow browser web gallery sessions on gateway/web-port/storage-node origins to call `/api/*` cleanly
@@ -164,10 +185,10 @@ async function createApp(configOverrides = {}) {
     if (origin && isAllowedCorsOrigin(origin, req)) {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Vary', 'Origin');
-      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
       res.setHeader(
         'Access-Control-Allow-Headers',
-        'Authorization,Content-Type,X-API-Key,If-None-Match,X-File-Name,X-File-Sha256,X-File-Hash,X-Created-At,X-Photo-Date,X-Verify-Checksum,X-Share-Passcode'
+        'Authorization,Content-Type,X-API-Key,If-None-Match,X-File-Name,X-File-Sha256,X-File-Hash,X-Created-At,X-Photo-Date,X-Verify-Checksum,X-Share-Passcode,X-Upload-Source,X-Skip-Auto-Proxy,X-Chunk-Sha256,X-Gps-Lat,X-Gps-Lng,X-Location-Label'
       );
       res.setHeader('Access-Control-Expose-Headers', 'ETag,X-Photo-Variant,X-Master-Sha256,Content-Disposition');
       if (req.method === 'OPTIONS') {
@@ -180,7 +201,7 @@ async function createApp(configOverrides = {}) {
   // Same-origin Gateway proxy for web gallery users assigned to a remote STORAGE_NODE
   // (eliminates CORS, HTTPS->HTTP mixed-content blocks, and private LAN/Tailscale node reachability issues).
   const WEB_PROXY_ALLOWED_PATH_RE =
-    /^\/(whoami|storage|photos(?:\/(?:delete|trash|trash\/restore|trash\/empty|download-zip))?|photo\/[^/]+(?:\/(?:preview|video-proxy|protect-original|favorite))?|shares(?:\/[^/]+)?|upload|check(?:\/[^/]+)?)$/;
+    /^\/(whoami|storage|photos(?:\/(?:delete|trash|trash\/restore|trash\/empty|download-zip|memories|map|cleanup-suggestions))?|photo\/[^/]+(?:\/(?:preview|video-proxy|protect-original|favorite))?|albums(?:\/[^/]+(?:\/photos(?:\/remove)?)?)?|shares(?:\/[^/]+)?|upload(?:\/chunked\/(?:init|[^/]+(?:\/(?:complete|part\/\d+))?))?|check(?:\/[^/]+)?)$/;
   app.use(async (req, res, next) => {
     if (!req.path.startsWith('/api/web-node/')) return next();
     const subPath = req.path.slice('/api/web-node'.length);
@@ -236,6 +257,12 @@ async function createApp(configOverrides = {}) {
       'x-created-at',
       'x-photo-date',
       'x-verify-checksum',
+      'x-upload-source',
+      'x-skip-auto-proxy',
+      'x-chunk-sha256',
+      'x-gps-lat',
+      'x-gps-lng',
+      'x-location-label',
     ];
     for (const h of forwardReqHeaders) {
       if (req.headers[h] !== undefined) upstreamHeaders[h] = String(req.headers[h]);

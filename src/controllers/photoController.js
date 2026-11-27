@@ -20,6 +20,8 @@ const zlib = require('zlib');
 const { promisify } = require('util');
 const { isS3Configured, createPresignedUrl, deleteS3Object } = require('../services/s3Service');
 const { isVideoFilename } = require('../services/proxyService');
+const { buildMemories } = require('../services/memoryService');
+const { buildCleanupSuggestions } = require('../services/mediaAnalysisService');
 const {
   streamZipToResponse,
   createDiskReadStream,
@@ -63,6 +65,10 @@ function matchesSmartSearchQuery(item, rawQuery) {
     item.takenAt || '',
     item.savedPath || '',
     item.cameraModel || '',
+    item.locationLabel || '',
+    typeof item.gpsLat === 'number' && typeof item.gpsLng === 'number'
+      ? `${item.gpsLat.toFixed(2)},${item.gpsLng.toFixed(2)} gps location map`
+      : '',
     ...monthNames,
     isVid ? 'video videos movie clip' : 'photo photos image picture',
     item.isFavorite ? 'favorite favorites fav starred heart' : '',
@@ -353,6 +359,100 @@ function createPhotoController({ config }) {
           success: false,
           error: err.message,
         });
+      }
+    },
+
+    async getMemories(req, res) {
+      try {
+        const { hashIndex } = req.userContext;
+        const all = hashIndex.listMasters();
+        const refDate = req.query.date ? String(req.query.date).trim() : null;
+        const memories = buildMemories(all, { referenceDate: refDate });
+        return sendJsonOptimized(req, res, {
+          success: true,
+          referenceDate: refDate || new Date().toISOString().slice(0, 10),
+          memories,
+        });
+      } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+      }
+    },
+
+    async getPhotoMap(req, res) {
+      try {
+        const { hashIndex } = req.userContext;
+        const all = hashIndex.listMasters();
+        const geoPhotos = all.filter(
+          (p) => typeof p.gpsLat === 'number' && typeof p.gpsLng === 'number'
+        );
+
+        // Cluster nearby photos (~0.15 deg grid cell ~ 15km) for snappy map markers
+        const clusterMap = new Map();
+        for (const p of geoPhotos) {
+          const cellLat = Math.round(p.gpsLat * 6) / 6;
+          const cellLng = Math.round(p.gpsLng * 6) / 6;
+          const key = p.locationLabel ? `loc:${p.locationLabel}` : `cell:${cellLat.toFixed(2)},${cellLng.toFixed(2)}`;
+          if (!clusterMap.has(key)) {
+            clusterMap.set(key, {
+              id: key,
+              label: p.locationLabel || `${p.gpsLat.toFixed(2)}, ${p.gpsLng.toFixed(2)}`,
+              latSum: 0,
+              lngSum: 0,
+              coverHash: p.hash,
+              photos: [],
+            });
+          }
+          const c = clusterMap.get(key);
+          c.latSum += p.gpsLat;
+          c.lngSum += p.gpsLng;
+          c.photos.push(p);
+        }
+
+        const clusters = Array.from(clusterMap.values())
+          .map((c) => ({
+            id: c.id,
+            label: c.label,
+            lat: Math.round((c.latSum / c.photos.length) * 1e6) / 1e6,
+            lng: Math.round((c.lngSum / c.photos.length) * 1e6) / 1e6,
+            count: c.photos.length,
+            coverHash: c.coverHash,
+            hashes: c.photos.map((p) => p.hash),
+            latestDate: c.photos[0]?.photoDate || '',
+          }))
+          .sort((a, b) => b.count - a.count);
+
+        return sendJsonOptimized(req, res, {
+          success: true,
+          totalPhotos: all.length,
+          geoTaggedCount: geoPhotos.length,
+          clusterCount: clusters.length,
+          clusters,
+          photos: geoPhotos.slice(0, 1000),
+        });
+      } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+      }
+    },
+
+    async getCleanupSuggestions(req, res) {
+      try {
+        const { hashIndex, storageDir } = req.userContext;
+        const scan = req.query.scan !== '0' && req.query.scan !== 'false';
+        const blurThreshold = Number(req.query.blurThreshold) > 0 ? Number(req.query.blurThreshold) : 35;
+        const maxScan = Math.min(200, Math.max(10, Number(req.query.maxScan) || 80));
+        const report = await buildCleanupSuggestions({
+          hashIndex,
+          storageDir,
+          scan,
+          maxScan,
+          blurThreshold,
+        });
+        return sendJsonOptimized(req, res, {
+          success: true,
+          ...report,
+        });
+      } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
       }
     },
 

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>photoHub Admin — Server &amp; User Storage</title>
+  <title>PhotoHub Admin — Server Analytics, Shares &amp; Jobs</title>
   <style>
     :root {
       --bg: #0f172a;
@@ -14,7 +14,9 @@
       --muted: #94a3b8;
       --blue: #38bdf8;
       --green: #34d399;
-      --orange: #fbbf24;
+      --orange: #fb923c;
+      --amber: #fbbf24;
+      --purple: #a78bfa;
       --red: #f87171;
     }
     * { box-sizing: border-box; }
@@ -25,39 +27,42 @@
       color: var(--text);
       line-height: 1.5;
     }
-    .container { max-width: 1120px; margin: 0 auto; padding: 24px 16px 48px; }
+    .container { max-width: 1240px; margin: 0 auto; padding: 24px 16px 56px; }
     header {
       display: flex;
       flex-wrap: wrap;
       align-items: center;
       justify-content: space-between;
       gap: 12px;
-      margin-bottom: 24px;
+      margin-bottom: 22px;
     }
-    .brand h1 { margin: 0; font-size: 1.5rem; font-weight: 700; }
-    .brand p { margin: 2px 0 0; color: var(--muted); font-size: 0.9rem; }
-    .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .brand h1 { margin: 0; font-size: 1.5rem; font-weight: 800; letter-spacing: -0.02em; }
+    .brand p { margin: 3px 0 0; color: var(--muted); font-size: 0.86rem; }
+    .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     button {
       background: var(--surface-soft);
       color: var(--text);
       border: 1px solid var(--border);
-      padding: 8px 14px;
-      border-radius: 8px;
-      font-size: 0.875rem;
+      padding: 8px 13px;
+      border-radius: 9px;
+      font-size: 0.84rem;
       font-weight: 600;
       cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
     }
-    button:hover { border-color: var(--blue); }
-    button.primary { background: #0284c7; border-color: #0284c7; }
-    button.primary:hover { background: #0369a1; }
-    button.small { padding: 5px 10px; font-size: 0.78rem; }
+    button:hover { border-color: var(--orange); }
+    button.primary { background: linear-gradient(135deg, #f97316, #ea580c); border-color: #ea580c; color: #fff; }
+    button.primary:hover { opacity: 0.92; }
+    button.danger { background: rgba(248, 113, 113, 0.14); border-color: rgba(248, 113, 113, 0.35); color: var(--red); }
+    button.danger:hover { background: var(--red); color: #fff; }
+    button.small { padding: 5px 10px; font-size: 0.76rem; }
     input[type="password"], input[type="search"], select {
       background: var(--bg);
       color: var(--text);
       border: 1px solid var(--border);
-      border-radius: 8px;
+      border-radius: 9px;
       padding: 8px 12px;
-      font-size: 0.9rem;
+      font-size: 0.86rem;
     }
     .login-box {
       max-width: 440px;
@@ -78,34 +83,44 @@
       border-radius: 10px;
       padding: 10px 14px;
       margin-bottom: 16px;
-      font-size: 0.9rem;
+      font-size: 0.88rem;
     }
     .grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+    .two-col {
+      display: grid;
+      grid-template-columns: 1.35fr 1fr;
       gap: 14px;
-      margin-bottom: 22px;
+      margin-bottom: 18px;
+    }
+    @media (max-width: 900px) {
+      .two-col { grid-template-columns: 1fr; }
     }
     .card {
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 14px;
-      padding: 16px 18px;
+      padding: 15px 17px;
     }
-    .card-label { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
-    .card-val { font-size: 1.45rem; font-weight: 700; margin: 4px 0; }
-    .card-sub { font-size: 0.82rem; color: var(--muted); }
+    .card-label { font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 700; }
+    .card-val { font-size: 1.38rem; font-weight: 800; margin: 4px 0; font-variant-numeric: tabular-nums; }
+    .card-sub { font-size: 0.8rem; color: var(--muted); }
     .badge {
       display: inline-block;
-      padding: 2px 9px;
+      padding: 2px 8px;
       border-radius: 999px;
-      font-size: 0.74rem;
-      font-weight: 600;
+      font-size: 0.72rem;
+      font-weight: 700;
     }
     .badge.green { background: rgba(52, 211, 153, 0.16); color: var(--green); }
     .badge.red { background: rgba(248, 113, 113, 0.16); color: var(--red); }
     .badge.blue { background: rgba(56, 189, 248, 0.16); color: var(--blue); }
-    .badge.orange { background: rgba(251, 191, 36, 0.16); color: var(--orange); }
+    .badge.orange { background: rgba(251, 146, 60, 0.18); color: var(--orange); }
+    .badge.purple { background: rgba(167, 139, 250, 0.18); color: var(--purple); }
     .progress-track {
       width: 100%;
       height: 7px;
@@ -114,14 +129,73 @@
       overflow: hidden;
       margin-top: 6px;
     }
-    .progress-fill { height: 100%; background: var(--green); transition: width 0.2s; }
-    .progress-fill.warn { background: var(--orange); }
+    .progress-fill { height: 100%; background: var(--green); transition: width 0.25s; }
+    .progress-fill.warn { background: var(--amber); }
     .progress-fill.danger { background: var(--red); }
+    .stacked-bar {
+      display: flex;
+      width: 100%;
+      height: 14px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: var(--bg);
+      margin: 10px 0 12px;
+    }
+    .seg-orig { background: var(--orange); }
+    .seg-proxy { background: var(--blue); }
+    .seg-trash { background: var(--red); }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+    .legend span { display: inline-flex; align-items: center; gap: 6px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+    .diag-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+      font-size: 0.82rem;
+    }
+    .diag-item {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 8px 10px;
+    }
+    .diag-item small { display: block; color: var(--muted); font-size: 0.72rem; }
+    .diag-item strong { font-size: 0.88rem; }
+    .tabs {
+      display: inline-flex;
+      gap: 6px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 4px;
+      margin-bottom: 14px;
+      flex-wrap: wrap;
+    }
+    .tab-btn {
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      padding: 7px 14px;
+      border-radius: 8px;
+    }
+    .tab-btn.active {
+      background: var(--surface-soft);
+      color: var(--text);
+      box-shadow: inset 0 0 0 1px var(--border);
+    }
     .panel {
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 14px;
       overflow: hidden;
+      margin-bottom: 16px;
     }
     .panel-head {
       display: flex;
@@ -132,23 +206,23 @@
       padding: 14px 18px;
       border-bottom: 1px solid var(--border);
     }
-    .panel-head h2 { margin: 0; font-size: 1.05rem; }
+    .panel-head h2 { margin: 0; font-size: 1.02rem; }
     .table-wrap { overflow-x: auto; }
-    table { width: 100%; border-collapse: collapse; min-width: 720px; }
+    table { width: 100%; border-collapse: collapse; min-width: 760px; }
     th, td {
       text-align: left;
-      padding: 12px 16px;
+      padding: 11px 15px;
       border-bottom: 1px solid var(--border);
-      font-size: 0.88rem;
+      font-size: 0.85rem;
       vertical-align: middle;
     }
-    th { font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+    th { font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
     tr:last-child td { border-bottom: none; }
     code {
       background: var(--bg);
       padding: 2px 6px;
       border-radius: 5px;
-      font-size: 0.82rem;
+      font-size: 0.8rem;
     }
     .hidden { display: none !important; }
   </style>
@@ -157,7 +231,7 @@
   <div class="container">
     <div id="loginBox" class="login-box hidden">
       <h2>photoHub Admin Console</h2>
-      <p id="loginHint">Enter your server <code>ADMIN_KEY</code> from <code>.env</code> to inspect user quotas and disk storage.</p>
+      <p id="loginHint">Enter your server <code>ADMIN_KEY</code> from <code>.env</code> to manage storage, users, share links, and proxy jobs.</p>
       <div id="loginError" class="error-msg hidden"></div>
       <form id="loginForm">
         <input id="adminKeyInput" type="password" placeholder="ADMIN_KEY" autocomplete="current-password" required />
@@ -169,10 +243,12 @@
       <header>
         <div class="brand">
           <h1>photoHub Admin Console</h1>
-          <p id="serverMeta">Loading server status...</p>
+          <p id="serverMeta">Loading server telemetry…</p>
         </div>
         <div class="toolbar">
-          <button id="rescanAllBtn">Rescan Storage Disks</button>
+          <button id="genProxiesAllBtn">Generate Missing Proxies</button>
+          <button id="rescanAllBtn">Rescan Disks</button>
+          <button id="exportCsvBtn">Export CSV</button>
           <button id="refreshBtn" class="primary">Refresh</button>
           <button id="logoutBtn" class="hidden">Lock</button>
         </div>
@@ -180,9 +256,10 @@
 
       <div id="bannerAlert" class="error-msg hidden"></div>
 
+      <!-- KPI Cards -->
       <section class="grid">
         <div class="card">
-          <div class="card-label">Server Photo Storage Used</div>
+          <div class="card-label">Photo Storage Used</div>
           <div id="cardUsedVal" class="card-val">—</div>
           <div id="cardUsedSub" class="card-sub">—</div>
         </div>
@@ -198,21 +275,76 @@
           <div id="cardDiskSub" class="card-sub">—</div>
         </div>
         <div class="card">
-          <div class="card-label">New User Sign-Ins</div>
+          <div class="card-label">New Sign-Ins</div>
           <div id="cardSignupVal" class="card-val">—</div>
           <div id="cardSignupSub" class="card-sub">—</div>
         </div>
+        <div class="card">
+          <div class="card-label">Active Share Links</div>
+          <div id="cardSharesVal" class="card-val">—</div>
+          <div id="cardSharesSub" class="card-sub">—</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Background Proxy Queue</div>
+          <div id="cardQueueVal" class="card-val">—</div>
+          <div id="cardQueueSub" class="card-sub">—</div>
+        </div>
       </section>
 
-      <section class="panel">
+      <!-- Analytics + System Diagnostics -->
+      <section class="two-col">
+        <div class="card">
+          <div class="card-label">Storage &amp; Library Breakdown</div>
+          <div class="stacked-bar">
+            <div id="segOrig" class="seg-orig" style="width:80%"></div>
+            <div id="segProxy" class="seg-proxy" style="width:15%"></div>
+            <div id="segTrash" class="seg-trash" style="width:5%"></div>
+          </div>
+          <div class="legend">
+            <span><i class="dot" style="background:var(--orange)"></i>Originals: <strong id="legOrig">—</strong></span>
+            <span><i class="dot" style="background:var(--blue)"></i>Proxies: <strong id="legProxy">—</strong></span>
+            <span><i class="dot" style="background:var(--red)"></i>Trash: <strong id="legTrash">—</strong></span>
+          </div>
+          <div class="diag-grid" style="margin-top:14px;">
+            <div class="diag-item"><small>Photos · Videos</small><strong id="statMediaSplit">—</strong></div>
+            <div class="diag-item"><small>Proxy Coverage</small><strong id="statProxyCov">—</strong></div>
+            <div class="diag-item"><small>Geo-Tagged (Map)</small><strong id="statGeoCount">—</strong></div>
+            <div class="diag-item"><small>Custom Albums</small><strong id="statAlbumCount">—</strong></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-label">Server Health &amp; Capabilities</div>
+          <div class="diag-grid">
+            <div class="diag-item"><small>Runtime</small><strong id="sysRuntime">—</strong></div>
+            <div class="diag-item"><small>Uptime</small><strong id="sysUptime">—</strong></div>
+            <div class="diag-item"><small>Memory (RSS / Heap)</small><strong id="sysMem">—</strong></div>
+            <div class="diag-item"><small>Transcoders</small><strong id="sysCaps">—</strong></div>
+          </div>
+          <div id="nodesBox" class="hidden" style="margin-top:12px;">
+            <div class="card-label" style="margin-bottom:6px;">Federated Storage Nodes</div>
+            <div id="nodesList" style="display:flex;flex-direction:column;gap:6px;font-size:0.8rem;"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Tabs -->
+      <div class="tabs" role="tablist">
+        <button class="tab-btn active" data-tab="users">Users &amp; Folders (<span id="tabUserCount">0</span>)</button>
+        <button class="tab-btn" data-tab="shares">Public Shares (<span id="tabShareCount">0</span>)</button>
+        <button class="tab-btn" data-tab="jobs">Proxy Jobs &amp; 4K Uploads (<span id="tabJobCount">0</span>)</button>
+      </div>
+
+      <!-- TAB 1: USERS -->
+      <section id="tabPanelUsers" class="panel">
         <div class="panel-head">
           <h2>Users &amp; Storage Folders (<span id="userCount">0</span>)</h2>
           <div class="toolbar">
-            <input id="searchInput" type="search" placeholder="Search email or folder..." />
+            <input id="searchInput" type="search" placeholder="Search email or folder…" />
             <select id="sortSelect">
               <option value="used">Sort: Space Used ↓</option>
               <option value="pct">Sort: Quota % ↓</option>
-              <option value="items">Sort: Photo Count ↓</option>
+              <option value="items">Sort: Media Count ↓</option>
               <option value="name">Sort: Name A–Z</option>
             </select>
           </div>
@@ -222,9 +354,10 @@
             <thead>
               <tr>
                 <th>User / Account</th>
-                <th>Server Folder</th>
-                <th>Media</th>
-                <th>Originals · Proxies</th>
+                <th>Folder</th>
+                <th>Media · Albums</th>
+                <th>Originals · Proxies · Trash</th>
+                <th>Proxy %</th>
                 <th>Quota Usage</th>
                 <th>Actions</th>
               </tr>
@@ -233,12 +366,84 @@
           </table>
         </div>
       </section>
+
+      <!-- TAB 2: SHARES -->
+      <section id="tabPanelShares" class="panel hidden">
+        <div class="panel-head">
+          <h2>Active Public Share Links</h2>
+          <span class="card-sub">Revoke any active link immediately across the server.</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Title &amp; Token</th>
+                <th>Owner / Folder</th>
+                <th>Items</th>
+                <th>Views</th>
+                <th>Security</th>
+                <th>Expires</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="sharesBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- TAB 3: JOBS & CHUNKED UPLOADS -->
+      <section id="tabPanelJobs" class="hidden">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Active Resumable 4K Chunked Uploads</h2>
+            <span class="card-sub">Incomplete uploads auto-clean after 24 hours.</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>File</th>
+                  <th>Folder</th>
+                  <th>Chunks</th>
+                  <th>Progress</th>
+                  <th>Last Activity</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="chunkedBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Recent Background Proxy &amp; Analysis Jobs</h2>
+            <button class="small primary" onclick="triggerBackfill(null)">Backfill All Missing Proxies</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Status</th>
+                  <th>File</th>
+                  <th>Folder</th>
+                  <th>Source</th>
+                  <th>Duration</th>
+                  <th>Finished</th>
+                </tr>
+              </thead>
+              <tbody id="jobsBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
     </div>
   </div>
 
   <script>
     const STORAGE_KEY = 'photohub_admin_key';
     let lastData = null;
+    let activeTab = 'users';
 
     function fmtBytes(bytes) {
       if (bytes === null || bytes === undefined) return 'Unlimited';
@@ -248,6 +453,16 @@
       if (num >= 1e6) return (num / 1e6).toFixed(1) + ' MB';
       if (num >= 1e3) return (num / 1e3).toFixed(1) + ' KB';
       return num + ' B';
+    }
+
+    function fmtUptime(secs) {
+      const s = Math.max(0, Number(secs) || 0);
+      const d = Math.floor(s / 86400);
+      const h = Math.floor((s % 86400) / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      if (d > 0) return `${d}d ${h}h ${m}m`;
+      if (h > 0) return `${h}h ${m}m`;
+      return `${m}m ${s % 60}s`;
     }
 
     function esc(str) {
@@ -278,12 +493,21 @@
       document.getElementById('loginForm').classList.toggle('hidden', isSetupError);
     }
 
+    function switchAdminTab(tab) {
+      activeTab = tab;
+      document.querySelectorAll('.tab-btn').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+      document.getElementById('tabPanelUsers').classList.toggle('hidden', tab !== 'users');
+      document.getElementById('tabPanelShares').classList.toggle('hidden', tab !== 'shares');
+      document.getElementById('tabPanelJobs').classList.toggle('hidden', tab !== 'jobs');
+    }
+
     async function loadOverview() {
       const res = await fetch('/api/admin/overview', { headers: getHeaders() });
       const data = await res.json().catch(() => ({}));
       if (res.status === 401) {
+        const hadKey = Boolean(sessionStorage.getItem(STORAGE_KEY));
         sessionStorage.removeItem(STORAGE_KEY);
-        showLogin(sessionStorage.getItem(STORAGE_KEY) ? 'Invalid ADMIN_KEY.' : '');
+        showLogin(hadKey ? 'Invalid ADMIN_KEY.' : '');
         return;
       }
       if (res.status === 503 && data.needsSetup) {
@@ -303,22 +527,27 @@
     }
 
     function renderOverview(data) {
-      const cap = data.capacity;
-      const srv = data.server;
+      const cap = data.capacity || {};
+      const srv = data.server || {};
+      const sys = data.system || {};
+      const ana = data.analytics || {};
+      const pq = data.proxyQueue || {};
+      const shares = data.activeShares || [];
+      const chunked = data.chunkedUploads || [];
+
       document.getElementById('serverMeta').textContent =
-        `Storage: ${srv.storageDir} · S3: ${srv.s3Enabled ? 'Enabled' : 'Local Disk'} · Nodes: ${srv.nodeCount} · Updated ${new Date().toLocaleTimeString()}`;
+        `Storage: ${srv.storageDir} · Backend: ${srv.s3Enabled ? 'S3/MinIO' : 'Local Disk'} · Nodes: ${srv.nodeCount} · Updated ${new Date().toLocaleTimeString()}`;
 
       document.getElementById('cardUsedVal').textContent = fmtBytes(cap.totalUsedBytes);
       document.getElementById('cardUsedSub').textContent =
-        `${cap.totalItems.toLocaleString()} files (${fmtBytes(cap.totalMastersBytes)} originals · ${fmtBytes(cap.totalProxiesBytes)} proxies)`;
+        `${(cap.totalItems || 0).toLocaleString()} active files`;
 
       const capLimit = cap.serverCapacityBytes;
       document.getElementById('cardAllocVal').textContent =
         capLimit ? `${fmtBytes(cap.totalAllocatedQuotaBytes)} / ${fmtBytes(capLimit)}` : fmtBytes(cap.totalAllocatedQuotaBytes);
       document.getElementById('cardAllocSub').textContent = capLimit
-        ? `Per-user default: ${cap.defaultQuotaBytes ? fmtBytes(cap.defaultQuotaBytes) : 'Unlimited'}`
-        : 'SERVER_CAPACITY_GB not set (unlimited pool)';
-
+        ? `Default per user: ${cap.defaultQuotaBytes ? fmtBytes(cap.defaultQuotaBytes) : 'Unlimited'}`
+        : 'SERVER_CAPACITY_GB not set';
       const allocRatio = capLimit ? Math.min(100, Math.round((Math.max(cap.totalAllocatedQuotaBytes, cap.totalUsedBytes) / capLimit) * 100)) : 0;
       const bar = document.getElementById('cardAllocBar');
       bar.style.width = `${allocRatio}%`;
@@ -327,18 +556,67 @@
       document.getElementById('cardDiskVal').textContent =
         cap.diskFreeBytes !== null ? fmtBytes(cap.diskFreeBytes) : 'Unavailable';
       document.getElementById('cardDiskSub').textContent =
-        cap.diskTotalBytes !== null ? `of ${fmtBytes(cap.diskTotalBytes)} disk capacity` : 'Host filesystem stats unavailable';
+        cap.diskTotalBytes !== null ? `of ${fmtBytes(cap.diskTotalBytes)} disk` : 'Host statfs unavailable';
 
       const signupEl = document.getElementById('cardSignupVal');
       const signupSub = document.getElementById('cardSignupSub');
       if (cap.isFullForNewUsers) {
-        signupEl.innerHTML = '<span class="badge red">Blocked (Full)</span>';
+        signupEl.innerHTML = '<span class="badge red">Blocked</span>';
         signupSub.textContent = cap.newSignupBlockReason || 'Server full';
       } else {
         signupEl.innerHTML = '<span class="badge green">Open</span>';
         signupSub.textContent = cap.maxUsers
           ? `${cap.registeredUserCount} / ${cap.maxUsers} max accounts`
-          : `${cap.registeredUserCount} account(s) active`;
+          : `${cap.registeredUserCount} active account(s)`;
+      }
+
+      document.getElementById('cardSharesVal').textContent = String(ana.activeShareCount || 0);
+      document.getElementById('cardSharesSub').textContent = `${(ana.totalShareViews || 0).toLocaleString()} total link view(s)`;
+
+      document.getElementById('cardQueueVal').textContent = `${pq.active || 0} active · ${pq.queued || 0} queued`;
+      document.getElementById('cardQueueSub').textContent = `${pq.completed || 0} done · ${pq.failed || 0} failed`;
+
+      // Storage breakdown stacked bar
+      const origB = Math.max(0, (cap.totalMastersBytes || 0) - (ana.totalTrashBytes || 0));
+      const proxyB = cap.totalProxiesBytes || 0;
+      const trashB = ana.totalTrashBytes || 0;
+      const sumB = Math.max(1, origB + proxyB + trashB);
+      document.getElementById('segOrig').style.width = `${Math.round((origB / sumB) * 100)}%`;
+      document.getElementById('segProxy').style.width = `${Math.round((proxyB / sumB) * 100)}%`;
+      document.getElementById('segTrash').style.width = `${Math.round((trashB / sumB) * 100)}%`;
+      document.getElementById('legOrig').textContent = fmtBytes(cap.totalMastersBytes || 0);
+      document.getElementById('legProxy').textContent = fmtBytes(proxyB);
+      document.getElementById('legTrash').textContent = `${fmtBytes(trashB)} (${ana.totalTrashItems || 0})`;
+
+      document.getElementById('statMediaSplit').textContent = `${(ana.totalPhotosCount || 0).toLocaleString()} photos · ${(ana.totalVideosCount || 0).toLocaleString()} videos`;
+      document.getElementById('statProxyCov').textContent = `${ana.proxyCoveragePct ?? 100}%`;
+      document.getElementById('statGeoCount').textContent = `${(ana.totalGeoTagged || 0).toLocaleString()} mapped`;
+      document.getElementById('statAlbumCount').textContent = `${(ana.totalAlbums || 0).toLocaleString()} albums`;
+
+      // System health
+      document.getElementById('sysRuntime').textContent = `${sys.nodeVersion || 'Node'} · ${sys.platform || ''}`;
+      document.getElementById('sysUptime').textContent = fmtUptime(sys.uptimeSeconds);
+      document.getElementById('sysMem').textContent = `${fmtBytes(sys.rssBytes)} / ${fmtBytes(sys.heapUsedBytes)}`;
+      const caps = sys.capabilities || {};
+      document.getElementById('sysCaps').innerHTML =
+        `<span class="badge ${caps.sharp ? 'green' : 'red'}">sharp ${caps.sharp ? '✓' : '✕'}</span> ` +
+        `<span class="badge ${caps.ffmpeg ? 'green' : 'orange'}">ffmpeg ${caps.ffmpeg ? '✓' : '✕'}</span>`;
+
+      // Federated storage nodes
+      const nodes = data.nodes || [];
+      const nodesBox = document.getElementById('nodesBox');
+      if (nodes.length > 0) {
+        nodesBox.classList.remove('hidden');
+        document.getElementById('nodesList').innerHTML = nodes.map((n) => `
+          <div style="display:flex;justify-content:space-between;align-items:center;background:var(--bg);padding:6px 10px;border-radius:8px;border:1px solid var(--border);">
+            <span><strong>${esc(n.id)}</strong> <span style="color:var(--muted)">${esc(n.url)}</span></span>
+            <span>
+              <span class="badge ${n.reachable ? 'green' : 'red'}">${n.reachable ? 'Online' : 'Offline'}</span>
+              ${n.diskFreeBytes !== null ? `<span style="margin-left:6px;color:var(--muted)">${fmtBytes(n.diskFreeBytes)} free</span>` : ''}
+            </span>
+          </div>`).join('');
+      } else {
+        nodesBox.classList.add('hidden');
       }
 
       const banner = document.getElementById('bannerAlert');
@@ -349,7 +627,13 @@
         banner.classList.add('hidden');
       }
 
+      document.getElementById('tabUserCount').textContent = String((cap.users || []).length);
+      document.getElementById('tabShareCount').textContent = String(shares.length);
+      document.getElementById('tabJobCount').textContent = String(chunked.length + (pq.recentJobs || []).length);
+
       renderUsersTable(cap.users || []);
+      renderSharesTable(shares);
+      renderJobsTables(chunked, pq.recentJobs || []);
     }
 
     function renderUsersTable(users) {
@@ -375,7 +659,7 @@
       document.getElementById('userCount').textContent = String(filtered.length);
       const tbody = document.getElementById('usersBody');
       if (filtered.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:28px;">No matching users or folders.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:26px;">No matching users or folders.</td></tr>';
         return;
       }
 
@@ -390,24 +674,82 @@
           : '';
         return `<tr>
           <td>
-            <div style="font-weight:600;">${esc(u.displayName)} <span class="badge ${badgeCls}">${badgeLabel}</span></div>
-            <div style="font-size:0.8rem;color:var(--muted);">${esc(u.email || 'Node: ' + u.nodeId)}</div>
+            <div style="font-weight:700;">${esc(u.displayName)} <span class="badge ${badgeCls}">${badgeLabel}</span></div>
+            <div style="font-size:0.78rem;color:var(--muted);">${esc(u.email || 'Node: ' + u.nodeId)}</div>
           </td>
           <td><code>${esc(u.folderName)}</code></td>
-          <td>${u.itemCount.toLocaleString()}</td>
-          <td>${fmtBytes(u.mastersBytes)} <span style="color:var(--muted);">· ${fmtBytes(u.proxiesBytes)}</span></td>
-          <td style="min-width:170px;">
+          <td>${u.itemCount.toLocaleString()} <span style="color:var(--muted);">· ${u.albumCount || 0} alb</span></td>
+          <td>${fmtBytes(u.mastersBytes)} <span style="color:var(--muted);">· ${fmtBytes(u.proxiesBytes)} · ${fmtBytes(u.trashBytes || 0)}</span></td>
+          <td><span class="badge ${(u.proxyCoveragePct ?? 100) >= 90 ? 'green' : 'orange'}">${u.proxyCoveragePct ?? 100}%</span></td>
+          <td style="min-width:160px;">
             <div>${quotaText}</div>
             ${u.quotaBytes ? `<div class="progress-track"><div class="progress-fill ${fillCls}" style="width:${pct}%"></div></div>` : ''}
           </td>
           <td>
-            <div style="display:flex;gap:6px;">
+            <div style="display:flex;gap:5px;flex-wrap:wrap;">
               ${editBtn}
               <button class="small" onclick="rescanFolder('${esc(u.folderKey)}')">Rescan</button>
+              <button class="small" onclick="triggerBackfill('${esc(u.folderKey)}')">Proxies</button>
             </div>
           </td>
         </tr>`;
       }).join('');
+    }
+
+    function renderSharesTable(shares) {
+      const tbody = document.getElementById('sharesBody');
+      if (!shares.length) {
+        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:26px;">No active public share links.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = shares.map((s) => `<tr>
+        <td>
+          <div style="font-weight:700;">${esc(s.title)}</div>
+          <a href="/s/${encodeURIComponent(s.token)}" target="_blank" style="color:var(--blue);font-size:0.78rem;">/s/${esc(s.token.slice(0, 14))}…</a>
+        </td>
+        <td><code>${esc(s.folderName || '/')}</code><div style="font-size:0.76rem;color:var(--muted);">${esc(s.ownerName || s.ownerEmail || '')}</div></td>
+        <td>${s.itemCount}</td>
+        <td>${s.viewCount || 0}${s.maxViews ? ' / ' + s.maxViews : ''}</td>
+        <td>
+          ${s.hasPasscode ? '<span class="badge purple">Passcode</span> ' : ''}
+          <span class="badge ${s.allowDownload === false ? 'orange' : 'green'}">${s.allowDownload === false ? 'View Only' : 'Download OK'}</span>
+        </td>
+        <td>${new Date(s.expiresAt).toLocaleString()}</td>
+        <td><button class="small danger" onclick="revokeShareAdmin('${esc(s.token)}')">Revoke</button></td>
+      </tr>`).join('');
+    }
+
+    function renderJobsTables(chunked, jobs) {
+      const cBody = document.getElementById('chunkedBody');
+      if (!chunked.length) {
+        cBody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:20px;">No active chunked uploads right now.</td></tr>';
+      } else {
+        cBody.innerHTML = chunked.map((u) => `<tr>
+          <td><strong>${esc(u.fileName)}</strong><div style="font-size:0.75rem;color:var(--muted);">${fmtBytes(u.fileSize)}</div></td>
+          <td><code>${esc(u.folderName)}</code></td>
+          <td>${u.uploadedCount} / ${u.totalChunks}</td>
+          <td style="min-width:140px;">
+            <div>${u.progressPct}% (${fmtBytes(u.receivedBytes)})</div>
+            <div class="progress-track"><div class="progress-fill" style="width:${u.progressPct}%"></div></div>
+          </td>
+          <td>${new Date(u.updatedAt).toLocaleTimeString()}</td>
+          <td><button class="small danger" onclick="abortChunkedAdmin('${esc(u.uploadId)}')">Clean</button></td>
+        </tr>`).join('');
+      }
+
+      const jBody = document.getElementById('jobsBody');
+      if (!jobs.length) {
+        jBody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:20px;">No background proxy jobs recorded since server start.</td></tr>';
+      } else {
+        jBody.innerHTML = jobs.map((j) => `<tr>
+          <td><span class="badge ${j.status === 'completed' ? 'green' : 'red'}">${esc(j.status)}</span></td>
+          <td>${esc(j.fileName)}${j.error ? `<div style="color:var(--red);font-size:0.75rem;">${esc(j.error)}</div>` : ''}</td>
+          <td><code>${esc(j.folderName)}</code></td>
+          <td><span class="badge blue">${esc(j.source)}</span></td>
+          <td>${j.durationMs} ms</td>
+          <td>${new Date(j.finishedAt).toLocaleTimeString()}</td>
+        </tr>`).join('');
+      }
     }
 
     async function editUserQuota(sub, label, currentBytes) {
@@ -424,8 +766,8 @@
         headers: getHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ sub, quotaGb: gb }),
       });
-      const out = await res.json().catch(() => ({}));
       if (!res.ok) {
+        const out = await res.json().catch(() => ({}));
         alert(out.error || 'Failed to update quota');
         return;
       }
@@ -446,6 +788,81 @@
       await loadOverview();
     }
 
+    async function triggerBackfill(folderKey) {
+      const res = await fetch('/api/admin/generate-missing-proxies', {
+        method: 'POST',
+        headers: getHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify(folderKey ? { folderKey } : {}),
+      });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        alert(out.error || 'Proxy backfill failed');
+        return;
+      }
+      alert(`Queued ${out.queuedCount || 0} item(s) for background proxy & visual analysis.`);
+      await loadOverview();
+    }
+
+    async function revokeShareAdmin(token) {
+      if (!confirm('Revoke this public share link immediately?')) return;
+      const res = await fetch(`/api/admin/shares/${encodeURIComponent(token)}`, {
+        method: 'DELETE',
+        headers: getHeaders(),
+      });
+      if (!res.ok) {
+        const out = await res.json().catch(() => ({}));
+        alert(out.error || 'Could not revoke share');
+        return;
+      }
+      await loadOverview();
+    }
+
+    async function abortChunkedAdmin(uploadId) {
+      const res = await fetch(`/api/admin/chunked-uploads/${encodeURIComponent(uploadId)}`, {
+        method: 'DELETE',
+        headers: getHeaders(),
+      });
+      if (!res.ok) {
+        const out = await res.json().catch(() => ({}));
+        alert(out.error || 'Could not clean upload');
+        return;
+      }
+      await loadOverview();
+    }
+
+    function exportUsersCsv() {
+      if (!lastData || !lastData.capacity) return;
+      const rows = [
+        ['DisplayName', 'Email', 'AuthType', 'Folder', 'Items', 'Albums', 'OriginalsBytes', 'ProxiesBytes', 'TrashBytes', 'UsedBytes', 'QuotaBytes', 'ProxyCoveragePct'],
+      ];
+      for (const u of lastData.capacity.users || []) {
+        rows.push([
+          u.displayName,
+          u.email || '',
+          u.authType,
+          u.folderName,
+          u.itemCount,
+          u.albumCount || 0,
+          u.mastersBytes,
+          u.proxiesBytes,
+          u.trashBytes || 0,
+          u.usedBytes,
+          u.quotaBytes || 'Unlimited',
+          u.proxyCoveragePct ?? 100,
+        ]);
+      }
+      const csv = rows.map((r) => r.map((v) => `"${String(v ?? '').replace(/"/g, '""')}"`).join(',')).join('\n');
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `photohub-storage-report-${new Date().toISOString().slice(0, 10)}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+    }
+
     document.getElementById('loginForm').addEventListener('submit', async (e) => {
       e.preventDefault();
       const val = document.getElementById('adminKeyInput').value.trim();
@@ -458,8 +875,14 @@
       }
     });
 
+    document.querySelectorAll('.tab-btn').forEach((btn) => {
+      btn.addEventListener('click', () => switchAdminTab(btn.dataset.tab));
+    });
+
     document.getElementById('refreshBtn').addEventListener('click', loadOverview);
     document.getElementById('rescanAllBtn').addEventListener('click', () => rescanFolder(null));
+    document.getElementById('genProxiesAllBtn').addEventListener('click', () => triggerBackfill(null));
+    document.getElementById('exportCsvBtn').addEventListener('click', exportUsersCsv);
     document.getElementById('logoutBtn').addEventListener('click', () => {
       sessionStorage.removeItem(STORAGE_KEY);
       showLogin('');

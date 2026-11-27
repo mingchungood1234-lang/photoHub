@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/web/styles.css?v=6" />
+  <link rel="stylesheet" href="/web/styles.css?v=7" />
 </head>
 <body>
   <!-- Animated Sunny Boot Splash Screen -->
@@ -316,6 +316,8 @@
             <button type="button" class="f-pill" data-filter="photo">Photos</button>
             <button type="button" class="f-pill" data-filter="video">Videos</button>
             <button type="button" class="f-pill" data-filter="favorite">♥ Favorites</button>
+            <button type="button" class="f-pill" data-filter="albums">Albums</button>
+            <button type="button" class="f-pill" data-filter="map">📍 Map</button>
             <button type="button" class="f-pill" data-filter="protected">Protected</button>
             <button type="button" class="f-pill f-pill--trash" data-filter="trash" id="trashFilterBtn">Trash <span id="trashCountBadge" class="pill-count hidden">0</span></button>
           </div>
@@ -323,7 +325,7 @@
           <div class="toolbar-right">
             <div class="search-wrap">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-              <input type="search" id="gallerySearchInput" placeholder="Search Nov 2026, video, name…" autocomplete="off" />
+              <input type="search" id="gallerySearchInput" placeholder="Search Tokyo, Nov 2026, video…" autocomplete="off" />
             </div>
 
             <div class="segmented-control segmented-control--sm" id="groupingControl">
@@ -332,6 +334,8 @@
               <button type="button" class="seg-btn" data-group="year">Year</button>
             </div>
 
+            <button type="button" class="btn-soft btn-sm" id="cleanupBtn" title="Find similar, burst &amp; blurry shots">✨ Clean Up</button>
+            <button type="button" class="btn-soft btn-sm" id="manageSharesBtn" title="Manage active share links">🔗 Links</button>
             <button type="button" class="btn-soft btn-sm" id="selectModeBtn">Select</button>
             <input type="file" id="webUploadInput" class="hidden" multiple accept="image/*,video/*" />
             <button type="button" class="icon-btn" id="webUploadBtn" title="Upload Photos & Videos" aria-label="Upload photos and videos">
@@ -357,6 +361,108 @@
           <button type="button" class="btn-danger btn-sm" id="emptyTrashBtn">Empty Trash</button>
         </div>
       </div>
+
+      <!-- Memories Carousel Strip (On This Day, Trips, Favorites) -->
+      <section id="memoriesStrip" class="memories-strip hidden" aria-label="Memories">
+        <div class="memories-head">
+          <div>
+            <h3>Memories</h3>
+            <span id="memoriesSub" class="muted-text">On This Day &amp; curated highlights</span>
+          </div>
+        </div>
+        <div id="memoriesCarousel" class="memories-carousel"></div>
+      </section>
+
+      <!-- Custom Albums View (Trips, Events, Family) -->
+      <section id="albumsViewSection" class="albums-section hidden" aria-label="Custom Albums">
+        <div id="albumsOverviewPane">
+          <div class="albums-head">
+            <div class="filter-pills" id="albumCategoryPills">
+              <button type="button" class="f-pill is-active" data-alb-cat="all">All Albums</button>
+              <button type="button" class="f-pill" data-alb-cat="trip">✈️ Trips</button>
+              <button type="button" class="f-pill" data-alb-cat="event">🎉 Events</button>
+              <button type="button" class="f-pill" data-alb-cat="family">👨‍👩‍👧 Family</button>
+              <button type="button" class="f-pill" data-alb-cat="custom">📁 Custom</button>
+            </div>
+            <button type="button" class="btn-primary btn-sm" id="newAlbumBtn">+ New Album</button>
+          </div>
+          <div id="albumsGrid" class="albums-grid"></div>
+        </div>
+
+        <div id="activeAlbumBanner" class="active-album-banner hidden">
+          <div class="active-album-info">
+            <button type="button" class="btn-soft btn-xs" id="backToAlbumsBtn">← Albums</button>
+            <div>
+              <h3 id="activeAlbumTitle">Album</h3>
+              <span id="activeAlbumMeta" class="muted-text"></span>
+            </div>
+          </div>
+          <div class="active-album-actions">
+            <button type="button" class="btn-primary btn-sm" id="shareActiveAlbumBtn">Share Album</button>
+            <button type="button" class="btn-soft btn-sm" id="editActiveAlbumBtn">Edit</button>
+            <button type="button" class="btn-danger btn-sm" id="deleteActiveAlbumBtn">Delete</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Interactive Photo Map & Location Search View -->
+      <section id="mapViewSection" class="map-section hidden" aria-label="Photo Map">
+        <div class="map-header">
+          <div>
+            <h3>Photo Map &amp; Places</h3>
+            <span id="mapSummaryText" class="muted-text">Loading geo-tagged photos…</span>
+          </div>
+          <div class="map-controls">
+            <button type="button" class="btn-soft btn-xs" id="mapZoomInBtn" title="Zoom in">＋</button>
+            <button type="button" class="btn-soft btn-xs" id="mapZoomOutBtn" title="Zoom out">－</button>
+            <button type="button" class="btn-soft btn-xs" id="mapResetBtn">Reset View</button>
+          </div>
+        </div>
+        <div class="map-stage" id="photoMapStage">
+          <div class="map-canvas" id="photoMapCanvas">
+            <svg class="world-map-svg" viewBox="0 0 1000 500" preserveAspectRatio="none" aria-hidden="true">
+              <defs>
+                <linearGradient id="oceanGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="var(--soft-peach)" stop-opacity="0.65"/>
+                  <stop offset="100%" stop-color="var(--canvas)" stop-opacity="0.95"/>
+                </linearGradient>
+              </defs>
+              <rect width="1000" height="500" fill="url(#oceanGrad)"/>
+              <g class="map-grid-lines" stroke="var(--border)" stroke-width="0.7" opacity="0.6">
+                <line x1="0" y1="125" x2="1000" y2="125"/><line x1="0" y1="250" x2="1000" y2="250"/><line x1="0" y1="375" x2="1000" y2="375"/>
+                <line x1="250" y1="0" x2="250" y2="500"/><line x1="500" y1="0" x2="500" y2="500"/><line x1="750" y1="0" x2="750" y2="500"/>
+              </g>
+              <!-- Simplified stylized continents (equirectangular projection) -->
+              <g class="map-land" fill="var(--orange)" fill-opacity="0.16" stroke="var(--orange)" stroke-opacity="0.35" stroke-width="1">
+                <!-- North America -->
+                <path d="M95,70 L175,65 L245,88 L292,112 L272,155 L240,188 L218,220 L195,215 L175,188 L145,160 L118,125 Z"/>
+                <!-- Greenland -->
+                <path d="M315,40 L375,38 L392,70 L352,92 L322,74 Z"/>
+                <!-- South America -->
+                <path d="M235,235 L292,248 L335,295 L322,355 L290,418 L262,438 L252,380 L238,312 Z"/>
+                <!-- Europe -->
+                <path d="M462,74 L548,68 L585,95 L575,134 L535,148 L482,146 L464,122 Z"/>
+                <!-- Africa -->
+                <path d="M468,162 L552,162 L608,210 L612,262 L582,342 L548,376 L516,330 L495,258 L462,218 Z"/>
+                <!-- Asia -->
+                <path d="M565,68 L740,64 L855,88 L880,145 L835,198 L785,222 L735,235 L685,212 L630,192 L585,152 Z"/>
+                <!-- Japan / SEA Islands -->
+                <path d="M870,138 L895,148 L885,176 L866,168 Z"/>
+                <path d="M775,246 L830,255 L858,278 L792,276 Z"/>
+                <!-- Australia & NZ -->
+                <path d="M792,315 L882,312 L904,368 L858,395 L796,374 Z"/>
+                <path d="M926,378 L948,392 L934,414 L918,402 Z"/>
+              </g>
+            </svg>
+            <div id="photoMapPins" class="map-pins-layer"></div>
+          </div>
+        </div>
+        <div id="mapPlacePills" class="map-place-pills"></div>
+        <div id="mapSelectedHeader" class="map-selected-head hidden">
+          <strong id="mapSelectedTitle">Location</strong>
+          <button type="button" class="btn-soft btn-xs" id="mapClearPlaceBtn">Show All Mapped</button>
+        </div>
+      </section>
 
       <!-- Shimmer Loading Skeleton -->
       <div id="gallerySkeleton" class="gallery-skeleton hidden" aria-label="Loading photos">
@@ -397,6 +503,8 @@
     <div class="selection-actions">
       <button type="button" class="btn-soft btn-sm" id="selectAllVisibleBtn">All</button>
       <button type="button" class="btn-primary btn-sm" id="downloadZipBtn" disabled>ZIP</button>
+      <button type="button" class="btn-soft btn-sm" id="addToAlbumSelectedBtn" disabled>+ Album</button>
+      <button type="button" class="btn-soft btn-sm hidden" id="removeFromAlbumSelectedBtn" disabled>Remove</button>
       <button type="button" class="btn-soft btn-sm" id="shareSelectedBtn" disabled>Share</button>
       <button type="button" class="btn-primary btn-sm hidden" id="restoreSelectedBtn" disabled>Restore</button>
       <button type="button" class="btn-danger btn-sm" id="deleteSelectedBtn" disabled>Trash</button>
@@ -474,6 +582,7 @@
           <span>Original</span>
         </button>
         <button type="button" class="btn-soft btn-sm" id="lbShareBtn">Share Link</button>
+        <button type="button" class="btn-soft btn-sm" id="lbAlbumBtn">+ Album</button>
         <button type="button" class="btn-soft btn-sm" id="lbProtectBtn">Protect</button>
         <button type="button" class="btn-primary btn-sm hidden" id="lbRestoreBtn">Restore</button>
         <button type="button" class="btn-danger btn-sm" id="lbDeleteBtn">Trash</button>
@@ -505,6 +614,16 @@
           <span>Passcode (optional)</span>
           <input type="text" id="sharePasscodeInput" placeholder="Leave blank for open link" autocomplete="off" />
         </label>
+        <div class="share-options-row">
+          <label class="checkbox-field">
+            <input type="checkbox" id="shareAllowDownloadCheck" checked />
+            <span>Allow original &amp; ZIP downloads</span>
+          </label>
+        </div>
+        <label class="form-field">
+          <span>Max views (optional)</span>
+          <input type="number" id="shareMaxViewsInput" min="1" max="10000" placeholder="Unlimited" />
+        </label>
         <button type="submit" class="btn-primary btn-full" id="shareGenerateBtn">Create Link</button>
       </form>
 
@@ -512,7 +631,109 @@
         <input type="text" id="shareUrlOutput" readonly />
         <button type="button" class="btn-primary btn-sm" id="shareCopyBtn">Copy</button>
       </div>
+      <div class="modal-footer-link">
+        <button type="button" class="link-btn" id="openManageSharesFromModalBtn">Manage all active share links →</button>
+      </div>
     </div>
+  </div>
+
+  <!-- ==================== MANAGE SHARE LINKS MODAL ==================== -->
+  <div id="manageSharesModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="manageSharesTitle">
+    <div class="modal-card modal-card--lg">
+      <button type="button" class="modal-close" id="closeManageSharesBtn" aria-label="Close">✕</button>
+      <h3 id="manageSharesTitle">Active Share Links</h3>
+      <p class="modal-sub">Copy, switch View-Only mode, or revoke your active public links anytime.</p>
+      <div id="manageSharesList" class="manage-list"></div>
+    </div>
+  </div>
+
+  <!-- ==================== CREATE / EDIT ALBUM MODAL ==================== -->
+  <div id="albumModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="albumModalTitle">
+    <div class="modal-card">
+      <button type="button" class="modal-close" id="closeAlbumModalBtn" aria-label="Close">✕</button>
+      <h3 id="albumModalTitle">New Album</h3>
+      <p class="modal-sub">Group your trips, events, or family milestones cleanly.</p>
+      <form id="albumForm" class="share-form">
+        <label class="form-field">
+          <span>Album Name</span>
+          <input type="text" id="albumNameInput" placeholder="e.g. Kyoto Spring Trip" maxlength="80" required />
+        </label>
+        <label class="form-field">
+          <span>Category</span>
+          <select id="albumCategorySelect">
+            <option value="trip">✈️ Trip</option>
+            <option value="event">🎉 Event</option>
+            <option value="family">👨‍👩‍👧 Family</option>
+            <option value="custom">📁 Custom</option>
+          </select>
+        </label>
+        <label class="form-field">
+          <span>Description (optional)</span>
+          <input type="text" id="albumDescInput" placeholder="A short note about this album" maxlength="280" />
+        </label>
+        <button type="submit" class="btn-primary btn-full" id="albumSaveBtn">Save Album</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- ==================== ADD TO ALBUM PICKER MODAL ==================== -->
+  <div id="albumPickerModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="albumPickerTitle">
+    <div class="modal-card">
+      <button type="button" class="modal-close" id="closeAlbumPickerBtn" aria-label="Close">✕</button>
+      <h3 id="albumPickerTitle">Add to Album</h3>
+      <p class="modal-sub" id="albumPickerSub">Choose an existing album or create a new one.</p>
+      <div id="albumPickerList" class="manage-list"></div>
+      <div style="margin-top:14px;">
+        <button type="button" class="btn-primary btn-full" id="pickerCreateNewAlbumBtn">+ Create New Album with Selected</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== SMART CLEANUP STUDIO MODAL ==================== -->
+  <div id="cleanupModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="cleanupModalTitle">
+    <div class="modal-card modal-card--xl">
+      <button type="button" class="modal-close" id="closeCleanupModalBtn" aria-label="Close">✕</button>
+      <div class="cleanup-head">
+        <div>
+          <h3 id="cleanupModalTitle">Smart Photo Cleanup</h3>
+          <p class="modal-sub" id="cleanupSummaryText" style="margin-bottom:0;">Scanning for burst shots, visually similar photos, and blurry frames…</p>
+        </div>
+        <div class="cleanup-head-actions">
+          <button type="button" class="btn-soft btn-sm" id="cleanupRescanBtn">Scan More</button>
+          <button type="button" class="btn-danger btn-sm" id="cleanupTrashSelectedBtn" disabled>Move Selected to Trash</button>
+        </div>
+      </div>
+
+      <div class="filter-pills" id="cleanupTabPills" style="margin:14px 0;">
+        <button type="button" class="f-pill is-active" data-cleanup-tab="similar">Similar &amp; Burst (<span id="cleanupSimCount">0</span>)</button>
+        <button type="button" class="f-pill" data-cleanup-tab="blurry">Blurry Shots (<span id="cleanupBlurCount">0</span>)</button>
+      </div>
+
+      <div id="cleanupContent" class="cleanup-scroll"></div>
+    </div>
+  </div>
+
+  <!-- ==================== MEMORY STORY VIEWER ==================== -->
+  <div id="memoryViewer" class="memory-viewer hidden" role="dialog" aria-modal="true" aria-label="Memory story player">
+    <div class="memory-progress-bars" id="memoryProgressBars"></div>
+    <div class="memory-top">
+      <div>
+        <span class="mini-badge mini-badge--orange" id="memoryBadge">On This Day</span>
+        <strong id="memoryTitle">Memory</strong>
+        <span id="memorySubtitle"></span>
+      </div>
+      <div class="lb-top-actions">
+        <button type="button" class="btn-soft btn-xs" id="memoryShareBtn">Share</button>
+        <button type="button" class="lb-icon-btn" id="memoryPlayPauseBtn" aria-label="Play or pause">⏸</button>
+        <button type="button" class="lb-icon-btn" id="memoryCloseBtn" aria-label="Close memory">✕</button>
+      </div>
+    </div>
+    <div class="memory-stage" id="memoryStage">
+      <button type="button" class="lb-nav lb-nav--prev" id="memoryPrevBtn" aria-label="Previous slide">‹</button>
+      <img id="memoryImg" class="memory-img" alt="" />
+      <button type="button" class="lb-nav lb-nav--next" id="memoryNextBtn" aria-label="Next slide">›</button>
+    </div>
+    <div class="memory-caption" id="memoryCaption"></div>
   </div>
 
   <!-- ==================== CONFIRM DELETE MODAL ==================== -->
@@ -564,6 +785,6 @@
     </div>
   </footer>
 
-  <script src="/web/app.js?v=6" defer></script>
+  <script src="/web/app.js?v=7" defer></script>
 </body>
 </html>

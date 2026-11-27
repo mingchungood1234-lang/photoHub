@@ -25,7 +25,9 @@ function createPublicRoutes({ healthController, authController, shareController 
   if (shareController) {
     router.get('/public/share/:token', shareController.getPublicShare);
     router.get('/public/share/:token/preview/:hash', shareController.streamPublicPreview);
+    router.get('/public/share/:token/video/:hash', shareController.streamPublicVideo);
     router.get('/public/share/:token/download/:hash', shareController.downloadPublicOriginal);
+    router.get('/public/share/:token/download-zip', shareController.downloadPublicZip);
   }
 
   return router;

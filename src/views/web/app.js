@@ -4,6 +4,9 @@
   const SESSION_KEY = 'photohub_web_session_v1';
   const PKCE_KEY = 'photohub_web_pkce_v1';
   const THEME_KEY = 'photohub_web_theme_v1';
+  const CHUNK_RESUME_KEY = 'photohub_chunked_resume_v1';
+  const CHUNKED_THRESHOLD_BYTES = 16 * 1024 * 1024; // Files >= 16 MB use resumable chunked 4K uploads
+  const CHUNK_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB parts
   const VIDEO_EXTS = new Set(['mov', 'mp4', 'm4v', '3gp', 'avi']);
 
   // ==================== STATE ====================
@@ -24,7 +27,7 @@
     isLoadingPhotos: false,
     isLoadingMore: false,
     photosEtag: null,
-    filterMedia: 'all', // 'all' | 'photo' | 'video' | 'favorite' | 'protected' | 'trash'
+    filterMedia: 'all', // 'all' | 'photo' | 'video' | 'favorite' | 'albums' | 'map' | 'protected' | 'trash'
     grouping: 'day', // 'day' | 'month' | 'year'
     searchQuery: '',
     selectedYear: null,
@@ -38,6 +41,27 @@
     lightboxPanX: 0,
     lightboxPanY: 0,
     shareTargetHashes: [],
+    shareAlbumId: null,
+    activeShares: [],
+    memories: [],
+    activeMemory: null,
+    memorySlideIndex: 0,
+    memoryTimer: null,
+    memoryPaused: false,
+    albums: [],
+    albumCategoryFilter: 'all',
+    activeAlbum: null,
+    activeAlbumPhotos: [],
+    editingAlbumId: null,
+    albumPickerHashes: [],
+    mapData: null,
+    selectedMapClusterId: null,
+    mapZoom: 1,
+    mapPanX: 0,
+    mapPanY: 0,
+    cleanupReport: null,
+    cleanupTab: 'similar',
+    cleanupSelectedHashes: new Set(),
     confirmCallback: null,
   };
 
@@ -653,6 +677,14 @@
     state.trashPhotos = [];
     state.trashCount = 0;
     state.years = [];
+    state.memories = [];
+    state.albums = [];
+    state.activeAlbum = null;
+    state.activeAlbumPhotos = [];
+    state.mapData = null;
+    state.selectedMapClusterId = null;
+    state.activeShares = [];
+    state.cleanupReport = null;
     state.photosEtag = null;
     state.selectedHashes.clear();
     state.lastSelectedIndex = -1;
@@ -730,6 +762,7 @@
         renderYearPills();
       }
       renderGallery();
+      loadMemories();
       verifySession();
     } catch (err) {
       if (state.photos.length === 0) {
@@ -861,6 +894,10 @@
       p.takenAt || '',
       p.savedPath || '',
       p.cameraModel || '',
+      p.locationLabel || '',
+      typeof p.gpsLat === 'number' && typeof p.gpsLng === 'number'
+        ? `${p.gpsLat.toFixed(2)},${p.gpsLng.toFixed(2)} gps map location`
+        : '',
       ...moNames,
       isVid ? 'video videos movie clip' : 'photo photos image picture',
       p.isFavorite ? 'favorite favorites fav starred heart' : '',
@@ -872,6 +909,23 @@
   }
 
   function filteredPhotos() {
+    if (state.filterMedia === 'albums') {
+      if (!state.activeAlbum) return [];
+      return state.activeAlbumPhotos.filter(
+        (p) => !state.searchQuery || matchesSmartSearch(p, state.searchQuery)
+      );
+    }
+    if (state.filterMedia === 'map') {
+      let list = (state.mapData && Array.isArray(state.mapData.photos) ? state.mapData.photos : []).slice();
+      if (state.selectedMapClusterId && state.mapData && Array.isArray(state.mapData.clusters)) {
+        const cl = state.mapData.clusters.find((c) => c.id === state.selectedMapClusterId);
+        if (cl) {
+          const allowed = new Set(cl.hashes.map((h) => String(h).toLowerCase()));
+          list = list.filter((p) => allowed.has(String(p.hash).toLowerCase()));
+        }
+      }
+      return list.filter((p) => !state.searchQuery || matchesSmartSearch(p, state.searchQuery));
+    }
     const isTrash = state.filterMedia === 'trash';
     const source = isTrash ? state.trashPhotos : state.photos;
     return source.filter((p) => {
@@ -1034,7 +1088,28 @@
 
   function renderGallery() {
     const isTrashView = state.filterMedia === 'trash';
+    const isAlbumsView = state.filterMedia === 'albums';
+    const isMapView = state.filterMedia === 'map';
+
     $('trashBanner').classList.toggle('hidden', !isTrashView);
+    $('albumsViewSection').classList.toggle('hidden', !isAlbumsView);
+    $('mapViewSection').classList.toggle('hidden', !isMapView);
+
+    const showMemories = state.filterMedia === 'all' && !state.searchQuery && state.memories.length > 0;
+    $('memoriesStrip').classList.toggle('hidden', !showMemories);
+
+    if (isAlbumsView) {
+      $('albumsOverviewPane').classList.toggle('hidden', Boolean(state.activeAlbum));
+      $('activeAlbumBanner').classList.toggle('hidden', !state.activeAlbum);
+      if (!state.activeAlbum) {
+        $('galleryTimeline').innerHTML = '';
+        $('galleryEmptyState').classList.add('hidden');
+        $('loadMoreWrap').classList.add('hidden');
+        renderAlbumsGrid();
+        return;
+      }
+    }
+
     const items = filteredPhotos();
     state.visibleFlatPhotos = items;
 
@@ -1042,7 +1117,11 @@
     const photoCount = state.photos.length - vidCount;
     $('galleryCountsText').textContent = isTrashView
       ? `${state.trashPhotos.length} item(s) in Trash`
-      : `${state.totalPhotos} total · ${photoCount} photos · ${vidCount} videos`;
+      : isAlbumsView && state.activeAlbum
+        ? `${state.activeAlbum.name} · ${items.length} item(s)`
+        : isMapView
+          ? `${items.length} mapped photo(s)`
+          : `${state.totalPhotos} total · ${photoCount} photos · ${vidCount} videos`;
 
     const container = $('galleryTimeline');
     container.innerHTML = '';
@@ -1053,6 +1132,12 @@
       if (isTrashView) {
         $('emptyStateTitle').textContent = 'Trash is Empty';
         $('emptyStateText').textContent = 'Deleted photos appear here for 30 days before permanent removal.';
+      } else if (isAlbumsView && state.activeAlbum) {
+        $('emptyStateTitle').textContent = 'Empty Album';
+        $('emptyStateText').textContent = 'Select photos from All Photos and tap "+ Album" to add them here.';
+      } else if (isMapView) {
+        $('emptyStateTitle').textContent = 'No Geo-Tagged Photos Yet';
+        $('emptyStateText').textContent = 'Photos with camera GPS coordinates appear here automatically.';
       } else {
         $('emptyStateTitle').textContent = state.photos.length === 0 ? 'No Backups Yet' : 'No Matching Items';
         $('emptyStateText').textContent =
@@ -1224,7 +1309,8 @@
     bar.classList.toggle('hidden', !state.isSelectionMode);
     if (!state.isSelectionMode) return;
     const isTrash = state.filterMedia === 'trash';
-    const source = isTrash ? state.trashPhotos : state.photos;
+    const inCustomAlbum = state.filterMedia === 'albums' && Boolean(state.activeAlbum);
+    const source = isTrash ? state.trashPhotos : inCustomAlbum ? state.activeAlbumPhotos : state.photos;
     const count = state.selectedHashes.size;
     let totalBytes = 0;
     for (const p of source) {
@@ -1238,6 +1324,10 @@
     $('deleteSelectedBtn').textContent = isTrash ? 'Delete Forever' : 'Trash';
     $('downloadZipBtn').classList.toggle('hidden', isTrash);
     $('downloadZipBtn').disabled = count === 0;
+    $('addToAlbumSelectedBtn').classList.toggle('hidden', isTrash);
+    $('addToAlbumSelectedBtn').disabled = count === 0;
+    $('removeFromAlbumSelectedBtn').classList.toggle('hidden', !inCustomAlbum);
+    $('removeFromAlbumSelectedBtn').disabled = count === 0;
     $('shareSelectedBtn').classList.toggle('hidden', isTrash);
     $('shareSelectedBtn').disabled = count === 0;
     $('restoreSelectedBtn').classList.toggle('hidden', !isTrash);
@@ -1360,8 +1450,9 @@
     }
   }
 
-  function openShareModal(hashes, defaultTitle = '') {
+  function openShareModal(hashes, defaultTitle = '', albumId = null) {
     state.shareTargetHashes = Array.from(hashes || []);
+    state.shareAlbumId = albumId || null;
     if (state.shareTargetHashes.length === 0) return;
     $('shareModalTitle').textContent =
       state.shareTargetHashes.length === 1
@@ -1370,6 +1461,8 @@
     $('shareTitleInput').value = defaultTitle || '';
     $('sharePasscodeInput').value = '';
     $('shareExpirySelect').value = '168';
+    $('shareAllowDownloadCheck').checked = true;
+    $('shareMaxViewsInput').value = '';
     $('shareResultBox').classList.add('hidden');
     $('shareUrlOutput').value = '';
     $('shareGenerateBtn').disabled = false;
@@ -1388,6 +1481,7 @@
     btn.disabled = true;
     btn.textContent = 'Creating…';
     try {
+      const maxViewsVal = Number($('shareMaxViewsInput').value);
       const res = await apiFetch('/api/shares', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1396,6 +1490,9 @@
           title: $('shareTitleInput').value.trim(),
           expiresInHours: Number($('shareExpirySelect').value) || 168,
           passcode: $('sharePasscodeInput').value.trim(),
+          allowDownload: Boolean($('shareAllowDownloadCheck').checked),
+          maxViews: Number.isFinite(maxViewsVal) && maxViewsVal > 0 ? Math.round(maxViewsVal) : null,
+          albumId: state.shareAlbumId || null,
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -1414,6 +1511,721 @@
       btn.disabled = false;
       btn.textContent = 'Create Another Link';
     }
+  }
+
+  // ==================== MANAGE SHARE LINKS ====================
+  async function openManageSharesModal() {
+    $('manageSharesModal').classList.remove('hidden');
+    const list = $('manageSharesList');
+    list.innerHTML = '<div class="muted-text" style="padding:14px;text-align:center;">Loading active links…</div>';
+    try {
+      const res = await apiFetch('/api/shares');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Could not load share links');
+      state.activeShares = Array.isArray(data.shares) ? data.shares : [];
+      renderManageSharesList();
+    } catch (err) {
+      list.innerHTML = `<div class="error-banner">${err.message || 'Failed to load links'}</div>`;
+    }
+  }
+
+  function closeManageSharesModal() {
+    $('manageSharesModal').classList.add('hidden');
+  }
+
+  function renderManageSharesList() {
+    const list = $('manageSharesList');
+    list.innerHTML = '';
+    if (!state.activeShares.length) {
+      list.innerHTML = '<div class="muted-text" style="padding:18px;text-align:center;">No active share links right now.</div>';
+      return;
+    }
+    for (const s of state.activeShares) {
+      const url = s.sharePath ? `${window.location.origin}${s.sharePath}` : s.shareUrl;
+      const row = document.createElement('div');
+      row.className = 'manage-row';
+      const info = document.createElement('div');
+      info.className = 'manage-row-info';
+      const expStr = new Date(s.expiresAt).toLocaleDateString();
+      const viewsStr = s.maxViews ? `${s.viewCount || 0}/${s.maxViews} views` : `${s.viewCount || 0} views`;
+      const flags = [
+        `${s.itemCount} item(s)`,
+        viewsStr,
+        s.hasPasscode ? '🔒 Passcode' : null,
+        s.allowDownload === false ? '👁 View Only' : '↓ Downloads OK',
+        `Exp ${expStr}`,
+      ].filter(Boolean).join(' · ');
+      const titleEl = document.createElement('strong');
+      titleEl.textContent = s.title || 'Shared Photos';
+      const metaEl = document.createElement('span');
+      metaEl.textContent = flags;
+      info.appendChild(titleEl);
+      info.appendChild(metaEl);
+
+      const actions = document.createElement('div');
+      actions.className = 'manage-row-actions';
+
+      const copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.className = 'btn-soft btn-xs';
+      copyBtn.textContent = 'Copy';
+      copyBtn.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(url);
+          showToast('Share link copied!', 'mint');
+        } catch {
+          showToast(url, 'orange');
+        }
+      });
+
+      const toggleDlBtn = document.createElement('button');
+      toggleDlBtn.type = 'button';
+      toggleDlBtn.className = 'btn-soft btn-xs';
+      toggleDlBtn.textContent = s.allowDownload === false ? 'Enable DL' : 'View-Only';
+      toggleDlBtn.addEventListener('click', async () => {
+        try {
+          const res = await apiFetch(`/api/shares/${encodeURIComponent(s.token)}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ allowDownload: s.allowDownload === false }),
+          });
+          if (!res.ok) throw new Error('Update failed');
+          s.allowDownload = s.allowDownload === false;
+          renderManageSharesList();
+          showToast(s.allowDownload ? 'Downloads enabled' : 'Switched to View-Only', 'mint');
+        } catch (err) {
+          showToast(err.message || 'Could not update share', 'rose');
+        }
+      });
+
+      const revBtn = document.createElement('button');
+      revBtn.type = 'button';
+      revBtn.className = 'btn-danger btn-xs';
+      revBtn.textContent = 'Revoke';
+      revBtn.addEventListener('click', async () => {
+        try {
+          const res = await apiFetch(`/api/shares/${encodeURIComponent(s.token)}`, { method: 'DELETE' });
+          if (!res.ok) throw new Error('Revoke failed');
+          state.activeShares = state.activeShares.filter((x) => x.token !== s.token);
+          renderManageSharesList();
+          showToast('Share link revoked', 'amber');
+        } catch (err) {
+          showToast(err.message || 'Could not revoke link', 'rose');
+        }
+      });
+
+      actions.append(copyBtn, toggleDlBtn, revBtn);
+      row.append(info, actions);
+      list.appendChild(row);
+    }
+  }
+
+  // ==================== MEMORIES & ANIMATED STORY VIEWER ====================
+  function attachPreviewToImg(imgEl, hash) {
+    if (!imgEl || !hash) return;
+    if (thumbUrlCache.has(hash)) {
+      imgEl.src = thumbUrlCache.get(hash);
+      return;
+    }
+    apiFetch(`/api/photo/${encodeURIComponent(hash)}/preview`)
+      .then((r) => (r.ok ? r.blob() : null))
+      .then((blob) => {
+        if (!blob || !blob.size) return;
+        const url = URL.createObjectURL(blob);
+        rememberThumbUrl(hash, url);
+        if (imgEl.isConnected) imgEl.src = url;
+      })
+      .catch(() => {});
+  }
+
+  async function loadMemories() {
+    if (!state.session) return;
+    try {
+      const now = new Date();
+      const ymd = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+      const res = await apiFetch(`/api/photos/memories?date=${encodeURIComponent(ymd)}`);
+      if (!res.ok) return;
+      const data = await res.json().catch(() => ({}));
+      state.memories = Array.isArray(data.memories) ? data.memories : [];
+      renderMemoriesStrip();
+    } catch {
+      // non-fatal
+    }
+  }
+
+  function renderMemoriesStrip() {
+    const strip = $('memoriesStrip');
+    const carousel = $('memoriesCarousel');
+    if (!strip || !carousel) return;
+    const show = state.filterMedia === 'all' && !state.searchQuery && state.memories.length > 0;
+    strip.classList.toggle('hidden', !show);
+    if (!show) return;
+
+    carousel.innerHTML = '';
+    for (const mem of state.memories) {
+      const card = document.createElement('div');
+      card.className = 'memory-card';
+      card.tabIndex = 0;
+      card.setAttribute('role', 'button');
+
+      const img = document.createElement('img');
+      img.alt = mem.title;
+      card.appendChild(img);
+      if (mem.coverHash) attachPreviewToImg(img, mem.coverHash);
+
+      const ov = document.createElement('div');
+      ov.className = 'memory-card-overlay';
+      const badge = document.createElement('span');
+      badge.className = 'memory-card-badge';
+      badge.textContent = mem.badge || 'Memory';
+      const bottom = document.createElement('div');
+      const title = document.createElement('div');
+      title.className = 'memory-card-title';
+      title.textContent = mem.title;
+      const sub = document.createElement('div');
+      sub.className = 'memory-card-sub';
+      sub.textContent = mem.subtitle || `${mem.itemCount} items`;
+      bottom.append(title, sub);
+      ov.append(badge, bottom);
+      card.appendChild(ov);
+
+      card.addEventListener('click', () => openMemoryViewer(mem));
+      carousel.appendChild(card);
+    }
+  }
+
+  function clearMemoryTimer() {
+    if (state.memoryTimer) {
+      clearTimeout(state.memoryTimer);
+      state.memoryTimer = null;
+    }
+  }
+
+  function openMemoryViewer(mem) {
+    if (!mem || !Array.isArray(mem.photos) || mem.photos.length === 0) return;
+    state.activeMemory = mem;
+    state.memorySlideIndex = 0;
+    state.memoryPaused = false;
+    $('memoryBadge').textContent = mem.badge || 'Memory';
+    $('memoryTitle').textContent = mem.title || 'Memory';
+    $('memorySubtitle').textContent = mem.subtitle || '';
+    $('memoryPlayPauseBtn').textContent = '⏸';
+    $('memoryViewer').classList.remove('hidden');
+    document.body.style.overflow = 'hidden';
+    renderMemorySlide();
+  }
+
+  function closeMemoryViewer() {
+    clearMemoryTimer();
+    state.activeMemory = null;
+    $('memoryViewer').classList.add('hidden');
+    document.body.style.overflow = '';
+  }
+
+  async function renderMemorySlide() {
+    clearMemoryTimer();
+    const mem = state.activeMemory;
+    if (!mem) return;
+    const slides = mem.photos;
+    const idx = Math.max(0, Math.min(slides.length - 1, state.memorySlideIndex));
+    state.memorySlideIndex = idx;
+    const photo = slides[idx];
+
+    const bars = $('memoryProgressBars');
+    bars.innerHTML = '';
+    for (let i = 0; i < slides.length; i++) {
+      const b = document.createElement('div');
+      b.className = `memory-bar${i < idx ? ' is-done' : ''}`;
+      b.innerHTML = '<div class="memory-bar-fill"></div>';
+      bars.appendChild(b);
+    }
+    requestAnimationFrame(() => {
+      const activeBar = bars.children[idx];
+      if (activeBar && !state.memoryPaused) activeBar.classList.add('is-active');
+    });
+
+    $('memoryPrevBtn').disabled = idx <= 0;
+    $('memoryNextBtn').disabled = idx >= slides.length - 1;
+    const loc = photo.locationLabel ? ` · 📍 ${photo.locationLabel}` : '';
+    $('memoryCaption').textContent = `${photo.photoDate || ''} · ${photo.originalName || ''}${loc} (${idx + 1}/${slides.length})`;
+
+    const img = $('memoryImg');
+    img.style.animation = 'none';
+    const url = await fetchLightboxPreviewCached(photo.hash);
+    if (state.activeMemory !== mem || state.memorySlideIndex !== idx) return;
+    if (url) {
+      img.src = url;
+      void img.offsetWidth;
+      img.style.animation = '';
+    }
+
+    if (!state.memoryPaused) {
+      state.memoryTimer = setTimeout(() => {
+        if (!state.activeMemory || state.memoryPaused) return;
+        if (state.memorySlideIndex < slides.length - 1) {
+          state.memorySlideIndex++;
+          renderMemorySlide();
+        } else {
+          closeMemoryViewer();
+        }
+      }, 4100);
+    }
+  }
+
+  function toggleMemoryPause() {
+    state.memoryPaused = !state.memoryPaused;
+    $('memoryPlayPauseBtn').textContent = state.memoryPaused ? '▶' : '⏸';
+    if (state.memoryPaused) {
+      clearMemoryTimer();
+    } else {
+      renderMemorySlide();
+    }
+  }
+
+  // ==================== CUSTOM ALBUMS (TRIPS, EVENTS, FAMILY) ====================
+  const ALBUM_CAT_LABELS = {
+    trip: '✈️ Trip',
+    event: '🎉 Event',
+    family: '👨‍👩‍👧 Family',
+    custom: '📁 Album',
+  };
+
+  async function loadAlbums() {
+    if (!state.session) return;
+    try {
+      const res = await apiFetch('/api/albums');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      state.albums = Array.isArray(data.albums) ? data.albums : [];
+      renderAlbumsGrid();
+    } catch (err) {
+      showToast(err.message || 'Could not load albums', 'rose');
+    }
+  }
+
+  function renderAlbumsGrid() {
+    const grid = $('albumsGrid');
+    if (!grid) return;
+    grid.innerHTML = '';
+    const list = state.albums.filter(
+      (a) => state.albumCategoryFilter === 'all' || a.category === state.albumCategoryFilter
+    );
+    if (list.length === 0) {
+      grid.innerHTML =
+        '<div class="empty-state" style="grid-column:1/-1;padding:36px 12px;"><h3>No Albums Yet</h3><p>Create Trips, Events, or Family albums to organize and share collections.</p></div>';
+      return;
+    }
+
+    for (const alb of list) {
+      const card = document.createElement('div');
+      card.className = 'album-card';
+
+      const cov = document.createElement('div');
+      cov.className = 'album-cover';
+      if (alb.coverHash) {
+        const img = document.createElement('img');
+        img.alt = alb.name;
+        cov.appendChild(img);
+        attachPreviewToImg(img, alb.coverHash);
+      } else {
+        cov.innerHTML = '<span class="album-cover-placeholder">📸</span>';
+      }
+      const badge = document.createElement('span');
+      badge.className = 'album-cat-badge';
+      badge.textContent = ALBUM_CAT_LABELS[alb.category] || '📁 Album';
+      cov.appendChild(badge);
+
+      const body = document.createElement('div');
+      body.className = 'album-card-body';
+      const h4 = document.createElement('h4');
+      h4.textContent = alb.name;
+      const span = document.createElement('span');
+      span.textContent = `${alb.itemCount || 0} item(s)${alb.dateRange ? ' · ' + alb.dateRange : ''}`;
+      body.append(h4, span);
+
+      card.append(cov, body);
+      card.addEventListener('click', () => openAlbumDetail(alb.id));
+      grid.appendChild(card);
+    }
+  }
+
+  async function openAlbumDetail(albumId) {
+    try {
+      const res = await apiFetch(`/api/albums/${encodeURIComponent(albumId)}`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.album) throw new Error(data.error || 'Album not found');
+      state.activeAlbum = data.album;
+      state.activeAlbumPhotos = Array.isArray(data.photos) ? data.photos : [];
+      $('activeAlbumTitle').textContent = `${ALBUM_CAT_LABELS[data.album.category] || '📁'} · ${data.album.name}`;
+      $('activeAlbumMeta').textContent = [
+        `${state.activeAlbumPhotos.length} item(s)`,
+        data.album.dateRange || null,
+        data.album.description || null,
+      ].filter(Boolean).join(' · ');
+      renderGallery();
+    } catch (err) {
+      showToast(err.message || 'Could not open album', 'rose');
+    }
+  }
+
+  function closeAlbumDetail() {
+    state.activeAlbum = null;
+    state.activeAlbumPhotos = [];
+    toggleSelectionMode(false);
+    renderGallery();
+  }
+
+  function openAlbumModal(editAlbum = null, initialHashes = []) {
+    state.editingAlbumId = editAlbum ? editAlbum.id : null;
+    state.albumPickerHashes = Array.isArray(initialHashes) ? initialHashes : [];
+    $('albumModalTitle').textContent = editAlbum ? 'Edit Album' : 'New Album';
+    $('albumNameInput').value = editAlbum ? editAlbum.name : '';
+    $('albumCategorySelect').value = editAlbum ? editAlbum.category || 'custom' : 'trip';
+    $('albumDescInput').value = editAlbum ? editAlbum.description || '' : '';
+    $('albumModal').classList.remove('hidden');
+  }
+
+  function closeAlbumModal() {
+    $('albumModal').classList.add('hidden');
+    state.editingAlbumId = null;
+  }
+
+  async function handleSaveAlbum(e) {
+    e.preventDefault();
+    const name = $('albumNameInput').value.trim();
+    if (!name) return;
+    const category = $('albumCategorySelect').value;
+    const description = $('albumDescInput').value.trim();
+    try {
+      if (state.editingAlbumId) {
+        const res = await apiFetch(`/api/albums/${encodeURIComponent(state.editingAlbumId)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, category, description }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || 'Could not update album');
+        showToast('Album updated!', 'mint');
+        closeAlbumModal();
+        await loadAlbums();
+        if (state.activeAlbum && state.activeAlbum.id === data.album.id) {
+          await openAlbumDetail(data.album.id);
+        }
+      } else {
+        const res = await apiFetch('/api/albums', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, category, description, hashes: state.albumPickerHashes }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || 'Could not create album');
+        showToast(
+          state.albumPickerHashes.length
+            ? `Created "${name}" with ${state.albumPickerHashes.length} item(s)!`
+            : `Created album "${name}"!`,
+          'mint'
+        );
+        state.albumPickerHashes = [];
+        closeAlbumModal();
+        await loadAlbums();
+        if (state.isSelectionMode) toggleSelectionMode(false);
+      }
+    } catch (err) {
+      showToast(err.message || 'Album save failed', 'rose');
+    }
+  }
+
+  async function openAlbumPickerModal(hashes) {
+    state.albumPickerHashes = Array.from(hashes || []);
+    if (state.albumPickerHashes.length === 0) return;
+    $('albumPickerSub').textContent = `Add ${state.albumPickerHashes.length} selected item(s) to an album:`;
+    $('albumPickerModal').classList.remove('hidden');
+    const list = $('albumPickerList');
+    list.innerHTML = '<div class="muted-text" style="padding:12px;text-align:center;">Loading albums…</div>';
+    await loadAlbums();
+    list.innerHTML = '';
+    if (state.albums.length === 0) {
+      list.innerHTML = '<div class="muted-text" style="padding:12px;text-align:center;">No albums yet — create your first one below!</div>';
+      return;
+    }
+    for (const alb of state.albums) {
+      const row = document.createElement('div');
+      row.className = 'manage-row';
+      const info = document.createElement('div');
+      info.className = 'manage-row-info';
+      const title = document.createElement('strong');
+      title.textContent = `${ALBUM_CAT_LABELS[alb.category] || '📁'} · ${alb.name}`;
+      const sub = document.createElement('span');
+      sub.textContent = `${alb.itemCount || 0} item(s)`;
+      info.append(title, sub);
+
+      const addBtn = document.createElement('button');
+      addBtn.type = 'button';
+      addBtn.className = 'btn-soft btn-xs';
+      addBtn.textContent = 'Add Here';
+      addBtn.addEventListener('click', async () => {
+        try {
+          const res = await apiFetch(`/api/albums/${encodeURIComponent(alb.id)}/photos`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ hashes: state.albumPickerHashes }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.error || 'Could not add photos');
+          showToast(`Added ${data.addedCount || 0} photo(s) to "${alb.name}"`, 'mint');
+          closeAlbumPickerModal();
+          await loadAlbums();
+          if (state.isSelectionMode) toggleSelectionMode(false);
+        } catch (err) {
+          showToast(err.message || 'Add failed', 'rose');
+        }
+      });
+      row.append(info, addBtn);
+      list.appendChild(row);
+    }
+  }
+
+  function closeAlbumPickerModal() {
+    $('albumPickerModal').classList.add('hidden');
+  }
+
+  async function removeSelectedFromActiveAlbum(hashes) {
+    if (!state.activeAlbum || !hashes.length) return;
+    try {
+      const res = await apiFetch(`/api/albums/${encodeURIComponent(state.activeAlbum.id)}/photos/remove`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hashes }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Could not remove from album');
+      showToast(`Removed ${data.removedCount || 0} item(s) from album`, 'amber');
+      toggleSelectionMode(false);
+      await openAlbumDetail(state.activeAlbum.id);
+    } catch (err) {
+      showToast(err.message || 'Remove failed', 'rose');
+    }
+  }
+
+  // ==================== PHOTO MAP & LOCATION SEARCH ====================
+  function applyMapTransform() {
+    const canvas = $('photoMapCanvas');
+    if (!canvas) return;
+    canvas.style.transform = `translate3d(${state.mapPanX}px, ${state.mapPanY}px, 0) scale(${state.mapZoom})`;
+  }
+
+  async function loadPhotoMap() {
+    if (!state.session) return;
+    try {
+      const res = await apiFetch('/api/photos/map');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      state.mapData = await res.json();
+      renderPhotoMap();
+      renderGallery();
+    } catch (err) {
+      showToast(err.message || 'Could not load photo map', 'rose');
+    }
+  }
+
+  function renderPhotoMap() {
+    const data = state.mapData;
+    const pinsLayer = $('photoMapPins');
+    const pillsLayer = $('mapPlacePills');
+    if (!data || !pinsLayer || !pillsLayer) return;
+
+    const clusters = Array.isArray(data.clusters) ? data.clusters : [];
+    $('mapSummaryText').textContent =
+      data.geoTaggedCount > 0
+        ? `${data.geoTaggedCount} geo-tagged item(s) across ${clusters.length} location(s) · Click a pin or search any city`
+        : 'No GPS tags detected yet. Photos taken with Location Services enabled appear here.';
+
+    pinsLayer.innerHTML = '';
+    pillsLayer.innerHTML = '';
+
+    for (const c of clusters) {
+      const xPct = Math.max(3, Math.min(97, ((c.lng + 180) / 360) * 100));
+      const yPct = Math.max(6, Math.min(94, ((90 - c.lat) / 180) * 100));
+      const isSelected = state.selectedMapClusterId === c.id;
+
+      const pin = document.createElement('button');
+      pin.type = 'button';
+      pin.className = `map-pin${isSelected ? ' is-active' : ''}`;
+      pin.style.left = `${xPct}%`;
+      pin.style.top = `${yPct}%`;
+      pin.innerHTML = `<span class="map-pin-count">${c.count}</span><span></span>`;
+      pin.querySelector('span:last-child').textContent = c.label.split(',')[0];
+      pin.addEventListener('click', (e) => {
+        e.stopPropagation();
+        state.selectedMapClusterId = isSelected ? null : c.id;
+        renderPhotoMap();
+        renderGallery();
+      });
+      pinsLayer.appendChild(pin);
+
+      const pill = document.createElement('button');
+      pill.type = 'button';
+      pill.className = `year-pill${isSelected ? ' is-active' : ''}`;
+      pill.textContent = `📍 ${c.label} (${c.count})`;
+      pill.addEventListener('click', () => {
+        state.selectedMapClusterId = isSelected ? null : c.id;
+        renderPhotoMap();
+        renderGallery();
+      });
+      pillsLayer.appendChild(pill);
+    }
+
+    const selCluster = clusters.find((c) => c.id === state.selectedMapClusterId) || null;
+    $('mapSelectedHeader').classList.toggle('hidden', !selCluster);
+    if (selCluster) {
+      $('mapSelectedTitle').textContent = `📍 ${selCluster.label} · ${selCluster.count} photo(s)`;
+    }
+    applyMapTransform();
+  }
+
+  // ==================== SMART CLEANUP STUDIO (SIMILAR / BURST / BLURRY) ====================
+  async function openCleanupModal(scan = true) {
+    $('cleanupModal').classList.remove('hidden');
+    $('cleanupSummaryText').textContent = 'Analyzing photos for burst shots, near-duplicates, and blurry frames…';
+    $('cleanupContent').innerHTML = '<div class="muted-text" style="padding:26px;text-align:center;">Running visual similarity &amp; sharpness scan…</div>';
+    state.cleanupSelectedHashes.clear();
+    updateCleanupTrashButton();
+
+    try {
+      const res = await apiFetch(`/api/photos/cleanup-suggestions?scan=${scan ? '1' : '0'}`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) throw new Error(data.error || 'Cleanup scan failed');
+      state.cleanupReport = data;
+
+      // Auto-preselect non-best duplicates so 1 click cleans up burst clutter safely
+      for (const grp of data.similarGroups || []) {
+        for (const p of grp.photos || []) {
+          if (!p.isBest && !p.isFavorite && !p.keepOriginalOnDevice) {
+            state.cleanupSelectedHashes.add(p.hash.toLowerCase());
+          }
+        }
+      }
+      renderCleanupStudio();
+    } catch (err) {
+      $('cleanupContent').innerHTML = `<div class="error-banner">${err.message || 'Could not run cleanup scan'}</div>`;
+    }
+  }
+
+  function closeCleanupModal() {
+    $('cleanupModal').classList.add('hidden');
+  }
+
+  function updateCleanupTrashButton() {
+    const btn = $('cleanupTrashSelectedBtn');
+    if (!btn) return;
+    const count = state.cleanupSelectedHashes.size;
+    btn.disabled = count === 0;
+    btn.textContent = count > 0 ? `Move ${count} to Trash` : 'Move Selected to Trash';
+  }
+
+  function renderCleanupStudio() {
+    const rep = state.cleanupReport;
+    if (!rep) return;
+    const s = rep.summary || {};
+    $('cleanupSimCount').textContent = String(s.similarGroupCount || 0);
+    $('cleanupBlurCount').textContent = String(s.blurryCount || 0);
+    $('cleanupSummaryText').textContent =
+      `Analyzed ${s.analyzedCount || 0}/${s.totalPhotos || 0} photo(s) · Potential savings ${formatBytes(s.potentialSavingsBytes || 0)}${s.pendingCount > 0 ? ` · ${s.pendingCount} more ready to scan` : ''}`;
+    $('cleanupRescanBtn').classList.toggle('hidden', !(s.pendingCount > 0));
+
+    const box = $('cleanupContent');
+    box.innerHTML = '';
+
+    if (state.cleanupTab === 'similar') {
+      const groups = rep.similarGroups || [];
+      if (groups.length === 0) {
+        box.innerHTML = '<div class="empty-state" style="padding:30px 10px;"><h3>No Similar or Burst Clutter Found</h3><p>Your library looks super tidy!</p></div>';
+        updateCleanupTrashButton();
+        return;
+      }
+      for (const grp of groups) {
+        const gEl = document.createElement('div');
+        gEl.className = 'cleanup-group';
+        const head = document.createElement('div');
+        head.className = 'cleanup-group-head';
+        head.innerHTML = `<strong></strong><span class="muted-text"></span>`;
+        head.querySelector('strong').textContent = grp.label;
+        head.querySelector('span').textContent = `Save up to ${formatBytes(grp.reclaimableBytes)}`;
+        gEl.appendChild(head);
+
+        const cards = document.createElement('div');
+        cards.className = 'cleanup-cards';
+        for (const p of grp.photos) {
+          const norm = p.hash.toLowerCase();
+          const picked = state.cleanupSelectedHashes.has(norm);
+          const card = document.createElement('div');
+          card.className = `cleanup-card${p.isBest ? ' is-best' : ''}${picked ? ' is-picked' : ''}`;
+          const img = document.createElement('img');
+          img.alt = p.originalName || '';
+          card.appendChild(img);
+          attachPreviewToImg(img, p.hash);
+
+          const tag = document.createElement('span');
+          tag.className = `cleanup-tag ${picked ? 'cleanup-tag--trash' : p.isBest ? 'cleanup-tag--best' : ''}`;
+          tag.textContent = picked ? 'Trash' : p.isBest ? '★ Best Shot' : 'Keep';
+          card.appendChild(tag);
+
+          const foot = document.createElement('div');
+          foot.className = 'cleanup-foot';
+          foot.innerHTML = `<span>${formatBytes(p.size)}</span><span>${typeof p.blurScore === 'number' ? '⚡' + Math.round(p.blurScore) : ''}</span>`;
+          card.appendChild(foot);
+
+          card.addEventListener('click', () => {
+            if (state.cleanupSelectedHashes.has(norm)) state.cleanupSelectedHashes.delete(norm);
+            else state.cleanupSelectedHashes.add(norm);
+            renderCleanupStudio();
+          });
+          cards.appendChild(card);
+        }
+        gEl.appendChild(cards);
+        box.appendChild(gEl);
+      }
+    } else {
+      const blurry = rep.blurryPhotos || [];
+      if (blurry.length === 0) {
+        box.innerHTML = '<div class="empty-state" style="padding:30px 10px;"><h3>No Blurry Shots Detected</h3><p>All analyzed photos look crisp and focused.</p></div>';
+        updateCleanupTrashButton();
+        return;
+      }
+      const gEl = document.createElement('div');
+      gEl.className = 'cleanup-group';
+      const cards = document.createElement('div');
+      cards.className = 'cleanup-cards';
+      for (const p of blurry) {
+        const norm = p.hash.toLowerCase();
+        const picked = state.cleanupSelectedHashes.has(norm);
+        const card = document.createElement('div');
+        card.className = `cleanup-card${picked ? ' is-picked' : ''}`;
+        const img = document.createElement('img');
+        img.alt = p.originalName || '';
+        card.appendChild(img);
+        attachPreviewToImg(img, p.hash);
+
+        const tag = document.createElement('span');
+        tag.className = `cleanup-tag ${picked ? 'cleanup-tag--trash' : ''}`;
+        tag.textContent = picked ? 'Trash' : `Blur ${Math.round(p.blurScore || 0)}`;
+        card.appendChild(tag);
+
+        const foot = document.createElement('div');
+        foot.className = 'cleanup-foot';
+        foot.innerHTML = `<span>${formatBytes(p.size)}</span><span>${p.photoDate || ''}</span>`;
+        card.appendChild(foot);
+
+        card.addEventListener('click', () => {
+          if (state.cleanupSelectedHashes.has(norm)) state.cleanupSelectedHashes.delete(norm);
+          else state.cleanupSelectedHashes.add(norm);
+          renderCleanupStudio();
+        });
+        cards.appendChild(card);
+      }
+      gEl.appendChild(cards);
+      box.appendChild(gEl);
+    }
+    updateCleanupTrashButton();
   }
 
   // ==================== LIGHTBOX ====================
@@ -1448,8 +2260,15 @@
       ['Original Size', formatBytes(photo.size)],
       ['Proxy Size', photo.proxySize ? formatBytes(photo.proxySize) : photo.videoProxySize ? formatBytes(photo.videoProxySize) : 'None'],
       ['Camera', photo.cameraModel || '—'],
+      ['Location', photo.locationLabel || (typeof photo.gpsLat === 'number' ? `${photo.gpsLat.toFixed(4)}, ${photo.gpsLng.toFixed(4)}` : '—')],
       ['Verification', `SHA-256 Verified (${String(photo.hash || '').slice(0, 12)}…)`],
     ];
+    if (photo.width && photo.height) {
+      rows.splice(3, 0, ['Resolution', `${photo.width} × ${photo.height}`]);
+    }
+    if (typeof photo.blurScore === 'number') {
+      rows.push(['Sharpness', `${Math.round(photo.blurScore)} (${photo.blurScore < 35 ? 'Soft / Blurry' : 'Sharp'})`]);
+    }
     if (photo.deletedAt) {
       rows.push(['Trashed', `${new Date(photo.deletedAt).toLocaleDateString()} (${photo.daysRemaining ?? 30}d left)`]);
     }
@@ -1530,6 +2349,7 @@
 
     $('lbProtectBtn').classList.toggle('hidden', isTrash);
     $('lbShareBtn').classList.toggle('hidden', isTrash);
+    $('lbAlbumBtn').classList.toggle('hidden', isTrash);
     $('lbRestoreBtn').classList.toggle('hidden', !isTrash);
     $('lbProtectBtn').textContent = photo.keepOriginalOnDevice ? 'Unprotect' : 'Protect';
     $('lbDeleteBtn').textContent = isTrash ? 'Delete Forever' : 'Trash';
@@ -1766,6 +2586,7 @@
   const uploadState = {
     queue: [],
     activeXhrs: new Set(),
+    activeChunkUploadIds: new Set(),
     inFlightBytes: new Map(),
     isRunning: false,
     cancelled: false,
@@ -1778,8 +2599,28 @@
     totalBytes: 0,
     completedBytes: 0,
     currentFilename: '',
+    currentDetail: '',
     hideTimer: null,
   };
+
+  function loadChunkResumeMap() {
+    try {
+      return JSON.parse(localStorage.getItem(CHUNK_RESUME_KEY) || '{}') || {};
+    } catch {
+      return {};
+    }
+  }
+
+  function saveChunkResumeId(fileKey, uploadId) {
+    try {
+      const map = loadChunkResumeMap();
+      if (uploadId) map[fileKey] = { uploadId, ts: Date.now() };
+      else delete map[fileKey];
+      localStorage.setItem(CHUNK_RESUME_KEY, JSON.stringify(map));
+    } catch {
+      // ignore storage errors
+    }
+  }
 
   function isSupportedMediaFile(file) {
     if (!file || !file.name || file.size <= 0) return false;
@@ -1910,6 +2751,7 @@
       }
       xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
       xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
+      xhr.setRequestHeader('X-Upload-Source', 'web');
       if (file.lastModified) {
         xhr.setRequestHeader('X-Created-At', new Date(file.lastModified).toISOString());
       }
@@ -1948,6 +2790,160 @@
 
       xhr.send(file);
     });
+  }
+
+  async function uploadFileChunkedResumable(file, sha256, onProgress) {
+    const fileKey = `${file.name}|${file.size}|${file.lastModified || 0}`;
+    const resumeEntry = loadChunkResumeMap()[fileKey];
+    const resumeUploadId = resumeEntry && resumeEntry.uploadId ? resumeEntry.uploadId : null;
+
+    const initRes = await apiFetch('/api/upload/chunked/init', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fileName: file.name,
+        mimeType: file.type || 'application/octet-stream',
+        fileSize: file.size,
+        chunkSize: CHUNK_SIZE_BYTES,
+        expectedHash: sha256 || '',
+        createdAt: file.lastModified ? new Date(file.lastModified).toISOString() : '',
+        resumeUploadId,
+      }),
+    });
+    const initData = await initRes.json().catch(() => ({}));
+    if (!initRes.ok || !initData.success) {
+      return { status: initRes.status, ok: false, data: initData };
+    }
+    if (initData.alreadyExists) {
+      saveChunkResumeId(fileKey, null);
+      if (typeof onProgress === 'function') onProgress(file.size);
+      return { status: 200, ok: true, data: initData };
+    }
+
+    const { uploadId, chunkSize, totalChunks } = initData;
+    const uploadedSet = new Set(Array.isArray(initData.uploadedChunks) ? initData.uploadedChunks : []);
+    saveChunkResumeId(fileKey, uploadId);
+    uploadState.activeChunkUploadIds.add(uploadId);
+
+    const chunkProgress = new Map();
+    for (const idx of uploadedSet) {
+      const start = idx * chunkSize;
+      const end = Math.min(file.size, start + chunkSize);
+      chunkProgress.set(idx, end - start);
+    }
+    const emitTotal = () => {
+      let sum = 0;
+      for (const v of chunkProgress.values()) sum += v;
+      if (typeof onProgress === 'function') onProgress(Math.min(file.size, sum));
+    };
+    emitTotal();
+
+    const pendingIndices = [];
+    for (let i = 0; i < totalChunks; i++) {
+      if (!uploadedSet.has(i)) pendingIndices.push(i);
+    }
+
+    const sendPartOnce = (idx, blob) =>
+      new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        uploadState.activeXhrs.add(xhr);
+        xhr.open('PUT', apiUrlFor(`/api/upload/chunked/${encodeURIComponent(uploadId)}/part/${idx}`), true);
+        const token = state.session && state.session.token;
+        if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+        xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+        xhr.upload.onprogress = (ev) => {
+          if (ev.lengthComputable) {
+            chunkProgress.set(idx, Math.min(blob.size, ev.loaded));
+            emitTotal();
+          }
+        };
+        const cleanup = () => uploadState.activeXhrs.delete(xhr);
+        xhr.onload = () => {
+          cleanup();
+          if (xhr.status >= 200 && xhr.status < 300) {
+            chunkProgress.set(idx, blob.size);
+            emitTotal();
+            resolve();
+          } else {
+            reject(new Error(`Chunk ${idx} failed with HTTP ${xhr.status}`));
+          }
+        };
+        xhr.onerror = () => {
+          cleanup();
+          reject(new Error(`Network error on chunk ${idx}`));
+        };
+        xhr.onabort = () => {
+          cleanup();
+          const e = new Error('Cancelled');
+          e.isAbort = true;
+          reject(e);
+        };
+        xhr.send(blob);
+      });
+
+    const uploadOnePart = async (idx) => {
+      const start = idx * chunkSize;
+      const end = Math.min(file.size, start + chunkSize);
+      const blob = file.slice(start, end);
+      let lastErr;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (uploadState.cancelled) {
+          const e = new Error('Cancelled');
+          e.isAbort = true;
+          throw e;
+        }
+        try {
+          await sendPartOnce(idx, blob);
+          return;
+        } catch (err) {
+          if (err && err.isAbort) throw err;
+          lastErr = err;
+          await new Promise((r) => setTimeout(r, 600 * (attempt + 1)));
+        }
+      }
+      throw lastErr || new Error(`Chunk ${idx} failed`);
+    };
+
+    try {
+      const partWorkers = [];
+      const partConcurrency = 2;
+      const runWorker = async () => {
+        while (!uploadState.cancelled && pendingIndices.length > 0) {
+          const nextIdx = pendingIndices.shift();
+          uploadState.currentFilename = `${file.name} (part ${nextIdx + 1}/${totalChunks})`;
+          renderUploadTray();
+          await uploadOnePart(nextIdx);
+        }
+      };
+      for (let w = 0; w < Math.min(partConcurrency, Math.max(1, pendingIndices.length)); w++) {
+        partWorkers.push(runWorker());
+      }
+      await Promise.all(partWorkers);
+
+      if (uploadState.cancelled) {
+        const e = new Error('Cancelled');
+        e.isAbort = true;
+        throw e;
+      }
+
+      uploadState.currentFilename = `${file.name} (verifying SHA-256…)`;
+      renderUploadTray();
+      const compRes = await apiFetch(`/api/upload/chunked/${encodeURIComponent(uploadId)}/complete`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Upload-Source': 'chunked-web',
+        },
+        body: JSON.stringify({ expectedHash: sha256 || '' }),
+      });
+      const compData = await compRes.json().catch(() => ({}));
+      if (compRes.ok && compData.success) {
+        saveChunkResumeId(fileKey, null);
+      }
+      return { status: compRes.status, ok: compRes.ok, data: compData };
+    } finally {
+      uploadState.activeChunkUploadIds.delete(uploadId);
+    }
   }
 
   async function processOneDroppedFile(file) {
@@ -1995,10 +2991,16 @@
         }
       }
 
-      const res = await uploadFileWithProgress(file, sha256, (loaded) => {
-        uploadState.inFlightBytes.set(file, Math.min(file.size, loaded));
-        renderUploadTray();
-      });
+      const useChunked = file.size >= CHUNKED_THRESHOLD_BYTES;
+      const res = useChunked
+        ? await uploadFileChunkedResumable(file, sha256, (loaded) => {
+            uploadState.inFlightBytes.set(file, Math.min(file.size, loaded));
+            renderUploadTray();
+          })
+        : await uploadFileWithProgress(file, sha256, (loaded) => {
+            uploadState.inFlightBytes.set(file, Math.min(file.size, loaded));
+            renderUploadTray();
+          });
 
       if (res.status === 401) {
         uploadState.cancelled = true;
@@ -2092,6 +3094,13 @@
         switchView('gallery');
       }
       loadGallery(false);
+      // Gentle refresh shortly after so auto-generated server proxies appear cleanly
+      setTimeout(() => {
+        if (state.session && !state.isLoadingPhotos) {
+          state.photosEtag = null;
+          loadGallery(false);
+        }
+      }, 2800);
     }
 
     clearTimeout(uploadState.hideTimer);
@@ -2159,6 +3168,10 @@
       }
     }
     uploadState.activeXhrs.clear();
+    for (const uid of uploadState.activeChunkUploadIds) {
+      apiFetch(`/api/upload/chunked/${encodeURIComponent(uid)}`, { method: 'DELETE' }).catch(() => {});
+    }
+    uploadState.activeChunkUploadIds.clear();
   }
 
   function initInvisibleDragAndDrop() {
@@ -2279,9 +3292,18 @@
         state.filterMedia = btn.dataset.filter;
         state.selectedHashes.clear();
         state.lastSelectedIndex = -1;
+        if (state.filterMedia !== 'albums') {
+          state.activeAlbum = null;
+          state.activeAlbumPhotos = [];
+        }
         updateSelectionBar();
         if (state.filterMedia === 'trash') {
           loadTrash();
+        } else if (state.filterMedia === 'albums') {
+          loadAlbums();
+          renderGallery();
+        } else if (state.filterMedia === 'map') {
+          loadPhotoMap();
         } else {
           renderGallery();
         }
@@ -2343,6 +3365,14 @@
       const hashes = Array.from(state.selectedHashes);
       if (hashes.length > 0) downloadSelectedAsZip(hashes);
     });
+    $('addToAlbumSelectedBtn').addEventListener('click', () => {
+      const hashes = Array.from(state.selectedHashes);
+      if (hashes.length > 0) openAlbumPickerModal(hashes);
+    });
+    $('removeFromAlbumSelectedBtn').addEventListener('click', () => {
+      const hashes = Array.from(state.selectedHashes);
+      if (hashes.length > 0) removeSelectedFromActiveAlbum(hashes);
+    });
     $('shareSelectedBtn').addEventListener('click', () => {
       const hashes = Array.from(state.selectedHashes);
       if (hashes.length > 0) openShareModal(hashes);
@@ -2379,12 +3409,171 @@
       else loadGallery(true);
     });
 
-    // Share modal
+    // Share modal + Manage Share Links + Cleanup + Albums + Map + Memory Viewer
     $('closeShareModalBtn').addEventListener('click', closeShareModal);
     $('shareModal').addEventListener('click', (e) => {
       if (e.target === $('shareModal')) closeShareModal();
     });
     $('shareCreateForm').addEventListener('submit', handleCreateShareLink);
+    $('openManageSharesFromModalBtn').addEventListener('click', () => {
+      closeShareModal();
+      openManageSharesModal();
+    });
+    $('manageSharesBtn').addEventListener('click', openManageSharesModal);
+    $('closeManageSharesBtn').addEventListener('click', closeManageSharesModal);
+    $('manageSharesModal').addEventListener('click', (e) => {
+      if (e.target === $('manageSharesModal')) closeManageSharesModal();
+    });
+
+    // Albums controls
+    document.querySelectorAll('#albumCategoryPills .f-pill').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#albumCategoryPills .f-pill').forEach((b) => b.classList.remove('is-active'));
+        btn.classList.add('is-active');
+        state.albumCategoryFilter = btn.dataset.albCat || 'all';
+        renderAlbumsGrid();
+      });
+    });
+    $('newAlbumBtn').addEventListener('click', () => openAlbumModal(null, []));
+    $('closeAlbumModalBtn').addEventListener('click', closeAlbumModal);
+    $('albumModal').addEventListener('click', (e) => {
+      if (e.target === $('albumModal')) closeAlbumModal();
+    });
+    $('albumForm').addEventListener('submit', handleSaveAlbum);
+    $('backToAlbumsBtn').addEventListener('click', closeAlbumDetail);
+    $('shareActiveAlbumBtn').addEventListener('click', () => {
+      if (!state.activeAlbum) return;
+      const hashes = state.activeAlbumPhotos.map((p) => p.hash);
+      if (hashes.length === 0) {
+        showToast('Add photos to this album first before sharing.', 'amber');
+        return;
+      }
+      openShareModal(hashes, state.activeAlbum.name, state.activeAlbum.id);
+    });
+    $('editActiveAlbumBtn').addEventListener('click', () => {
+      if (state.activeAlbum) openAlbumModal(state.activeAlbum);
+    });
+    $('deleteActiveAlbumBtn').addEventListener('click', () => {
+      if (!state.activeAlbum) return;
+      const alb = state.activeAlbum;
+      openConfirmModal(
+        `Delete album "${alb.name}"?`,
+        'This deletes only the album container. All photos stay safely in your cloud library.',
+        async () => {
+          try {
+            const res = await apiFetch(`/api/albums/${encodeURIComponent(alb.id)}`, { method: 'DELETE' });
+            if (!res.ok) throw new Error('Delete failed');
+            showToast(`Deleted album "${alb.name}"`, 'amber');
+            closeAlbumDetail();
+            await loadAlbums();
+          } catch (err) {
+            showToast(err.message || 'Could not delete album', 'rose');
+          }
+        },
+        'Delete Album'
+      );
+    });
+    $('closeAlbumPickerBtn').addEventListener('click', closeAlbumPickerModal);
+    $('albumPickerModal').addEventListener('click', (e) => {
+      if (e.target === $('albumPickerModal')) closeAlbumPickerModal();
+    });
+    $('pickerCreateNewAlbumBtn').addEventListener('click', () => {
+      const hashes = state.albumPickerHashes.slice();
+      closeAlbumPickerModal();
+      openAlbumModal(null, hashes);
+    });
+
+    // Map controls
+    $('mapZoomInBtn').addEventListener('click', () => {
+      state.mapZoom = Math.min(4, state.mapZoom * 1.35);
+      applyMapTransform();
+    });
+    $('mapZoomOutBtn').addEventListener('click', () => {
+      state.mapZoom = Math.max(1, state.mapZoom / 1.35);
+      if (state.mapZoom <= 1.02) {
+        state.mapZoom = 1;
+        state.mapPanX = 0;
+        state.mapPanY = 0;
+      }
+      applyMapTransform();
+    });
+    $('mapResetBtn').addEventListener('click', () => {
+      state.mapZoom = 1;
+      state.mapPanX = 0;
+      state.mapPanY = 0;
+      state.selectedMapClusterId = null;
+      renderPhotoMap();
+      renderGallery();
+    });
+    $('mapClearPlaceBtn').addEventListener('click', () => {
+      state.selectedMapClusterId = null;
+      renderPhotoMap();
+      renderGallery();
+    });
+    let mapDrag = null;
+    $('photoMapStage').addEventListener('mousedown', (e) => {
+      if (state.mapZoom <= 1.01) return;
+      mapDrag = { x: e.clientX - state.mapPanX, y: e.clientY - state.mapPanY };
+    });
+    window.addEventListener('mousemove', (e) => {
+      if (!mapDrag) return;
+      state.mapPanX = e.clientX - mapDrag.x;
+      state.mapPanY = e.clientY - mapDrag.y;
+      applyMapTransform();
+    });
+    window.addEventListener('mouseup', () => {
+      mapDrag = null;
+    });
+
+    // Cleanup studio controls
+    $('cleanupBtn').addEventListener('click', () => openCleanupModal(true));
+    $('closeCleanupModalBtn').addEventListener('click', closeCleanupModal);
+    $('cleanupModal').addEventListener('click', (e) => {
+      if (e.target === $('cleanupModal')) closeCleanupModal();
+    });
+    $('cleanupRescanBtn').addEventListener('click', () => openCleanupModal(true));
+    document.querySelectorAll('#cleanupTabPills .f-pill').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#cleanupTabPills .f-pill').forEach((b) => b.classList.remove('is-active'));
+        btn.classList.add('is-active');
+        state.cleanupTab = btn.dataset.cleanupTab || 'similar';
+        renderCleanupStudio();
+      });
+    });
+    $('cleanupTrashSelectedBtn').addEventListener('click', () => {
+      const hashes = Array.from(state.cleanupSelectedHashes);
+      if (hashes.length === 0) return;
+      openConfirmModal(
+        `Move ${hashes.length} photo(s) to Trash?`,
+        'They remain recoverable in Trash for 30 days before permanent deletion.',
+        async () => {
+          await movePhotosToTrash(hashes);
+          state.cleanupSelectedHashes.clear();
+          await openCleanupModal(false);
+        },
+        'Move to Trash'
+      );
+    });
+
+    // Memory viewer controls
+    $('memoryCloseBtn').addEventListener('click', closeMemoryViewer);
+    $('memoryPlayPauseBtn').addEventListener('click', toggleMemoryPause);
+    $('memoryPrevBtn').addEventListener('click', () => {
+      if (state.memorySlideIndex > 0) {
+        state.memorySlideIndex--;
+        renderMemorySlide();
+      }
+    });
+    $('memoryNextBtn').addEventListener('click', () => {
+      if (state.activeMemory && state.memorySlideIndex < state.activeMemory.photos.length - 1) {
+        state.memorySlideIndex++;
+        renderMemorySlide();
+      }
+    });
+    $('memoryShareBtn').addEventListener('click', () => {
+      if (!state.activeMemory) return;
+      openShareModal(state.activeMemory.hashes, state.activeMemory.title);
+    });
     $('shareCopyBtn').addEventListener('click', async () => {
       const val = $('shareUrlOutput').value;
       if (!val) return;
@@ -2417,6 +3606,10 @@
     $('lbShareBtn').addEventListener('click', () => {
       const photo = state.visibleFlatPhotos[state.lightboxIndex];
       if (photo) openShareModal([photo.hash], photo.originalName || '');
+    });
+    $('lbAlbumBtn').addEventListener('click', () => {
+      const photo = state.visibleFlatPhotos[state.lightboxIndex];
+      if (photo) openAlbumPickerModal([photo.hash]);
     });
     $('lbRestoreBtn').addEventListener('click', async () => {
       const photo = state.visibleFlatPhotos[state.lightboxIndex];
@@ -2526,8 +3719,38 @@
         if (e.key === 'Escape') closeShareModal();
         return;
       }
+      if (!$('manageSharesModal').classList.contains('hidden')) {
+        if (e.key === 'Escape') closeManageSharesModal();
+        return;
+      }
+      if (!$('albumModal').classList.contains('hidden')) {
+        if (e.key === 'Escape') closeAlbumModal();
+        return;
+      }
+      if (!$('albumPickerModal').classList.contains('hidden')) {
+        if (e.key === 'Escape') closeAlbumPickerModal();
+        return;
+      }
+      if (!$('cleanupModal').classList.contains('hidden')) {
+        if (e.key === 'Escape') closeCleanupModal();
+        return;
+      }
       if (!$('loginModal').classList.contains('hidden')) {
         if (e.key === 'Escape') closeLoginModal();
+        return;
+      }
+      if (!$('memoryViewer').classList.contains('hidden')) {
+        if (e.key === 'Escape') closeMemoryViewer();
+        else if (e.key === 'ArrowLeft' && state.memorySlideIndex > 0) {
+          state.memorySlideIndex--;
+          renderMemorySlide();
+        } else if (e.key === 'ArrowRight' && state.activeMemory && state.memorySlideIndex < state.activeMemory.photos.length - 1) {
+          state.memorySlideIndex++;
+          renderMemorySlide();
+        } else if (e.key === ' ') {
+          e.preventDefault();
+          toggleMemoryPause();
+        }
         return;
       }
       if ($('lightbox').classList.contains('hidden')) return;

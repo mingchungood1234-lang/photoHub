@@ -15,10 +15,13 @@
 
 const express = require('express');
 
-function createPhotoRoutes({ photoController, shareController }) {
+function createPhotoRoutes({ photoController, shareController, albumController }) {
   const router = express.Router();
 
   router.get('/photos', photoController.listPhotos);
+  router.get('/photos/memories', photoController.getMemories);
+  router.get('/photos/map', photoController.getPhotoMap);
+  router.get('/photos/cleanup-suggestions', photoController.getCleanupSuggestions);
   router.get('/photos/trash', photoController.listTrash);
   router.post('/photos/trash', photoController.moveToTrash);
   router.post('/photos/trash/restore', photoController.restoreFromTrash);
@@ -34,9 +37,23 @@ function createPhotoRoutes({ photoController, shareController }) {
   router.delete('/photo/:hash', photoController.deletePhoto);
   router.get('/photo/:hash', photoController.downloadMaster);
 
+  if (albumController) {
+    router.get('/albums', albumController.listAlbums);
+    router.post('/albums', albumController.createAlbum);
+    router.get('/albums/:id', albumController.getAlbum);
+    router.put('/albums/:id', albumController.updateAlbum);
+    router.patch('/albums/:id', albumController.updateAlbum);
+    router.delete('/albums/:id', albumController.deleteAlbum);
+    router.post('/albums/:id/photos', albumController.addPhotosToAlbum);
+    router.delete('/albums/:id/photos', albumController.removePhotosFromAlbum);
+    router.post('/albums/:id/photos/remove', albumController.removePhotosFromAlbum);
+  }
+
   if (shareController) {
     router.post('/shares', shareController.createShare);
     router.get('/shares', shareController.listShares);
+    router.put('/shares/:token', shareController.updateShare);
+    router.patch('/shares/:token', shareController.updateShare);
     router.delete('/shares/:token', shareController.revokeShare);
   }
 

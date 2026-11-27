@@ -21,6 +21,14 @@ function createUploadRoutes({ checkController, uploadController, uploadMiddlewar
   router.post('/upload/presign', uploadController.presignUpload);
   router.post('/upload/confirm', uploadController.confirmUpload);
 
+  // Resumable chunked uploads for large 4K videos
+  router.post('/upload/chunked/init', uploadController.initChunkedUpload);
+  router.get('/upload/chunked/:uploadId', uploadController.getChunkedUploadStatus);
+  router.put('/upload/chunked/:uploadId/part/:chunkIndex', uploadController.uploadChunkPart);
+  router.post('/upload/chunked/:uploadId/part/:chunkIndex', uploadController.uploadChunkPart);
+  router.post('/upload/chunked/:uploadId/complete', uploadController.completeChunkedUpload);
+  router.delete('/upload/chunked/:uploadId', uploadController.abortChunkedUpload);
+
   return router;
 }
 

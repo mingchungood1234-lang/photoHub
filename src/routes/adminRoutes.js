@@ -14,6 +14,9 @@ function createAdminRoutes({ adminController }) {
   router.get('/overview', adminController.getOverview);
   router.post('/rescan', adminController.rescanStorage);
   router.post('/user-quota', adminController.updateUserQuota);
+  router.post('/generate-missing-proxies', adminController.generateMissingProxies);
+  router.delete('/shares/:token', adminController.revokeShareAdmin);
+  router.delete('/chunked-uploads/:uploadId', adminController.abortChunkedUploadAdmin);
 
   return router;
 }

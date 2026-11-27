@@ -86,6 +86,9 @@ async function startTestServer(extraOverrides = {}) {
     storageDir,
     dataDir,
     async cleanup() {
+      if (app.locals.proxyQueue) {
+        await app.locals.proxyQueue.waitForIdle(3000);
+      }
       await new Promise((resolve) => server.close(resolve));
       await fsp.rm(tmpRoot, { recursive: true, force: true });
     },
@@ -2525,4 +2528,388 @@ test('Duplicate prevention blocks tagged proxy re-uploads (filename & EXIF marke
   ).json();
   assert.equal(listAfter.total, 1);
   assert.equal(listAfter.photos[0].hash, masterHash);
+});
+
+test('Auto-proxy queue, EXIF GPS map & search, Memories, Custom Albums, Share upgrades, Chunked 4K upload, Cleanup, and Admin upgrades', async (t) => {
+  const ctx = await startTestServer({
+    userKeys: 'alice_key:alice,bob_key:bob',
+    adminKey: 'super_admin_secret_test',
+  });
+  t.after(() => ctx.cleanup());
+
+  const sharp = require('sharp');
+
+  // Helper: build a high-contrast sharp JPEG buffer (crisp edges -> high Laplacian variance)
+  async function makeSharpCheckerJpeg(offset = 0, width = 240, height = 240) {
+    const raw = Buffer.alloc(width * height * 3);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const cell = ((Math.floor(x / 16) + Math.floor(y / 16)) % 2 === 0) ? 235 : 25;
+        const v = Math.max(0, Math.min(255, cell + offset));
+        const idx = (y * width + x) * 3;
+        raw[idx] = v;
+        raw[idx + 1] = Math.max(0, v - 15);
+        raw[idx + 2] = Math.min(255, v + 10);
+      }
+    }
+    return sharp(raw, { raw: { width, height, channels: 3 } }).jpeg({ quality: 90 }).toBuffer();
+  }
+
+  // Helper: build a blurry/flat JPEG buffer (near-zero Laplacian variance -> flagged as blurry)
+  async function makeBlurryJpeg(width = 240, height = 240) {
+    const raw = Buffer.alloc(width * height * 3, 128);
+    return sharp(raw, { raw: { width, height, channels: 3 } }).jpeg({ quality: 85 }).toBuffer();
+  }
+
+  // Helper: inject a minimal valid EXIF APP1 block with GPS (Tokyo: 35°40'34"N, 139°39'01"E) into a JPEG
+  function injectTokyoGpsExif(jpegBuf) {
+    // Little-endian TIFF header + IFD0 (1 entry: GPSInfoIFDPointer 0x8825 -> offset 26)
+    // GPS IFD at offset 26 (4 entries: LatRef 'N', Lat 3 rationals, LngRef 'E', Lng 3 rationals)
+    // Rational data at offset 80 (48 bytes)
+    const tiff = Buffer.alloc(128, 0);
+    tiff.write('II', 0, 'ascii');
+    tiff.writeUInt16LE(42, 2);
+    tiff.writeUInt32LE(8, 4); // IFD0 offset = 8
+    // IFD0 at 8
+    tiff.writeUInt16LE(1, 8); // 1 entry
+    tiff.writeUInt16LE(0x8825, 10); // GPS IFD pointer tag
+    tiff.writeUInt16LE(4, 12); // LONG
+    tiff.writeUInt32LE(1, 14);
+    tiff.writeUInt32LE(26, 18); // GPS IFD offset = 26
+    tiff.writeUInt32LE(0, 22); // next IFD = 0
+
+    // GPS IFD at 26: 4 entries (4*12 + 6 = 54 bytes -> ends at 80)
+    tiff.writeUInt16LE(4, 26);
+    // Entry 0: GPSLatitudeRef (0x0001), ASCII, count 2, inline 'N\0'
+    tiff.writeUInt16LE(0x0001, 28);
+    tiff.writeUInt16LE(2, 30);
+    tiff.writeUInt32LE(2, 32);
+    tiff.write('N\0', 36, 'ascii');
+    // Entry 1: GPSLatitude (0x0002), RATIONAL (5), count 3, offset 80
+    tiff.writeUInt16LE(0x0002, 40);
+    tiff.writeUInt16LE(5, 42);
+    tiff.writeUInt32LE(3, 44);
+    tiff.writeUInt32LE(80, 48);
+    // Entry 2: GPSLongitudeRef (0x0003), ASCII, count 2, inline 'E\0'
+    tiff.writeUInt16LE(0x0003, 52);
+    tiff.writeUInt16LE(2, 54);
+    tiff.writeUInt32LE(2, 56);
+    tiff.write('E\0', 60, 'ascii');
+    // Entry 3: GPSLongitude (0x0004), RATIONAL (5), count 3, offset 104
+    tiff.writeUInt16LE(0x0004, 64);
+    tiff.writeUInt16LE(5, 66);
+    tiff.writeUInt32LE(3, 68);
+    tiff.writeUInt32LE(104, 72);
+    tiff.writeUInt32LE(0, 76);
+
+    // Lat rationals at 80: 35 deg, 40 min, 34 sec = 35.676111
+    tiff.writeUInt32LE(35, 80); tiff.writeUInt32LE(1, 84);
+    tiff.writeUInt32LE(40, 88); tiff.writeUInt32LE(1, 92);
+    tiff.writeUInt32LE(34, 96); tiff.writeUInt32LE(1, 100);
+    // Lng rationals at 104: 139 deg, 39 min, 1 sec = 139.650278
+    tiff.writeUInt32LE(139, 104); tiff.writeUInt32LE(1, 108);
+    tiff.writeUInt32LE(39, 112); tiff.writeUInt32LE(1, 116);
+    tiff.writeUInt32LE(1, 120); tiff.writeUInt32LE(1, 124);
+
+    const exifHeader = Buffer.from('Exif\0\0', 'ascii');
+    const app1Len = 2 + exifHeader.length + tiff.length;
+    const app1 = Buffer.alloc(4);
+    app1[0] = 0xff;
+    app1[1] = 0xe1;
+    app1.writeUInt16BE(app1Len, 2);
+    return Buffer.concat([jpegBuf.subarray(0, 2), app1, exifHeader, tiff, jpegBuf.subarray(2)]);
+  }
+
+  // 1. Auto-Generate Proxy + EXIF GPS Extraction after Web Upload
+  const tokyoJpeg = injectTokyoGpsExif(await makeSharpCheckerJpeg(0));
+  const up1 = await ctx.request('/api/upload', {
+    method: 'POST',
+    headers: {
+      'X-API-Key': 'alice_key',
+      'X-File-Name': 'IMG_TOKYO_1.jpg',
+      'X-Photo-Date': '2025-11-27T10:00:00Z',
+      'X-Upload-Source': 'web',
+      'Content-Type': 'image/jpeg',
+    },
+    body: tokyoJpeg,
+  });
+  assert.equal(up1.status, 200);
+  const up1Body = await up1.json();
+  assert.equal(up1Body.proxyQueued, true);
+  assert.equal(up1Body.locationLabel, 'Tokyo, Japan');
+  const h1 = up1Body.hash;
+
+  // Upload a near-identical burst shot 5 seconds later + a blurry photo in London 2 years ago
+  const tokyoBurstJpeg = injectTokyoGpsExif(await makeSharpCheckerJpeg(3));
+  const up2 = await ctx.request('/api/upload', {
+    method: 'POST',
+    headers: {
+      'X-API-Key': 'alice_key',
+      'X-File-Name': 'IMG_TOKYO_2.jpg',
+      'X-Photo-Date': '2025-11-27T10:00:05Z',
+      'X-Upload-Source': 'web',
+      'Content-Type': 'image/jpeg',
+    },
+    body: tokyoBurstJpeg,
+  });
+  const h2 = (await up2.json()).hash;
+
+  const londonBlurryJpeg = await makeBlurryJpeg();
+  const up3 = await ctx.request('/api/upload', {
+    method: 'POST',
+    headers: {
+      'X-API-Key': 'alice_key',
+      'X-File-Name': 'IMG_LONDON_BLUR.jpg',
+      'X-Photo-Date': '2024-11-27T14:20:00Z',
+      'X-Gps-Lat': '51.5072',
+      'X-Gps-Lng': '-0.1276',
+      'X-Upload-Source': 'web',
+      'Content-Type': 'image/jpeg',
+    },
+    body: londonBlurryJpeg,
+  });
+  const up3Body = await up3.json();
+  assert.equal(up3Body.locationLabel, 'London, UK');
+  const h3 = up3Body.hash;
+
+  // Wait for background auto-proxy & visual analysis queue to finish cleanly (via live Admin telemetry)
+  for (let i = 0; i < 40; i++) {
+    const ov = await (
+      await ctx.request('/api/admin/overview', { headers: { 'X-Admin-Key': 'super_admin_secret_test' } })
+    ).json();
+    if (ov.proxyQueue && ov.proxyQueue.active === 0 && ov.proxyQueue.queued === 0 && ov.proxyQueue.completed >= 3) {
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 80));
+  }
+
+  const prevRes = await ctx.request(`/api/photo/${h1}/preview`, { headers: { 'X-API-Key': 'alice_key' } });
+  assert.equal(prevRes.status, 200);
+  assert.equal(prevRes.headers['x-photo-variant'], 'proxy');
+
+  // 2. Photo Map & Location Search
+  const mapRes = await ctx.request('/api/photos/map', { headers: { 'X-API-Key': 'alice_key' } });
+  assert.equal(mapRes.status, 200);
+  const mapData = await mapRes.json();
+  assert.equal(mapData.geoTaggedCount, 3);
+  assert.equal(mapData.clusters.length, 2);
+  assert.ok(mapData.clusters.some((c) => c.label === 'Tokyo, Japan' && c.count === 2));
+  assert.ok(mapData.clusters.some((c) => c.label === 'London, UK' && c.count === 1));
+
+  const searchTokyo = await (
+    await ctx.request('/api/photos?q=tokyo', { headers: { 'X-API-Key': 'alice_key' } })
+  ).json();
+  assert.equal(searchTokyo.total, 2);
+
+  // 3. Memories ("On This Day" + Trip)
+  const memRes = await ctx.request('/api/photos/memories?date=2026-11-27', {
+    headers: { 'X-API-Key': 'alice_key' },
+  });
+  assert.equal(memRes.status, 200);
+  const memData = await memRes.json();
+  assert.ok(memData.memories.some((m) => m.type === 'on_this_day' && m.title === '1 Year Ago'));
+  assert.ok(memData.memories.some((m) => m.type === 'on_this_day' && m.title === '2 Years Ago'));
+  assert.ok(memData.memories.some((m) => m.type === 'trip' && m.title === 'Tokyo'));
+
+  // 4. Custom Albums CRUD & Tenant Isolation
+  const createAlbRes = await ctx.request('/api/albums', {
+    method: 'POST',
+    headers: { 'X-API-Key': 'alice_key', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'Japan Trip', category: 'trip', description: 'Autumn memories', hashes: [h1] }),
+  });
+  assert.equal(createAlbRes.status, 201);
+  const alb = (await createAlbRes.json()).album;
+  assert.equal(alb.category, 'trip');
+  assert.equal(alb.itemCount, 1);
+
+  const addAlbRes = await ctx.request(`/api/albums/${alb.id}/photos`, {
+    method: 'POST',
+    headers: { 'X-API-Key': 'alice_key', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ hashes: [h2, h3] }),
+  });
+  assert.equal((await addAlbRes.json()).album.itemCount, 3);
+
+  // Bob cannot access Alice's album
+  const bobAlbRes = await ctx.request(`/api/albums/${alb.id}`, { headers: { 'X-API-Key': 'bob_key' } });
+  assert.equal(bobAlbRes.status, 404);
+
+  // Remove h3 from album
+  const remAlbRes = await ctx.request(`/api/albums/${alb.id}/photos/remove`, {
+    method: 'POST',
+    headers: { 'X-API-Key': 'alice_key', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ hashes: [h3] }),
+  });
+  assert.equal((await remAlbRes.json()).album.itemCount, 2);
+
+  // 5. Public Share Link Upgrades (Album Share, View-Only, ZIP download, View Count & Max Views)
+  const shareRes = await ctx.request('/api/shares', {
+    method: 'POST',
+    headers: { 'X-API-Key': 'alice_key', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ albumId: alb.id, allowDownload: false, maxViews: 2 }),
+  });
+  assert.equal(shareRes.status, 201);
+  const share = (await shareRes.json()).share;
+  assert.equal(share.allowDownload, false);
+  assert.equal(share.itemCount, 2);
+
+  const pubView1 = await ctx.request(`/api/public/share/${share.token}`);
+  assert.equal(pubView1.status, 200);
+  const pubView1Body = await pubView1.json();
+  assert.equal(pubView1Body.share.viewCount, 1);
+  assert.equal(pubView1Body.share.allowDownload, false);
+
+  // View-only blocks downloads & ZIP
+  const blockedDl = await ctx.request(`/api/public/share/${share.token}/download/${h1}`);
+  assert.equal(blockedDl.status, 403);
+  const blockedZip = await ctx.request(`/api/public/share/${share.token}/download-zip`);
+  assert.equal(blockedZip.status, 403);
+
+  // Enable downloads via PATCH and verify Public ZIP download works
+  const patchShare = await ctx.request(`/api/shares/${share.token}`, {
+    method: 'PATCH',
+    headers: { 'X-API-Key': 'alice_key', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ allowDownload: true }),
+  });
+  assert.equal(patchShare.status, 200);
+  assert.equal((await patchShare.json()).share.allowDownload, true);
+
+  const zipRes = await ctx.request(`/api/public/share/${share.token}/download-zip`);
+  assert.equal(zipRes.status, 200);
+  assert.ok(String(zipRes.headers['content-type'] || '').includes('application/zip'));
+  assert.equal(zipRes.buffer.subarray(0, 4).toString('hex'), '504b0304'); // PKZIP local file header
+
+  // Second public view succeeds; third hits maxViews=2 -> 410 Gone
+  assert.equal((await ctx.request(`/api/public/share/${share.token}`)).status, 200);
+  assert.equal((await ctx.request(`/api/public/share/${share.token}`)).status, 410);
+
+  // 6. Resumable Chunked Upload for Large 4K Videos (out-of-order + resume + SHA-256 verification)
+  const chunkSize = 256 * 1024;
+  const fullVideoBuf = crypto.randomBytes(600 * 1024); // 600 KB -> 3 chunks (256K, 256K, 88K)
+  const fullVideoSha = crypto.createHash('sha256').update(fullVideoBuf).digest('hex');
+
+  const initRes = await ctx.request('/api/upload/chunked/init', {
+    method: 'POST',
+    headers: { 'X-API-Key': 'alice_key', 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      fileName: 'VACATION_4K.MP4',
+      mimeType: 'video/mp4',
+      fileSize: fullVideoBuf.length,
+      chunkSize,
+      expectedHash: fullVideoSha,
+      strictChecksum: true,
+    }),
+  });
+  assert.equal(initRes.status, 201);
+  const initBody = await initRes.json();
+  assert.equal(initBody.totalChunks, 3);
+  const uploadId = initBody.uploadId;
+
+  // Upload chunk 0 and chunk 2 out of order
+  const p0 = fullVideoBuf.subarray(0, chunkSize);
+  const p1 = fullVideoBuf.subarray(chunkSize, chunkSize * 2);
+  const p2 = fullVideoBuf.subarray(chunkSize * 2);
+
+  assert.equal(
+    (await ctx.request(`/api/upload/chunked/${uploadId}/part/0`, {
+      method: 'PUT',
+      headers: { 'X-API-Key': 'alice_key', 'Content-Type': 'application/octet-stream' },
+      body: p0,
+    })).status,
+    200
+  );
+  assert.equal(
+    (await ctx.request(`/api/upload/chunked/${uploadId}/part/2`, {
+      method: 'PUT',
+      headers: { 'X-API-Key': 'alice_key', 'Content-Type': 'application/octet-stream' },
+      body: p2,
+    })).status,
+    200
+  );
+
+  // Simulate reconnect & resume query
+  const resumeRes = await ctx.request('/api/upload/chunked/init', {
+    method: 'POST',
+    headers: { 'X-API-Key': 'alice_key', 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      fileName: 'VACATION_4K.MP4',
+      mimeType: 'video/mp4',
+      fileSize: fullVideoBuf.length,
+      chunkSize,
+      expectedHash: fullVideoSha,
+      resumeUploadId: uploadId,
+    }),
+  });
+  const resumeBody = await resumeRes.json();
+  assert.equal(resumeBody.resumed, true);
+  assert.deepEqual(resumeBody.uploadedChunks, [0, 2]);
+
+  // Upload final missing chunk 1 with per-chunk SHA-256 verification
+  const p1Sha = crypto.createHash('sha256').update(p1).digest('hex');
+  assert.equal(
+    (await ctx.request(`/api/upload/chunked/${uploadId}/part/1`, {
+      method: 'PUT',
+      headers: {
+        'X-API-Key': 'alice_key',
+        'Content-Type': 'application/octet-stream',
+        'X-Chunk-Sha256': p1Sha,
+      },
+      body: p1,
+    })).status,
+    200
+  );
+
+  // Complete chunked upload & verify assembled file bytes match 100%
+  const compRes = await ctx.request(`/api/upload/chunked/${uploadId}/complete`, {
+    method: 'POST',
+    headers: { 'X-API-Key': 'alice_key', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ expectedHash: fullVideoSha, strictChecksum: true }),
+  });
+  assert.equal(compRes.status, 200);
+  const compBody = await compRes.json();
+  assert.equal(compBody.hash, fullVideoSha);
+  assert.equal(compBody.size, fullVideoBuf.length);
+
+  const dlVid = await ctx.request(`/api/photo/${fullVideoSha}`, { headers: { 'X-API-Key': 'alice_key' } });
+  assert.equal(dlVid.status, 200);
+  assert.equal(Buffer.compare(dlVid.buffer, fullVideoBuf), 0);
+
+  // 7. Similar / Burst Photo & Blurry Shot Cleanup
+  const cleanRes = await ctx.request('/api/photos/cleanup-suggestions?scan=1', {
+    headers: { 'X-API-Key': 'alice_key' },
+  });
+  assert.equal(cleanRes.status, 200);
+  const cleanData = await cleanRes.json();
+  assert.equal(cleanData.sharpAvailable, true);
+  assert.ok(cleanData.similarGroups.length >= 1, 'Expected burst/similar group for the two Tokyo shots');
+  assert.ok(cleanData.similarGroups[0].photos.some((p) => p.hash === h1));
+  assert.ok(cleanData.similarGroups[0].photos.some((p) => p.hash === h2));
+  assert.ok(cleanData.blurryPhotos.some((p) => p.hash === h3), 'Expected flat London shot flagged as blurry');
+
+  // 8. Admin Dashboard Upgrades (System diagnostics, Analytics, Proxy Queue, Active Shares & Admin Revoke)
+  const adminRes = await ctx.request('/api/admin/overview', {
+    headers: { 'X-Admin-Key': 'super_admin_secret_test' },
+  });
+  assert.equal(adminRes.status, 200);
+  const adminData = await adminRes.json();
+  assert.ok(adminData.system && adminData.system.nodeVersion);
+  assert.equal(adminData.system.capabilities.sharp, true);
+  assert.equal(adminData.analytics.totalPhotosCount, 3);
+  assert.equal(adminData.analytics.totalVideosCount, 1);
+  assert.equal(adminData.analytics.totalGeoTagged, 3);
+  assert.equal(adminData.analytics.totalAlbums, 1);
+  assert.equal(adminData.activeShares.length, 1);
+  assert.ok(adminData.proxyQueue.completed >= 3);
+
+  const adminRevoke = await ctx.request(`/api/admin/shares/${share.token}`, {
+    method: 'DELETE',
+    headers: { 'X-Admin-Key': 'super_admin_secret_test' },
+  });
+  assert.equal(adminRevoke.status, 200);
+
+  const adminBackfill = await ctx.request('/api/admin/generate-missing-proxies', {
+    method: 'POST',
+    headers: { 'X-Admin-Key': 'super_admin_secret_test', 'Content-Type': 'application/json' },
+    body: JSON.stringify({}),
+  });
+  assert.equal(adminBackfill.status, 200);
 });

@@ -17,8 +17,7 @@ const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
-
-const JPEG_EXTS = new Set(['.jpg', '.jpeg']);
+const { readJpegExifMetadata } = require('../services/exifGeoService');
 
 function computeBufferSha256(buffer) {
   return crypto.createHash('sha256').update(buffer).digest('hex');
@@ -73,120 +72,11 @@ function parseExifDateString(str) {
 }
 
 /**
- * Lightweight dependency-free reader for JPEG APP1 EXIF DateTimeOriginal/DateTime
- * using at most a 64 KB header read so huge photo libraries scan quickly.
+ * Lightweight dependency-free reader for JPEG APP1 EXIF DateTimeOriginal/Camera/GPS
+ * delegated to `exifGeoService.js` (at most a 64 KB header read).
  */
 async function readJpegExifDateTime(fullPath) {
-  const ext = path.extname(fullPath).toLowerCase();
-  if (!JPEG_EXTS.has(ext)) return null;
-
-  let fh = null;
-  try {
-    fh = await fsp.open(fullPath, 'r');
-    const maxBytes = 65536;
-    const rawBuf = Buffer.allocUnsafe(maxBytes);
-    const { bytesRead } = await fh.read(rawBuf, 0, maxBytes, 0);
-    if (bytesRead < 16) return null;
-    const buf = rawBuf.subarray(0, bytesRead);
-    if (buf[0] !== 0xff || buf[1] !== 0xd8) return null;
-
-    let pos = 2;
-    while (pos + 4 <= buf.length) {
-      while (pos < buf.length && buf[pos] === 0xff && buf[pos + 1] === 0xff) {
-        pos += 1;
-      }
-      if (pos + 4 > buf.length || buf[pos] !== 0xff) break;
-      const marker = buf[pos + 1];
-      if (marker === 0xda || marker === 0xd9) break; // SOS / EOI
-      const segLen = buf.readUInt16BE(pos + 2);
-      if (segLen < 2 || pos + 2 + segLen > buf.length) break;
-
-      if (
-        marker === 0xe1 &&
-        segLen >= 16 &&
-        buf.toString('ascii', pos + 4, pos + 10) === 'Exif\0\0'
-      ) {
-        const tiffStart = pos + 10;
-        const endian = buf.toString('ascii', tiffStart, tiffStart + 2);
-        if (endian !== 'II' && endian !== 'MM') return null;
-        const le = endian === 'II';
-        const readU16 = (off) =>
-          off + 2 <= buf.length
-            ? le
-              ? buf.readUInt16LE(off)
-              : buf.readUInt16BE(off)
-            : 0;
-        const readU32 = (off) =>
-          off + 4 <= buf.length
-            ? le
-              ? buf.readUInt32LE(off)
-              : buf.readUInt32BE(off)
-            : 0;
-
-        if (readU16(tiffStart + 2) !== 0x002a) return null;
-        const ifd0Rel = readU32(tiffStart + 4);
-
-        const scanIfd = (ifdRel) => {
-          const ifdOff = tiffStart + ifdRel;
-          if (ifdOff + 2 > buf.length) return { entries: [] };
-          const count = Math.min(readU16(ifdOff), 256);
-          const tags = new Map();
-          for (let i = 0; i < count; i++) {
-            const entryOff = ifdOff + 2 + i * 12;
-            if (entryOff + 12 > buf.length) break;
-            const tag = readU16(entryOff);
-            const type = readU16(entryOff + 2);
-            const valCount = readU32(entryOff + 4);
-            tags.set(tag, { type, valCount, valueOff: entryOff + 8 });
-          }
-          return tags;
-        };
-
-        const readAsciiTag = (tagEntry, minLen = 1) => {
-          if (!tagEntry || tagEntry.type !== 2 || tagEntry.valCount < minLen) return null;
-          const byteCount = Math.min(tagEntry.valCount, 64);
-          const dataOff =
-            tagEntry.valCount <= 4
-              ? tagEntry.valueOff
-              : tiffStart + readU32(tagEntry.valueOff);
-          if (dataOff < tiffStart || dataOff + byteCount > buf.length) return null;
-          return buf.toString('ascii', dataOff, dataOff + byteCount).replace(/\0.*$/, '').trim() || null;
-        };
-
-        const ifd0 = scanIfd(ifd0Rel);
-        const make = readAsciiTag(ifd0.get(0x010f), 2);
-        const model = readAsciiTag(ifd0.get(0x0110), 2);
-        const cameraModel = model
-          ? make && !model.toLowerCase().startsWith(make.toLowerCase())
-            ? `${make} ${model}`
-            : model
-          : make || null;
-
-        if (ifd0.has(0x8769)) {
-          const exifPtr = readU32(ifd0.get(0x8769).valueOff);
-          const exifIfd = scanIfd(exifPtr);
-          const rawOrig =
-            readAsciiTag(exifIfd.get(0x9003), 19) ||
-            readAsciiTag(exifIfd.get(0x9004), 19);
-          const parsedOrig = parseExifDateString(rawOrig);
-          if (parsedOrig) return { ...parsedOrig, cameraModel };
-        }
-        const parsedIfd0 = parseExifDateString(readAsciiTag(ifd0.get(0x0132), 19));
-        if (parsedIfd0) return { ...parsedIfd0, cameraModel };
-        if (cameraModel) return { day: null, takenAt: null, cameraModel };
-        return null;
-      }
-
-      pos += 2 + segLen;
-    }
-    return null;
-  } catch {
-    return null;
-  } finally {
-    if (fh) {
-      await fh.close().catch(() => {});
-    }
-  }
+  return readJpegExifMetadata(fullPath);
 }
 
 function extractDateFromFilename(fileName) {
@@ -263,6 +153,10 @@ async function inferDiskMediaDates(relPath, fileName, stat, fullPath) {
   const mtimeDay = formatLocalYmd(stat.mtime);
 
   const cameraModel = (exif && exif.cameraModel) || null;
+  const gpsLat = exif && typeof exif.gpsLat === 'number' ? exif.gpsLat : null;
+  const gpsLng = exif && typeof exif.gpsLng === 'number' ? exif.gpsLng : null;
+  const locationLabel = (exif && exif.locationLabel) || null;
+  const geo = { cameraModel, gpsLat, gpsLng, locationLabel };
 
   if (pathInfo.day) {
     let takenAt = null;
@@ -273,27 +167,27 @@ async function inferDiskMediaDates(relPath, fileName, stat, fullPath) {
     } else if (mtimeDay === pathInfo.day) {
       takenAt = stat.mtime.toISOString();
     }
-    return { photoDate: pathInfo.day, takenAt, cameraModel };
+    return { photoDate: pathInfo.day, takenAt, ...geo };
   }
 
   if (exif && exif.day) {
-    return { photoDate: exif.day, takenAt: exif.takenAt, cameraModel };
+    return { photoDate: exif.day, takenAt: exif.takenAt, ...geo };
   }
 
   if (fileDate) {
     const takenAt =
       fileDate.takenAt || (mtimeDay === fileDate.day ? stat.mtime.toISOString() : null);
-    return { photoDate: fileDate.day, takenAt, cameraModel };
+    return { photoDate: fileDate.day, takenAt, ...geo };
   }
 
   if (pathInfo.year && stat.mtime.getFullYear() !== pathInfo.year) {
-    return { photoDate: `${pathInfo.year}-01-01`, takenAt: null, cameraModel };
+    return { photoDate: `${pathInfo.year}-01-01`, takenAt: null, ...geo };
   }
 
   return {
     photoDate: mtimeDay,
     takenAt: stat.mtime.toISOString(),
-    cameraModel,
+    ...geo,
   };
 }
 
@@ -441,23 +335,39 @@ class HashIndex {
             changed = true;
           } else {
             indexedPaths.add(path.normalize(entry.relativePath));
-            if (!entry.diskHash && entry.storageType !== 's3' && (!entry.photoDate || !entry.takenAt)) {
+            const needsMetaBackfill =
+              entry.storageType !== 's3' &&
+              ((!entry.diskHash && (!entry.photoDate || !entry.takenAt)) ||
+                (entry.gpsLat === undefined && !entry._exifScanned));
+            if (needsMetaBackfill) {
               const inferred = await inferDiskMediaDates(
                 entry.relativePath,
                 entry.originalName || path.basename(fullPath),
                 stat,
                 fullPath
               );
-              if (inferred.photoDate && entry.photoDate !== inferred.photoDate) {
-                entry.photoDate = inferred.photoDate;
-                changed = true;
-              }
-              if (inferred.takenAt && !entry.takenAt) {
-                entry.takenAt = inferred.takenAt;
-                changed = true;
+              if (!entry.diskHash) {
+                if (inferred.photoDate && entry.photoDate !== inferred.photoDate) {
+                  entry.photoDate = inferred.photoDate;
+                  changed = true;
+                }
+                if (inferred.takenAt && !entry.takenAt) {
+                  entry.takenAt = inferred.takenAt;
+                  changed = true;
+                }
               }
               if (inferred.cameraModel && !entry.cameraModel) {
                 entry.cameraModel = inferred.cameraModel;
+                changed = true;
+              }
+              if (typeof inferred.gpsLat === 'number' && typeof inferred.gpsLng === 'number') {
+                entry.gpsLat = inferred.gpsLat;
+                entry.gpsLng = inferred.gpsLng;
+                entry.locationLabel = inferred.locationLabel || entry.locationLabel || null;
+                changed = true;
+              }
+              if (!entry._exifScanned) {
+                entry._exifScanned = true;
                 changed = true;
               }
             }
@@ -510,6 +420,10 @@ class HashIndex {
                   photoDate: inferred.photoDate,
                   takenAt: inferred.takenAt,
                   cameraModel: inferred.cameraModel || null,
+                  gpsLat: inferred.gpsLat,
+                  gpsLng: inferred.gpsLng,
+                  locationLabel: inferred.locationLabel || null,
+                  _exifScanned: true,
                   uploadedAt: (stat.birthtime || stat.mtime).toISOString(),
                 });
                 indexedPaths.add(relPath);
@@ -791,6 +705,38 @@ class HashIndex {
     return record;
   }
 
+  async updateVisualMetrics(masterHash, { dHash = null, blurScore = null, width = null, height = null } = {}) {
+    const lookupResult = await this.lookup(masterHash, { allowStatFastPath: true });
+    if (lookupResult.status === 'missing' || !lookupResult.record) {
+      return null;
+    }
+    const normMaster = (lookupResult.masterHash || String(masterHash || '')).trim().toLowerCase();
+    const record = this.records.get(normMaster) || lookupResult.record;
+    let mutated = false;
+    if (typeof dHash === 'string' && dHash.length === 16 && record.dHash !== dHash) {
+      record.dHash = dHash;
+      mutated = true;
+    }
+    if (typeof blurScore === 'number' && Number.isFinite(blurScore) && record.blurScore !== blurScore) {
+      record.blurScore = blurScore;
+      mutated = true;
+    }
+    if (width && !record.width) {
+      record.width = Number(width);
+      mutated = true;
+    }
+    if (height && !record.height) {
+      record.height = Number(height);
+      mutated = true;
+    }
+    if (mutated) {
+      this.records.set(normMaster, record);
+      this._markDirty();
+      await this.persist();
+    }
+    return record;
+  }
+
   /**
    * Soft-deletes photos into the 30-day Trash bin by setting `deletedAt` across canonical & alias keys.
    */
@@ -943,6 +889,13 @@ class HashIndex {
       isFavorite: Boolean(entry.isFavorite),
       deletedAt: entry.deletedAt || null,
       cameraModel: entry.cameraModel || null,
+      gpsLat: typeof entry.gpsLat === 'number' ? entry.gpsLat : null,
+      gpsLng: typeof entry.gpsLng === 'number' ? entry.gpsLng : null,
+      locationLabel: entry.locationLabel || null,
+      dHash: entry.dHash || null,
+      blurScore: typeof entry.blurScore === 'number' ? entry.blurScore : null,
+      width: entry.width || null,
+      height: entry.height || null,
     };
   }
 

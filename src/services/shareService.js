@@ -95,6 +95,9 @@ class ShareStore {
     hashes = [],
     expiresInHours = DEFAULT_EXPIRY_HOURS,
     passcode = '',
+    allowDownload = true,
+    maxViews = null,
+    albumId = null,
     nodeId = null,
   }) {
     this._pruneExpired();
@@ -119,6 +122,12 @@ class ShareStore {
         ? Math.min(MAX_EXPIRY_HOURS, Math.max(1, Math.round(hoursRaw)))
         : DEFAULT_EXPIRY_HOURS;
 
+    const maxViewsNum = Number(maxViews);
+    const safeMaxViews =
+      Number.isFinite(maxViewsNum) && maxViewsNum > 0
+        ? Math.min(100000, Math.round(maxViewsNum))
+        : null;
+
     const rawToken = crypto.randomBytes(18).toString('base64url');
     const cleanNodeId =
       nodeId && nodeId !== 'primary' && /^[a-zA-Z0-9_-]{1,32}$/.test(String(nodeId))
@@ -139,6 +148,11 @@ class ShareStore {
       ownerName: ownerName || null,
       title: String(title || '').trim().slice(0, 120) || (cleanHashes.length === 1 ? 'Shared Photo' : `${cleanHashes.length} Shared Photos`),
       hashes: cleanHashes,
+      allowDownload: allowDownload !== false,
+      maxViews: safeMaxViews,
+      viewCount: 0,
+      lastViewedAt: null,
+      albumId: albumId ? String(albumId).trim() : null,
       createdAt: new Date(now).toISOString(),
       expiresAt: new Date(now + safeHours * 3600 * 1000).toISOString(),
       expiresInHours: safeHours,
@@ -164,6 +178,59 @@ class ShareStore {
     return rec;
   }
 
+  isViewLimitReached(shareRecord) {
+    if (!shareRecord || !shareRecord.maxViews) return false;
+    return (Number(shareRecord.viewCount) || 0) >= Number(shareRecord.maxViews);
+  }
+
+  async incrementView(token) {
+    const rec = this.shares.get(String(token || '').trim());
+    if (!rec) return null;
+    rec.viewCount = (Number(rec.viewCount) || 0) + 1;
+    rec.lastViewedAt = new Date().toISOString();
+    await this._persist();
+    return rec;
+  }
+
+  async updateShare(token, folderName, { title, allowDownload, expiresInHours, maxViews, passcode } = {}) {
+    const rec = this.shares.get(String(token || '').trim());
+    if (!rec) return null;
+    if ((rec.folderName || null) !== (folderName || null)) return null;
+
+    if (title !== undefined) {
+      const clean = String(title || '').trim().slice(0, 120);
+      if (clean) rec.title = clean;
+    }
+    if (allowDownload !== undefined) {
+      rec.allowDownload = Boolean(allowDownload);
+    }
+    if (expiresInHours !== undefined) {
+      const h = Number(expiresInHours);
+      if (Number.isFinite(h) && h > 0) {
+        const safeH = Math.min(MAX_EXPIRY_HOURS, Math.max(1, Math.round(h)));
+        rec.expiresInHours = safeH;
+        rec.expiresAt = new Date(Date.now() + safeH * 3600 * 1000).toISOString();
+      }
+    }
+    if (maxViews !== undefined) {
+      const mv = Number(maxViews);
+      rec.maxViews = Number.isFinite(mv) && mv > 0 ? Math.min(100000, Math.round(mv)) : null;
+    }
+    if (passcode !== undefined) {
+      const cleanPass = String(passcode || '').trim();
+      if (cleanPass) {
+        rec.passcodeSalt = crypto.randomBytes(12).toString('hex');
+        rec.passcodeHash = hashPasscode(cleanPass, rec.passcodeSalt);
+      } else {
+        rec.passcodeSalt = null;
+        rec.passcodeHash = null;
+      }
+    }
+
+    await this._persist();
+    return this.formatPublicMeta(rec);
+  }
+
   verifyPasscode(shareRecord, providedPasscode) {
     if (!shareRecord || !shareRecord.passcodeHash) return true;
     return verifyPasscodeHash(
@@ -186,12 +253,34 @@ class ShareStore {
     return out;
   }
 
+  listAll() {
+    this._pruneExpired();
+    const out = [];
+    for (const rec of this.shares.values()) {
+      out.push({
+        ...this.formatPublicMeta(rec),
+        folderName: rec.folderName || '/',
+        ownerEmail: rec.ownerEmail || null,
+      });
+    }
+    out.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+    return out;
+  }
+
   async revokeShare(token, folderName) {
     const rec = this.shares.get(String(token || '').trim());
     if (!rec) return false;
     if ((rec.folderName || null) !== (folderName || null)) {
       return false;
     }
+    this.shares.delete(rec.token);
+    await this._persist();
+    return true;
+  }
+
+  async adminRevokeShare(token) {
+    const rec = this.shares.get(String(token || '').trim());
+    if (!rec) return false;
     this.shares.delete(rec.token);
     await this._persist();
     return true;
@@ -204,6 +293,11 @@ class ShareStore {
       itemCount: rec.hashes.length,
       hashes: rec.hashes,
       hasPasscode: Boolean(rec.passcodeHash),
+      allowDownload: rec.allowDownload !== false,
+      maxViews: rec.maxViews || null,
+      viewCount: Number(rec.viewCount) || 0,
+      lastViewedAt: rec.lastViewedAt || null,
+      albumId: rec.albumId || null,
       createdAt: rec.createdAt,
       expiresAt: rec.expiresAt,
       expiresInHours: rec.expiresInHours,

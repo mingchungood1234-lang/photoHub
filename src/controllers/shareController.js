@@ -19,6 +19,11 @@ const path = require('path');
 const { Readable } = require('stream');
 const { isS3Configured, createPresignedUrl } = require('../services/s3Service');
 const { isVideoFilename } = require('../services/proxyService');
+const {
+  streamZipToResponse,
+  createDiskReadStream,
+  createHttpReadStream,
+} = require('../services/zipStreamService');
 
 async function fileExistsAsync(filePath) {
   try {
@@ -29,7 +34,7 @@ async function fileExistsAsync(filePath) {
   }
 }
 
-function createShareController({ config, shareStore, contextService }) {
+function createShareController({ config, shareStore, contextService, albumStore = null }) {
   const sharePagePath = path.join(__dirname, '..', 'views', 'share.html');
 
   function findRemoteNodeForToken(token, req) {
@@ -108,11 +113,22 @@ function createShareController({ config, shareStore, contextService }) {
       try {
         const { hashIndex, folderName, sub, email, name } = req.userContext;
         const body = req.body || {};
-        const rawHashes = Array.isArray(body.hashes)
+        let rawHashes = Array.isArray(body.hashes)
           ? body.hashes
           : body.hash
             ? [body.hash]
             : [];
+        let fallbackTitle = body.title;
+
+        // Support creating a share link directly from an Album ID
+        if (body.albumId && albumStore && rawHashes.length === 0) {
+          const alb = albumStore.getAlbum(body.albumId, folderName);
+          if (!alb) {
+            return res.status(404).json({ success: false, error: 'Album not found.' });
+          }
+          rawHashes = alb.hashes || [];
+          if (!fallbackTitle) fallbackTitle = alb.name;
+        }
 
         const verifiedHashes = [];
         for (const h of rawHashes) {
@@ -137,10 +153,13 @@ function createShareController({ config, shareStore, contextService }) {
           ownerSub: sub,
           ownerEmail: email,
           ownerName: name,
-          title: body.title,
+          title: fallbackTitle,
           hashes: verifiedHashes,
           expiresInHours: body.expiresInHours,
           passcode: body.passcode,
+          allowDownload: body.allowDownload !== false,
+          maxViews: body.maxViews,
+          albumId: body.albumId || null,
           nodeId: localNodeId,
         });
 
@@ -159,6 +178,35 @@ function createShareController({ config, shareStore, contextService }) {
           success: false,
           error: err.message,
         });
+      }
+    },
+
+    async updateShare(req, res) {
+      try {
+        const { folderName } = req.userContext;
+        const body = req.body || {};
+        const updated = await shareStore.updateShare(req.params.token, folderName, {
+          title: body.title,
+          allowDownload: body.allowDownload,
+          expiresInHours: body.expiresInHours,
+          maxViews: body.maxViews,
+          passcode: body.passcode,
+        });
+        if (!updated) {
+          return res.status(404).json({ success: false, error: 'Share link not found.' });
+        }
+        const publicShareUrl = buildPublicShareUrl(req, updated.token);
+        return res.json({
+          success: true,
+          share: {
+            ...updated,
+            sharePath: `/s/${encodeURIComponent(updated.token)}`,
+            shareUrl: publicShareUrl,
+            url: publicShareUrl,
+          },
+        });
+      } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
       }
     },
 
@@ -209,6 +257,13 @@ function createShareController({ config, shareStore, contextService }) {
           });
         }
 
+        if (shareStore.isViewLimitReached(share)) {
+          return res.status(410).json({
+            success: false,
+            error: 'This share link has reached its maximum view limit.',
+          });
+        }
+
         const passcode = extractPasscode(req);
         if (share.passcodeHash && !shareStore.verifyPasscode(share, passcode)) {
           return res.status(401).json({
@@ -220,6 +275,8 @@ function createShareController({ config, shareStore, contextService }) {
             error: passcode ? 'Incorrect passcode.' : 'Passcode required.',
           });
         }
+
+        await shareStore.incrementView(share.token);
 
         const ctx = await resolveContextForShare(share);
         const photos = [];
@@ -233,6 +290,7 @@ function createShareController({ config, shareStore, contextService }) {
               size: summary.size,
               photoDate: summary.photoDate,
               takenAt: summary.takenAt,
+              locationLabel: summary.locationLabel || null,
               isVideo: isVideoFilename(summary.originalName || summary.savedPath || ''),
               hasPreview: summary.hasPreview,
               hasVideoProxy: summary.hasVideoProxy,
@@ -257,6 +315,9 @@ function createShareController({ config, shareStore, contextService }) {
             createdAt: share.createdAt,
             expiresAt: share.expiresAt,
             hasPasscode: Boolean(share.passcodeHash),
+            allowDownload: share.allowDownload !== false,
+            viewCount: Number(share.viewCount) || 0,
+            maxViews: share.maxViews || null,
             itemCount: photos.length,
           },
           photos,
@@ -341,6 +402,9 @@ function createShareController({ config, shareStore, contextService }) {
 
         const share = shareStore.getShare(token);
         if (!share) return res.status(404).json({ success: false, error: 'Share expired or not found.' });
+        if (share.allowDownload === false) {
+          return res.status(403).json({ success: false, error: 'Downloads are disabled for this view-only share link.' });
+        }
         if (share.passcodeHash && !shareStore.verifyPasscode(share, extractPasscode(req))) {
           return res.status(401).json({ success: false, requiresPasscode: true, error: 'Passcode required.' });
         }
@@ -374,6 +438,144 @@ function createShareController({ config, shareStore, contextService }) {
         return res.sendFile(path.resolve(fullPath), { dotfiles: 'allow', acceptRanges: true });
       } catch (err) {
         return res.status(500).json({ success: false, error: err.message });
+      }
+    },
+
+    async streamPublicVideo(req, res) {
+      try {
+        const { token, hash } = req.params;
+        const remoteNode = findRemoteNodeForToken(token, req);
+        if (remoteNode) {
+          return proxyPublicShareToNode(
+            req,
+            res,
+            remoteNode,
+            `/api/public/share/${encodeURIComponent(token)}/video/${encodeURIComponent(hash)}`
+          );
+        }
+
+        const share = shareStore.getShare(token);
+        if (!share) return res.status(404).json({ success: false, error: 'Share expired or not found.' });
+        if (share.passcodeHash && !shareStore.verifyPasscode(share, extractPasscode(req))) {
+          return res.status(401).json({ success: false, requiresPasscode: true, error: 'Passcode required.' });
+        }
+        const normHash = String(hash || '').trim().toLowerCase();
+        if (!share.hashes.includes(normHash)) {
+          return res.status(404).json({ success: false, error: 'Video not in this share.' });
+        }
+
+        const ctx = await resolveContextForShare(share);
+        const found = await ctx.hashIndex.lookup(normHash, { allowStatFastPath: true });
+        if (found.status === 'missing' || !found.record || found.record.deletedAt) {
+          return res.status(404).json({ success: false, error: 'Video not found.' });
+        }
+
+        const record = found.record;
+        if (record.videoProxyRelativePath) {
+          const vpPath = path.join(ctx.storageDir, record.videoProxyRelativePath);
+          if (await fileExistsAsync(vpPath)) {
+            res.setHeader('Content-Type', 'video/mp4');
+            return res.sendFile(path.resolve(vpPath), { dotfiles: 'allow', acceptRanges: true });
+          }
+        }
+        if (record.storageType === 's3' && isS3Configured(config.s3)) {
+          const url = createPresignedUrl({
+            s3Config: config.s3,
+            method: 'GET',
+            objectKey: record.relativePath,
+            expiresIn: 300,
+          });
+          return res.redirect(url);
+        }
+        const fullPath = path.join(ctx.storageDir, record.relativePath);
+        if (!(await fileExistsAsync(fullPath))) {
+          return res.status(404).json({ success: false, error: 'File not found.' });
+        }
+        return res.sendFile(path.resolve(fullPath), { dotfiles: 'allow', acceptRanges: true });
+      } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+      }
+    },
+
+    async downloadPublicZip(req, res) {
+      try {
+        const { token } = req.params;
+        const remoteNode = findRemoteNodeForToken(token, req);
+        if (remoteNode) {
+          return proxyPublicShareToNode(
+            req,
+            res,
+            remoteNode,
+            `/api/public/share/${encodeURIComponent(token)}/download-zip`
+          );
+        }
+
+        const share = shareStore.getShare(token);
+        if (!share) return res.status(404).json({ success: false, error: 'Share expired or not found.' });
+        if (share.allowDownload === false) {
+          return res.status(403).json({ success: false, error: 'Downloads are disabled for this view-only share link.' });
+        }
+        if (share.passcodeHash && !shareStore.verifyPasscode(share, extractPasscode(req))) {
+          return res.status(401).json({ success: false, requiresPasscode: true, error: 'Passcode required.' });
+        }
+
+        const ctx = await resolveContextForShare(share);
+        const entries = [];
+        for (const h of share.hashes) {
+          const found = await ctx.hashIndex.lookup(h, { allowStatFastPath: true });
+          if (found.status === 'missing' || !found.record || found.record.deletedAt) continue;
+          const record = found.record;
+          const entryDate = record.takenAt
+            ? new Date(record.takenAt)
+            : record.uploadedAt
+              ? new Date(record.uploadedAt)
+              : new Date();
+          const name = record.originalName || path.basename(record.relativePath || `${found.masterHash.slice(0, 12)}.bin`);
+
+          if (record.storageType === 's3' && isS3Configured(config.s3)) {
+            entries.push({
+              name,
+              date: entryDate,
+              openStream: () => {
+                const url = createPresignedUrl({
+                  s3Config: config.s3,
+                  method: 'GET',
+                  objectKey: record.relativePath,
+                  expiresIn: 300,
+                });
+                return createHttpReadStream(url);
+              },
+            });
+          } else if (record.relativePath) {
+            const fullPath = path.join(ctx.storageDir, record.relativePath);
+            if (await fileExistsAsync(fullPath)) {
+              entries.push({
+                name,
+                date: entryDate,
+                openStream: async () => createDiskReadStream(fullPath),
+              });
+            }
+          }
+        }
+
+        if (entries.length === 0) {
+          return res.status(404).json({ success: false, error: 'No downloadable files found in this share.' });
+        }
+
+        const safeSlug =
+          String(share.title || 'PhotoHub-Share')
+            .replace(/[^a-zA-Z0-9._-]+/g, '-')
+            .replace(/^-+|-+$/g, '')
+            .slice(0, 48) || 'PhotoHub-Share';
+        res.setHeader('Content-Type', 'application/zip');
+        res.setHeader('Content-Disposition', `attachment; filename="${safeSlug}.zip"`);
+        res.setHeader('Cache-Control', 'no-store');
+        return streamZipToResponse(res, entries);
+      } catch (err) {
+        if (!res.headersSent) {
+          return res.status(500).json({ success: false, error: err.message });
+        }
+        return res.end();
       }
     },
   };

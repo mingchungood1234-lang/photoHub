@@ -19,6 +19,10 @@ let sharpModule = null;
 try {
   // Optional dependency; gracefully falls back if unavailable
   sharpModule = require('sharp');
+  if (sharpModule && typeof sharpModule.cache === 'function') {
+    // Disable libvips file-descriptor cache so deleted/moved files never trigger EBUSY on Windows
+    sharpModule.cache(false);
+  }
 } catch {
   sharpModule = null;
 }
