@@ -6,6 +6,9 @@ import android.text.format.Formatter
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -19,6 +22,7 @@ import androidx.compose.foundation.lazy.grid.*
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
@@ -26,13 +30,17 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -42,11 +50,19 @@ import com.photohub.compressor.data.ServerPhoto
 import com.photohub.compressor.media.MediaLibraryService
 import com.photohub.compressor.media.ShareUtils
 import com.photohub.compressor.sync.LocalProxySyncManager
+import com.photohub.compressor.ui.components.CloudLoadingSkeleton
 import com.photohub.compressor.ui.components.GradientPrimaryButton
 import com.photohub.compressor.ui.components.MascotMood
+import com.photohub.compressor.ui.components.PulsingStatusDot
+import com.photohub.compressor.ui.components.SoftOrangeButton
 import com.photohub.compressor.ui.components.SunnyMascot
+import com.photohub.compressor.ui.components.WarmShimmerBox
+import com.photohub.compressor.ui.theme.PhotoHubAmber
+import com.photohub.compressor.ui.theme.PhotoHubDeepOrange
 import com.photohub.compressor.ui.theme.PhotoHubGreen
+import com.photohub.compressor.ui.theme.PhotoHubMint
 import com.photohub.compressor.ui.theme.PhotoHubOrange
+import com.photohub.compressor.ui.theme.PhotoHubRed
 import com.photohub.compressor.viewmodel.*
 import kotlinx.coroutines.launch
 import java.io.File
@@ -175,15 +191,34 @@ fun ServerGalleryScreen(
         )
     }
 
-    // Build flat index offsets for scrolling to years & scrubber positions
-    val anchorIndices = remember(uiState.timeline) {
+    val hasUnproxiedBanner = uiState.unproxiedCount > 0 || uiState.isBatchProxying || uiState.batchBannerMessage != null
+    val hasRestoreBanner = uiState.isBatchRestoring || uiState.restoreBannerMessage != null
+    val hasDeleteBanner = uiState.isBatchDeleting || uiState.deleteBannerMessage != null
+
+    // Build flat index offsets for scrolling to years & scrubber positions (accounts for Hero + Control Bar + active banners)
+    val anchorIndices = remember(
+        uiState.timeline,
+        uiState.timelineGrouping,
+        uiState.errorMessage,
+        hasUnproxiedBanner,
+        hasRestoreBanner,
+        hasDeleteBanner,
+        syncState.isSyncing
+    ) {
         val map = mutableMapOf<String, Int>()
         val sectionIndices = mutableListOf<Int>()
-        var idx = 0
+        var idx = 2 // CloudHeroStorageCard + CloudControlBar
+        if (uiState.errorMessage != null) idx++
+        if (hasUnproxiedBanner) idx++
+        if (hasRestoreBanner) idx++
+        if (hasDeleteBanner) idx++
+        if (syncState.isSyncing) idx++
         for (sec in uiState.timeline.sections) {
-            if (sec.startsNewYear) {
+            if (sec.startsNewYear && uiState.timelineGrouping != ServerTimelineGrouping.YEAR) {
                 map["year-${sec.yearLabel}"] = idx
                 idx++
+            } else if (uiState.timelineGrouping == ServerTimelineGrouping.YEAR) {
+                map["year-${sec.yearLabel}"] = idx
             }
             map[sec.anchorId] = idx
             sectionIndices.add(idx)
@@ -194,31 +229,35 @@ fun ServerGalleryScreen(
     }
 
     Scaffold(
+        containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             if (uiState.isSelectionMode) {
                 val visible = uiState.visiblePhotos
                 val allVisibleSelected = visible.isNotEmpty() &&
                     visible.all { it.hash.lowercase(Locale.ROOT) in uiState.selectedHashes }
                 TopAppBar(
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = MaterialTheme.colorScheme.background
+                    ),
                     title = {
-                        Text("${uiState.selectedHashes.size} Selected", fontWeight = FontWeight.SemiBold)
+                        Text("${uiState.selectedHashes.size} Selected", fontWeight = FontWeight.ExtraBold)
                     },
                     navigationIcon = {
                         TextButton(onClick = {
                             if (allVisibleSelected) viewModel.clearSelection() else viewModel.selectAllVisible()
                         }) {
-                            Text(if (allVisibleSelected) "Clear" else "All")
+                            Text(if (allVisibleSelected) "Clear" else "Select All", fontWeight = FontWeight.Bold)
                         }
                     },
                     actions = {
                         TextButton(onClick = { viewModel.exitSelectionMode() }) {
-                            Text("Done", fontWeight = FontWeight.SemiBold)
+                            Text("Done", fontWeight = FontWeight.Bold)
                         }
                     }
                 )
             } else {
                 TopAppBar(
-                    title = { Text("Cloud", fontWeight = FontWeight.Bold) },
+                    title = { Text("Cloud", fontWeight = FontWeight.ExtraBold) },
                     colors = TopAppBarDefaults.topAppBarColors(
                         containerColor = MaterialTheme.colorScheme.background
                     ),
@@ -237,16 +276,15 @@ fun ServerGalleryScreen(
                             onClick = { viewModel.enterSelectionMode() },
                             enabled = uiState.photos.isNotEmpty() && !uiState.isBatchRestoring && !uiState.isBatchProxying && !uiState.isBatchDeleting
                         ) {
-                            Text("Select")
+                            Text("Select", fontWeight = FontWeight.Bold)
                         }
 
                         Box {
-                            val isFiltered = uiState.filterMode != ServerGalleryFilter.ALL ||
-                                uiState.mediaTypeFilter != ServerMediaTypeFilter.ALL
                             IconButton(onClick = { showMenu = true }) {
                                 Icon(
-                                    imageVector = if (isFiltered) Icons.Rounded.FilterAlt else Icons.Rounded.MoreVert,
-                                    contentDescription = "Filters and Actions"
+                                    imageVector = if (uiState.hasActiveFilter) Icons.Rounded.FilterAlt else Icons.Rounded.MoreVert,
+                                    contentDescription = "Filters and Actions",
+                                    tint = if (uiState.hasActiveFilter) PhotoHubOrange else LocalContentColor.current
                                 )
                             }
                             DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
@@ -282,7 +320,7 @@ fun ServerGalleryScreen(
                                 }
                                 HorizontalDivider()
                                 Text(
-                                    "Media Type",
+                                    "Media Filter",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
@@ -330,21 +368,16 @@ fun ServerGalleryScreen(
                             enabled = !uiState.isLoading
                         ) {
                             if (uiState.isLoading) {
-                                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(19.dp),
+                                    strokeWidth = 2.dp,
+                                    color = PhotoHubOrange
+                                )
                             } else {
                                 Icon(Icons.Rounded.Refresh, contentDescription = "Refresh")
                             }
                         }
                     }
-                )
-            }
-        },
-        bottomBar = {
-            if (uiState.isSelectionMode) {
-                SelectionRestoreBottomBar(
-                    uiState = uiState,
-                    onRestoreSelected = { viewModel.requestRestoreSelected() },
-                    onDeleteSelected = { viewModel.requestDeleteSelected() }
                 )
             }
         }
@@ -356,257 +389,379 @@ fun ServerGalleryScreen(
         ) {
             when {
                 uiState.isLoading && uiState.photos.isEmpty() -> {
-                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Column(
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            SunnyMascot(mood = MascotMood.UPLOADING, size = 112.dp)
-                            Text(
-                                "Loading…",
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-                    }
+                    CloudLoadingSkeleton()
                 }
                 uiState.errorMessage != null && uiState.photos.isEmpty() -> {
                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Column(
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(12.dp),
-                            modifier = Modifier.padding(24.dp)
+                        Surface(
+                            shape = RoundedCornerShape(24.dp),
+                            color = MaterialTheme.colorScheme.surface,
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 24.dp)
                         ) {
-                            SunnyMascot(mood = MascotMood.ALERT, size = 116.dp)
-                            Text("Offline", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
-                            Text(
-                                uiState.errorMessage.orEmpty(),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            GradientPrimaryButton(text = "Retry", onClick = { viewModel.loadPhotos() })
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(12.dp),
+                                modifier = Modifier.padding(24.dp)
+                            ) {
+                                SunnyMascot(mood = MascotMood.ALERT, size = 114.dp)
+                                Text(
+                                    "Could Not Reach Cloud",
+                                    style = MaterialTheme.typography.titleLarge,
+                                    fontWeight = FontWeight.ExtraBold
+                                )
+                                Text(
+                                    uiState.errorMessage.orEmpty(),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    textAlign = TextAlign.Center,
+                                    maxLines = 3,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                GradientPrimaryButton(
+                                    text = "Retry Connection",
+                                    icon = Icons.Rounded.Refresh,
+                                    onClick = { viewModel.loadPhotos() }
+                                )
+                            }
                         }
                     }
                 }
                 uiState.photos.isEmpty() -> {
                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Column(
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(12.dp),
-                            modifier = Modifier.padding(24.dp)
+                        Surface(
+                            shape = RoundedCornerShape(24.dp),
+                            color = MaterialTheme.colorScheme.surface,
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 24.dp)
                         ) {
-                            SunnyMascot(mood = MascotMood.SLEEPING, size = 120.dp)
-                            Text("No Backups", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
-                            GradientPrimaryButton(text = "Refresh", onClick = { viewModel.loadPhotos() })
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(12.dp),
+                                modifier = Modifier.padding(24.dp)
+                            ) {
+                                SunnyMascot(mood = MascotMood.SLEEPING, size = 118.dp)
+                                Text(
+                                    "No Cloud Backups Yet",
+                                    style = MaterialTheme.typography.titleLarge,
+                                    fontWeight = FontWeight.ExtraBold
+                                )
+                                Text(
+                                    "Head to the Backup tab to upload your first full-resolution photos & videos.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    textAlign = TextAlign.Center
+                                )
+                                GradientPrimaryButton(
+                                    text = "Refresh Cloud",
+                                    icon = Icons.Rounded.Refresh,
+                                    onClick = { viewModel.loadPhotos() }
+                                )
+                            }
                         }
                     }
                 }
                 else -> {
-                    Column(modifier = Modifier.fillMaxSize()) {
-                        if (uiState.timeline.years.size > 1) {
-                            LazyRow(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-                                    .padding(horizontal = 12.dp, vertical = 6.dp),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                items(uiState.timeline.years, key = { it.anchorId }) { yr ->
-                                    val selected = uiState.selectedYearAnchor == yr.anchorId
-                                    FilterChip(
-                                        selected = selected,
-                                        onClick = {
-                                            viewModel.selectYearAnchor(yr.anchorId)
-                                            val targetIdx = anchorIndices.first[yr.anchorId]
-                                            if (targetIdx != null) {
-                                                scope.launch { gridState.animateScrollToItem(targetIdx) }
-                                            }
-                                        },
-                                        label = { Text(yr.label, style = MaterialTheme.typography.labelMedium) }
-                                    )
-                                }
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        LazyVerticalGrid(
+                            columns = GridCells.Adaptive(minSize = 104.dp),
+                            state = gridState,
+                            contentPadding = PaddingValues(
+                                start = 12.dp,
+                                end = 12.dp,
+                                top = 8.dp,
+                                bottom = if (uiState.isSelectionMode) 96.dp else 20.dp
+                            ),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.fillMaxSize()
+                        ) {
+                            // Web-matched Warm Sunset Hero & Storage Summary Card
+                            item(key = "cloud-hero", span = { GridItemSpan(maxLineSpan) }) {
+                                CloudHeroStorageCard(uiState = uiState, isSyncing = syncState.isSyncing)
                             }
-                        }
 
-                        Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                            LazyVerticalGrid(
-                                columns = GridCells.Adaptive(minSize = 110.dp),
-                                state = gridState,
-                                horizontalArrangement = Arrangement.spacedBy(2.dp),
-                                verticalArrangement = Arrangement.spacedBy(2.dp),
-                                modifier = Modifier.fillMaxSize()
-                            ) {
-                                uiState.errorMessage?.let { err ->
-                                    item(span = { GridItemSpan(maxLineSpan) }) {
+                            // Web-matched Search, Filter Pills, Grouping & Year Quick-Jump Toolbar
+                            item(key = "cloud-controls", span = { GridItemSpan(maxLineSpan) }) {
+                                CloudControlBar(
+                                    uiState = uiState,
+                                    viewModel = viewModel,
+                                    onSelectYear = { anchorId ->
+                                        viewModel.selectYearAnchor(anchorId)
+                                        val targetIdx = anchorIndices.first[anchorId]
+                                        if (targetIdx != null) {
+                                            scope.launch { gridState.animateScrollToItem(targetIdx) }
+                                        }
+                                    }
+                                )
+                            }
+
+                            uiState.errorMessage?.let { err ->
+                                item(key = "cloud-offline-banner", span = { GridItemSpan(maxLineSpan) }) {
+                                    Surface(
+                                        shape = RoundedCornerShape(14.dp),
+                                        color = MaterialTheme.colorScheme.primaryContainer,
+                                        border = BorderStroke(1.dp, PhotoHubOrange.copy(alpha = 0.32f)),
+                                        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)
+                                    ) {
                                         Row(
-                                            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
                                             verticalAlignment = Alignment.CenterVertically
                                         ) {
                                             Icon(Icons.Rounded.WifiOff, null, tint = PhotoHubOrange, modifier = Modifier.size(16.dp))
-                                            Spacer(modifier = Modifier.width(6.dp))
-                                            Text("Offline cache · $err", style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Text(
+                                                "Offline cache · $err",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                fontWeight = FontWeight.Medium,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
                                         }
                                     }
                                 }
+                            }
 
-                                if (uiState.unproxiedCount > 0 || uiState.isBatchProxying || uiState.batchBannerMessage != null) {
-                                    item(span = { GridItemSpan(maxLineSpan) }) {
-                                        UnproxiedBanner(uiState = uiState, viewModel = viewModel)
-                                    }
+                            if (hasUnproxiedBanner) {
+                                item(key = "cloud-unproxied-banner", span = { GridItemSpan(maxLineSpan) }) {
+                                    UnproxiedBanner(uiState = uiState, viewModel = viewModel)
                                 }
+                            }
 
-                                if (uiState.isBatchRestoring || uiState.restoreBannerMessage != null) {
-                                    item(span = { GridItemSpan(maxLineSpan) }) {
-                                        RestoreOriginalsBanner(uiState = uiState, viewModel = viewModel)
-                                    }
+                            if (hasRestoreBanner) {
+                                item(key = "cloud-restore-banner", span = { GridItemSpan(maxLineSpan) }) {
+                                    RestoreOriginalsBanner(uiState = uiState, viewModel = viewModel)
                                 }
+                            }
 
-                                if (uiState.isBatchDeleting || uiState.deleteBannerMessage != null) {
-                                    item(span = { GridItemSpan(maxLineSpan) }) {
-                                        DeletePhotosBanner(uiState = uiState, viewModel = viewModel)
-                                    }
+                            if (hasDeleteBanner) {
+                                item(key = "cloud-delete-banner", span = { GridItemSpan(maxLineSpan) }) {
+                                    DeletePhotosBanner(uiState = uiState, viewModel = viewModel)
                                 }
+                            }
 
-                                if (syncState.isSyncing) {
-                                    item(span = { GridItemSpan(maxLineSpan) }) {
+                            if (syncState.isSyncing) {
+                                item(key = "cloud-sync-banner", span = { GridItemSpan(maxLineSpan) }) {
+                                    Surface(
+                                        shape = RoundedCornerShape(16.dp),
+                                        color = MaterialTheme.colorScheme.surface,
+                                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                                        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)
+                                    ) {
                                         Row(
-                                            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
                                             verticalAlignment = Alignment.CenterVertically
                                         ) {
-                                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                                            Spacer(modifier = Modifier.width(8.dp))
+                                            CircularProgressIndicator(
+                                                modifier = Modifier.size(16.dp),
+                                                strokeWidth = 2.dp,
+                                                color = PhotoHubOrange
+                                            )
+                                            Spacer(modifier = Modifier.width(10.dp))
                                             Text(
                                                 text = syncState.statusText.ifBlank {
-                                                    "Syncing proxies (${syncState.completedCount}/${syncState.totalCount})…"
+                                                    "Syncing previews (${syncState.completedCount}/${syncState.totalCount})…"
                                                 },
                                                 style = MaterialTheme.typography.bodySmall,
+                                                fontWeight = FontWeight.SemiBold,
                                                 modifier = Modifier.weight(1f),
                                                 maxLines = 1,
                                                 overflow = TextOverflow.Ellipsis
                                             )
-                                            TextButton(onClick = { syncManager.cancel() }) {
-                                                Text("Stop", style = MaterialTheme.typography.labelSmall)
+                                            TextButton(
+                                                onClick = { syncManager.cancel() },
+                                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                                            ) {
+                                                Text(
+                                                    "Stop",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = PhotoHubDeepOrange
+                                                )
                                             }
                                         }
                                     }
                                 }
+                            }
 
-                                if (uiState.timeline.sections.isEmpty()) {
-                                    item(span = { GridItemSpan(maxLineSpan) }) {
-                                        Column(
-                                            modifier = Modifier.fillMaxWidth().padding(vertical = 44.dp),
-                                            horizontalAlignment = Alignment.CenterHorizontally
-                                        ) {
-                                            Text("No items match the current filter.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                            if (uiState.filterMode != ServerGalleryFilter.ALL || uiState.mediaTypeFilter != ServerMediaTypeFilter.ALL) {
-                                                TextButton(onClick = {
-                                                    viewModel.setFilterMode(ServerGalleryFilter.ALL)
-                                                    viewModel.setMediaTypeFilter(ServerMediaTypeFilter.ALL)
-                                                }) {
-                                                    Text("Show All")
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    for (sec in uiState.timeline.sections) {
-                                        if (sec.startsNewYear && uiState.timelineGrouping != ServerTimelineGrouping.YEAR) {
-                                            item(key = "yr-${sec.anchorId}", span = { GridItemSpan(maxLineSpan) }) {
-                                                val yrInfo = uiState.timeline.years.firstOrNull { it.label == sec.yearLabel }
-                                                Row(
-                                                    modifier = Modifier
-                                                        .fillMaxWidth()
-                                                        .padding(start = 12.dp, end = 12.dp, top = 14.dp, bottom = 2.dp),
-                                                    verticalAlignment = Alignment.CenterVertically
-                                                ) {
-                                                    Text(sec.yearLabel, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                                                    if (yrInfo != null) {
-                                                        Text("${yrInfo.itemCount}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        item(key = "hdr-${sec.id}", span = { GridItemSpan(maxLineSpan) }) {
-                                            Row(
-                                                modifier = Modifier
-                                                    .fillMaxWidth()
-                                                    .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.94f))
-                                                    .padding(horizontal = 12.dp, vertical = 6.dp),
-                                                verticalAlignment = Alignment.CenterVertically
-                                            ) {
-                                                Text(sec.title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                                                if (uiState.isSelectionMode) {
-                                                    val secAllSelected = sec.photos.isNotEmpty() &&
-                                                        sec.photos.all { it.hash.lowercase(Locale.ROOT) in uiState.selectedHashes }
-                                                    TextButton(
-                                                        onClick = { viewModel.toggleSectionSelection(sec.photos) },
-                                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
-                                                        modifier = Modifier.height(28.dp)
-                                                    ) {
-                                                        Text(
-                                                            if (secAllSelected) "Clear" else "Select",
-                                                            style = MaterialTheme.typography.labelSmall,
-                                                            fontWeight = FontWeight.SemiBold
-                                                        )
-                                                    }
-                                                } else {
-                                                    Text("${sec.photos.size}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                                }
-                                            }
-                                        }
-
-                                        items(sec.photos, key = { "${sec.id}-${it.hash}" }) { photo ->
-                                            LaunchedEffect(photo.hash, photo.needsProxy) {
-                                                viewModel.loadCompressedPreviewIfNeeded(photo)
-                                            }
-                                            val normHash = photo.hash.lowercase(Locale.ROOT)
-                                            val isSelected = normHash in uiState.selectedHashes
-                                            val restoredOrProtected = uiState.isRestoredOrProtected(photo)
-                                            val thumbBitmap = remember(photo.hash, uiState.thumbnailCacheVersion) {
-                                                viewModel.getCachedThumbnail(photo.hash)
-                                            }
-                                            ServerThumbnailCell(
-                                                photo = photo,
-                                                bitmap = thumbBitmap,
-                                                showPlaceholder = (photo.hash in uiState.failedPreviewHashes) || (photo.isVideo && photo.needsProxy),
-                                                isSelectionMode = uiState.isSelectionMode,
-                                                isSelected = isSelected,
-                                                isRestoredOrProtected = restoredOrProtected,
-                                                onClick = {
-                                                    if (uiState.isSelectionMode) {
-                                                        viewModel.togglePhotoSelection(photo.hash)
-                                                    } else {
-                                                        viewModel.openPhotoDetail(photo)
-                                                    }
-                                                },
-                                                onLongClick = {
-                                                    if (!uiState.isSelectionMode && !uiState.isBatchRestoring && !uiState.isBatchProxying && !uiState.isBatchDeleting) {
-                                                        viewModel.enterSelectionMode(photo.hash)
-                                                    }
-                                                }
+                            if (uiState.timeline.sections.isEmpty()) {
+                                item(key = "cloud-empty-filter", span = { GridItemSpan(maxLineSpan) }) {
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(vertical = 36.dp, horizontal = 20.dp),
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                                    ) {
+                                        SunnyMascot(mood = MascotMood.SLEEPING, size = 84.dp)
+                                        Text(
+                                            "No Matching Items",
+                                            style = MaterialTheme.typography.titleMedium,
+                                            fontWeight = FontWeight.ExtraBold
+                                        )
+                                        Text(
+                                            text = if (uiState.searchQuery.isNotBlank()) {
+                                                "No backed-up items match \"${uiState.searchQuery}\"."
+                                            } else {
+                                                "Try clearing your filter or switching tabs."
+                                            },
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            textAlign = TextAlign.Center
+                                        )
+                                        if (uiState.hasActiveFilter) {
+                                            SoftOrangeButton(
+                                                text = "Clear Filters",
+                                                onClick = { viewModel.clearFilters() }
                                             )
                                         }
                                     }
                                 }
-                            }
-
-                            if (uiState.timeline.sections.size >= 6) {
-                                TimelineScrubber(
-                                    sections = uiState.timeline.sections,
-                                    onScrubSection = { secIdx ->
-                                        val sec = uiState.timeline.sections.getOrNull(secIdx) ?: return@TimelineScrubber
-                                        viewModel.selectYearAnchor("year-${sec.yearLabel}")
-                                        val gridPos = anchorIndices.first[sec.anchorId]
-                                        if (gridPos != null) {
-                                            scope.launch { gridState.scrollToItem(gridPos) }
+                            } else {
+                                for (sec in uiState.timeline.sections) {
+                                    if (sec.startsNewYear && uiState.timelineGrouping != ServerTimelineGrouping.YEAR) {
+                                        item(key = "yr-${sec.anchorId}", span = { GridItemSpan(maxLineSpan) }) {
+                                            val yrInfo = uiState.timeline.years.firstOrNull { it.label == sec.yearLabel }
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .padding(top = 12.dp, bottom = 2.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Text(
+                                                    sec.yearLabel,
+                                                    style = MaterialTheme.typography.titleLarge,
+                                                    fontWeight = FontWeight.ExtraBold,
+                                                    modifier = Modifier.weight(1f)
+                                                )
+                                                if (yrInfo != null) {
+                                                    Surface(
+                                                        shape = CircleShape,
+                                                        color = MaterialTheme.colorScheme.primaryContainer
+                                                    ) {
+                                                        Text(
+                                                            "${yrInfo.itemCount} items",
+                                                            style = MaterialTheme.typography.labelSmall,
+                                                            fontWeight = FontWeight.Bold,
+                                                            color = PhotoHubOrange,
+                                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                                                        )
+                                                    }
+                                                }
+                                            }
                                         }
-                                    },
-                                    modifier = Modifier.align(Alignment.CenterEnd)
-                                )
+                                    }
+
+                                    item(key = "hdr-${sec.id}", span = { GridItemSpan(maxLineSpan) }) {
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(top = 8.dp, bottom = 2.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Text(
+                                                sec.title,
+                                                style = MaterialTheme.typography.titleSmall,
+                                                fontWeight = FontWeight.ExtraBold,
+                                                modifier = Modifier.weight(1f)
+                                            )
+                                            if (uiState.isSelectionMode) {
+                                                val secAllSelected = sec.photos.isNotEmpty() &&
+                                                    sec.photos.all { it.hash.lowercase(Locale.ROOT) in uiState.selectedHashes }
+                                                Surface(
+                                                    onClick = { viewModel.toggleSectionSelection(sec.photos) },
+                                                    shape = CircleShape,
+                                                    color = MaterialTheme.colorScheme.primaryContainer
+                                                ) {
+                                                    Text(
+                                                        if (secAllSelected) "Clear" else "Select",
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        fontWeight = FontWeight.Bold,
+                                                        color = PhotoHubOrange,
+                                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                                                    )
+                                                }
+                                            } else {
+                                                Surface(
+                                                    shape = CircleShape,
+                                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.85f)
+                                                ) {
+                                                    Text(
+                                                        "${sec.photos.size}",
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        fontWeight = FontWeight.Bold,
+                                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    items(sec.photos, key = { "${sec.id}-${it.hash}" }) { photo ->
+                                        LaunchedEffect(photo.hash, photo.needsProxy) {
+                                            viewModel.loadCompressedPreviewIfNeeded(photo)
+                                        }
+                                        val normHash = photo.hash.lowercase(Locale.ROOT)
+                                        val isSelected = normHash in uiState.selectedHashes
+                                        val restoredOrProtected = uiState.isRestoredOrProtected(photo)
+                                        val thumbBitmap = remember(photo.hash, uiState.thumbnailCacheVersion) {
+                                            viewModel.getCachedThumbnail(photo.hash)
+                                        }
+                                        ServerThumbnailCell(
+                                            photo = photo,
+                                            bitmap = thumbBitmap,
+                                            showPlaceholder = (photo.hash in uiState.failedPreviewHashes) || (photo.isVideo && photo.needsProxy),
+                                            isSelectionMode = uiState.isSelectionMode,
+                                            isSelected = isSelected,
+                                            isRestoredOrProtected = restoredOrProtected,
+                                            onClick = {
+                                                if (uiState.isSelectionMode) {
+                                                    viewModel.togglePhotoSelection(photo.hash)
+                                                } else {
+                                                    viewModel.openPhotoDetail(photo)
+                                                }
+                                            },
+                                            onLongClick = {
+                                                if (!uiState.isSelectionMode && !uiState.isBatchRestoring && !uiState.isBatchProxying && !uiState.isBatchDeleting) {
+                                                    viewModel.enterSelectionMode(photo.hash)
+                                                }
+                                            }
+                                        )
+                                    }
+                                }
                             }
+                        }
+
+                        if (uiState.timeline.sections.size >= 6) {
+                            TimelineScrubber(
+                                sections = uiState.timeline.sections,
+                                onScrubSection = { secIdx ->
+                                    val sec = uiState.timeline.sections.getOrNull(secIdx) ?: return@TimelineScrubber
+                                    viewModel.selectYearAnchor("year-${sec.yearLabel}")
+                                    val gridPos = anchorIndices.first[sec.anchorId]
+                                    if (gridPos != null) {
+                                        scope.launch { gridState.scrollToItem(gridPos) }
+                                    }
+                                },
+                                modifier = Modifier.align(Alignment.CenterEnd)
+                            )
+                        }
+
+                        // Floating Pill Selection Action Bar (matches webpage `.selection-bar`)
+                        if (uiState.isSelectionMode) {
+                            SelectionRestoreBottomBar(
+                                uiState = uiState,
+                                onRestoreSelected = { viewModel.requestRestoreSelected() },
+                                onDeleteSelected = { viewModel.requestDeleteSelected() },
+                                modifier = Modifier
+                                    .align(Alignment.BottomCenter)
+                                    .padding(horizontal = 14.dp, vertical = 10.dp)
+                            )
                         }
                     }
                 }
@@ -619,14 +774,416 @@ fun ServerGalleryScreen(
                         .background(Color.Black.copy(alpha = 0.45f)),
                     contentAlignment = Alignment.Center
                 ) {
-                    Surface(shape = RoundedCornerShape(16.dp), tonalElevation = 6.dp) {
+                    Surface(
+                        shape = RoundedCornerShape(22.dp),
+                        color = MaterialTheme.colorScheme.surface,
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                        tonalElevation = 6.dp
+                    ) {
                         Column(
                             modifier = Modifier.padding(24.dp),
                             horizontalAlignment = Alignment.CenterHorizontally,
                             verticalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
-                            CircularProgressIndicator()
-                            Text(uiState.pickStatusText, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                            SunnyMascot(mood = MascotMood.UPLOADING, size = 72.dp)
+                            Text(
+                                uiState.pickStatusText,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CloudHeroStorageCard(
+    uiState: ServerGalleryUiState,
+    isSyncing: Boolean
+) {
+    val context = LocalContext.current
+    val greeting = remember(uiState.userName) {
+        val first = uiState.userName.trim().split(" ").firstOrNull().orEmpty()
+        if (first.isNotEmpty()) "Hi, $first" else "Your Cloud Photos"
+    }
+    val folderBadge = remember(uiState.userFolder) {
+        val f = uiState.userFolder.trim()
+        if (f.isEmpty()) "/ root" else "/$f"
+    }
+    val mood = when {
+        uiState.isBatchProxying || uiState.isBatchRestoring || isSyncing || uiState.isLoading -> MascotMood.UPLOADING
+        uiState.errorMessage != null -> MascotMood.ALERT
+        else -> MascotMood.HAPPY
+    }
+
+    val storage = uiState.serverStorage
+    val usedBytes = storage?.usedBytes ?: uiState.totalServerBytes
+    val usedStr = Formatter.formatFileSize(context, maxOf(0L, usedBytes))
+    val quotaBytes = storage?.quotaBytes ?: 0L
+    val hasQuota = quotaBytes > 0L
+    val targetFraction = when {
+        hasQuota -> (usedBytes.toDouble() / quotaBytes.toDouble()).toFloat().coerceIn(0.03f, 1f)
+        (storage?.diskTotalBytes ?: 0L) > 0L ->
+            (usedBytes.toDouble() / storage!!.diskTotalBytes!!.toDouble()).toFloat().coerceIn(0.04f, 1f)
+        usedBytes > 0L -> 0.22f
+        else -> 0.04f
+    }
+    val animatedFill by animateFloatAsState(
+        targetValue = targetFraction,
+        animationSpec = spring(dampingRatio = 0.8f, stiffness = 240f),
+        label = "storageBarFill"
+    )
+    val quotaRightLabel = when {
+        hasQuota -> {
+            val qStr = Formatter.formatFileSize(context, quotaBytes)
+            val pct = (targetFraction * 100f).roundToInt()
+            "$qStr ($pct%)"
+        }
+        (storage?.diskFreeBytes ?: 0L) > 0L ->
+            "${Formatter.formatFileSize(context, storage!!.diskFreeBytes!!)} free"
+        else -> "Unlimited"
+    }
+    val splitSubtitle = if (storage?.mastersBytes != null && storage.proxiesBytes != null) {
+        "Originals ${Formatter.formatFileSize(context, maxOf(0L, storage.mastersBytes))} · Proxies ${Formatter.formatFileSize(context, maxOf(0L, storage.proxiesBytes))}"
+    } else {
+        "Originals & compressed proxies synced"
+    }
+
+    Surface(
+        shape = RoundedCornerShape(22.dp),
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        shadowElevation = 2.dp,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 4.dp)
+    ) {
+        Box(
+            modifier = Modifier.background(
+                Brush.linearGradient(
+                    colors = listOf(PhotoHubOrange.copy(alpha = 0.07f), Color.Transparent)
+                )
+            )
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    SunnyMascot(mood = mood, size = 54.dp)
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(5.dp)
+                    ) {
+                        Text(
+                            text = greeting,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.ExtraBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Surface(
+                                shape = CircleShape,
+                                color = PhotoHubOrange.copy(alpha = 0.14f)
+                            ) {
+                                Text(
+                                    text = folderBadge,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = PhotoHubOrange,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 3.dp)
+                                )
+                            }
+                            Surface(
+                                shape = CircleShape,
+                                color = PhotoHubMint.copy(alpha = 0.14f)
+                            ) {
+                                Text(
+                                    text = if (uiState.serverS3Enabled) "Auto · S3" else "Auto · Direct",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = PhotoHubMint,
+                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 3.dp)
+                                )
+                            }
+                        }
+                        Text(
+                            text = "${uiState.photos.size} total · ${uiState.photoCount} photos · ${uiState.videoCount} videos",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+
+                // Warm Gradient Storage Meter Bar (matches webpage `.storage-meter-wrap`)
+                Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "$usedStr used",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = quotaRightLabel,
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(9.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.surfaceVariant)
+                            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxHeight()
+                                .fillMaxWidth(animatedFill)
+                                .clip(CircleShape)
+                                .background(
+                                    Brush.horizontalGradient(
+                                        listOf(PhotoHubAmber, PhotoHubOrange, PhotoHubDeepOrange)
+                                    )
+                                )
+                        )
+                    }
+
+                    Text(
+                        text = splitSubtitle,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CloudControlBar(
+    uiState: ServerGalleryUiState,
+    viewModel: ServerGalleryViewModel,
+    onSelectYear: (String) -> Unit
+) {
+    Surface(
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 4.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            // Search Input + Compact Grouping Segmented Pill (`Day | Month | Year`)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Surface(
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.background,
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Icon(
+                            Icons.Rounded.Search,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+                            if (uiState.searchQuery.isEmpty()) {
+                                Text(
+                                    "Search name or date…",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            BasicTextField(
+                                value = uiState.searchQuery,
+                                onValueChange = { viewModel.setSearchQuery(it) },
+                                singleLine = true,
+                                textStyle = MaterialTheme.typography.bodySmall.copy(
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    fontWeight = FontWeight.Medium
+                                ),
+                                cursorBrush = SolidColor(PhotoHubOrange),
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                        if (uiState.searchQuery.isNotEmpty()) {
+                            Icon(
+                                Icons.Rounded.Cancel,
+                                contentDescription = "Clear search",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier
+                                    .size(16.dp)
+                                    .clickable { viewModel.setSearchQuery("") }
+                            )
+                        }
+                    }
+                }
+
+                // Segmented Grouping Pill (`Day | Month | Year`)
+                Surface(
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(3.dp),
+                        horizontalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        ServerTimelineGrouping.entries.forEach { mode ->
+                            val selected = uiState.timelineGrouping == mode
+                            Surface(
+                                onClick = { viewModel.setTimelineGrouping(mode) },
+                                shape = CircleShape,
+                                color = if (selected) MaterialTheme.colorScheme.surface else Color.Transparent,
+                                shadowElevation = if (selected) 1.dp else 0.dp
+                            ) {
+                                Text(
+                                    text = mode.shortLabel,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (selected) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Filter Pills (`All`, `Photos`, `Videos`, `Protected`, + `Needs Proxy`)
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                items(ServerMediaTypeFilter.entries) { media ->
+                    val selected = uiState.mediaTypeFilter == media && uiState.filterMode == ServerGalleryFilter.ALL
+                    val label = if (media == ServerMediaTypeFilter.PROTECTED && uiState.protectedCount > 0) {
+                        "${media.title} (${uiState.protectedCount})"
+                    } else {
+                        media.title
+                    }
+                    Surface(
+                        onClick = {
+                            if (uiState.filterMode != ServerGalleryFilter.ALL) {
+                                viewModel.setFilterMode(ServerGalleryFilter.ALL)
+                            }
+                            viewModel.setMediaTypeFilter(media)
+                        },
+                        shape = CircleShape,
+                        color = if (selected) PhotoHubOrange else MaterialTheme.colorScheme.background,
+                        border = BorderStroke(
+                            1.dp,
+                            if (selected) PhotoHubOrange else MaterialTheme.colorScheme.outlineVariant
+                        )
+                    ) {
+                        Text(
+                            text = label,
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = if (selected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 13.dp, vertical = 6.dp)
+                        )
+                    }
+                }
+
+                if (uiState.unproxiedCount > 0 || uiState.filterMode == ServerGalleryFilter.NEEDS_PROXY) {
+                    item {
+                        val selected = uiState.filterMode == ServerGalleryFilter.NEEDS_PROXY
+                        Surface(
+                            onClick = {
+                                viewModel.setFilterMode(
+                                    if (selected) ServerGalleryFilter.ALL else ServerGalleryFilter.NEEDS_PROXY
+                                )
+                            },
+                            shape = CircleShape,
+                            color = if (selected) PhotoHubOrange else MaterialTheme.colorScheme.primaryContainer,
+                            border = BorderStroke(
+                                1.dp,
+                                if (selected) PhotoHubOrange else PhotoHubOrange.copy(alpha = 0.35f)
+                            )
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(5.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(6.dp)
+                                        .clip(CircleShape)
+                                        .background(if (selected) Color.White else PhotoHubOrange)
+                                )
+                                Text(
+                                    text = "Needs Proxy (${uiState.unproxiedCount})",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (selected) Color.White else MaterialTheme.colorScheme.onPrimaryContainer
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Year Quick-Jump Pills (`2026 · 412`, `2025 · 801`, ...)
+            if (uiState.timeline.years.size > 1) {
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(uiState.timeline.years, key = { it.anchorId }) { yr ->
+                        val selected = uiState.selectedYearAnchor == yr.anchorId
+                        Surface(
+                            onClick = { onSelectYear(yr.anchorId) },
+                            shape = CircleShape,
+                            color = if (selected) PhotoHubOrange else MaterialTheme.colorScheme.surfaceVariant,
+                            border = BorderStroke(
+                                1.dp,
+                                if (selected) PhotoHubOrange else MaterialTheme.colorScheme.outlineVariant
+                            )
+                        ) {
+                            Text(
+                                text = "${yr.label} · ${yr.itemCount}",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = if (selected) Color.White else MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.padding(horizontal = 11.dp, vertical = 5.dp)
+                            )
                         }
                     }
                 }
@@ -641,76 +1198,129 @@ private fun UnproxiedBanner(
     viewModel: ServerGalleryViewModel
 ) {
     Surface(
-        shape = CircleShape,
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 6.dp)
+            .padding(vertical = 2.dp)
     ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically
+        Column(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            when {
-                uiState.isBatchProxying -> {
-                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        "Creating proxies ${uiState.batchCompleted}/${uiState.batchTotal}",
-                        style = MaterialTheme.typography.bodySmall,
-                        fontWeight = FontWeight.Medium,
-                        modifier = Modifier.weight(1f)
-                    )
-                    TextButton(onClick = { viewModel.stopBatchProxy() }) {
-                        Text("Stop", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
-                    }
-                }
-                uiState.unproxiedCount > 0 -> {
-                    Row(
-                        modifier = Modifier
-                            .weight(1f)
-                            .clickable {
-                                val next = if (uiState.filterMode == ServerGalleryFilter.NEEDS_PROXY) {
-                                    ServerGalleryFilter.ALL
-                                } else {
-                                    ServerGalleryFilter.NEEDS_PROXY
-                                }
-                                viewModel.setFilterMode(next)
-                            },
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box(modifier = Modifier.size(7.dp).clip(CircleShape).background(PhotoHubOrange))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = if (uiState.filterMode == ServerGalleryFilter.NEEDS_PROXY) {
-                                "Showing ${uiState.unproxiedCount} unproxied · Tap for All"
-                            } else {
-                                "${uiState.unproxiedCount} missing proxy"
-                            },
-                            style = MaterialTheme.typography.bodySmall,
-                            fontWeight = FontWeight.Medium
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                when {
+                    uiState.isBatchProxying -> {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                            color = PhotoHubOrange
                         )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "Creating proxies ${uiState.batchCompleted}/${uiState.batchTotal}",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                            if (uiState.batchStatusText.isNotBlank()) {
+                                Text(
+                                    uiState.batchStatusText,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                        TextButton(
+                            onClick = { viewModel.stopBatchProxy() },
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                        ) {
+                            Text("Stop", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, color = PhotoHubDeepOrange)
+                        }
                     }
-                    TextButton(
-                        onClick = { viewModel.startBatchProxy() },
-                        enabled = !uiState.isBatchRestoring && !uiState.isBatchDeleting
-                    ) {
-                        Text("Proxy All", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                    uiState.unproxiedCount > 0 -> {
+                        Row(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable {
+                                    val next = if (uiState.filterMode == ServerGalleryFilter.NEEDS_PROXY) {
+                                        ServerGalleryFilter.ALL
+                                    } else {
+                                        ServerGalleryFilter.NEEDS_PROXY
+                                    }
+                                    viewModel.setFilterMode(next)
+                                },
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            PulsingStatusDot(color = PhotoHubOrange)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = if (uiState.filterMode == ServerGalleryFilter.NEEDS_PROXY) {
+                                    "Showing ${uiState.unproxiedCount} unproxied · Tap for All"
+                                } else {
+                                    "${uiState.unproxiedCount} item${if (uiState.unproxiedCount == 1) "" else "s"} missing proxy"
+                                },
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        val canProxy = !uiState.isBatchRestoring && !uiState.isBatchDeleting
+                        Box(
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(
+                                    Brush.horizontalGradient(
+                                        listOf(Color(0xFFFF9840), PhotoHubOrange, PhotoHubDeepOrange)
+                                    )
+                                )
+                                .clickable(enabled = canProxy) { viewModel.startBatchProxy() }
+                                .padding(horizontal = 12.dp, vertical = 6.dp)
+                        ) {
+                            Text(
+                                "Proxy All",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White
+                            )
+                        }
+                    }
+                    uiState.batchBannerMessage != null -> {
+                        Icon(Icons.Rounded.CheckCircle, null, tint = PhotoHubGreen, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            uiState.batchBannerMessage.orEmpty(),
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
+                        IconButton(onClick = { viewModel.dismissBatchBanner() }, modifier = Modifier.size(26.dp)) {
+                            Icon(Icons.Rounded.Close, null, modifier = Modifier.size(15.dp))
+                        }
                     }
                 }
-                uiState.batchBannerMessage != null -> {
-                    Icon(Icons.Rounded.CheckCircle, null, tint = PhotoHubGreen, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        uiState.batchBannerMessage.orEmpty(),
-                        style = MaterialTheme.typography.bodySmall,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f)
+            }
+
+            if (uiState.isBatchProxying && uiState.batchTotal > 0) {
+                val frac = (uiState.batchCompleted.toFloat() / uiState.batchTotal.toFloat()).coerceIn(0.04f, 1f)
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(5.dp)
+                        .clip(CircleShape)
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .fillMaxWidth(frac)
+                            .clip(CircleShape)
+                            .background(Brush.horizontalGradient(listOf(PhotoHubAmber, PhotoHubOrange, PhotoHubDeepOrange)))
                     )
-                    IconButton(onClick = { viewModel.dismissBatchBanner() }, modifier = Modifier.size(24.dp)) {
-                        Icon(Icons.Rounded.Close, null, modifier = Modifier.size(14.dp))
-                    }
                 }
             }
         }
@@ -833,40 +1443,80 @@ private fun RestoreOriginalsBanner(
     viewModel: ServerGalleryViewModel
 ) {
     Surface(
-        shape = CircleShape,
-        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, PhotoHubOrange.copy(alpha = 0.32f)),
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 4.dp)
+            .padding(vertical = 2.dp)
     ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically
+        Column(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            if (uiState.isBatchRestoring) {
-                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    "Restoring originals ${uiState.restoreCompleted}/${uiState.restoreTotal}",
-                    style = MaterialTheme.typography.bodySmall,
-                    fontWeight = FontWeight.Medium,
-                    modifier = Modifier.weight(1f)
-                )
-                TextButton(onClick = { viewModel.stopBatchRestore() }) {
-                    Text("Stop", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (uiState.isBatchRestoring) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = PhotoHubOrange
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            "Restoring originals ${uiState.restoreCompleted}/${uiState.restoreTotal}",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                        if (uiState.restoreStatusText.isNotBlank()) {
+                            Text(
+                                uiState.restoreStatusText,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                    TextButton(
+                        onClick = { viewModel.stopBatchRestore() },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                    ) {
+                        Text("Stop", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, color = PhotoHubDeepOrange)
+                    }
+                } else if (uiState.restoreBannerMessage != null) {
+                    Icon(Icons.Rounded.CheckCircle, null, tint = PhotoHubGreen, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        uiState.restoreBannerMessage.orEmpty(),
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(onClick = { viewModel.dismissRestoreBanner() }, modifier = Modifier.size(26.dp)) {
+                        Icon(Icons.Rounded.Close, null, modifier = Modifier.size(15.dp))
+                    }
                 }
-            } else if (uiState.restoreBannerMessage != null) {
-                Icon(Icons.Rounded.CheckCircle, null, tint = PhotoHubGreen, modifier = Modifier.size(16.dp))
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    uiState.restoreBannerMessage.orEmpty(),
-                    style = MaterialTheme.typography.bodySmall,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
-                )
-                IconButton(onClick = { viewModel.dismissRestoreBanner() }, modifier = Modifier.size(24.dp)) {
-                    Icon(Icons.Rounded.Close, null, modifier = Modifier.size(14.dp))
+            }
+
+            if (uiState.isBatchRestoring && uiState.restoreTotal > 0) {
+                val frac = (uiState.restoreCompleted.toFloat() / uiState.restoreTotal.toFloat()).coerceIn(0.04f, 1f)
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(5.dp)
+                        .clip(CircleShape)
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .fillMaxWidth(frac)
+                            .clip(CircleShape)
+                            .background(Brush.horizontalGradient(listOf(PhotoHubAmber, PhotoHubOrange, PhotoHubDeepOrange)))
+                    )
                 }
             }
         }
@@ -879,46 +1529,48 @@ private fun DeletePhotosBanner(
     viewModel: ServerGalleryViewModel
 ) {
     Surface(
-        shape = CircleShape,
-        color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.55f),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, PhotoHubRed.copy(alpha = 0.35f)),
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 4.dp)
+            .padding(vertical = 2.dp)
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             if (uiState.isBatchDeleting) {
                 CircularProgressIndicator(
                     modifier = Modifier.size(16.dp),
                     strokeWidth = 2.dp,
-                    color = MaterialTheme.colorScheme.error
+                    color = PhotoHubRed
                 )
-                Spacer(modifier = Modifier.width(8.dp))
+                Spacer(modifier = Modifier.width(10.dp))
                 Text(
                     "Deleting selected photos from server…",
-                    style = MaterialTheme.typography.bodySmall,
-                    fontWeight = FontWeight.Medium,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
                     modifier = Modifier.weight(1f)
                 )
             } else if (uiState.deleteBannerMessage != null) {
                 Icon(
                     Icons.Rounded.DeleteOutline,
                     null,
-                    tint = MaterialTheme.colorScheme.error,
-                    modifier = Modifier.size(16.dp)
+                    tint = PhotoHubRed,
+                    modifier = Modifier.size(18.dp)
                 )
-                Spacer(modifier = Modifier.width(6.dp))
+                Spacer(modifier = Modifier.width(8.dp))
                 Text(
                     uiState.deleteBannerMessage.orEmpty(),
-                    style = MaterialTheme.typography.bodySmall,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
                 )
-                IconButton(onClick = { viewModel.dismissDeleteBanner() }, modifier = Modifier.size(24.dp)) {
-                    Icon(Icons.Rounded.Close, null, modifier = Modifier.size(14.dp))
+                IconButton(onClick = { viewModel.dismissDeleteBanner() }, modifier = Modifier.size(26.dp)) {
+                    Icon(Icons.Rounded.Close, null, modifier = Modifier.size(15.dp))
                 }
             }
         }
@@ -929,7 +1581,8 @@ private fun DeletePhotosBanner(
 private fun SelectionRestoreBottomBar(
     uiState: ServerGalleryUiState,
     onRestoreSelected: () -> Unit,
-    onDeleteSelected: () -> Unit
+    onDeleteSelected: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
     val selectedList = uiState.photos.filter { it.hash.lowercase(Locale.ROOT) in uiState.selectedHashes }
@@ -938,29 +1591,36 @@ private fun SelectionRestoreBottomBar(
     val sizeStr = Formatter.formatFileSize(context, targetBytes)
     val actionsEnabled = selectedList.isNotEmpty() && !uiState.isBatchRestoring && !uiState.isBatchProxying && !uiState.isBatchDeleting
 
-    Surface(tonalElevation = 6.dp, shadowElevation = 8.dp) {
+    Surface(
+        shape = CircleShape,
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.5.dp, PhotoHubOrange.copy(alpha = 0.8f)),
+        shadowElevation = 10.dp,
+        tonalElevation = 4.dp,
+        modifier = modifier.fillMaxWidth()
+    ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 12.dp),
+                .padding(horizontal = 16.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = if (selectedList.isEmpty()) "Tap photos to select" else "${selectedList.size} selected (~$sizeStr)",
+                    text = if (selectedList.isEmpty()) "Tap photos to select" else "${selectedList.size} selected",
                     style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold
+                    fontWeight = FontWeight.ExtraBold
                 )
                 if (selectedList.isNotEmpty()) {
                     val alreadyCount = selectedList.size - unrestored.size
                     Text(
                         text = if (alreadyCount > 0) {
-                            "${unrestored.size} to restore · $alreadyCount already restored"
+                            "~$sizeStr · ${unrestored.size} new"
                         } else {
-                            "${unrestored.size} original(s) to download"
+                            "~$sizeStr · ${unrestored.size} original${if (unrestored.size == 1) "" else "s"}"
                         },
-                        style = MaterialTheme.typography.bodySmall,
+                        style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
@@ -969,26 +1629,58 @@ private fun SelectionRestoreBottomBar(
             }
             Spacer(modifier = Modifier.width(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                OutlinedButton(
+                Surface(
                     onClick = onDeleteSelected,
                     enabled = actionsEnabled,
-                    colors = ButtonDefaults.outlinedButtonColors(
-                        contentColor = MaterialTheme.colorScheme.error
-                    ),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+                    shape = CircleShape,
+                    color = PhotoHubRed.copy(alpha = if (actionsEnabled) 0.14f else 0.06f),
+                    border = BorderStroke(1.dp, PhotoHubRed.copy(alpha = if (actionsEnabled) 0.35f else 0.15f))
                 ) {
-                    Icon(Icons.Rounded.DeleteOutline, contentDescription = "Delete from Server", modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Delete")
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            Icons.Rounded.DeleteOutline,
+                            contentDescription = "Delete from Server",
+                            tint = PhotoHubRed.copy(alpha = if (actionsEnabled) 1f else 0.45f),
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Text(
+                            "Delete",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = PhotoHubRed.copy(alpha = if (actionsEnabled) 1f else 0.45f)
+                        )
+                    }
                 }
-                Button(
-                    onClick = onRestoreSelected,
-                    enabled = actionsEnabled,
-                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+
+                Box(
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(
+                            if (actionsEnabled) {
+                                Brush.horizontalGradient(listOf(Color(0xFFFF9840), PhotoHubOrange, PhotoHubDeepOrange))
+                            } else {
+                                Brush.horizontalGradient(listOf(PhotoHubOrange.copy(alpha = 0.4f), PhotoHubDeepOrange.copy(alpha = 0.4f)))
+                            }
+                        )
+                        .clickable(enabled = actionsEnabled, onClick = onRestoreSelected)
+                        .padding(horizontal = 14.dp, vertical = 8.dp)
                 ) {
-                    Icon(Icons.Rounded.CloudDownload, null, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Restore")
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                    ) {
+                        Icon(Icons.Rounded.CloudDownload, null, tint = Color.White, modifier = Modifier.size(16.dp))
+                        Text(
+                            "Restore",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White
+                        )
+                    }
                 }
             }
         }
@@ -1006,13 +1698,23 @@ private fun ServerThumbnailCell(
     onClick: () -> Unit,
     onLongClick: () -> Unit
 ) {
+    val tileShape = RoundedCornerShape(12.dp)
+    val tileScale by animateFloatAsState(
+        targetValue = if (isSelected) 0.95f else 1f,
+        animationSpec = spring(dampingRatio = 0.72f, stiffness = 450f),
+        label = "tileScale"
+    )
+
     Box(
         modifier = Modifier
             .aspectRatio(1f)
-            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
-            .then(
-                if (isSelected) Modifier.border(2.5.dp, MaterialTheme.colorScheme.primary)
-                else Modifier
+            .scale(tileScale)
+            .clip(tileShape)
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .border(
+                width = if (isSelected) 2.5.dp else 0.5.dp,
+                color = if (isSelected) PhotoHubOrange else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
+                shape = tileShape
             )
             .combinedClickable(
                 onClick = onClick,
@@ -1028,33 +1730,54 @@ private fun ServerThumbnailCell(
                 modifier = Modifier.fillMaxSize()
             )
         } else if (showPlaceholder) {
-            Icon(
-                imageVector = if (photo.isVideo) Icons.Rounded.Videocam else Icons.Rounded.Photo,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Icon(
+                    imageVector = if (photo.isVideo) Icons.Rounded.Videocam else Icons.Rounded.Photo,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(22.dp)
+                )
+                Text(
+                    text = if (photo.isVideo) "Video" else "Photo",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
         } else {
-            CircularProgressIndicator(modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
+            WarmShimmerBox(modifier = Modifier.fillMaxSize(), cornerRadius = 12.dp)
         }
 
         if (isSelected) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.22f))
+                    .background(PhotoHubOrange.copy(alpha = 0.24f))
             )
         }
 
-        if (photo.isVideo && bitmap != null) {
-            Box(
+        // Bottom-left frosted `▶ Video` pill (matches webpage `.tile-video-pill`)
+        if (photo.isVideo) {
+            Row(
                 modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .padding(5.dp)
+                    .align(Alignment.BottomStart)
+                    .padding(6.dp)
                     .clip(CircleShape)
-                    .background(Color.Black.copy(alpha = 0.48f))
-                    .padding(5.dp)
+                    .background(Color(0xFF14100E).copy(alpha = 0.72f))
+                    .padding(horizontal = 7.dp, vertical = 3.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(3.dp)
             ) {
-                Icon(Icons.Rounded.PlayArrow, null, tint = Color.White, modifier = Modifier.size(14.dp))
+                Icon(Icons.Rounded.PlayArrow, null, tint = Color.White, modifier = Modifier.size(12.dp))
+                Text(
+                    "Video",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White
+                )
             }
         }
 
@@ -1062,15 +1785,15 @@ private fun ServerThumbnailCell(
             Box(
                 modifier = Modifier
                     .align(Alignment.TopStart)
-                    .padding(6.dp)
+                    .padding(7.dp)
                     .size(22.dp)
                     .clip(CircleShape)
                     .background(
-                        if (isSelected) MaterialTheme.colorScheme.primary
-                        else Color.Black.copy(alpha = 0.38f)
+                        if (isSelected) PhotoHubOrange
+                        else Color.Black.copy(alpha = 0.45f)
                     )
                     .border(
-                        width = 1.5.dp,
+                        width = 1.8.dp,
                         color = Color.White,
                         shape = CircleShape
                     ),
@@ -1081,40 +1804,47 @@ private fun ServerThumbnailCell(
                         Icons.Rounded.Check,
                         contentDescription = "Selected",
                         tint = Color.White,
-                        modifier = Modifier.size(14.dp)
+                        modifier = Modifier.size(13.dp)
                     )
                 }
             }
         }
 
-        if (isRestoredOrProtected) {
-            Box(
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .padding(5.dp)
-                    .clip(CircleShape)
-                    .background(Color.Black.copy(alpha = 0.45f))
-                    .padding(3.dp)
-            ) {
-                Icon(
-                    Icons.Rounded.VerifiedUser,
-                    contentDescription = "Restored Original",
-                    tint = PhotoHubGreen,
-                    modifier = Modifier.size(12.dp)
-                )
-            }
-        }
-
-        if (photo.needsProxy) {
-            Box(
+        // Top-right status badges: Mint protected check + Orange needs-proxy dot (matches webpage `.tile-badges`)
+        if (isRestoredOrProtected || photo.needsProxy) {
+            Row(
                 modifier = Modifier
                     .align(Alignment.TopEnd)
-                    .padding(6.dp)
-                    .size(8.dp)
-                    .clip(CircleShape)
-                    .background(PhotoHubOrange)
-                    .border(1.dp, Color.White.copy(alpha = 0.85f), CircleShape)
-            )
+                    .padding(6.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (isRestoredOrProtected) {
+                    Box(
+                        modifier = Modifier
+                            .size(20.dp)
+                            .clip(CircleShape)
+                            .background(PhotoHubMint.copy(alpha = 0.92f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Rounded.Check,
+                            contentDescription = "Protected Original",
+                            tint = Color.White,
+                            modifier = Modifier.size(12.dp)
+                        )
+                    }
+                }
+                if (photo.needsProxy) {
+                    Box(
+                        modifier = Modifier
+                            .size(9.dp)
+                            .clip(CircleShape)
+                            .background(PhotoHubOrange)
+                            .border(1.2.dp, Color.White.copy(alpha = 0.9f), CircleShape)
+                    )
+                }
+            }
         }
     }
 }
@@ -1173,8 +1903,8 @@ private fun TimelineScrubber(
                 .height(36.dp)
                 .clip(CircleShape)
                 .background(
-                    if (isScrubbing) MaterialTheme.colorScheme.primary
-                    else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.28f)
+                    if (isScrubbing) PhotoHubOrange
+                    else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f)
                 )
         )
 
@@ -1182,7 +1912,8 @@ private fun TimelineScrubber(
             val sec = sections[activeSecIndex]
             Surface(
                 shape = CircleShape,
-                color = Color.Black.copy(alpha = 0.85f),
+                color = Color(0xFF1A120E).copy(alpha = 0.92f),
+                border = BorderStroke(1.dp, PhotoHubOrange.copy(alpha = 0.5f)),
                 shadowElevation = 4.dp,
                 modifier = Modifier
                     .align(Alignment.TopEnd)
@@ -1191,7 +1922,7 @@ private fun TimelineScrubber(
                 Text(
                     text = sec.scrubLabel,
                     style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.SemiBold,
+                    fontWeight = FontWeight.Bold,
                     color = Color.White,
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
                 )

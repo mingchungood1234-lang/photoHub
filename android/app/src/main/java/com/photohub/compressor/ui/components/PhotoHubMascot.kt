@@ -550,3 +550,90 @@ fun WarmCard(
         )
     }
 }
+
+@Composable
+fun WarmShimmerBox(
+    modifier: Modifier = Modifier,
+    cornerRadius: Dp = 12.dp
+) {
+    val infinite = rememberInfiniteTransition(label = "warmShimmer")
+    val shift by infinite.animateFloat(
+        initialValue = -0.6f,
+        targetValue = 1.6f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1350, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "shimmerShift"
+    )
+    val baseColor = MaterialTheme.colorScheme.surfaceVariant
+    val highlight = PhotoHubOrange.copy(alpha = 0.16f)
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(cornerRadius))
+            .background(
+                brush = Brush.linearGradient(
+                    colors = listOf(baseColor, highlight, baseColor),
+                    start = Offset(shift * 420f - 180f, 0f),
+                    end = Offset(shift * 420f + 180f, 180f)
+                )
+            )
+    )
+}
+
+@Composable
+fun CloudLoadingSkeleton(modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 10.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            SunnyMascot(mood = MascotMood.UPLOADING, size = 90.dp)
+            Text(
+                "Waking up your cloud…",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onBackground
+            )
+            WarmShimmerBox(
+                modifier = Modifier
+                    .width(148.dp)
+                    .height(5.dp),
+                cornerRadius = 99.dp
+            )
+        }
+
+        WarmShimmerBox(
+            modifier = Modifier
+                .width(136.dp)
+                .height(18.dp),
+            cornerRadius = 8.dp
+        )
+
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            repeat(4) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    repeat(3) {
+                        WarmShimmerBox(
+                            modifier = Modifier
+                                .weight(1f)
+                                .aspectRatio(1f),
+                            cornerRadius = 12.dp
+                        )
+                    }
+                }
+            }
+        }
+    }
+}

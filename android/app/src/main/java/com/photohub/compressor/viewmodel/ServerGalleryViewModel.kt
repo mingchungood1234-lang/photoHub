@@ -35,15 +35,16 @@ enum class ServerGalleryFilter(val title: String) {
 }
 
 enum class ServerMediaTypeFilter(val title: String) {
-    ALL("All Media"),
-    PHOTOS("Photos Only"),
-    VIDEOS("Videos Only")
+    ALL("All"),
+    PHOTOS("Photos"),
+    VIDEOS("Videos"),
+    PROTECTED("Protected")
 }
 
-enum class ServerTimelineGrouping(val title: String) {
-    DAY("Date & Year"),
-    MONTH("Month & Year"),
-    YEAR("Year Only")
+enum class ServerTimelineGrouping(val title: String, val shortLabel: String) {
+    DAY("Date & Year", "Day"),
+    MONTH("Month & Year", "Month"),
+    YEAR("Year Only", "Year")
 }
 
 data class ServerTimelineYearSummary(
@@ -77,15 +78,28 @@ object ServerTimelineBuilder {
         filterMode: ServerGalleryFilter,
         mediaTypeFilter: ServerMediaTypeFilter,
         grouping: ServerTimelineGrouping,
+        searchQuery: String = "",
+        locallyProtectedHashes: Set<String> = emptySet(),
         nowMs: Long = System.currentTimeMillis()
     ): ServerTimelineData {
+        val trimmedQuery = searchQuery.trim().lowercase(Locale.ROOT)
         val filtered = photos.filter { photo ->
             if (filterMode == ServerGalleryFilter.NEEDS_PROXY && !photo.needsProxy) return@filter false
-            when (mediaTypeFilter) {
+            val passesMedia = when (mediaTypeFilter) {
                 ServerMediaTypeFilter.ALL -> true
                 ServerMediaTypeFilter.PHOTOS -> !photo.isVideo
                 ServerMediaTypeFilter.VIDEOS -> photo.isVideo
+                ServerMediaTypeFilter.PROTECTED ->
+                    photo.isProtectedOriginal || locallyProtectedHashes.contains(photo.hash.lowercase(Locale.ROOT))
             }
+            if (!passesMedia) return@filter false
+            if (trimmedQuery.isNotEmpty()) {
+                val matchesName = photo.originalName.lowercase(Locale.ROOT).contains(trimmedQuery)
+                val matchesDate = photo.photoDate.lowercase(Locale.ROOT).contains(trimmedQuery)
+                val matchesPath = photo.savedPath.lowercase(Locale.ROOT).contains(trimmedQuery)
+                if (!matchesName && !matchesDate && !matchesPath) return@filter false
+            }
+            true
         }
         if (filtered.isEmpty()) return ServerTimelineData()
 
@@ -558,7 +572,12 @@ data class ServerGalleryUiState(
     val filterMode: ServerGalleryFilter = ServerGalleryFilter.ALL,
     val mediaTypeFilter: ServerMediaTypeFilter = ServerMediaTypeFilter.ALL,
     val timelineGrouping: ServerTimelineGrouping = ServerTimelineGrouping.DAY,
+    val searchQuery: String = "",
     val selectedYearAnchor: String? = null,
+    val userName: String = "",
+    val userFolder: String = "",
+    val serverS3Enabled: Boolean = false,
+    val serverStorage: ServerStorageInfo? = null,
     val isSelectionMode: Boolean = false,
     val selectedHashes: Set<String> = emptySet(),
     val locallyProtectedHashes: Set<String> = emptySet(),
@@ -582,6 +601,14 @@ data class ServerGalleryUiState(
     val shareFileReady: File? = null
 ) {
     val unproxiedCount: Int get() = photos.count { it.needsProxy }
+    val videoCount: Int get() = photos.count { it.isVideo }
+    val photoCount: Int get() = (photos.size - videoCount).coerceAtLeast(0)
+    val protectedCount: Int get() = photos.count { isRestoredOrProtected(it) }
+    val totalServerBytes: Long get() = photos.sumOf { maxOf(0L, it.size) }
+    val hasActiveFilter: Boolean
+        get() = filterMode != ServerGalleryFilter.ALL ||
+            mediaTypeFilter != ServerMediaTypeFilter.ALL ||
+            searchQuery.trim().isNotEmpty()
     val visiblePhotos: List<ServerPhoto> get() = timeline.sections.flatMap { it.photos }
     fun isRestoredOrProtected(photo: ServerPhoto): Boolean =
         photo.isProtectedOriginal || locallyProtectedHashes.contains(photo.hash.lowercase(Locale.ROOT))
@@ -642,6 +669,18 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                 loadFromLocalStore()
             }
         }
+        viewModelScope.launch {
+            settings.state.collect { cfg ->
+                _uiState.update { prev ->
+                    prev.copy(
+                        userName = cfg.userName,
+                        userFolder = cfg.userFolder,
+                        serverS3Enabled = cfg.serverS3Enabled,
+                        serverStorage = cfg.serverStorage
+                    )
+                }
+            }
+        }
     }
 
     fun onEnterScreen() {
@@ -676,11 +715,20 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
             withContext(Dispatchers.Main) {
                 _uiState.update { prev ->
                     val nextPhotos = if (cached.isNotEmpty() || prev.photos.isEmpty()) cached else prev.photos
-                    val rebuilt = rebuildTimelineData(nextPhotos, prev.filterMode, prev.mediaTypeFilter, prev.timelineGrouping, prev.selectedYearAnchor)
+                    val nextProtected = if (nextPhotos === cached) protectedSet else computeLocallyProtectedHashes(nextPhotos)
+                    val rebuilt = rebuildTimelineData(
+                        nextPhotos,
+                        prev.filterMode,
+                        prev.mediaTypeFilter,
+                        prev.timelineGrouping,
+                        prev.selectedYearAnchor,
+                        prev.searchQuery,
+                        nextProtected
+                    )
                     prev.copy(
                         photos = nextPhotos,
                         thumbnailCacheVersion = prev.thumbnailCacheVersion + 1L,
-                        locallyProtectedHashes = if (nextPhotos === cached) protectedSet else computeLocallyProtectedHashes(nextPhotos),
+                        locallyProtectedHashes = nextProtected,
                         timeline = rebuilt.first,
                         selectedYearAnchor = rebuilt.second
                     )
@@ -695,13 +743,32 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
         viewModelScope.launch {
             val client = PhotoHubApiClient(context, settings)
+            val whoamiDeferred = async { runCatching { client.whoami() }.getOrNull() }
             try {
                 val fetched = client.fetchAllServerPhotos(sync = true)
                 val cur = settings.current
                 store.savePhotos(fetched, cur.normalizedBaseUrl, cur.apiKeyCacheScope)
                 val protectedSet = withContext(Dispatchers.IO) { computeLocallyProtectedHashes(fetched) }
+                whoamiDeferred.await()?.let { who ->
+                    settings.updateServerCapabilities(who.storage, who.s3Enabled)
+                    settings.updateResolvedNode(
+                        serverUrl = "",
+                        nodeId = who.nodeId,
+                        folderName = who.userFolder,
+                        email = who.email,
+                        name = who.name
+                    )
+                }
                 _uiState.update { prev ->
-                    val rebuilt = rebuildTimelineData(fetched, prev.filterMode, prev.mediaTypeFilter, prev.timelineGrouping, prev.selectedYearAnchor)
+                    val rebuilt = rebuildTimelineData(
+                        fetched,
+                        prev.filterMode,
+                        prev.mediaTypeFilter,
+                        prev.timelineGrouping,
+                        prev.selectedYearAnchor,
+                        prev.searchQuery,
+                        protectedSet
+                    )
                     val clearedFailed = prev.failedPreviewHashes.filterNot { h ->
                         fetched.any { it.hash == h && !it.needsProxy }
                     }.toSet()
@@ -730,22 +797,82 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
     fun setFilterMode(mode: ServerGalleryFilter) {
         _uiState.update { prev ->
-            val rebuilt = rebuildTimelineData(prev.photos, mode, prev.mediaTypeFilter, prev.timelineGrouping, prev.selectedYearAnchor)
+            val rebuilt = rebuildTimelineData(
+                prev.photos,
+                mode,
+                prev.mediaTypeFilter,
+                prev.timelineGrouping,
+                prev.selectedYearAnchor,
+                prev.searchQuery,
+                prev.locallyProtectedHashes
+            )
             prev.copy(filterMode = mode, timeline = rebuilt.first, selectedYearAnchor = rebuilt.second)
         }
     }
 
     fun setMediaTypeFilter(media: ServerMediaTypeFilter) {
         _uiState.update { prev ->
-            val rebuilt = rebuildTimelineData(prev.photos, prev.filterMode, media, prev.timelineGrouping, prev.selectedYearAnchor)
+            val rebuilt = rebuildTimelineData(
+                prev.photos,
+                prev.filterMode,
+                media,
+                prev.timelineGrouping,
+                prev.selectedYearAnchor,
+                prev.searchQuery,
+                prev.locallyProtectedHashes
+            )
             prev.copy(mediaTypeFilter = media, timeline = rebuilt.first, selectedYearAnchor = rebuilt.second)
         }
     }
 
     fun setTimelineGrouping(grouping: ServerTimelineGrouping) {
         _uiState.update { prev ->
-            val rebuilt = rebuildTimelineData(prev.photos, prev.filterMode, prev.mediaTypeFilter, grouping, prev.selectedYearAnchor)
+            val rebuilt = rebuildTimelineData(
+                prev.photos,
+                prev.filterMode,
+                prev.mediaTypeFilter,
+                grouping,
+                prev.selectedYearAnchor,
+                prev.searchQuery,
+                prev.locallyProtectedHashes
+            )
             prev.copy(timelineGrouping = grouping, timeline = rebuilt.first, selectedYearAnchor = rebuilt.second)
+        }
+    }
+
+    fun setSearchQuery(query: String) {
+        _uiState.update { prev ->
+            val rebuilt = rebuildTimelineData(
+                prev.photos,
+                prev.filterMode,
+                prev.mediaTypeFilter,
+                prev.timelineGrouping,
+                prev.selectedYearAnchor,
+                query,
+                prev.locallyProtectedHashes
+            )
+            prev.copy(searchQuery = query, timeline = rebuilt.first, selectedYearAnchor = rebuilt.second)
+        }
+    }
+
+    fun clearFilters() {
+        _uiState.update { prev ->
+            val rebuilt = rebuildTimelineData(
+                prev.photos,
+                ServerGalleryFilter.ALL,
+                ServerMediaTypeFilter.ALL,
+                prev.timelineGrouping,
+                prev.selectedYearAnchor,
+                "",
+                prev.locallyProtectedHashes
+            )
+            prev.copy(
+                filterMode = ServerGalleryFilter.ALL,
+                mediaTypeFilter = ServerMediaTypeFilter.ALL,
+                searchQuery = "",
+                timeline = rebuilt.first,
+                selectedYearAnchor = rebuilt.second
+            )
         }
     }
 
@@ -758,9 +885,18 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
         filterMode: ServerGalleryFilter,
         mediaTypeFilter: ServerMediaTypeFilter,
         grouping: ServerTimelineGrouping,
-        existingAnchor: String?
+        existingAnchor: String?,
+        searchQuery: String = _uiState.value.searchQuery,
+        locallyProtectedHashes: Set<String> = _uiState.value.locallyProtectedHashes
     ): Pair<ServerTimelineData, String?> {
-        val data = ServerTimelineBuilder.build(photos, filterMode, mediaTypeFilter, grouping)
+        val data = ServerTimelineBuilder.build(
+            photos = photos,
+            filterMode = filterMode,
+            mediaTypeFilter = mediaTypeFilter,
+            grouping = grouping,
+            searchQuery = searchQuery,
+            locallyProtectedHashes = locallyProtectedHashes
+        )
         val nextAnchor = if (existingAnchor != null && data.years.any { it.anchorId == existingAnchor }) {
             existingAnchor
         } else {
@@ -891,7 +1027,15 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                     } else {
                         prev.filterMode
                     }
-                    val rebuilt = rebuildTimelineData(prev.photos, nextFilter, prev.mediaTypeFilter, prev.timelineGrouping, prev.selectedYearAnchor)
+                    val rebuilt = rebuildTimelineData(
+                        prev.photos,
+                        nextFilter,
+                        prev.mediaTypeFilter,
+                        prev.timelineGrouping,
+                        prev.selectedYearAnchor,
+                        prev.searchQuery,
+                        prev.locallyProtectedHashes
+                    )
                     prev.copy(
                         isBatchProxying = false,
                         batchStatusText = "",
@@ -938,7 +1082,15 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                     } else {
                         prev.locallyProtectedHashes - norm
                     }
-                    val rebuilt = rebuildTimelineData(nextPhotos, prev.filterMode, prev.mediaTypeFilter, prev.timelineGrouping, prev.selectedYearAnchor)
+                    val rebuilt = rebuildTimelineData(
+                        nextPhotos,
+                        prev.filterMode,
+                        prev.mediaTypeFilter,
+                        prev.timelineGrouping,
+                        prev.selectedYearAnchor,
+                        prev.searchQuery,
+                        nextLocallyProtected
+                    )
                     prev.copy(
                         photos = nextPhotos,
                         thumbnailCacheVersion = prev.thumbnailCacheVersion + 1L,
@@ -1409,7 +1561,9 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                 prev.filterMode,
                 prev.mediaTypeFilter,
                 prev.timelineGrouping,
-                prev.selectedYearAnchor
+                prev.selectedYearAnchor,
+                prev.searchQuery,
+                nextProtected
             )
             prev.copy(
                 photos = nextPhotos,

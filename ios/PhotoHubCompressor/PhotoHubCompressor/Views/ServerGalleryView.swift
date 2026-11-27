@@ -10,9 +10,10 @@ private enum ServerGalleryFilter: String, CaseIterable, Identifiable {
 }
 
 private enum ServerMediaTypeFilter: String, CaseIterable, Identifiable {
-    case all = "All Media"
-    case photos = "Photos Only"
-    case videos = "Videos Only"
+    case all = "All"
+    case photos = "Photos"
+    case videos = "Videos"
+    case protectedOnly = "Protected"
 
     var id: String { rawValue }
 }
@@ -23,6 +24,14 @@ private enum ServerTimelineGrouping: String, CaseIterable, Identifiable {
     case year = "Year Only"
 
     var id: String { rawValue }
+
+    var shortLabel: String {
+        switch self {
+        case .day: return "Day"
+        case .month: return "Month"
+        case .year: return "Year"
+        }
+    }
 }
 
 private enum BatchProxyOutcome: Sendable {
@@ -60,6 +69,7 @@ struct ServerGalleryView: View {
     @State private var filterMode: ServerGalleryFilter = .all
     @State private var mediaTypeFilter: ServerMediaTypeFilter = .all
     @State private var timelineGrouping: ServerTimelineGrouping = .day
+    @State private var searchQuery: String = ""
     @State private var timelineData: ServerTimelineData = .empty
     @State private var selectedYearAnchor: String?
     @State private var isScrubbingTimeline: Bool = false
@@ -90,11 +100,58 @@ struct ServerGalleryView: View {
     @State private var deleteConfirmPrompt: DeleteConfirmPrompt?
 
     private let columns = [
-        GridItem(.adaptive(minimum: 100, maximum: 140), spacing: 2)
+        GridItem(.adaptive(minimum: 102, maximum: 145), spacing: 6)
     ]
 
     private var unproxiedPhotos: [ServerPhoto] {
         photos.filter { $0.needsProxy }
+    }
+
+    private var protectedCount: Int {
+        photos.reduce(into: 0) { count, p in
+            if isRestoredOrProtected(p) { count += 1 }
+        }
+    }
+
+    private var videoCount: Int {
+        photos.reduce(into: 0) { count, p in
+            if p.isVideo { count += 1 }
+        }
+    }
+
+    private var photoCount: Int {
+        max(0, photos.count - videoCount)
+    }
+
+    private var totalServerBytes: Int64 {
+        photos.reduce(into: Int64(0)) { $0 += max(0, $1.size) }
+    }
+
+    private var activeHeroMood: MascotMood {
+        if isBatchProxying || isBatchRestoring || syncManager.isSyncing || isLoading {
+            return .uploading
+        }
+        if errorMessage != nil {
+            return .alert
+        }
+        return .happy
+    }
+
+    private var greetingTitle: String {
+        let trimmed = settings.userName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let first = trimmed.split(separator: " ").first, !first.isEmpty {
+            return "Hi, \(first)"
+        }
+        return "Your Cloud Photos"
+    }
+
+    private var folderBadgeLabel: String {
+        let folder = settings.userFolder.trimmingCharacters(in: .whitespacesAndNewlines)
+        return folder.isEmpty ? "/ root" : "/\(folder)"
+    }
+
+    private var hasActiveFilter: Bool {
+        filterMode != .all || mediaTypeFilter != .all || !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func isRestoredOrProtected(_ photo: ServerPhoto) -> Bool {
@@ -117,187 +174,236 @@ struct ServerGalleryView: View {
 
                 Group {
                     if isLoading && photos.isEmpty {
-                        VStack(spacing: 14) {
-                            SunnyMascotView(mood: .uploading, size: 112)
-                            Text("Loading…")
-                                .font(.headline.weight(.bold))
-                                .foregroundColor(PhotoHubPalette.ink)
-                        }
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        CloudLoadingSkeletonView()
                     } else if let errorMessage, photos.isEmpty {
                         VStack(spacing: 14) {
-                            SunnyMascotView(mood: .alert, size: 116)
-                            Text("Offline")
+                            SunnyMascotView(mood: .alert, size: 118)
+                            Text("Could Not Reach Cloud")
                                 .font(.title3.weight(.heavy))
                                 .foregroundColor(PhotoHubPalette.ink)
                             Text(errorMessage)
-                                .font(.caption)
+                                .font(.subheadline)
                                 .foregroundColor(PhotoHubPalette.muted)
-                                .lineLimit(2)
+                                .lineLimit(3)
                                 .multilineTextAlignment(.center)
                                 .padding(.horizontal, 28)
-                            Button("Retry") {
+                            Button {
                                 Task { await loadPhotos() }
+                            } label: {
+                                Label("Retry Connection", systemImage: "arrow.clockwise")
                             }
                             .buttonStyle(PhotoHubPrimaryButtonStyle())
+                            .padding(.top, 4)
                         }
+                        .padding(24)
+                        .background(PhotoHubPalette.card, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                                .stroke(PhotoHubPalette.cardBorder, lineWidth: 1)
+                        )
+                        .padding(.horizontal, 24)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else if photos.isEmpty {
                         VStack(spacing: 14) {
                             SunnyMascotView(mood: .sleeping, size: 120)
-                            Text("No Backups")
+                            Text("No Cloud Backups Yet")
                                 .font(.title3.weight(.heavy))
                                 .foregroundColor(PhotoHubPalette.ink)
-                            Button("Refresh") {
+                            Text("Head to the Backup tab to upload your first full-resolution photos & videos.")
+                                .font(.subheadline)
+                                .foregroundColor(PhotoHubPalette.muted)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal, 20)
+                            Button {
                                 Task { await loadPhotos() }
+                            } label: {
+                                Label("Refresh Cloud", systemImage: "arrow.clockwise")
                             }
                             .buttonStyle(PhotoHubPrimaryButtonStyle())
+                            .padding(.top, 4)
                         }
+                        .padding(24)
+                        .background(PhotoHubPalette.card, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                                .stroke(PhotoHubPalette.cardBorder, lineWidth: 1)
+                        )
+                        .padding(.horizontal, 24)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else {
                     ScrollViewReader { scrollProxy in
-                        VStack(spacing: 0) {
-                            if timelineData.years.count > 1 {
-                                yearQuickJumpBar(scrollProxy: scrollProxy)
-                            }
+                        ZStack(alignment: .trailing) {
+                            ScrollView {
+                                LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
+                                    // Web-matched Warm Sunset Hero & Storage Summary Card
+                                    cloudHeroStorageCard
+                                        .padding(.horizontal, 12)
+                                        .padding(.top, 8)
+                                        .padding(.bottom, 10)
 
-                            ZStack(alignment: .trailing) {
-                                ScrollView {
-                                    LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
-                                        if let errorMessage {
-                                            HStack(spacing: 6) {
-                                                Image(systemName: "wifi.slash")
-                                                    .font(.caption)
-                                                    .foregroundColor(.orange)
-                                                Text("Offline cache · \(errorMessage)")
-                                                    .font(.caption)
-                                                    .foregroundStyle(.secondary)
-                                                    .lineLimit(1)
-                                                Spacer()
-                                            }
-                                            .padding(.horizontal, 12)
-                                            .padding(.vertical, 6)
-                                        }
+                                    // Web-matched Search, Filter Pills, Grouping & Year Quick Jump Card
+                                    cloudControlBar(scrollProxy: scrollProxy)
+                                        .padding(.horizontal, 12)
+                                        .padding(.bottom, 10)
 
-                                        if !unproxiedPhotos.isEmpty || isBatchProxying || batchBannerMessage != nil {
-                                            unproxiedBannerView
-                                                .padding(.horizontal, 12)
-                                                .padding(.vertical, 6)
-                                        }
-
-                                        if isBatchRestoring || restoreBannerMessage != nil {
-                                            restoreBannerView
-                                                .padding(.horizontal, 12)
-                                                .padding(.vertical, 4)
-                                        }
-
-                                        if isBatchDeleting || deleteBannerMessage != nil {
-                                            deleteBannerView
-                                                .padding(.horizontal, 12)
-                                                .padding(.vertical, 4)
-                                        }
-
-                                        if syncManager.isSyncing {
-                                            HStack(spacing: 8) {
-                                                ProgressView()
-                                                    .scaleEffect(0.85)
-                                                Text(
-                                                    syncManager.statusText.isEmpty
-                                                    ? "Syncing proxies (\(syncManager.completedCount)/\(syncManager.totalCount))..."
-                                                    : syncManager.statusText
-                                                )
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
-                                                .lineLimit(1)
-                                                Spacer()
-                                                Button("Stop") {
-                                                    syncManager.cancel()
-                                                }
+                                    if let errorMessage {
+                                        HStack(spacing: 8) {
+                                            Image(systemName: "wifi.slash")
+                                                .font(.caption.weight(.bold))
+                                                .foregroundColor(PhotoHubPalette.orange)
+                                            Text("Offline cache · \(errorMessage)")
                                                 .font(.caption.weight(.medium))
-                                            }
-                                            .padding(.horizontal, 12)
-                                            .padding(.vertical, 6)
+                                                .foregroundColor(PhotoHubPalette.ink)
+                                                .lineLimit(1)
+                                            Spacer()
                                         }
+                                        .padding(.horizontal, 14)
+                                        .padding(.vertical, 9)
+                                        .background(PhotoHubPalette.softPeach, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                                .stroke(PhotoHubPalette.orange.opacity(0.32), lineWidth: 1)
+                                        )
+                                        .padding(.horizontal, 12)
+                                        .padding(.bottom, 8)
+                                    }
 
-                                        if timelineData.sections.isEmpty {
-                                            VStack(spacing: 10) {
-                                                Text(emptyFilteredMessage)
-                                                    .font(.subheadline)
-                                                    .foregroundStyle(.secondary)
-                                                if filterMode != .all || mediaTypeFilter != .all {
-                                                    Button("Show All") {
-                                                        filterMode = .all
-                                                        mediaTypeFilter = .all
-                                                    }
-                                                    .font(.subheadline.weight(.medium))
-                                                }
+                                    if !unproxiedPhotos.isEmpty || isBatchProxying || batchBannerMessage != nil {
+                                        unproxiedBannerView
+                                            .padding(.horizontal, 12)
+                                            .padding(.bottom, 8)
+                                    }
+
+                                    if isBatchRestoring || restoreBannerMessage != nil {
+                                        restoreBannerView
+                                            .padding(.horizontal, 12)
+                                            .padding(.bottom, 8)
+                                    }
+
+                                    if isBatchDeleting || deleteBannerMessage != nil {
+                                        deleteBannerView
+                                            .padding(.horizontal, 12)
+                                            .padding(.bottom, 8)
+                                    }
+
+                                    if syncManager.isSyncing {
+                                        HStack(spacing: 10) {
+                                            ProgressView()
+                                                .tint(PhotoHubPalette.orange)
+                                                .scaleEffect(0.85)
+                                            Text(
+                                                syncManager.statusText.isEmpty
+                                                ? "Syncing previews (\(syncManager.completedCount)/\(syncManager.totalCount))…"
+                                                : syncManager.statusText
+                                            )
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundColor(PhotoHubPalette.ink)
+                                            .lineLimit(1)
+                                            Spacer()
+                                            Button("Stop") {
+                                                syncManager.cancel()
                                             }
-                                            .frame(maxWidth: .infinity, alignment: .center)
-                                            .padding(.vertical, 44)
-                                        } else {
-                                            ForEach(timelineData.sections) { section in
-                                                if section.startsNewYear && timelineGrouping != .year {
-                                                    yearBannerHeader(for: section)
-                                                        .id("year-\(section.yearLabel)")
-                                                } else if timelineGrouping == .year {
-                                                    Color.clear
-                                                        .frame(height: 0)
-                                                        .id("year-\(section.yearLabel)")
-                                                }
+                                            .font(.caption.weight(.bold))
+                                            .foregroundColor(PhotoHubPalette.deepOrange)
+                                        }
+                                        .padding(.horizontal, 14)
+                                        .padding(.vertical, 10)
+                                        .background(PhotoHubPalette.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                                .stroke(PhotoHubPalette.cardBorder, lineWidth: 1)
+                                        )
+                                        .padding(.horizontal, 12)
+                                        .padding(.bottom, 8)
+                                    }
 
+                                    if timelineData.sections.isEmpty {
+                                        VStack(spacing: 12) {
+                                            SunnyMascotView(mood: .sleeping, size: 84)
+                                            Text("No Matching Items")
+                                                .font(.headline.weight(.bold))
+                                                .foregroundColor(PhotoHubPalette.ink)
+                                            Text(emptyFilteredMessage)
+                                                .font(.caption)
+                                                .foregroundColor(PhotoHubPalette.muted)
+                                                .multilineTextAlignment(.center)
+                                            if hasActiveFilter {
+                                                Button("Clear Filters") {
+                                                    filterMode = .all
+                                                    mediaTypeFilter = .all
+                                                    searchQuery = ""
+                                                }
+                                                .buttonStyle(PhotoHubSoftButtonStyle())
+                                                .padding(.top, 4)
+                                            }
+                                        }
+                                        .frame(maxWidth: .infinity, alignment: .center)
+                                        .padding(.vertical, 36)
+                                        .padding(.horizontal, 24)
+                                    } else {
+                                        ForEach(timelineData.sections) { section in
+                                            if section.startsNewYear && timelineGrouping != .year {
+                                                yearBannerHeader(for: section)
+                                                    .id("year-\(section.yearLabel)")
+                                            } else if timelineGrouping == .year {
                                                 Color.clear
                                                     .frame(height: 0)
-                                                    .id(section.anchorId)
+                                                    .id("year-\(section.yearLabel)")
+                                            }
 
-                                                Section {
-                                                    LazyVGrid(columns: columns, spacing: 2) {
-                                                        ForEach(section.photos) { photo in
-                                                            let norm = photo.hash.lowercased()
-                                                            let isSelected = selectedPhotoHashes.contains(norm)
-                                                            let protectedOrRestored = isRestoredOrProtected(photo)
-                                                            let _ = thumbCacheRevision
-                                                            ServerThumbnailCell(
-                                                                photo: photo,
-                                                                image: ThumbnailMemoryCache.shared.image(forHash: photo.hash),
-                                                                showPlaceholder: failedPreviewHashes.contains(photo.hash) || (photo.isVideo && photo.needsProxy),
-                                                                isSelectionMode: isSelectionMode,
-                                                                isSelected: isSelected,
-                                                                isRestoredOrProtected: protectedOrRestored
-                                                            )
-                                                            .contentShape(Rectangle())
-                                                            .onTapGesture {
-                                                                if isSelectionMode {
-                                                                    toggleSelection(for: photo)
-                                                                } else {
-                                                                    selectedPhoto = photo
-                                                                }
-                                                            }
-                                                            .onLongPressGesture {
-                                                                if !isSelectionMode && !isBatchRestoring && !isBatchProxying && !isBatchDeleting {
-                                                                    enterSelectionMode(initialPhoto: photo)
-                                                                }
-                                                            }
-                                                            .task(id: "\(photo.hash)-\(photo.needsProxy ? 0 : 1)") {
-                                                                await loadCompressedPreviewIfNeeded(for: photo)
+                                            Color.clear
+                                                .frame(height: 0)
+                                                .id(section.anchorId)
+
+                                            Section {
+                                                LazyVGrid(columns: columns, spacing: 6) {
+                                                    ForEach(section.photos) { photo in
+                                                        let norm = photo.hash.lowercased()
+                                                        let isSelected = selectedPhotoHashes.contains(norm)
+                                                        let protectedOrRestored = isRestoredOrProtected(photo)
+                                                        let _ = thumbCacheRevision
+                                                        ServerThumbnailCell(
+                                                            photo: photo,
+                                                            image: ThumbnailMemoryCache.shared.image(forHash: photo.hash),
+                                                            showPlaceholder: failedPreviewHashes.contains(photo.hash) || (photo.isVideo && photo.needsProxy),
+                                                            isSelectionMode: isSelectionMode,
+                                                            isSelected: isSelected,
+                                                            isRestoredOrProtected: protectedOrRestored
+                                                        )
+                                                        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                                        .onTapGesture {
+                                                            if isSelectionMode {
+                                                                toggleSelection(for: photo)
+                                                            } else {
+                                                                selectedPhoto = photo
                                                             }
                                                         }
+                                                        .onLongPressGesture {
+                                                            if !isSelectionMode && !isBatchRestoring && !isBatchProxying && !isBatchDeleting {
+                                                                enterSelectionMode(initialPhoto: photo)
+                                                            }
+                                                        }
+                                                        .task(id: "\(photo.hash)-\(photo.needsProxy ? 0 : 1)") {
+                                                            await loadCompressedPreviewIfNeeded(for: photo)
+                                                        }
                                                     }
-                                                    .padding(.bottom, 6)
-                                                } header: {
-                                                    timelineSectionHeader(section)
                                                 }
+                                                .padding(.horizontal, 12)
+                                                .padding(.bottom, 14)
+                                            } header: {
+                                                timelineSectionHeader(section)
                                             }
                                         }
                                     }
-                                    .padding(.bottom, 12)
                                 }
-                                .refreshable {
-                                    await loadPhotos()
-                                }
+                                .padding(.bottom, isSelectionMode ? 90 : 20)
+                            }
+                            .refreshable {
+                                await loadPhotos()
+                            }
 
-                                if timelineData.sections.count >= 6 {
-                                    immichTimelineScrubber(scrollProxy: scrollProxy)
-                                }
+                            if timelineData.sections.count >= 6 {
+                                immichTimelineScrubber(scrollProxy: scrollProxy)
                             }
                         }
                     }
@@ -374,8 +480,7 @@ struct ServerGalleryView: View {
                                 }
                             }
                         } label: {
-                            let isFiltered = (filterMode != .all || mediaTypeFilter != .all)
-                            Image(systemName: isFiltered ? "line.3.horizontal.decrease.circle.fill" : "ellipsis.circle")
+                            Image(systemName: hasActiveFilter ? "line.3.horizontal.decrease.circle.fill" : "ellipsis.circle")
                         }
 
                         Button {
@@ -402,6 +507,9 @@ struct ServerGalleryView: View {
                 rebuildTimeline()
             }
             .onChange(of: timelineGrouping) { _ in
+                rebuildTimeline()
+            }
+            .onChange(of: searchQuery) { _ in
                 rebuildTimeline()
             }
             .onDisappear {
@@ -460,102 +568,175 @@ struct ServerGalleryView: View {
 
     @ViewBuilder
     private var unproxiedBannerView: some View {
-        HStack(spacing: 10) {
-            if isBatchProxying {
-                ProgressView()
-                    .scaleEffect(0.85)
-                Text("Creating proxies \(batchCompleted)/\(batchTotal)")
-                    .font(.caption.weight(.medium))
-                Spacer()
-                Button("Stop") {
-                    batchTask?.cancel()
+        VStack(spacing: 8) {
+            HStack(spacing: 10) {
+                if isBatchProxying {
+                    ProgressView()
+                        .tint(PhotoHubPalette.orange)
+                        .scaleEffect(0.85)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Creating proxies \(batchCompleted)/\(batchTotal)")
+                            .font(.caption.weight(.bold).monospacedDigit())
+                            .foregroundColor(PhotoHubPalette.ink)
+                        if !batchStatusText.isEmpty {
+                            Text(batchStatusText)
+                                .font(.caption2)
+                                .foregroundColor(PhotoHubPalette.muted)
+                                .lineLimit(1)
+                        }
+                    }
+                    Spacer()
+                    Button("Stop") {
+                        batchTask?.cancel()
+                    }
+                    .font(.caption.weight(.bold))
+                    .foregroundColor(PhotoHubPalette.deepOrange)
+                } else if !unproxiedPhotos.isEmpty {
+                    Button {
+                        filterMode = (filterMode == .needsProxy) ? .all : .needsProxy
+                    } label: {
+                        HStack(spacing: 8) {
+                            AnimatedPulseDot(color: PhotoHubPalette.orange)
+                            Text(
+                                filterMode == .needsProxy
+                                ? "Showing \(unproxiedPhotos.count) unproxied · Tap for All"
+                                : "\(unproxiedPhotos.count) item\(unproxiedPhotos.count == 1 ? "" : "s") missing proxy"
+                            )
+                            .font(.caption.weight(.bold))
+                            .foregroundColor(PhotoHubPalette.ink)
+                        }
+                    }
+                    .buttonStyle(.plain)
+
+                    Spacer()
+
+                    Button {
+                        startBatchProxy()
+                    } label: {
+                        Text("Proxy All")
+                            .font(.caption.weight(.bold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(PhotoHubPalette.orangeGradient, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isBatchRestoring || isBatchDeleting)
+                } else if let msg = batchBannerMessage {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.subheadline)
+                        .foregroundColor(PhotoHubPalette.mint)
+                    Text(msg)
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(PhotoHubPalette.ink)
+                        .lineLimit(2)
+                    Spacer()
+                    Button {
+                        batchBannerMessage = nil
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.caption2.weight(.bold))
+                            .foregroundColor(PhotoHubPalette.muted)
+                            .padding(6)
+                            .background(PhotoHubPalette.softPeach, in: Circle())
+                    }
+                    .buttonStyle(.plain)
                 }
-                .font(.caption.weight(.semibold))
-            } else if !unproxiedPhotos.isEmpty {
-                Button {
-                    filterMode = (filterMode == .needsProxy) ? .all : .needsProxy
-                } label: {
-                    HStack(spacing: 6) {
-                        Circle()
-                            .fill(Color.orange)
-                            .frame(width: 7, height: 7)
-                        Text(
-                            filterMode == .needsProxy
-                            ? "Showing \(unproxiedPhotos.count) unproxied · Tap for All"
-                            : "\(unproxiedPhotos.count) missing proxy"
-                        )
-                        .font(.caption.weight(.medium))
-                        .foregroundColor(.primary)
+            }
+
+            if isBatchProxying && batchTotal > 0 {
+                let frac = min(1.0, max(0.04, Double(batchCompleted) / Double(batchTotal)))
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule()
+                            .fill(PhotoHubPalette.softPeach)
+                        Capsule()
+                            .fill(PhotoHubPalette.orangeGradient)
+                            .frame(width: geo.size.width * frac)
+                            .animation(.easeOut(duration: 0.25), value: frac)
                     }
                 }
-                .buttonStyle(.plain)
-
-                Spacer()
-
-                Button("Proxy All") {
-                    startBatchProxy()
-                }
-                .font(.caption.weight(.semibold))
-                .disabled(isBatchRestoring || isBatchDeleting)
-            } else if let msg = batchBannerMessage {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.caption)
-                    .foregroundColor(.green)
-                Text(msg)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Spacer()
-                Button {
-                    batchBannerMessage = nil
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
+                .frame(height: 5)
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(Color.secondary.opacity(0.09), in: Capsule())
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(PhotoHubPalette.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(PhotoHubPalette.cardBorder, lineWidth: 1)
+        )
     }
 
     @ViewBuilder
     private var restoreBannerView: some View {
-        HStack(spacing: 10) {
-            if isBatchRestoring {
-                ProgressView()
-                    .scaleEffect(0.85)
-                Text("Restoring originals \(restoreCompleted)/\(restoreTotal)")
-                    .font(.caption.weight(.medium))
-                Spacer()
-                Button("Stop") {
-                    restoreTask?.cancel()
+        VStack(spacing: 8) {
+            HStack(spacing: 10) {
+                if isBatchRestoring {
+                    ProgressView()
+                        .tint(PhotoHubPalette.orange)
+                        .scaleEffect(0.85)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Restoring originals \(restoreCompleted)/\(restoreTotal)")
+                            .font(.caption.weight(.bold).monospacedDigit())
+                            .foregroundColor(PhotoHubPalette.ink)
+                        if !restoreStatusText.isEmpty {
+                            Text(restoreStatusText)
+                                .font(.caption2)
+                                .foregroundColor(PhotoHubPalette.muted)
+                                .lineLimit(1)
+                        }
+                    }
+                    Spacer()
+                    Button("Stop") {
+                        restoreTask?.cancel()
+                    }
+                    .font(.caption.weight(.bold))
+                    .foregroundColor(PhotoHubPalette.deepOrange)
+                } else if let msg = restoreBannerMessage {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.subheadline)
+                        .foregroundColor(PhotoHubPalette.mint)
+                    Text(msg)
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(PhotoHubPalette.ink)
+                        .lineLimit(2)
+                    Spacer()
+                    Button {
+                        restoreBannerMessage = nil
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.caption2.weight(.bold))
+                            .foregroundColor(PhotoHubPalette.muted)
+                            .padding(6)
+                            .background(PhotoHubPalette.softPeach, in: Circle())
+                    }
+                    .buttonStyle(.plain)
                 }
-                .font(.caption.weight(.semibold))
-            } else if let msg = restoreBannerMessage {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.caption)
-                    .foregroundColor(.green)
-                Text(msg)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                Spacer()
-                Button {
-                    restoreBannerMessage = nil
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
+            }
+
+            if isBatchRestoring && restoreTotal > 0 {
+                let frac = min(1.0, max(0.04, Double(restoreCompleted) / Double(restoreTotal)))
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule()
+                            .fill(PhotoHubPalette.softPeach)
+                        Capsule()
+                            .fill(PhotoHubPalette.orangeGradient)
+                            .frame(width: geo.size.width * frac)
+                            .animation(.easeOut(duration: 0.25), value: frac)
+                    }
                 }
-                .buttonStyle(.plain)
+                .frame(height: 5)
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(Color.accentColor.opacity(0.09), in: Capsule())
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(PhotoHubPalette.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(PhotoHubPalette.orange.opacity(0.32), lineWidth: 1)
+        )
     }
 
     @ViewBuilder
@@ -563,32 +744,40 @@ struct ServerGalleryView: View {
         HStack(spacing: 10) {
             if isBatchDeleting {
                 ProgressView()
+                    .tint(PhotoHubPalette.rose)
                     .scaleEffect(0.85)
-                Text("Deleting selected photos from server...")
-                    .font(.caption.weight(.medium))
+                Text("Deleting selected photos from server…")
+                    .font(.caption.weight(.bold))
+                    .foregroundColor(PhotoHubPalette.ink)
                 Spacer()
             } else if let msg = deleteBannerMessage {
                 Image(systemName: "trash.circle.fill")
-                    .font(.caption)
-                    .foregroundColor(.red)
+                    .font(.subheadline)
+                    .foregroundColor(PhotoHubPalette.rose)
                 Text(msg)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(PhotoHubPalette.ink)
                     .lineLimit(2)
                 Spacer()
                 Button {
                     deleteBannerMessage = nil
                 } label: {
                     Image(systemName: "xmark")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
+                        .font(.caption2.weight(.bold))
+                        .foregroundColor(PhotoHubPalette.muted)
+                        .padding(6)
+                        .background(PhotoHubPalette.softPeach, in: Circle())
                 }
                 .buttonStyle(.plain)
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(Color.red.opacity(0.09), in: Capsule())
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(PhotoHubPalette.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(PhotoHubPalette.rose.opacity(0.35), lineWidth: 1)
+        )
     }
 
     @ViewBuilder
@@ -603,45 +792,71 @@ struct ServerGalleryView: View {
 
         HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(selectedList.isEmpty ? "Tap photos to select" : "\(selectedList.count) selected (~\(sizeStr))")
-                    .font(.subheadline.weight(.semibold))
+                Text(selectedList.isEmpty ? "Tap photos to select" : "\(selectedList.count) selected")
+                    .font(.subheadline.weight(.heavy).monospacedDigit())
+                    .foregroundColor(PhotoHubPalette.ink)
                 if !selectedList.isEmpty {
                     let alreadyCount = selectedList.count - unrestored.count
                     Text(
                         alreadyCount > 0
-                        ? "\(unrestored.count) to restore · \(alreadyCount) already restored"
-                        : "\(unrestored.count) original(s) to download"
+                        ? "~\(sizeStr) · \(unrestored.count) new"
+                        : "~\(sizeStr) · \(unrestored.count) original\(unrestored.count == 1 ? "" : "s")"
                     )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(.caption2.weight(.semibold).monospacedDigit())
+                    .foregroundColor(PhotoHubPalette.muted)
                     .lineLimit(1)
                 }
             }
-            Spacer()
-            Button(role: .destructive) {
+            Spacer(minLength: 4)
+
+            Button {
                 requestDeleteSelected()
             } label: {
-                Label("Delete", systemImage: "trash")
-                    .font(.subheadline.weight(.semibold))
+                HStack(spacing: 5) {
+                    Image(systemName: "trash")
+                        .font(.caption.weight(.bold))
+                    Text("Delete")
+                        .font(.caption.weight(.bold))
+                }
+                .foregroundColor(PhotoHubPalette.rose)
+                .padding(.horizontal, 13)
+                .padding(.vertical, 9)
+                .background(PhotoHubPalette.rose.opacity(0.14), in: Capsule())
+                .overlay(Capsule().stroke(PhotoHubPalette.rose.opacity(0.32), lineWidth: 1))
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(.plain)
+            .opacity(actionsDisabled ? 0.45 : 1.0)
             .disabled(actionsDisabled)
 
             Button {
                 requestRestoreSelected()
             } label: {
-                Label("Restore", systemImage: "icloud.and.arrow.down")
-                    .font(.subheadline.weight(.semibold))
+                HStack(spacing: 5) {
+                    Image(systemName: "icloud.and.arrow.down")
+                        .font(.caption.weight(.bold))
+                    Text("Restore")
+                        .font(.caption.weight(.bold))
+                }
+                .foregroundColor(.white)
+                .padding(.horizontal, 15)
+                .padding(.vertical, 9)
+                .background(PhotoHubPalette.orangeGradient, in: Capsule())
+                .shadow(color: PhotoHubPalette.orange.opacity(actionsDisabled ? 0 : 0.30), radius: 8, y: 3)
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(.plain)
+            .opacity(actionsDisabled ? 0.45 : 1.0)
             .disabled(actionsDisabled)
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-        .background(.ultraThinMaterial)
-        .overlay(alignment: .top) {
-            Divider()
-        }
+        .padding(.vertical, 11)
+        .background(PhotoHubPalette.card, in: Capsule())
+        .overlay(
+            Capsule()
+                .stroke(PhotoHubPalette.orange.opacity(0.75), lineWidth: 1.5)
+        )
+        .shadow(color: Color.black.opacity(0.18), radius: 18, y: 8)
+        .padding(.horizontal, 14)
+        .padding(.bottom, 8)
     }
 
     private func enterSelectionMode(initialPhoto: ServerPhoto? = nil) {
@@ -907,6 +1122,9 @@ struct ServerGalleryView: View {
     }
 
     private var emptyFilteredMessage: String {
+        if !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "No backed-up items match \"\(searchQuery)\"."
+        }
         if filterMode == .needsProxy && unproxiedPhotos.isEmpty {
             return "All photos on your server have compressed proxies."
         }
@@ -917,63 +1135,335 @@ struct ServerGalleryView: View {
             return "No photos match the current filter."
         case .videos:
             return "No videos match the current filter."
+        case .protectedOnly:
+            return "No restored originals are protected yet."
         }
     }
 
     @ViewBuilder
-    private func yearQuickJumpBar(scrollProxy: ScrollViewProxy) -> some View {
-        ScrollView(.horizontal, showsIndicators: false) {
+    private var cloudHeroStorageCard: some View {
+        let storage = settings.serverStorage
+        let usedBytes = storage?.usedBytes ?? totalServerBytes
+        let usedStr = ByteCountFormatter.string(fromByteCount: max(0, usedBytes), countStyle: .file)
+        let quotaBytes = storage?.quotaBytes ?? 0
+        let hasQuota = quotaBytes > 0
+        let fillFraction: Double = {
+            if hasQuota {
+                return min(1.0, max(0.03, Double(usedBytes) / Double(quotaBytes)))
+            }
+            if let diskTotal = storage?.diskTotalBytes, diskTotal > 0 {
+                return min(1.0, max(0.04, Double(usedBytes) / Double(diskTotal)))
+            }
+            return usedBytes > 0 ? 0.22 : 0.04
+        }()
+        let quotaRightLabel: String = {
+            if hasQuota {
+                let qStr = ByteCountFormatter.string(fromByteCount: quotaBytes, countStyle: .file)
+                let pct = Int((fillFraction * 100).rounded())
+                return "\(qStr) (\(pct)%)"
+            }
+            if let free = storage?.diskFreeBytes, free > 0 {
+                let freeStr = ByteCountFormatter.string(fromByteCount: free, countStyle: .file)
+                return "\(freeStr) free"
+            }
+            return "Unlimited"
+        }()
+        let splitSubtitle: String = {
+            if let masters = storage?.mastersBytes, let proxies = storage?.proxiesBytes {
+                let mStr = ByteCountFormatter.string(fromByteCount: max(0, masters), countStyle: .file)
+                let pStr = ByteCountFormatter.string(fromByteCount: max(0, proxies), countStyle: .file)
+                return "Originals \(mStr) · Proxies \(pStr)"
+            }
+            return "Originals & compressed proxies synced"
+        }()
+
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 12) {
+                SunnyMascotView(mood: activeHeroMood, size: 54)
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(greetingTitle)
+                        .font(.title3.weight(.heavy))
+                        .foregroundColor(PhotoHubPalette.ink)
+                        .lineLimit(1)
+
+                    HStack(spacing: 6) {
+                        Text(folderBadgeLabel)
+                            .font(.caption2.weight(.bold))
+                            .foregroundColor(PhotoHubPalette.orange)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 3.5)
+                            .background(PhotoHubPalette.orange.opacity(0.14), in: Capsule())
+                            .lineLimit(1)
+
+                        Text(settings.serverS3Enabled ? "Auto · S3" : "Auto · Direct")
+                            .font(.caption2.weight(.bold))
+                            .foregroundColor(PhotoHubPalette.mint)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 3.5)
+                            .background(PhotoHubPalette.mint.opacity(0.14), in: Capsule())
+                            .lineLimit(1)
+                    }
+
+                    Text("\(photos.count) total · \(photoCount) photos · \(videoCount) videos")
+                        .font(.caption.weight(.semibold).monospacedDigit())
+                        .foregroundColor(PhotoHubPalette.muted)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+
+            // Warm Storage Meter Bar (matches webpage `.storage-meter-wrap`)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("\(usedStr) used")
+                        .font(.caption.weight(.bold).monospacedDigit())
+                        .foregroundColor(PhotoHubPalette.ink)
+                    Spacer()
+                    Text(quotaRightLabel)
+                        .font(.caption.weight(.bold).monospacedDigit())
+                        .foregroundColor(PhotoHubPalette.muted)
+                }
+
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule()
+                            .fill(PhotoHubPalette.softPeach)
+                            .overlay(
+                                Capsule()
+                                    .stroke(PhotoHubPalette.cardBorder, lineWidth: 1)
+                            )
+                        Capsule()
+                            .fill(
+                                LinearGradient(
+                                    colors: [PhotoHubPalette.warmAmber, PhotoHubPalette.orange, PhotoHubPalette.deepOrange],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            )
+                            .frame(width: max(8, geo.size.width * fillFraction))
+                            .animation(.spring(response: 0.5, dampingFraction: 0.8), value: fillFraction)
+                    }
+                }
+                .frame(height: 9)
+
+                Text(splitSubtitle)
+                    .font(.caption2.weight(.semibold).monospacedDigit())
+                    .foregroundColor(PhotoHubPalette.muted)
+            }
+        }
+        .padding(16)
+        .background(
+            ZStack {
+                PhotoHubPalette.card
+                LinearGradient(
+                    colors: [PhotoHubPalette.orange.opacity(0.07), Color.clear],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .stroke(PhotoHubPalette.cardBorder, lineWidth: 1)
+        )
+        .shadow(color: PhotoHubPalette.orange.opacity(0.08), radius: 14, y: 6)
+    }
+
+    @ViewBuilder
+    private func cloudControlBar(scrollProxy: ScrollViewProxy) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            // Search Input + Compact Grouping Segmented Pill
             HStack(spacing: 8) {
-                ForEach(timelineData.years) { yr in
-                    let isSelected = selectedYearAnchor == yr.anchorId
-                    Button {
-                        selectedYearAnchor = yr.anchorId
-                        withAnimation(.easeInOut(duration: 0.25)) {
-                            scrollProxy.scrollTo(yr.anchorId, anchor: .top)
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.caption.weight(.bold))
+                        .foregroundColor(PhotoHubPalette.muted)
+                    TextField("Search name or date…", text: $searchQuery)
+                        .font(.caption.weight(.medium))
+                        .foregroundColor(PhotoHubPalette.ink)
+                        .compatibleAutocorrectionDisabled()
+                    if !searchQuery.isEmpty {
+                        Button {
+                            searchQuery = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.caption)
+                                .foregroundColor(PhotoHubPalette.muted)
                         }
-                    } label: {
-                        Text(yr.label)
-                            .font(.caption.weight(.semibold))
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 11)
+                .padding(.vertical, 8)
+                .background(PhotoHubPalette.canvas, in: Capsule())
+                .overlay(
+                    Capsule()
+                        .stroke(PhotoHubPalette.cardBorder, lineWidth: 1)
+                )
+
+                // Segmented Grouping Pill (`Day | Month | Year`)
+                HStack(spacing: 2) {
+                    ForEach(ServerTimelineGrouping.allCases) { mode in
+                        let isSelected = timelineGrouping == mode
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                timelineGrouping = mode
+                            }
+                        } label: {
+                            Text(mode.shortLabel)
+                                .font(.caption2.weight(.bold))
+                                .foregroundColor(isSelected ? PhotoHubPalette.ink : PhotoHubPalette.muted)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 6)
+                                .background(
+                                    isSelected ? PhotoHubPalette.card : Color.clear,
+                                    in: Capsule()
+                                )
+                                .shadow(color: Color.black.opacity(isSelected ? 0.08 : 0), radius: 3, y: 1)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(3)
+                .background(PhotoHubPalette.softPeach, in: Capsule())
+                .overlay(Capsule().stroke(PhotoHubPalette.cardBorder, lineWidth: 1))
+            }
+
+            // Filter Pills (`All`, `Photos`, `Videos`, `Protected`, + `Needs Proxy`)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(ServerMediaTypeFilter.allCases) { media in
+                        let isSelected = (mediaTypeFilter == media && filterMode == .all)
+                        let label: String = {
+                            if media == .protectedOnly && protectedCount > 0 {
+                                return "\(media.rawValue) (\(protectedCount))"
+                            }
+                            return media.rawValue
+                        }()
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                filterMode = .all
+                                mediaTypeFilter = media
+                            }
+                        } label: {
+                            Text(label)
+                                .font(.caption.weight(.bold))
+                                .foregroundColor(isSelected ? .white : PhotoHubPalette.muted)
+                                .padding(.horizontal, 13)
+                                .padding(.vertical, 6)
+                                .background(
+                                    isSelected ? PhotoHubPalette.orange : PhotoHubPalette.canvas,
+                                    in: Capsule()
+                                )
+                                .overlay(
+                                    Capsule()
+                                        .stroke(isSelected ? PhotoHubPalette.orange : PhotoHubPalette.cardBorder, lineWidth: 1)
+                                )
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    if !unproxiedPhotos.isEmpty || filterMode == .needsProxy {
+                        let isSelected = filterMode == .needsProxy
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                filterMode = isSelected ? .all : .needsProxy
+                            }
+                        } label: {
+                            HStack(spacing: 5) {
+                                Circle()
+                                    .fill(isSelected ? Color.white : PhotoHubPalette.orange)
+                                    .frame(width: 6, height: 6)
+                                Text("Needs Proxy (\(unproxiedPhotos.count))")
+                                    .font(.caption.weight(.bold).monospacedDigit())
+                            }
+                            .foregroundColor(isSelected ? .white : PhotoHubPalette.deepOrange)
                             .padding(.horizontal, 12)
-                            .padding(.vertical, 5)
+                            .padding(.vertical, 6)
                             .background(
-                                isSelected ? Color.accentColor : Color.secondary.opacity(0.12),
+                                isSelected ? PhotoHubPalette.orange : PhotoHubPalette.softPeach,
                                 in: Capsule()
                             )
-                            .foregroundColor(isSelected ? .white : .primary)
+                            .overlay(
+                                Capsule()
+                                    .stroke(isSelected ? PhotoHubPalette.orange : PhotoHubPalette.orange.opacity(0.35), lineWidth: 1)
+                            )
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
+
+            // Year Quick Jump Pills (`2026 · 412`, `2025 · 801`, ...)
+            if timelineData.years.count > 1 {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(timelineData.years) { yr in
+                            let isSelected = selectedYearAnchor == yr.anchorId
+                            Button {
+                                selectedYearAnchor = yr.anchorId
+                                withAnimation(.easeInOut(duration: 0.25)) {
+                                    scrollProxy.scrollTo(yr.anchorId, anchor: .top)
+                                }
+                            } label: {
+                                Text("\(yr.label) · \(yr.itemCount)")
+                                    .font(.caption2.weight(.bold).monospacedDigit())
+                                    .padding(.horizontal, 11)
+                                    .padding(.vertical, 5)
+                                    .background(
+                                        isSelected ? PhotoHubPalette.orange : PhotoHubPalette.softPeach,
+                                        in: Capsule()
+                                    )
+                                    .overlay(
+                                        Capsule()
+                                            .stroke(isSelected ? PhotoHubPalette.orange : PhotoHubPalette.cardBorder, lineWidth: 1)
+                                    )
+                                    .foregroundColor(isSelected ? .white : PhotoHubPalette.ink)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
         }
-        .background(.ultraThinMaterial)
+        .padding(12)
+        .background(PhotoHubPalette.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(PhotoHubPalette.cardBorder, lineWidth: 1)
+        )
     }
 
     @ViewBuilder
     private func yearBannerHeader(for section: ServerTimelineSection) -> some View {
         let yearInfo = timelineData.years.first(where: { $0.label == section.yearLabel })
-        HStack(alignment: .firstTextBaseline) {
+        HStack(alignment: .center) {
             Text(section.yearLabel)
-                .font(.title2.weight(.bold))
+                .font(.title2.weight(.heavy))
+                .foregroundColor(PhotoHubPalette.ink)
             Spacer()
             if let yearInfo {
-                Text("\(yearInfo.itemCount)")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                Text("\(yearInfo.itemCount) items")
+                    .font(.caption2.weight(.bold).monospacedDigit())
+                    .foregroundColor(PhotoHubPalette.orange)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(PhotoHubPalette.softPeach, in: Capsule())
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.top, 16)
-        .padding(.bottom, 2)
+        .padding(.horizontal, 14)
+        .padding(.top, 14)
+        .padding(.bottom, 4)
     }
 
     @ViewBuilder
     private func timelineSectionHeader(_ section: ServerTimelineSection) -> some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 8) {
             Text(section.title)
-                .font(.subheadline.weight(.semibold))
+                .font(.subheadline.weight(.heavy))
+                .foregroundColor(PhotoHubPalette.ink)
             Spacer()
             if isSelectionMode {
                 let secHashes = section.photos.map { $0.hash.lowercased() }
@@ -985,16 +1475,23 @@ struct ServerGalleryView: View {
                         for h in secHashes { selectedPhotoHashes.insert(h) }
                     }
                 }
-                .font(.caption.weight(.semibold))
+                .font(.caption.weight(.bold))
+                .foregroundColor(PhotoHubPalette.orange)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(PhotoHubPalette.softPeach, in: Capsule())
             } else {
                 Text("\(section.photos.count)")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .font(.caption2.weight(.bold).monospacedDigit())
+                    .foregroundColor(PhotoHubPalette.muted)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(PhotoHubPalette.softPeach.opacity(0.85), in: Capsule())
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
-        .background(.ultraThinMaterial)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(PhotoHubPalette.canvas.opacity(0.94))
     }
 
     @ViewBuilder
@@ -1007,7 +1504,7 @@ struct ServerGalleryView: View {
 
             ZStack(alignment: .topTrailing) {
                 Capsule()
-                    .fill(isScrubbingTimeline ? Color.accentColor : Color.primary.opacity(0.28))
+                    .fill(isScrubbingTimeline ? PhotoHubPalette.orange : PhotoHubPalette.muted.opacity(0.45))
                     .frame(width: isScrubbingTimeline ? 6 : 4, height: 36)
                     .padding(.trailing, 3)
                     .offset(y: max(0, min(handleSpan, scrubFraction * handleSpan)))
@@ -1063,7 +1560,9 @@ struct ServerGalleryView: View {
             photos: photos,
             filterMode: filterMode,
             mediaTypeFilter: mediaTypeFilter,
-            grouping: timelineGrouping
+            grouping: timelineGrouping,
+            searchQuery: searchQuery,
+            locallyProtectedHashes: locallyProtectedHashes
         )
         timelineData = built
         if let selectedYearAnchor,
@@ -1111,6 +1610,7 @@ struct ServerGalleryView: View {
         isLoading = true
         defer { isLoading = false }
         let client = PhotoHubAPIClient(settings: settings)
+        async let whoamiTask: WhoAmIResponse? = try? await client.whoami()
         do {
             let fetched = try await client.fetchAllServerPhotos(sync: true)
             LocalProxyStore.shared.savePhotos(
@@ -1125,6 +1625,16 @@ struct ServerGalleryView: View {
                 failedPreviewHashes.remove(photo.hash)
             }
             errorMessage = nil
+            if let who = await whoamiTask {
+                settings.applyServerCapabilities(storage: who.storage, s3Enabled: who.s3Enabled)
+                settings.updateResolvedNode(
+                    serverUrl: "",
+                    nodeId: who.nodeId,
+                    folderName: who.userFolder,
+                    email: who.email,
+                    name: who.name
+                )
+            }
             LocalProxySyncManager.shared.startPrefetchIfNeeded(for: fetched, settings: settings)
         } catch APIClientError.httpError(401, _) {
             LocalProxySyncManager.shared.cancel()
@@ -1236,20 +1746,35 @@ private enum ServerTimelineBuilder {
         photos: [ServerPhoto],
         filterMode: ServerGalleryFilter,
         mediaTypeFilter: ServerMediaTypeFilter,
-        grouping: ServerTimelineGrouping
+        grouping: ServerTimelineGrouping,
+        searchQuery: String = "",
+        locallyProtectedHashes: Set<String> = []
     ) -> ServerTimelineData {
+        let trimmedQuery = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let filtered = photos.filter { photo in
             if filterMode == .needsProxy && !photo.needsProxy {
                 return false
             }
             switch mediaTypeFilter {
             case .all:
-                return true
+                break
             case .photos:
-                return !photo.isVideo
+                if photo.isVideo { return false }
             case .videos:
-                return photo.isVideo
+                if !photo.isVideo { return false }
+            case .protectedOnly:
+                let isProtected = photo.isProtectedOriginal || locallyProtectedHashes.contains(photo.hash.lowercased())
+                if !isProtected { return false }
             }
+            if !trimmedQuery.isEmpty {
+                let matchesName = photo.originalName.lowercased().contains(trimmedQuery)
+                let matchesDate = photo.photoDate.lowercased().contains(trimmedQuery)
+                let matchesPath = photo.savedPath.lowercased().contains(trimmedQuery)
+                if !matchesName && !matchesDate && !matchesPath {
+                    return false
+                }
+            }
+            return true
         }
         guard !filtered.isEmpty else { return .empty }
 
@@ -1420,89 +1945,108 @@ private struct ServerThumbnailCell: View {
     let isSelected: Bool
     let isRestoredOrProtected: Bool
 
+    private let tileShape = RoundedRectangle(cornerRadius: 12, style: .continuous)
+
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                Rectangle()
-                    .fill(Color.secondary.opacity(0.12))
-
                 if let image {
                     Image(uiImage: image)
                         .resizable()
                         .scaledToFill()
                         .frame(width: geo.size.width, height: geo.size.height)
                         .clipped()
+                        .transition(.opacity.animation(.easeOut(duration: 0.22)))
                 } else if showPlaceholder {
-                    Image(systemName: photo.isVideo ? "video" : "photo")
-                        .font(.title3)
-                        .foregroundStyle(.secondary)
+                    tileShape
+                        .fill(PhotoHubPalette.softPeach)
+                    VStack(spacing: 4) {
+                        Image(systemName: photo.isVideo ? "video.fill" : "photo")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundColor(PhotoHubPalette.muted)
+                        Text(photo.isVideo ? "Video" : "Photo")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(PhotoHubPalette.muted)
+                    }
                 } else {
-                    ProgressView()
-                        .scaleEffect(0.8)
+                    WarmShimmerView(cornerRadius: 12)
                 }
 
                 if isSelected {
-                    Rectangle()
-                        .fill(Color.accentColor.opacity(0.24))
+                    tileShape
+                        .fill(PhotoHubPalette.orange.opacity(0.24))
                 }
             }
+            .clipShape(tileShape)
             .overlay {
                 if isSelected {
-                    Rectangle()
-                        .stroke(Color.accentColor, lineWidth: 2.5)
+                    tileShape
+                        .stroke(PhotoHubPalette.orange, lineWidth: 2.5)
+                } else {
+                    tileShape
+                        .stroke(PhotoHubPalette.cardBorder.opacity(0.45), lineWidth: 0.5)
                 }
             }
-            .overlay(alignment: .bottomTrailing) {
-                if photo.isVideo && image != nil {
-                    Image(systemName: "play.fill")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(.white)
-                        .padding(6)
-                        .background(Color.black.opacity(0.48), in: Circle())
-                        .padding(5)
+            .overlay(alignment: .bottomLeading) {
+                if photo.isVideo {
+                    HStack(spacing: 3) {
+                        Image(systemName: "play.fill")
+                            .font(.system(size: 8.5, weight: .bold))
+                        Text("Video")
+                            .font(.system(size: 9.5, weight: .bold))
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3.5)
+                    .background(Color(red: 0.08, green: 0.06, blue: 0.05).opacity(0.72), in: Capsule())
+                    .padding(6)
                 }
             }
             .overlay(alignment: .topLeading) {
                 if isSelectionMode {
-                    Group {
+                    ZStack {
+                        Circle()
+                            .fill(isSelected ? PhotoHubPalette.orange : Color.black.opacity(0.45))
+                            .frame(width: 22, height: 22)
+                            .overlay(
+                                Circle()
+                                    .stroke(Color.white, lineWidth: 1.8)
+                            )
                         if isSelected {
-                            Image(systemName: "checkmark.circle.fill")
-                                .font(.system(size: 19, weight: .semibold))
-                                .foregroundStyle(.white, Color.accentColor)
-                        } else {
-                            Image(systemName: "circle")
-                                .font(.system(size: 19, weight: .semibold))
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 10.5, weight: .heavy))
                                 .foregroundColor(.white)
                         }
                     }
-                    .shadow(color: Color.black.opacity(0.45), radius: 2, x: 0, y: 1)
-                    .padding(6)
-                }
-            }
-            .overlay(alignment: .bottomLeading) {
-                if isRestoredOrProtected {
-                    Image(systemName: "checkmark.shield.fill")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(.green)
-                        .padding(4)
-                        .background(Color.black.opacity(0.48), in: Circle())
-                        .padding(5)
+                    .shadow(color: Color.black.opacity(0.35), radius: 3, y: 1)
+                    .padding(7)
                 }
             }
             .overlay(alignment: .topTrailing) {
-                if photo.needsProxy {
-                    Circle()
-                        .fill(Color.orange)
-                        .frame(width: 8, height: 8)
-                        .overlay(
-                            Circle()
-                                .stroke(Color.white.opacity(0.85), lineWidth: 1)
-                        )
-                        .padding(6)
+                HStack(spacing: 4) {
+                    if isRestoredOrProtected {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 9, weight: .heavy))
+                            .foregroundColor(.white)
+                            .frame(width: 20, height: 20)
+                            .background(PhotoHubPalette.mint.opacity(0.92), in: Circle())
+                            .shadow(color: Color.black.opacity(0.25), radius: 2, y: 1)
+                    }
+                    if photo.needsProxy {
+                        Circle()
+                            .fill(PhotoHubPalette.orange)
+                            .frame(width: 9, height: 9)
+                            .overlay(
+                                Circle()
+                                    .stroke(Color.white.opacity(0.9), lineWidth: 1.2)
+                            )
+                    }
                 }
+                .padding(6)
             }
             .frame(width: geo.size.width, height: geo.size.height)
-            .clipped()
+            .scaleEffect(isSelected ? 0.95 : 1.0)
+            .animation(.spring(response: 0.22, dampingFraction: 0.72), value: isSelected)
         }
         .aspectRatio(1, contentMode: .fit)
     }
@@ -1562,81 +2106,135 @@ private struct ServerPhotoDetailView: View {
         currentPhoto.isProtectedOriginal || LocalProxyTracker.shared.isRestoredMasterHash(currentPhoto.hash)
     }
 
-    var body: some View {
-        AdaptiveNavigationStack {
-            VStack(spacing: 12) {
-                Spacer()
-                if let player {
-                    VideoPlayer(player: player)
-                        .aspectRatio(16 / 9, contentMode: .fit)
-                        .cornerRadius(12)
-                        .padding(.horizontal)
-                } else if let img = previewImage ?? initialImage {
-                    ZStack(alignment: .bottom) {
-                        Image(uiImage: img)
-                            .resizable()
-                            .scaledToFit()
-                            .padding(.horizontal)
+    private let lightboxBg = Color(red: 0.055, green: 0.039, blue: 0.031) // #0E0A08 deep warm espresso
+    private let lightboxCardBg = Color(red: 0.125, green: 0.094, blue: 0.078) // #201814
+    private let lightboxBorder = Color.white.opacity(0.12)
+    private let lightboxInk = Color(red: 1.0, green: 0.969, blue: 0.941) // #FFF7F0
+    private let lightboxMuted = Color(red: 0.78, green: 0.70, blue: 0.65)
 
-                        if isLoadingVideo {
-                            HStack(spacing: 8) {
-                                ProgressView()
-                                    .tint(.white)
-                                Text("Loading compressed video proxy...")
-                                    .font(.caption)
-                                    .foregroundColor(.white)
+    var body: some View {
+        ZStack {
+            lightboxBg.ignoresSafeArea()
+
+            VStack(spacing: 10) {
+                // Cinematic Lightbox Header (matches webpage `.lightbox-top`)
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(currentPhoto.originalName)
+                            .font(.subheadline.weight(.heavy))
+                            .foregroundColor(lightboxInk)
+                            .lineLimit(1)
+                        let dateStr = currentPhoto.parsedCreationDate.map { Self.detailDateFormatter.string(from: $0) }
+                            ?? (currentPhoto.photoDate.isEmpty ? "Undated" : currentPhoto.photoDate)
+                        let masterSizeStr = ByteCountFormatter.string(fromByteCount: currentPhoto.size, countStyle: .file)
+                        Text("\(dateStr) · Original \(masterSizeStr)")
+                            .font(.caption2.weight(.semibold).monospacedDigit())
+                            .foregroundColor(lightboxMuted)
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                    Button {
+                        dismiss()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.caption.weight(.heavy))
+                            .foregroundColor(lightboxInk)
+                            .frame(width: 34, height: 34)
+                            .background(Color.white.opacity(0.12), in: Circle())
+                            .overlay(Circle().stroke(lightboxBorder, lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 14)
+
+                // Media Stage
+                ZStack {
+                    if let player {
+                        VideoPlayer(player: player)
+                            .aspectRatio(16 / 9, contentMode: .fit)
+                            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                            .padding(.horizontal, 14)
+                    } else if let img = previewImage ?? initialImage {
+                        ZStack(alignment: .bottom) {
+                            Image(uiImage: img)
+                                .resizable()
+                                .scaledToFit()
+                                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                .padding(.horizontal, 12)
+
+                            if isLoadingVideo {
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                        .tint(PhotoHubPalette.orange)
+                                        .scaleEffect(0.85)
+                                    Text("Loading video proxy…")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundColor(lightboxInk)
+                                }
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .background(lightboxCardBg.opacity(0.92), in: Capsule())
+                                .overlay(Capsule().stroke(lightboxBorder, lineWidth: 1))
+                                .padding(.bottom, 12)
                             }
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-                            .background(Color.black.opacity(0.7), in: Capsule())
-                            .padding(.bottom, 10)
+                        }
+                    } else if currentPhoto.isVideo && currentPhoto.needsProxy {
+                        VStack(spacing: 12) {
+                            SunnyMascotView(mood: .happy, size: 78)
+                            Text("No Video Proxy Yet")
+                                .font(.headline.weight(.bold))
+                                .foregroundColor(lightboxInk)
+                            Text("Tap Create Video Proxy below to generate a lightweight playable MP4 & thumbnail.")
+                                .font(.caption)
+                                .foregroundColor(lightboxMuted)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal, 28)
+                        }
+                    } else {
+                        VStack(spacing: 12) {
+                            SunnyMascotView(mood: .uploading, size: 74)
+                            Text("Loading preview…")
+                                .font(.caption.weight(.bold))
+                                .foregroundColor(lightboxMuted)
                         }
                     }
-                } else if currentPhoto.isVideo && currentPhoto.needsProxy {
-                    VStack(spacing: 10) {
-                        Image(systemName: "video.badge.plus")
-                            .font(.system(size: 52))
-                            .foregroundColor(.orange)
-                        Text("No compressed video proxy yet")
-                            .font(.headline)
-                        Text("Tap Create Compressed Proxy below to generate a small playable MP4 & thumbnail.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal)
-                    }
-                } else {
-                    ProgressView("Loading compressed proxy...")
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                 if let videoUnavailableNote {
                     Text(videoUnavailableNote)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundColor(PhotoHubPalette.warmAmber)
                         .multilineTextAlignment(.center)
-                        .padding(.horizontal)
+                        .padding(.horizontal, 20)
                 }
-
-                Spacer()
 
                 if isBusy && !busyLabel.isEmpty {
                     HStack(spacing: 8) {
                         ProgressView()
+                            .tint(PhotoHubPalette.orange)
+                            .scaleEffect(0.85)
                         Text(busyLabel)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .font(.caption.weight(.semibold))
+                            .foregroundColor(lightboxInk)
                     }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .background(lightboxCardBg, in: Capsule())
+                    .overlay(Capsule().stroke(PhotoHubPalette.orange.opacity(0.4), lineWidth: 1))
                 }
 
                 if let saveMessage {
                     Text(saveMessage)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(PhotoHubPalette.mint)
                         .multilineTextAlignment(.center)
-                        .padding(.horizontal)
+                        .padding(.horizontal, 20)
                 }
 
-                VStack(alignment: .leading, spacing: 10) {
+                // Frosted Dark Bottom Control Sheet (matches webpage `.lightbox-bottom`)
+                VStack(alignment: .leading, spacing: 11) {
                     let localVideoBytes: Int64? = {
                         guard let url = localVideoProxyURL,
                               let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
@@ -1648,136 +2246,182 @@ private struct ServerPhotoDetailView: View {
                     let previewBytes = localVideoBytes ?? dataBytes ?? currentPhoto.videoProxySize ?? currentPhoto.proxySize
                     let smallStr = previewBytes.map {
                         ByteCountFormatter.string(fromByteCount: $0, countStyle: .file)
-                    } ?? (currentPhoto.needsProxy ? "No Proxy" : "Proxy")
-                    let masterStr = ByteCountFormatter.string(fromByteCount: currentPhoto.size, countStyle: .file)
+                    }
 
-                    HStack(alignment: .center) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(
-                                currentPhoto.parsedCreationDate.map { Self.detailDateFormatter.string(from: $0) }
-                                ?? currentPhoto.originalName
-                            )
-                            .font(.subheadline.weight(.semibold))
-                            .lineLimit(1)
+                    // Pill Badges Row
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            if currentPhoto.isVideo {
+                                Text("Video")
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundColor(PhotoHubPalette.orange)
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 4)
+                                    .background(PhotoHubPalette.orange.opacity(0.18), in: Capsule())
+                            }
 
-                            Text("\(smallStr) proxy · \(masterStr) original")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            if isOriginalProtected {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "checkmark.shield.fill")
+                                        .font(.caption2)
+                                    Text("Protected Original")
+                                        .font(.caption2.weight(.bold))
+                                }
+                                .foregroundColor(PhotoHubPalette.mint)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 4)
+                                .background(PhotoHubPalette.mint.opacity(0.18), in: Capsule())
+                            }
+
+                            let proxyTint = currentPhoto.needsProxy ? PhotoHubPalette.warmAmber : PhotoHubPalette.mint
+                            Text(currentPhoto.needsProxy ? "Needs Proxy" : (smallStr.map { "Proxy \($0)" } ?? "Proxy Ready"))
+                                .font(.caption2.weight(.bold).monospacedDigit())
+                                .foregroundColor(proxyTint)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 4)
+                                .background(proxyTint.opacity(0.18), in: Capsule())
 
                             HStack(spacing: 4) {
-                                Image(systemName: "checkmark.shield.fill")
+                                Image(systemName: "checkmark.seal.fill")
                                     .font(.caption2)
-                                    .foregroundColor(.green)
-                                Text("SHA-256 verified (\(String(currentPhoto.hash.prefix(10)))…)")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundColor(PhotoHubPalette.mint)
+                                Text("SHA-256 \(String(currentPhoto.hash.prefix(8)))…")
+                                    .font(.caption2.weight(.semibold).monospacedDigit())
+                                    .foregroundColor(lightboxMuted)
                             }
-                        }
-
-                        Spacer()
-
-                        if isOriginalProtected {
-                            Text("Original Kept")
-                                .font(.caption2.weight(.semibold))
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(Color.blue.opacity(0.16), in: Capsule())
-                                .foregroundColor(.blue)
-                        }
-
-                        Text(currentPhoto.needsProxy ? "Needs Proxy" : "Proxy Ready")
-                            .font(.caption2.weight(.semibold))
-                            .padding(.horizontal, 8)
+                            .padding(.horizontal, 9)
                             .padding(.vertical, 4)
-                            .background(
-                                (currentPhoto.needsProxy ? Color.orange : Color.green).opacity(0.16),
-                                in: Capsule()
-                            )
-                            .foregroundColor(currentPhoto.needsProxy ? .orange : .green)
+                            .background(Color.white.opacity(0.08), in: Capsule())
+                        }
                     }
 
                     if isOriginalProtected {
                         HStack(spacing: 8) {
                             Image(systemName: "lock.shield.fill")
-                                .foregroundColor(.blue)
-                            Text("Restored original is protected from auto re-compression.")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
+                                .font(.caption)
+                                .foregroundColor(PhotoHubPalette.mint)
+                            Text("Protected from auto re-compression.")
+                                .font(.caption2.weight(.medium))
+                                .foregroundColor(lightboxMuted)
                             Spacer()
                             Button("Allow Re-Proxy") {
                                 Task { await updateOriginalProtection(false) }
                             }
-                            .font(.caption2.weight(.semibold))
+                            .font(.caption2.weight(.bold))
+                            .foregroundColor(PhotoHubPalette.orange)
                             .disabled(isBusy)
                         }
-                        .padding(8)
-                        .background(Color.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .background(PhotoHubPalette.mint.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
 
                     if needsProxyAction {
                         Button {
                             Task { await createProxyForCurrentItem() }
                         } label: {
-                            Label(currentPhoto.isVideo ? "Create Video Proxy" : "Create Proxy", systemImage: "wand.and.stars")
-                                .frame(maxWidth: .infinity)
+                            HStack(spacing: 6) {
+                                Image(systemName: "wand.and.stars")
+                                Text(currentPhoto.isVideo ? "Create Video Proxy" : "Create Proxy")
+                            }
+                            .font(.caption.weight(.bold))
+                            .foregroundColor(PhotoHubPalette.warmAmber)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(PhotoHubPalette.warmAmber.opacity(0.14), in: Capsule())
+                            .overlay(Capsule().stroke(PhotoHubPalette.warmAmber.opacity(0.38), lineWidth: 1))
                         }
-                        .buttonStyle(.bordered)
-                        .tint(.orange)
+                        .buttonStyle(.plain)
                         .disabled(isBusy)
                     }
 
+                    // Primary Sunset Gradient CTA (`Share Original`)
                     Button {
                         Task { await shareFullMasterOriginal() }
                     } label: {
-                        Label("Share Original", systemImage: "square.and.arrow.up")
-                            .frame(maxWidth: .infinity)
+                        HStack(spacing: 7) {
+                            Image(systemName: "square.and.arrow.up")
+                                .font(.subheadline.weight(.bold))
+                            Text("Share Original")
+                                .font(.subheadline.weight(.bold))
+                        }
+                        .foregroundColor(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .background(PhotoHubPalette.orangeGradient, in: Capsule())
+                        .shadow(color: PhotoHubPalette.orange.opacity(0.32), radius: 10, y: 4)
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.plain)
+                    .opacity(isBusy ? 0.5 : 1.0)
                     .disabled(isBusy)
 
-                    HStack(spacing: 12) {
+                    // Secondary Action Pills (`Save Proxy`, `Restore`, `Delete`)
+                    HStack(spacing: 8) {
                         Button {
                             Task { await saveCompressedProxyToPhotos() }
                         } label: {
-                            Label("Save Proxy", systemImage: currentPhoto.isVideo ? "video" : "photo")
-                                .frame(maxWidth: .infinity)
+                            HStack(spacing: 5) {
+                                Image(systemName: currentPhoto.isVideo ? "video" : "photo")
+                                    .font(.caption.weight(.bold))
+                                Text("Save Proxy")
+                                    .font(.caption.weight(.bold))
+                            }
+                            .foregroundColor(lightboxInk)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(Color.white.opacity(0.10), in: Capsule())
+                            .overlay(Capsule().stroke(lightboxBorder, lineWidth: 1))
                         }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(.plain)
+                        .opacity((isBusy || (!currentPhoto.isVideo && (compressedData ?? initialCompressedData) == nil && previewImage == nil)) ? 0.45 : 1.0)
                         .disabled(isBusy || (!currentPhoto.isVideo && (compressedData ?? initialCompressedData) == nil && previewImage == nil))
 
                         Button {
                             Task { await restoreFullMasterToPhotos() }
                         } label: {
-                            Label("Restore", systemImage: "arrow.down.circle")
-                                .frame(maxWidth: .infinity)
+                            HStack(spacing: 5) {
+                                Image(systemName: "arrow.down.circle")
+                                    .font(.caption.weight(.bold))
+                                Text("Restore")
+                                    .font(.caption.weight(.bold))
+                            }
+                            .foregroundColor(lightboxInk)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(Color.white.opacity(0.10), in: Capsule())
+                            .overlay(Capsule().stroke(lightboxBorder, lineWidth: 1))
                         }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(.plain)
+                        .opacity(isBusy ? 0.45 : 1.0)
+                        .disabled(isBusy)
+
+                        Button {
+                            showDeleteConfirm = true
+                        } label: {
+                            Image(systemName: "trash")
+                                .font(.caption.weight(.bold))
+                                .foregroundColor(PhotoHubPalette.rose)
+                                .frame(width: 44, height: 36)
+                                .background(PhotoHubPalette.rose.opacity(0.16), in: Capsule())
+                                .overlay(Capsule().stroke(PhotoHubPalette.rose.opacity(0.36), lineWidth: 1))
+                        }
+                        .buttonStyle(.plain)
+                        .opacity(isBusy ? 0.45 : 1.0)
                         .disabled(isBusy)
                     }
-
-                    Button(role: .destructive) {
-                        showDeleteConfirm = true
-                    } label: {
-                        Label("Delete from Server", systemImage: "trash")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(isBusy)
                 }
-                .padding()
-                .background(.ultraThinMaterial)
-                .cornerRadius(16)
-                .padding(.horizontal)
-                .padding(.bottom, 8)
+                .padding(14)
+                .background(lightboxCardBg.opacity(0.94), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(lightboxBorder, lineWidth: 1)
+                )
+                .padding(.horizontal, 12)
+                .padding(.bottom, 10)
             }
-            .navigationTitle(currentPhoto.originalName)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button("Close") { dismiss() }
-                }
-            }
-            .task {
+        }
+        .preferredColorScheme(.dark)
+        .task {
                 if previewImage == nil {
                     if let initialImage, let initialCompressedData {
                         previewImage = initialImage
@@ -1843,7 +2487,6 @@ private struct ServerPhotoDetailView: View {
                     "Permanently delete \(currentPhoto.originalName) (~\(masterStr)) and its compressed proxies from your PhotoHub server? This cannot be undone."
                 )
             }
-        }
     }
 
     private func createProxyForCurrentItem() async {

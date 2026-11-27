@@ -492,3 +492,82 @@ struct WarmStatPill: View {
         .background(tint.opacity(0.13), in: Capsule())
     }
 }
+
+// MARK: - Animated Warm Shimmer & Cloud Skeleton (Matched to Webpage UI)
+
+struct WarmShimmerView: View {
+    var cornerRadius: CGFloat = 12
+    @State private var phase: CGFloat = -1.0
+
+    var body: some View {
+        GeometryReader { geo in
+            let width = max(1, geo.size.width)
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .fill(PhotoHubPalette.softPeach)
+                .overlay(
+                    LinearGradient(
+                        colors: [
+                            Color.clear,
+                            PhotoHubPalette.orange.opacity(0.14),
+                            Color.white.opacity(0.28),
+                            PhotoHubPalette.orange.opacity(0.10),
+                            Color.clear
+                        ],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                    .frame(width: width * 1.4)
+                    .offset(x: phase * width * 1.4)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        }
+        .onAppear {
+            withAnimation(.linear(duration: 1.35).repeatForever(autoreverses: false)) {
+                phase = 1.0
+            }
+        }
+    }
+}
+
+struct CloudLoadingSkeletonView: View {
+    private let columns = [
+        GridItem(.flexible(), spacing: 6),
+        GridItem(.flexible(), spacing: 6),
+        GridItem(.flexible(), spacing: 6)
+    ]
+
+    var body: some View {
+        ScrollView(showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 16) {
+                VStack(spacing: 10) {
+                    SunnyMascotView(mood: .uploading, size: 92)
+                    Text("Waking up your cloud…")
+                        .font(.subheadline.weight(.bold))
+                        .foregroundColor(PhotoHubPalette.ink)
+                    Capsule()
+                        .fill(PhotoHubPalette.softPeach)
+                        .frame(width: 148, height: 5)
+                        .overlay(
+                            WarmShimmerView(cornerRadius: 99)
+                                .frame(height: 5)
+                        )
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+
+                WarmShimmerView(cornerRadius: 8)
+                    .frame(width: 132, height: 18)
+
+                LazyVGrid(columns: columns, spacing: 6) {
+                    ForEach(0..<12, id: \.self) { _ in
+                        WarmShimmerView(cornerRadius: 12)
+                            .aspectRatio(1, contentMode: .fit)
+                    }
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 8)
+            .padding(.bottom, 24)
+        }
+    }
+}
