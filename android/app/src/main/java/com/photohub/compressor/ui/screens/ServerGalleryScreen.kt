@@ -565,9 +565,12 @@ fun ServerGalleryScreen(
                                             val normHash = photo.hash.lowercase(Locale.ROOT)
                                             val isSelected = normHash in uiState.selectedHashes
                                             val restoredOrProtected = uiState.isRestoredOrProtected(photo)
+                                            val thumbBitmap = remember(photo.hash, uiState.thumbnailCacheVersion) {
+                                                viewModel.getCachedThumbnail(photo.hash)
+                                            }
                                             ServerThumbnailCell(
                                                 photo = photo,
-                                                bitmap = uiState.imageCache[photo.hash],
+                                                bitmap = thumbBitmap,
                                                 showPlaceholder = (photo.hash in uiState.failedPreviewHashes) || (photo.isVideo && photo.needsProxy),
                                                 isSelectionMode = uiState.isSelectionMode,
                                                 isSelected = isSelected,

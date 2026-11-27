@@ -17,6 +17,8 @@
  */
 
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 const { getConfig } = require('./config/env');
 const {
   resolveSessionSecret,
@@ -70,6 +72,7 @@ async function createApp(configOverrides = {}) {
   app.locals.config = config;
   app.locals.hashIndex = contextService.defaultHashIndex;
   app.locals.folderContexts = contextService.folderContexts;
+  app.locals.flushAllIndexes = contextService.flushAllIndexes;
   app.locals.sessionSecret = sessionSecret;
 
   // Middleware: parsers transform incoming bytes into `req.body` or `req.files`
@@ -107,6 +110,59 @@ async function createApp(configOverrides = {}) {
     photoController: createPhotoController({ config }),
     adminController: createAdminController({ config, contextService, userDirectory, nodeAllocationService }),
   };
+
+  // Allow browser web gallery sessions on gateway/storage-node origins to call `/api/*` cleanly
+  const allowedOrigins = new Set();
+  const tryAddOrigin = (rawUrl) => {
+    if (!rawUrl) return;
+    try {
+      allowedOrigins.add(new URL(rawUrl).origin);
+    } catch {
+      // ignore invalid URL
+    }
+  };
+  tryAddOrigin(config.publicUrl);
+  for (const node of config.storageNodes || []) {
+    tryAddOrigin(node && node.url);
+  }
+  app.use('/api', (req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin && (allowedOrigins.size === 0 || allowedOrigins.has(origin))) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Authorization,Content-Type,X-API-Key,If-None-Match');
+      res.setHeader('Access-Control-Expose-Headers', 'ETag,X-Photo-Variant,X-Master-Sha256,Content-Disposition');
+      if (req.method === 'OPTIONS') {
+        return res.status(204).end();
+      }
+    }
+    return next();
+  });
+
+  // Mount web frontend (landing showcase + responsive authenticated photo gallery)
+  const webDir = path.join(__dirname, 'views', 'web');
+  const webIndexPath = path.join(webDir, 'index.html');
+  app.use(
+    '/web',
+    express.static(webDir, {
+      dotfiles: 'ignore',
+      maxAge: '1h',
+      index: false,
+    })
+  );
+  const googleVerifyFile = path.join(__dirname, '..', 'google9fbaf3843fb871e7.html');
+  app.get('/google9fbaf3843fb871e7.html', (req, res, next) => {
+    if (fs.existsSync(googleVerifyFile)) {
+      return res.sendFile(googleVerifyFile);
+    }
+    return next();
+  });
+  const sendWebApp = (req, res) => res.sendFile(webIndexPath, { dotfiles: 'allow' });
+  app.get('/', sendWebApp);
+  app.get('/auth/callback', sendWebApp);
+  app.get('/gallery', sendWebApp);
+  app.get('/about', sendWebApp);
 
   // Mount all `/api/*` routes, `/admin` web page, and register errorMiddleware LAST (Express error-handler rule)
   app.get('/admin', controllers.adminController.getDashboardPage);

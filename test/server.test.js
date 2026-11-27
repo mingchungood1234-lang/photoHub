@@ -19,6 +19,9 @@ async function startTestServer(extraOverrides = {}) {
     dataDir,
     apiKey: '',
     userKeys: '',
+    googleClientId: '',
+    googleClientSecret: '',
+    requireAuth: false,
     ...extraOverrides,
   });
 
@@ -1951,6 +1954,134 @@ test('Streaming raw upload handles duplicate check, strict checksum rejection, a
 
     const rootEntries = await fsp.readdir(ctx.storageDir);
     assert.equal(rootEntries.some((n) => n.includes('.tmp')), false);
+  } finally {
+    await ctx.cleanup();
+  }
+});
+
+test('GET /api/photos returns ETag, serves 304 Not Modified when unchanged, and invalidates after mutation', async () => {
+  const ctx = await startTestServer();
+  try {
+    const first = await ctx.request('/api/photos?limit=50&offset=0');
+    assert.equal(first.status, 200);
+    const etag1 = first.headers.etag;
+    assert.ok(etag1 && etag1.startsWith('W/"v'), `Expected weak ETag, got ${etag1}`);
+
+    const notModified = await ctx.request('/api/photos?limit=50&offset=0', {
+      headers: { 'If-None-Match': etag1 },
+    });
+    assert.equal(notModified.status, 304);
+    assert.equal(notModified.buffer.length, 0);
+
+    // Upload a new photo and confirm ETag changes and 200 is returned with updated total
+    const payload = Buffer.from('etag-invalidation-test-photo-bytes');
+    const sha = crypto.createHash('sha256').update(payload).digest('hex');
+    const up = await ctx.request('/api/upload', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'image/jpeg',
+        'X-File-Name': 'ETAG_1.JPG',
+        'X-File-Sha256': sha,
+      },
+      body: payload,
+    });
+    assert.equal(up.status, 200);
+
+    const second = await ctx.request('/api/photos?limit=50&offset=0', {
+      headers: { 'If-None-Match': etag1 },
+    });
+    assert.equal(second.status, 200);
+    const etag2 = second.headers.etag;
+    assert.notEqual(etag2, etag1);
+    const body2 = await second.json();
+    assert.equal(body2.total, 1);
+
+    // Confirm compact JSON index on disk (no pretty-print indentation bloat)
+    const rawIndex = await fsp.readFile(path.join(ctx.dataDir, 'hash-index.json'), 'utf8');
+    assert.equal(rawIndex.includes('\n  '), false);
+  } finally {
+    await ctx.cleanup();
+  }
+});
+
+test('Web frontend assets serve cleanly and Google PKCE allows same-origin web callback while blocking open redirects', async () => {
+  const ctx = await startTestServer({
+    googleClientId: 'web-test-client-id',
+    googleClientSecret: 'web-test-secret',
+    publicUrl: 'https://photohub.example.com',
+    exchangeGoogleCodeForProfile: async () => ({
+      sub: 'web-google-sub-1',
+      email: 'webuser@example.com',
+      name: 'Sunny Web',
+    }),
+  });
+  try {
+    const home = await ctx.request('/');
+    assert.equal(home.status, 200);
+    assert.ok(home.buffer.toString('utf8').includes('id="splashLoader"'));
+
+    const css = await ctx.request('/web/styles.css');
+    assert.equal(css.status, 200);
+    assert.ok(String(css.headers['content-type'] || '').includes('text/css'));
+
+    const js = await ctx.request('/web/app.js');
+    assert.equal(js.status, 200);
+    assert.ok(String(js.headers['content-type'] || '').includes('javascript'));
+
+    const icon = await ctx.request('/web/icon.png');
+    assert.equal(icon.status, 200);
+    assert.ok(icon.buffer.length > 1000);
+
+    const cfgRes = await ctx.request('/api/auth/config');
+    assert.equal(cfgRes.status, 200);
+    const cfg = await cfgRes.json();
+    assert.equal(cfg.googleEnabled, true);
+    assert.equal(cfg.authRequired, true);
+
+    const verifier = 'web-pkce-verifier-0123456789abcdefghijklmnopqrstuvwxyz';
+    const challenge = crypto
+      .createHash('sha256')
+      .update(verifier)
+      .digest('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+
+    // Reject cross-origin redirect URI
+    const evilRes = await ctx.request(
+      `/api/auth/google/start?code_challenge=${encodeURIComponent(challenge)}&redirect_uri=${encodeURIComponent('https://evil.attacker.com/auth/callback')}`
+    );
+    assert.equal(evilRes.status, 400);
+
+    // Accept same-origin web redirect URI & complete PKCE exchange
+    const startRes = await ctx.request(
+      `/api/auth/google/start?code_challenge=${encodeURIComponent(challenge)}&redirect_uri=${encodeURIComponent('https://photohub.example.com/auth/callback')}`
+    );
+    assert.equal(startRes.status, 302);
+    const googleUrl = new URL(startRes.headers.location);
+    const state = googleUrl.searchParams.get('state');
+    assert.ok(state);
+
+    const cbRes = await ctx.request(
+      `/api/auth/google/callback?code=mock_web_code&state=${encodeURIComponent(state)}`
+    );
+    assert.equal(cbRes.status, 302);
+    const webRedirect = new URL(cbRes.headers.location);
+    assert.equal(webRedirect.origin, 'https://photohub.example.com');
+    assert.equal(webRedirect.pathname, '/auth/callback');
+    const oneTimeCode = webRedirect.searchParams.get('code');
+    assert.ok(oneTimeCode);
+
+    const exRes = await ctx.request('/api/auth/exchange', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: oneTimeCode, codeVerifier: verifier }),
+    });
+    assert.equal(exRes.status, 200);
+    const exBody = await exRes.json();
+    assert.equal(exBody.success, true);
+    assert.ok(exBody.token);
+    assert.equal(exBody.user.email, 'webuser@example.com');
   } finally {
     await ctx.cleanup();
   }

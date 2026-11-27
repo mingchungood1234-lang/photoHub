@@ -55,8 +55,7 @@ struct ServerGalleryView: View {
     @State private var isLoading: Bool = false
     @State private var errorMessage: String?
     @State private var selectedPhoto: ServerPhoto?
-    @State private var imageCache: [String: UIImage] = [:]
-    @State private var compressedDataCache: [String: Data] = [:]
+    @State private var thumbCacheRevision: Int = 0
     @State private var failedPreviewHashes: Set<String> = []
     @State private var filterMode: ServerGalleryFilter = .all
     @State private var mediaTypeFilter: ServerMediaTypeFilter = .all
@@ -256,9 +255,10 @@ struct ServerGalleryView: View {
                                                             let norm = photo.hash.lowercased()
                                                             let isSelected = selectedPhotoHashes.contains(norm)
                                                             let protectedOrRestored = isRestoredOrProtected(photo)
+                                                            let _ = thumbCacheRevision
                                                             ServerThumbnailCell(
                                                                 photo: photo,
-                                                                image: imageCache[photo.hash],
+                                                                image: ThumbnailMemoryCache.shared.image(forHash: photo.hash),
                                                                 showPlaceholder: failedPreviewHashes.contains(photo.hash) || (photo.isVideo && photo.needsProxy),
                                                                 isSelectionMode: isSelectionMode,
                                                                 isSelected: isSelected,
@@ -412,11 +412,14 @@ struct ServerGalleryView: View {
                 loadFromLocalStore()
             }
             .sheet(item: $selectedPhoto) { photo in
+                let cachedPreviewData = LocalProxyStore.shared.previewData(forHash: photo.hash)
+                let initialDetailImage = cachedPreviewData.flatMap { UIImage(data: $0) }
+                    ?? ThumbnailMemoryCache.shared.image(forHash: photo.hash)
                 ServerPhotoDetailView(
                     photo: photo,
                     settings: settings,
-                    initialImage: imageCache[photo.hash],
-                    initialCompressedData: compressedDataCache[photo.hash],
+                    initialImage: initialDetailImage,
+                    initialCompressedData: cachedPreviewData,
                     onPhotoUpdated: { updated in
                         applyUpdatedPhoto(updated)
                     },
@@ -731,12 +734,8 @@ struct ServerGalleryView: View {
         guard !removedSet.isEmpty else { return }
 
         photos.removeAll { removedSet.contains($0.hash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) }
-        for key in Array(imageCache.keys) where removedSet.contains(key.lowercased()) {
-            imageCache.removeValue(forKey: key)
-        }
-        for key in Array(compressedDataCache.keys) where removedSet.contains(key.lowercased()) {
-            compressedDataCache.removeValue(forKey: key)
-        }
+        ThumbnailMemoryCache.shared.remove(hashes: removedSet)
+        thumbCacheRevision &+= 1
         failedPreviewHashes = failedPreviewHashes.filter { !removedSet.contains($0.lowercased()) }
         selectedPhotoHashes = selectedPhotoHashes.filter { !removedSet.contains($0.lowercased()) }
         refreshLocallyProtectedHashes()
@@ -1081,10 +1080,15 @@ struct ServerGalleryView: View {
         }
         refreshLocallyProtectedHashes()
         failedPreviewHashes.remove(updated.hash)
-        if let data = LocalProxyStore.shared.previewData(forHash: updated.hash),
-           let img = UIImage(data: data) {
-            imageCache[updated.hash] = img
-            compressedDataCache[updated.hash] = data
+        let targetHash = updated.hash
+        Task.detached(priority: .utility) {
+            if let data = LocalProxyStore.shared.previewData(forHash: targetHash),
+               let thumb = ThumbnailMemoryCache.decodeGridThumbnail(from: data, maxPixelSize: 360) {
+                ThumbnailMemoryCache.shared.setImage(thumb, forHash: targetHash)
+                await MainActor.run {
+                    thumbCacheRevision &+= 1
+                }
+            }
         }
     }
 
@@ -1098,14 +1102,9 @@ struct ServerGalleryView: View {
             refreshLocallyProtectedHashes()
             rebuildTimeline()
         }
-        for photo in cached {
-            if imageCache[photo.hash] == nil,
-               let data = LocalProxyStore.shared.previewData(forHash: photo.hash),
-               let img = UIImage(data: data) {
-                imageCache[photo.hash] = img
-                compressedDataCache[photo.hash] = data
-            }
-        }
+        // Grid cells decode 360px thumbnails lazily off the main thread via ThumbnailMemoryCache
+        // so opening huge libraries stays instant and memory-bounded (~64 MB cap).
+        thumbCacheRevision &+= 1
     }
 
     private func loadPhotos() async {
@@ -1136,31 +1135,45 @@ struct ServerGalleryView: View {
     }
 
     private func loadCompressedPreviewIfNeeded(for photo: ServerPhoto) async {
-        guard imageCache[photo.hash] == nil else { return }
+        guard ThumbnailMemoryCache.shared.image(forHash: photo.hash) == nil else { return }
 
-        if let cachedData = LocalProxyStore.shared.previewData(forHash: photo.hash),
-           let cachedImg = UIImage(data: cachedData) {
-            imageCache[photo.hash] = cachedImg
-            compressedDataCache[photo.hash] = cachedData
-            failedPreviewHashes.remove(photo.hash)
+        let targetHash = photo.hash
+        let decodedLocal: UIImage? = await Task.detached(priority: .utility) {
+            guard let cachedData = LocalProxyStore.shared.previewData(forHash: targetHash) else {
+                return nil
+            }
+            return ThumbnailMemoryCache.decodeGridThumbnail(from: cachedData, maxPixelSize: 360)
+        }.value
+
+        if let decodedLocal {
+            ThumbnailMemoryCache.shared.setImage(decodedLocal, forHash: targetHash)
+            failedPreviewHashes.remove(targetHash)
+            thumbCacheRevision &+= 1
             return
         }
 
         // Un-proxied videos do not have a server preview image yet; avoid pulling gigabytes of video via /preview.
         if photo.isVideo && photo.needsProxy {
-            failedPreviewHashes.insert(photo.hash)
+            failedPreviewHashes.insert(targetHash)
             return
         }
 
         let client = PhotoHubAPIClient(settings: settings)
-        if let rawData = try? await client.downloadPhotoPreviewData(hash: photo.hash),
-           let (smallImage, smallData) = LocalProxyStore.shared.cacheDownloadedPreview(rawData, forHash: photo.hash) {
-            imageCache[photo.hash] = smallImage
-            compressedDataCache[photo.hash] = smallData
-            failedPreviewHashes.remove(photo.hash)
-        } else {
-            failedPreviewHashes.insert(photo.hash)
+        if let rawData = try? await client.downloadPhotoPreviewData(hash: targetHash) {
+            let thumb: UIImage? = await Task.detached(priority: .utility) {
+                guard let (_, smallData) = LocalProxyStore.shared.cacheDownloadedPreview(rawData, forHash: targetHash) else {
+                    return nil
+                }
+                return ThumbnailMemoryCache.decodeGridThumbnail(from: smallData, maxPixelSize: 360)
+            }.value
+            if let thumb {
+                ThumbnailMemoryCache.shared.setImage(thumb, forHash: targetHash)
+                failedPreviewHashes.remove(targetHash)
+                thumbCacheRevision &+= 1
+                return
+            }
         }
+        failedPreviewHashes.insert(targetHash)
     }
 }
 

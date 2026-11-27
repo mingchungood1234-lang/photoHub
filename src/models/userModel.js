@@ -127,11 +127,23 @@ function verifyPkceCodeChallenge(codeVerifier, expectedChallenge) {
   return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
 }
 
-function isAllowedAppRedirectUri(rawUri) {
+function isAllowedAppRedirectUri(rawUri, allowedWebOrigin = null) {
   if (!rawUri || typeof rawUri !== 'string') return false;
   try {
     const u = new URL(rawUri);
-    return u.protocol === 'photohub:' && u.hostname === 'auth';
+    if (u.protocol === 'photohub:' && u.hostname === 'auth') {
+      return true;
+    }
+    if (allowedWebOrigin && (u.protocol === 'http:' || u.protocol === 'https:')) {
+      const expected = new URL(allowedWebOrigin);
+      if (
+        u.origin === expected.origin &&
+        (u.pathname === '/' || u.pathname === '/auth/callback')
+      ) {
+        return true;
+      }
+    }
+    return false;
   } catch {
     return false;
   }

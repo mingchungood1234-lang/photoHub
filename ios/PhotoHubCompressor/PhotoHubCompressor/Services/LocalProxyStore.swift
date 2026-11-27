@@ -7,16 +7,86 @@ extension Notification.Name {
     static let localProxyStoreDidChange = Notification.Name("PhotoHubLocalProxyStoreDidChange")
 }
 
+/// Process-wide bounded LRU memory cache for decoded Cloud gallery grid thumbnails.
+/// Automatically evicts entries under iOS memory pressure and keeps grid RAM under ~64 MB
+/// even for multi-thousand-photo libraries.
+final class ThumbnailMemoryCache {
+    static let shared = ThumbnailMemoryCache()
+
+    private let cache = NSCache<NSString, UIImage>()
+    private var memoryWarningObserver: NSObjectProtocol?
+
+    private init() {
+        cache.countLimit = 260
+        cache.totalCostLimit = 64 * 1024 * 1024 // 64 MB
+        memoryWarningObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.removeAll()
+        }
+    }
+
+    func image(forHash hash: String) -> UIImage? {
+        cache.object(forKey: hash.lowercased() as NSString)
+    }
+
+    func setImage(_ image: UIImage, forHash hash: String) {
+        let pxW = Int(image.size.width * image.scale)
+        let pxH = Int(image.size.height * image.scale)
+        let cost = max(1, pxW * pxH * 4)
+        cache.setObject(image, forKey: hash.lowercased() as NSString, cost: cost)
+    }
+
+    func remove(hashes: Set<String>) {
+        for h in hashes {
+            cache.removeObject(forKey: h.lowercased() as NSString)
+        }
+    }
+
+    func removeAll() {
+        cache.removeAllObjects()
+    }
+
+    /// Decodes a compact display-ready thumbnail (default 360px) off the main thread using ImageIO
+    /// without allocating a full-resolution backing bitmap in RAM.
+    static func decodeGridThumbnail(from data: Data, maxPixelSize: Int = 360) -> UIImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+            return UIImage(data: data)
+        }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+        ]
+        guard let cgImg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+            return UIImage(data: data)
+        }
+        return UIImage(cgImage: cgImg)
+    }
+}
+
 /// Persistent local store for server gallery index, compressed image/poster previews, and compressed MP4 video proxies.
 /// Stored under Application Support (excluded from iCloud backup) so compressed proxies load immediately without network fetches.
 final class LocalProxyStore {
     static let shared = LocalProxyStore()
+
+    private static let maxDiskCacheBytes: Int64 = 600 * 1024 * 1024 // 600 MB LRU cap
+    private static let trimTargetDiskBytes: Int64 = 480 * 1024 * 1024
 
     private let lock = NSLock()
     private let fm = FileManager.default
     private let rootDir: URL
     private let previewsDir: URL
     private let videosDir: URL
+    private let ioQueue = DispatchQueue(label: "photohub.localProxyStore.io", qos: .utility)
+
+    private var indexMemoryCache: [String: [ServerPhoto]] = [:]
+    private var pendingIndexFlushItems: [String: DispatchWorkItem] = [:]
+    private var cacheWriteCounter: Int = 0
+    private var isTrimmingDiskCache: Bool = false
 
     private init() {
         let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -59,23 +129,55 @@ final class LocalProxyStore {
         videosDir.appendingPathComponent("\(safeHash(hash)).mp4")
     }
 
-    // MARK: - Server Photo Index
+    // MARK: - Server Photo Index (In-Memory Cached + Debounced Atomic Disk Persistence)
+
+    private func loadIndexLocked(url: URL) -> [ServerPhoto] {
+        let key = url.path
+        if let cached = indexMemoryCache[key] {
+            return cached
+        }
+        guard let data = try? Data(contentsOf: url),
+              let decoded = try? JSONDecoder().decode([ServerPhoto].self, from: data) else {
+            return []
+        }
+        indexMemoryCache[key] = decoded
+        return decoded
+    }
+
+    private func scheduleIndexFlushLocked(url: URL, immediate: Bool = false) {
+        let key = url.path
+        pendingIndexFlushItems[key]?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let snapshot = self.indexMemoryCache[key]
+            self.pendingIndexFlushItems.removeValue(forKey: key)
+            self.ensureDirectoriesExistLocked()
+            self.lock.unlock()
+            guard let snapshot, let encoded = try? JSONEncoder().encode(snapshot) else { return }
+            try? encoded.write(to: url, options: .atomic)
+        }
+        pendingIndexFlushItems[key] = work
+        if immediate {
+            ioQueue.async(execute: work)
+        } else {
+            ioQueue.asyncAfter(deadline: .now() + 0.35, execute: work)
+        }
+    }
 
     func cachedPhotos(baseURL: URL?, apiKey: String) -> [ServerPhoto] {
         lock.lock()
         defer { lock.unlock() }
         let url = indexFileURL(baseURL: baseURL, apiKey: apiKey)
-        guard let data = try? Data(contentsOf: url) else { return [] }
-        return (try? JSONDecoder().decode([ServerPhoto].self, from: data)) ?? []
+        return loadIndexLocked(url: url)
     }
 
     func savePhotos(_ photos: [ServerPhoto], baseURL: URL?, apiKey: String) {
         lock.lock()
         ensureDirectoriesExistLocked()
         let url = indexFileURL(baseURL: baseURL, apiKey: apiKey)
-        if let encoded = try? JSONEncoder().encode(photos) {
-            try? encoded.write(to: url, options: .atomic)
-        }
+        indexMemoryCache[url.path] = photos
+        scheduleIndexFlushLocked(url: url, immediate: true)
         lock.unlock()
     }
 
@@ -108,15 +210,16 @@ final class LocalProxyStore {
         )
         guard !targetSet.isEmpty else { return }
 
+        ThumbnailMemoryCache.shared.remove(hashes: targetSet)
+
         lock.lock()
         ensureDirectoriesExistLocked()
         let url = indexFileURL(baseURL: baseURL, apiKey: apiKey)
-        if let existingData = try? Data(contentsOf: url),
-           var decoded = try? JSONDecoder().decode([ServerPhoto].self, from: existingData) {
+        var decoded = loadIndexLocked(url: url)
+        if !decoded.isEmpty {
             decoded.removeAll { targetSet.contains($0.hash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) }
-            if let encoded = try? JSONEncoder().encode(decoded) {
-                try? encoded.write(to: url, options: .atomic)
-            }
+            indexMemoryCache[url.path] = decoded
+            scheduleIndexFlushLocked(url: url, immediate: true)
         }
         for hash in targetSet {
             try? fm.removeItem(at: previewFileURL(forHash: hash))
@@ -140,15 +243,10 @@ final class LocalProxyStore {
         lock.lock()
         ensureDirectoriesExistLocked()
         let url = indexFileURL(baseURL: baseURL, apiKey: apiKey)
-        var current: [ServerPhoto] = []
-        if let existingData = try? Data(contentsOf: url),
-           let decoded = try? JSONDecoder().decode([ServerPhoto].self, from: existingData) {
-            current = decoded
-        }
+        var current = loadIndexLocked(url: url)
         transform(&current)
-        if let encoded = try? JSONEncoder().encode(current) {
-            try? encoded.write(to: url, options: .atomic)
-        }
+        indexMemoryCache[url.path] = current
+        scheduleIndexFlushLocked(url: url, immediate: false)
         lock.unlock()
 
         if notify {
@@ -177,7 +275,13 @@ final class LocalProxyStore {
         ensureDirectoriesExistLocked()
         let dest = previewFileURL(forHash: hash)
         try? data.write(to: dest, options: .atomic)
+        cacheWriteCounter += 1
+        let shouldTrim = (cacheWriteCounter % 32 == 0) && !isTrimmingDiskCache
+        if shouldTrim { isTrimmingDiskCache = true }
         lock.unlock()
+        if shouldTrim {
+            scheduleDiskCacheTrim()
+        }
     }
 
     func copyPreviewFile(from sourceURL: URL, forHash hash: String) {
@@ -261,13 +365,55 @@ final class LocalProxyStore {
         ensureDirectoriesExistLocked()
         let dest = videoFileURL(forHash: hash)
         try? fm.removeItem(at: dest)
+        var shouldTrim = false
         do {
             try fm.copyItem(at: sourceURL, to: dest)
+            cacheWriteCounter += 1
+            if !isTrimmingDiskCache {
+                isTrimmingDiskCache = true
+                shouldTrim = true
+            }
             lock.unlock()
+            if shouldTrim { scheduleDiskCacheTrim() }
             return dest
         } catch {
             lock.unlock()
             return nil
+        }
+    }
+
+    private func scheduleDiskCacheTrim() {
+        ioQueue.async { [weak self] in
+            guard let self else { return }
+            defer {
+                self.lock.lock()
+                self.isTrimmingDiskCache = false
+                self.lock.unlock()
+            }
+            var entries: [(url: URL, size: Int64, mtime: Date)] = []
+            var totalBytes: Int64 = 0
+            for dir in [self.previewsDir, self.videosDir] {
+                guard let urls = try? self.fm.contentsOfDirectory(
+                    at: dir,
+                    includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey],
+                    options: [.skipsHiddenFiles]
+                ) else { continue }
+                for url in urls {
+                    guard let vals = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]),
+                          vals.isRegularFile == true,
+                          let size = vals.fileSize else { continue }
+                    let sz = Int64(size)
+                    totalBytes += sz
+                    entries.append((url, sz, vals.contentModificationDate ?? .distantPast))
+                }
+            }
+            guard totalBytes > Self.maxDiskCacheBytes else { return }
+            entries.sort { $0.mtime < $1.mtime }
+            for entry in entries where totalBytes > Self.trimTargetDiskBytes {
+                if (try? self.fm.removeItem(at: entry.url)) != nil {
+                    totalBytes -= entry.size
+                }
+            }
         }
     }
 
@@ -312,7 +458,11 @@ final class LocalProxyStore {
     }
 
     func clearAll() {
+        ThumbnailMemoryCache.shared.removeAll()
         lock.lock()
+        for item in pendingIndexFlushItems.values { item.cancel() }
+        pendingIndexFlushItems.removeAll()
+        indexMemoryCache.removeAll()
         try? fm.removeItem(at: rootDir)
         ensureDirectoriesExistLocked()
         lock.unlock()

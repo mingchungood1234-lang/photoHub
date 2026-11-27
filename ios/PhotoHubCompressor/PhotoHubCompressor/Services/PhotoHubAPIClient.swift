@@ -505,37 +505,73 @@ final class PhotoHubAPIClient {
         return try JSONDecoder().decode(WhoAmIResponse.self, from: data)
     }
 
+    private static let photosETagLock = NSLock()
+    private static var photosETagByScope: [String: (etag: String, count: Int)] = [:]
+
+    private func photosCacheScopeKey() -> String {
+        "\(settings.normalizedBaseURL?.absoluteString ?? "none")|\(settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines))"
+    }
+
     func fetchServerPhotos(limit: Int = 500, offset: Int = 0, sync: Bool = false) async throws -> [ServerPhoto] {
-        let page = try await fetchServerPhotosPage(limit: limit, offset: offset, sync: sync)
-        return page.photos
+        let (page, _) = try await fetchServerPhotosPage(limit: limit, offset: offset, sync: sync)
+        return page?.photos ?? []
     }
 
     func fetchAllServerPhotos(sync: Bool = true) async throws -> [ServerPhoto] {
+        let scopeKey = photosCacheScopeKey()
+        let cachedLocal = LocalProxyStore.shared.cachedPhotos(
+            baseURL: settings.normalizedBaseURL,
+            apiKey: settings.apiKey
+        )
+        Self.photosETagLock.lock()
+        let savedEntry = Self.photosETagByScope[scopeKey]
+        Self.photosETagLock.unlock()
+
+        let conditionalETag: String? = (savedEntry != nil && !cachedLocal.isEmpty && savedEntry?.count == cachedLocal.count)
+            ? savedEntry?.etag
+            : nil
+
         var collected: [ServerPhoto] = []
         var seenHashes = Set<String>()
         var offset = 0
         let pageSize = 500
+        var firstPageETag: String?
 
         while true {
-            let page = try await fetchServerPhotosPage(
+            let (page, responseETag) = try await fetchServerPhotosPage(
                 limit: pageSize,
                 offset: offset,
-                sync: sync && offset == 0
+                sync: sync && offset == 0,
+                ifNoneMatch: offset == 0 ? conditionalETag : nil
             )
-            for item in page.photos {
+            if page == nil {
+                // 304 Not Modified: gallery index hasn't changed on the server.
+                return cachedLocal
+            }
+            if offset == 0 {
+                firstPageETag = responseETag
+            }
+            let resolvedPage = page!
+            for item in resolvedPage.photos {
                 let key = item.hash.lowercased()
                 if seenHashes.insert(key).inserted {
                     collected.append(item)
                 }
             }
-            if page.photos.isEmpty {
+            if resolvedPage.photos.isEmpty {
                 break
             }
-            offset += page.photos.count
-            let serverHasMore = page.hasMore ?? (offset < page.total)
-            if !serverHasMore || offset >= page.total {
+            offset += resolvedPage.photos.count
+            let serverHasMore = resolvedPage.hasMore ?? (offset < resolvedPage.total)
+            if !serverHasMore || offset >= resolvedPage.total {
                 break
             }
+        }
+
+        if let firstPageETag, !firstPageETag.isEmpty {
+            Self.photosETagLock.lock()
+            Self.photosETagByScope[scopeKey] = (firstPageETag, collected.count)
+            Self.photosETagLock.unlock()
         }
         return collected
     }
@@ -547,7 +583,8 @@ final class PhotoHubAPIClient {
             .filter { $0.isHexDigit }
         guard cleanPrefix.count >= 8 else { return nil }
 
-        let page = try await fetchServerPhotosPage(limit: 50, offset: 0, sync: false, prefix: cleanPrefix)
+        let (pageOpt, _) = try await fetchServerPhotosPage(limit: 50, offset: 0, sync: false, prefix: cleanPrefix)
+        guard let page = pageOpt else { return nil }
         if let direct = page.photos.first(where: { $0.hash.lowercased().hasPrefix(cleanPrefix) }) {
             return direct
         }
@@ -563,8 +600,9 @@ final class PhotoHubAPIClient {
         limit: Int,
         offset: Int,
         sync: Bool,
-        prefix: String? = nil
-    ) async throws -> ServerPhotosResponse {
+        prefix: String? = nil,
+        ifNoneMatch: String? = nil
+    ) async throws -> (ServerPhotosResponse?, String?) {
         var components = URLComponents(url: try makeURL("/api/photos"), resolvingAgainstBaseURL: false)
         var queryItems = [
             URLQueryItem(name: "limit", value: String(limit)),
@@ -583,10 +621,18 @@ final class PhotoHubAPIClient {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         applyAuth(to: &request)
+        if let ifNoneMatch, !ifNoneMatch.isEmpty {
+            request.setValue(ifNoneMatch, forHTTPHeaderField: "If-None-Match")
+        }
 
         let (data, response) = try await pooledSession.data(for: request)
+        if let http = response as? HTTPURLResponse, http.statusCode == 304 {
+            return (nil, http.value(forHTTPHeaderField: "ETag"))
+        }
         try validateHTTP(response: response, data: data)
-        return try JSONDecoder().decode(ServerPhotosResponse.self, from: data)
+        let etag = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "ETag")
+        let decoded = try JSONDecoder().decode(ServerPhotosResponse.self, from: data)
+        return (decoded, etag)
     }
 
     /// Generates a proxy on-demand: tries fast server-side compression (`POST /api/proxy/generate`) first

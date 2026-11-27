@@ -577,6 +577,13 @@ function createContextService(config, { userDirectory = null } = {}) {
     return rescanned;
   }
 
+  async function flushAllIndexes() {
+    await defaultHashIndex.flush().catch(() => {});
+    for (const ctx of folderContexts.values()) {
+      await ctx.hashIndex.flush().catch(() => {});
+    }
+  }
+
   return {
     defaultHashIndex,
     folderContexts,
@@ -591,6 +598,7 @@ function createContextService(config, { userDirectory = null } = {}) {
     checkNewUserSignupCapacity,
     assertDiskFreeForUpload,
     rescanFolders,
+    flushAllIndexes,
   };
 }
 

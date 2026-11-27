@@ -24,6 +24,7 @@ const {
   isAllowedAppRedirectUri,
   selectNodeForUser,
 } = require('../models/userModel');
+const { isS3Configured } = require('../services/s3Service');
 
 function createAuthController({
   config,
@@ -36,9 +37,17 @@ function createAuthController({
 }) {
   return {
     getConfig(req, res) {
+      const googleEnabled = Boolean(config.googleClientId && config.googleClientSecret);
+      const apiKeyEnabled = Boolean(config.userKeyMap.size > 0 || config.apiKey);
+      const authRequired = Boolean(
+        apiKeyEnabled || Boolean(config.googleClientId) || config.requireAuth
+      );
       return res.json({
         success: true,
-        googleEnabled: Boolean(config.googleClientId && config.googleClientSecret),
+        googleEnabled,
+        apiKeyEnabled,
+        authRequired,
+        s3Enabled: isS3Configured(config.s3),
         hasStorageNodes: config.storageNodes.length > 0,
         nodeCount: config.storageNodes.length || 1,
         nodeAllocationMode: config.nodeAllocationMode || 'ordered',
@@ -58,15 +67,15 @@ function createAuthController({
       const redirectUri = String(
         req.query.redirect_uri || 'photohub://auth/callback'
       ).trim();
+      const baseUrl = contextService.resolveRequestBaseUrl(req);
 
-      if (!codeChallenge || codeChallenge.length < 32 || !isAllowedAppRedirectUri(redirectUri)) {
+      if (!codeChallenge || codeChallenge.length < 32 || !isAllowedAppRedirectUri(redirectUri, baseUrl)) {
         return res.status(400).json({
           success: false,
-          error: 'Valid PKCE code_challenge and photohub://auth redirect_uri are required.',
+          error: 'Valid PKCE code_challenge and allowed redirect_uri are required.',
         });
       }
 
-      const baseUrl = contextService.resolveRequestBaseUrl(req);
       const state = signToken(
         {
           typ: 'oauth_state',
@@ -95,7 +104,7 @@ function createAuthController({
       if (
         !statePayload ||
         statePayload.typ !== 'oauth_state' ||
-        !isAllowedAppRedirectUri(statePayload.redirectUri)
+        !isAllowedAppRedirectUri(statePayload.redirectUri, statePayload.baseUrl)
       ) {
         return res.status(400).send('Invalid or expired OAuth state.');
       }

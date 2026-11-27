@@ -27,6 +27,27 @@ const VIDEO_EXTENSIONS = new Set(['.mov', '.mp4', '.m4v', '.3gp', '.avi']);
 
 let cachedFfmpegAvailable = null;
 
+function createConcurrencyGate(maxConcurrent) {
+  let active = 0;
+  const queue = [];
+  return async function runLimited(fn) {
+    if (active >= maxConcurrent) {
+      await new Promise((resolve) => queue.push(resolve));
+    }
+    active += 1;
+    try {
+      return await fn();
+    } finally {
+      active -= 1;
+      const next = queue.shift();
+      if (next) next();
+    }
+  };
+}
+
+const sharpGate = createConcurrencyGate(2);
+const ffmpegGate = createConcurrencyGate(1);
+
 function isVideoFilename(name = '') {
   return VIDEO_EXTENSIONS.has(path.extname(String(name)).toLowerCase());
 }
@@ -53,18 +74,21 @@ async function getCapabilities() {
 }
 
 function runFfmpeg(args, timeoutMs = 120000) {
-  return new Promise((resolve, reject) => {
-    execFile('ffmpeg', args, { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 }, (err, _stdout, stderr) => {
-      if (err) {
-        const msg = stderr ? String(stderr).slice(-300) : err.message;
-        const wrapped = new Error(`ffmpeg failed: ${msg}`);
-        wrapped.cause = err;
-        reject(wrapped);
-        return;
-      }
-      resolve();
-    });
-  });
+  return ffmpegGate(
+    () =>
+      new Promise((resolve, reject) => {
+        execFile('ffmpeg', args, { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 }, (err, _stdout, stderr) => {
+          if (err) {
+            const msg = stderr ? String(stderr).slice(-300) : err.message;
+            const wrapped = new Error(`ffmpeg failed: ${msg}`);
+            wrapped.cause = err;
+            reject(wrapped);
+            return;
+          }
+          resolve();
+        });
+      })
+  );
 }
 
 async function computeFileSha256(filePath) {
@@ -100,19 +124,21 @@ async function generateImageProxyWithSharp(sourcePath, maxPixelSize, qualityPerc
     targetMax = Math.min(longest, maxPixelSize);
   }
 
-  return sharpModule(sourcePath)
-    .rotate()
-    .resize({
-      width: targetMax,
-      height: targetMax,
-      fit: 'inside',
-      withoutEnlargement: true,
-    })
-    .jpeg({
-      quality: qualityPercent,
-      mozjpeg: false,
-    })
-    .toBuffer();
+  return sharpGate(() =>
+    sharpModule(sourcePath)
+      .rotate()
+      .resize({
+        width: targetMax,
+        height: targetMax,
+        fit: 'inside',
+        withoutEnlargement: true,
+      })
+      .jpeg({
+        quality: qualityPercent,
+        mozjpeg: true,
+      })
+      .toBuffer()
+  );
 }
 
 async function generateServerSideProxy({

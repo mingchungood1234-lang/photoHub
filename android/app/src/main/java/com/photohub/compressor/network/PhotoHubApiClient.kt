@@ -101,6 +101,13 @@ private object SharedHttpClientPool {
 
     private val pinnedClients = ConcurrentHashMap<String, OkHttpClient>()
     private val lastWarmAtMs = ConcurrentHashMap<String, Long>()
+    private val photosEtagByScope = ConcurrentHashMap<String, Pair<String, Int>>()
+
+    fun getSavedPhotosEtag(scopeKey: String): Pair<String, Int>? = photosEtagByScope[scopeKey]
+
+    fun savePhotosEtag(scopeKey: String, etag: String, totalCount: Int) {
+        photosEtagByScope[scopeKey] = etag to totalCount
+    }
 
     fun clientFor(hosts: List<String>, pins: List<String>): OkHttpClient {
         if (pins.isEmpty() || hosts.isEmpty()) return baseClient
@@ -323,22 +330,45 @@ class PhotoHubApiClient(
     }
 
     suspend fun fetchAllServerPhotos(sync: Boolean = true): List<ServerPhoto> = withContext(Dispatchers.IO) {
+        val cur = settings.current
+        val scopeKey = "${cur.normalizedBaseUrl.orEmpty()}|${cur.apiKeyCacheScope}"
+        val cachedLocal = LocalProxyStore.getInstance(context)
+            .cachedPhotos(cur.normalizedBaseUrl, cur.apiKeyCacheScope)
+        val savedEtag = SharedHttpClientPool.getSavedPhotosEtag(scopeKey)
+        val conditionalEtag = if (savedEtag != null && cachedLocal.isNotEmpty() && savedEtag.second == cachedLocal.size) {
+            savedEtag.first
+        } else {
+            null
+        }
+
         val collected = mutableListOf<ServerPhoto>()
         val seenHashes = hashSetOf<String>()
         var offset = 0
         val pageSize = 500
+        var firstPageEtag: String? = null
 
         while (true) {
             val syncParam = if (sync && offset == 0) "&sync=1" else ""
             val url = makeUrl("/api/photos?limit=$pageSize&offset=$offset$syncParam")
-            val req = Request.Builder().url(url).get().applyAuth().build()
+            val reqBuilder = Request.Builder().url(url).get().applyAuth()
+            if (offset == 0 && !conditionalEtag.isNullOrBlank()) {
+                reqBuilder.header("If-None-Match", conditionalEtag)
+            }
             var pageCount = 0
             var total = 0
             var serverHasMore: Boolean? = null
+            var notModified = false
 
-            client.newCall(req).execute().use { resp ->
+            client.newCall(reqBuilder.build()).execute().use { resp ->
+                if (resp.code == 304) {
+                    notModified = true
+                    return@use
+                }
                 val text = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) throw ApiHttpException(resp.code, parseErrorMessage(resp.code, text))
+                if (offset == 0) {
+                    firstPageEtag = resp.header("ETag")
+                }
                 val json = JSONObject(text)
                 total = json.optInt("total", 0)
                 serverHasMore = if (json.has("hasMore") && !json.isNull("hasMore")) json.optBoolean("hasMore") else null
@@ -351,10 +381,17 @@ class PhotoHubApiClient(
                 }
             }
 
+            if (notModified) {
+                return@withContext cachedLocal
+            }
+
             if (pageCount == 0) break
             offset += pageCount
             val hasMore = serverHasMore ?: (offset < total)
             if (!hasMore || offset >= total) break
+        }
+        firstPageEtag?.takeIf { it.isNotBlank() }?.let { etag ->
+            SharedHttpClientPool.savePhotosEtag(scopeKey, etag, collected.size)
         }
         collected
     }

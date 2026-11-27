@@ -497,8 +497,12 @@ final class BackgroundUploadTransport: NSObject, URLSessionDataDelegate, @unchec
             if releaseCoordinatorAsset {
                 AssetUploadCoordinator.shared.releaseAsset(job.assetId, owner: .background)
                 if activeAssetIds().isEmpty {
-                    DispatchQueue.main.async {
+                    Task { @MainActor in
                         NotificationCenter.default.post(name: .photoHubCheckRemainingSilentUploads, object: nil)
+                        let bg = BackgroundBackupManager.shared
+                        if !bg.isPausedForRestore {
+                            bg.triggerSilentAutoUpload(settings: AppSettings(), isMovingToBackground: true)
+                        }
                     }
                 }
             }

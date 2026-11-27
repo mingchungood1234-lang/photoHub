@@ -31,6 +31,23 @@ if (require.main === module) {
         }
       };
 
+      const attachGracefulShutdown = (server) => {
+        let shuttingDown = false;
+        const shutdown = () => {
+          if (shuttingDown) return;
+          shuttingDown = true;
+          const flushFn = app.locals && app.locals.flushAllIndexes;
+          Promise.resolve(typeof flushFn === 'function' ? flushFn() : null)
+            .catch(() => {})
+            .finally(() => {
+              server.close(() => process.exit(0));
+              setTimeout(() => process.exit(0), 3000).unref();
+            });
+        };
+        process.once('SIGINT', shutdown);
+        process.once('SIGTERM', shutdown);
+      };
+
       if (protocol === 'https') {
         if (!sslCertPath || !sslKeyPath) {
           throw new Error(
@@ -49,6 +66,7 @@ if (require.main === module) {
         server.keepAliveTimeout = 65_000;
         server.headersTimeout = 66_000;
         server.requestTimeout = 0;
+        attachGracefulShutdown(server);
         server.listen(port, '0.0.0.0', onListening);
       } else {
         const server = http.createServer(app);
@@ -56,6 +74,7 @@ if (require.main === module) {
         server.keepAliveTimeout = 65_000;
         server.headersTimeout = 66_000;
         server.requestTimeout = 0;
+        attachGracefulShutdown(server);
         server.listen(port, '0.0.0.0', onListening);
       }
     })

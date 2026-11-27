@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.MediaStore
+import android.util.LruCache
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.photohub.compressor.background.BackgroundBackupManager
@@ -550,7 +551,7 @@ object BatchRestoreExecutor {
 data class ServerGalleryUiState(
     val photos: List<ServerPhoto> = emptyList(),
     val timeline: ServerTimelineData = ServerTimelineData(),
-    val imageCache: Map<String, Bitmap> = emptyMap(),
+    val thumbnailCacheVersion: Long = 0L,
     val failedPreviewHashes: Set<String> = emptySet(),
     val isLoading: Boolean = false,
     val errorMessage: String? = null,
@@ -614,6 +615,22 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
     private val _detailState = MutableStateFlow<PhotoDetailUiState?>(null)
     val detailState: StateFlow<PhotoDetailUiState?> = _detailState.asStateFlow()
 
+    // Bounded LRU thumbnail cache (max 1/8 JVM heap, capped at 48 MB) to prevent OOM on large libraries.
+    private val thumbnailLruCache: LruCache<String, Bitmap> = run {
+        val maxKb = (Runtime.getRuntime().maxMemory() / 1024L).toInt()
+        val cacheKb = minOf(maxKb / 8, 48 * 1024).coerceAtLeast(8 * 1024)
+        object : LruCache<String, Bitmap>(cacheKb) {
+            override fun sizeOf(key: String, value: Bitmap): Int =
+                (value.allocationByteCount / 1024).coerceAtLeast(1)
+        }
+    }
+
+    fun getCachedThumbnail(hash: String): Bitmap? = thumbnailLruCache.get(hash.lowercase(Locale.ROOT))
+
+    private fun putCachedThumbnail(hash: String, bmp: Bitmap) {
+        thumbnailLruCache.put(hash.lowercase(Locale.ROOT), bmp)
+    }
+
     private val inFlightPreviews = Collections.synchronizedSet(mutableSetOf<String>())
     private var batchJob: Job? = null
     private var restoreJob: Job? = null
@@ -653,25 +670,16 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
         val cur = settings.current
         val cached = store.cachedPhotos(cur.normalizedBaseUrl, cur.apiKeyCacheScope)
         viewModelScope.launch(Dispatchers.IO) {
-            val loadedBitmaps = mutableMapOf<String, Bitmap>()
-            for (photo in cached) {
-                if (!_uiState.value.imageCache.containsKey(photo.hash)) {
-                    store.previewData(photo.hash)?.let { data ->
-                        BitmapFactory.decodeByteArray(data, 0, data.size)?.let { bmp ->
-                            loadedBitmaps[photo.hash] = bmp
-                        }
-                    }
-                }
-            }
+            // Grid thumbnails are decoded lazily per visible tile into thumbnailLruCache (48 MB cap),
+            // avoiding decoding all library bitmaps into RAM at startup.
             val protectedSet = computeLocallyProtectedHashes(cached)
             withContext(Dispatchers.Main) {
                 _uiState.update { prev ->
                     val nextPhotos = if (cached.isNotEmpty() || prev.photos.isEmpty()) cached else prev.photos
-                    val nextCache = if (loadedBitmaps.isEmpty()) prev.imageCache else prev.imageCache + loadedBitmaps
                     val rebuilt = rebuildTimelineData(nextPhotos, prev.filterMode, prev.mediaTypeFilter, prev.timelineGrouping, prev.selectedYearAnchor)
                     prev.copy(
                         photos = nextPhotos,
-                        imageCache = nextCache,
+                        thumbnailCacheVersion = prev.thumbnailCacheVersion + 1L,
                         locallyProtectedHashes = if (nextPhotos === cached) protectedSet else computeLocallyProtectedHashes(nextPhotos),
                         timeline = rebuilt.first,
                         selectedYearAnchor = rebuilt.second
@@ -762,24 +770,23 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
     }
 
     fun loadCompressedPreviewIfNeeded(photo: ServerPhoto) {
-        if (_uiState.value.imageCache.containsKey(photo.hash) || !inFlightPreviews.add(photo.hash)) {
+        if (getCachedThumbnail(photo.hash) != null || !inFlightPreviews.add(photo.hash)) {
             return
         }
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val cached = store.previewData(photo.hash)
-                if (cached != null) {
-                    BitmapFactory.decodeByteArray(cached, 0, cached.size)?.let { bmp ->
-                        withContext(Dispatchers.Main) {
-                            _uiState.update { prev ->
-                                prev.copy(
-                                    imageCache = prev.imageCache + (photo.hash to bmp),
-                                    failedPreviewHashes = prev.failedPreviewHashes - photo.hash
-                                )
-                            }
+                val cachedBmp = store.decodeGridThumbnailBitmap(photo.hash, maxPixelSize = 320)
+                if (cachedBmp != null) {
+                    putCachedThumbnail(photo.hash, cachedBmp)
+                    withContext(Dispatchers.Main) {
+                        _uiState.update { prev ->
+                            prev.copy(
+                                thumbnailCacheVersion = prev.thumbnailCacheVersion + 1L,
+                                failedPreviewHashes = prev.failedPreviewHashes - photo.hash
+                            )
                         }
-                        return@launch
                     }
+                    return@launch
                 }
 
                 if (photo.isVideo && photo.needsProxy) {
@@ -794,11 +801,18 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                 val client = PhotoHubApiClient(context, settings)
                 val raw = runCatching { client.downloadPhotoPreviewData(photo.hash) }.getOrNull()
                 val compressed = raw?.let { store.cacheDownloadedPreview(it, photo.hash) }
+                val gridBmp = compressed?.let { (_, bytes) ->
+                    store.decodeGridThumbnailFromBytes(bytes, maxPixelSize = 320) ?: compressed.first
+                }
+                if (compressed != null && gridBmp !== compressed.first) {
+                    compressed.first.recycle()
+                }
                 withContext(Dispatchers.Main) {
-                    if (compressed != null) {
+                    if (gridBmp != null) {
+                        putCachedThumbnail(photo.hash, gridBmp)
                         _uiState.update { prev ->
                             prev.copy(
-                                imageCache = prev.imageCache + (photo.hash to compressed.first),
+                                thumbnailCacheVersion = prev.thumbnailCacheVersion + 1L,
                                 failedPreviewHashes = prev.failedPreviewHashes - photo.hash
                             )
                         }
@@ -908,8 +922,9 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
     fun applyUpdatedPhoto(updated: ServerPhoto) {
         viewModelScope.launch(Dispatchers.IO) {
-            val previewBmp = store.previewData(updated.hash)?.let {
-                BitmapFactory.decodeByteArray(it, 0, it.size)
+            val previewBmp = store.decodeGridThumbnailBitmap(updated.hash, maxPixelSize = 320)
+            if (previewBmp != null) {
+                putCachedThumbnail(updated.hash, previewBmp)
             }
             val norm = normHash(updated.hash)
             val isLocProtected = tracker.isRestoredMasterHash(norm)
@@ -918,7 +933,6 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                     val nextPhotos = prev.photos.map {
                         if (it.hash.equals(updated.hash, ignoreCase = true)) updated else it
                     }
-                    val nextCache = if (previewBmp != null) prev.imageCache + (updated.hash to previewBmp) else prev.imageCache
                     val nextLocallyProtected = if (isLocProtected) {
                         prev.locallyProtectedHashes + norm
                     } else {
@@ -927,7 +941,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                     val rebuilt = rebuildTimelineData(nextPhotos, prev.filterMode, prev.mediaTypeFilter, prev.timelineGrouping, prev.selectedYearAnchor)
                     prev.copy(
                         photos = nextPhotos,
-                        imageCache = nextCache,
+                        thumbnailCacheVersion = prev.thumbnailCacheVersion + 1L,
                         locallyProtectedHashes = nextLocallyProtected,
                         failedPreviewHashes = prev.failedPreviewHashes - updated.hash,
                         timeline = rebuilt.first,
@@ -976,7 +990,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
     // MARK: - Detail Modal Actions
 
     fun openPhotoDetail(photo: ServerPhoto) {
-        val initialBmp = _uiState.value.imageCache[photo.hash]
+        val initialBmp = getCachedThumbnail(photo.hash)
         _detailState.value = PhotoDetailUiState(
             photo = photo,
             isLocallyProtected = tracker.isRestoredMasterHash(photo.hash),
@@ -985,14 +999,18 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
         speculativePrefetchJob?.cancel()
 
         viewModelScope.launch(Dispatchers.IO) {
-            if (initialBmp == null && !(photo.isVideo && photo.needsProxy)) {
+            if (!(photo.isVideo && photo.needsProxy)) {
                 val cached = store.previewData(photo.hash)?.let {
                     BitmapFactory.decodeByteArray(it, 0, it.size)
                 }
-                val bmp = cached ?: runCatching {
-                    val raw = PhotoHubApiClient(context, settings).downloadPhotoPreviewData(photo.hash)
-                    store.cacheDownloadedPreview(raw, photo.hash)?.first
-                }.getOrNull()
+                val bmp = cached ?: if (initialBmp == null) {
+                    runCatching {
+                        val raw = PhotoHubApiClient(context, settings).downloadPhotoPreviewData(photo.hash)
+                        store.cacheDownloadedPreview(raw, photo.hash)?.first
+                    }.getOrNull()
+                } else {
+                    null
+                }
                 if (bmp != null) {
                     _detailState.update { it?.copy(previewBitmap = bmp) }
                 }
@@ -1378,9 +1396,11 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
     private fun applyDeletedHashes(removedHashes: Set<String>) {
         if (removedHashes.isEmpty()) return
+        for (h in removedHashes) {
+            thumbnailLruCache.remove(h.lowercase(Locale.ROOT))
+        }
         _uiState.update { prev ->
             val nextPhotos = prev.photos.filterNot { normHash(it.hash) in removedHashes }
-            val nextCache = prev.imageCache.filterKeys { normHash(it) !in removedHashes }
             val nextFailed = prev.failedPreviewHashes.filterNot { normHash(it) in removedHashes }.toSet()
             val nextSelected = prev.selectedHashes.filterNot { normHash(it) in removedHashes }.toSet()
             val nextProtected = prev.locallyProtectedHashes - removedHashes
@@ -1393,7 +1413,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
             )
             prev.copy(
                 photos = nextPhotos,
-                imageCache = nextCache,
+                thumbnailCacheVersion = prev.thumbnailCacheVersion + 1L,
                 failedPreviewHashes = nextFailed,
                 selectedHashes = nextSelected,
                 locallyProtectedHashes = nextProtected,

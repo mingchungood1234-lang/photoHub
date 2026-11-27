@@ -11,6 +11,9 @@ import org.json.JSONArray
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.security.MessageDigest
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 
 class LocalProxyStore private constructor(context: Context) {
     private val appContext = context.applicationContext
@@ -18,6 +21,12 @@ class LocalProxyStore private constructor(context: Context) {
     private val rootDir = File(appContext.filesDir, "PhotoHubLocalProxies")
     private val previewsDir = File(rootDir, "previews")
     private val videosDir = File(rootDir, "videos")
+    private val ioExecutor = Executors.newSingleThreadScheduledExecutor()
+
+    private val indexMemoryCache = mutableMapOf<String, List<ServerPhoto>>()
+    private val pendingIndexFlushes = mutableMapOf<String, ScheduledFuture<*>>()
+    private var cacheWriteCounter = 0
+    private var isTrimmingDiskCache = false
 
     private val _changes = MutableSharedFlow<Unit>(extraBufferCapacity = 16)
     val changes: SharedFlow<Unit> = _changes.asSharedFlow()
@@ -47,21 +56,51 @@ class LocalProxyStore private constructor(context: Context) {
     private fun previewFile(hash: String): File = File(previewsDir, "${safeHash(hash)}.dat")
     private fun videoFile(hash: String): File = File(videosDir, "${safeHash(hash)}.mp4")
 
-    fun cachedPhotos(baseUrl: String?, scopeKey: String): List<ServerPhoto> = synchronized(lock) {
-        val file = indexFile(baseUrl, scopeKey)
+    private fun loadIndexLocked(file: File): List<ServerPhoto> {
+        val key = file.absolutePath
+        indexMemoryCache[key]?.let { return it }
         if (!file.exists()) return emptyList()
-        return try {
+        val parsed = try {
             ServerPhoto.listFromJsonArray(JSONArray(file.readText()))
         } catch (_: Exception) {
             emptyList()
         }
+        indexMemoryCache[key] = parsed
+        return parsed
+    }
+
+    private fun scheduleIndexFlushLocked(file: File, immediate: Boolean) {
+        val key = file.absolutePath
+        pendingIndexFlushes.remove(key)?.cancel(false)
+        val task = Runnable {
+            val snapshot = synchronized(lock) {
+                pendingIndexFlushes.remove(key)
+                ensureDirsLocked()
+                indexMemoryCache[key]
+            } ?: return@Runnable
+            runCatching {
+                val tmp = File(file.parentFile, "${file.name}.tmp")
+                tmp.writeText(ServerPhoto.listToJsonArray(snapshot).toString())
+                if (!tmp.renameTo(file)) {
+                    file.writeText(ServerPhoto.listToJsonArray(snapshot).toString())
+                    tmp.delete()
+                }
+            }
+        }
+        val delayMs = if (immediate) 0L else 350L
+        pendingIndexFlushes[key] = ioExecutor.schedule(task, delayMs, TimeUnit.MILLISECONDS)
+    }
+
+    fun cachedPhotos(baseUrl: String?, scopeKey: String): List<ServerPhoto> = synchronized(lock) {
+        loadIndexLocked(indexFile(baseUrl, scopeKey))
     }
 
     fun savePhotos(photos: List<ServerPhoto>, baseUrl: String?, scopeKey: String) {
         synchronized(lock) {
             ensureDirsLocked()
             val file = indexFile(baseUrl, scopeKey)
-            file.writeText(ServerPhoto.listToJsonArray(photos).toString())
+            indexMemoryCache[file.absolutePath] = photos
+            scheduleIndexFlushLocked(file, immediate = true)
         }
     }
 
@@ -97,15 +136,12 @@ class LocalProxyStore private constructor(context: Context) {
         synchronized(lock) {
             ensureDirsLocked()
             val file = indexFile(baseUrl, scopeKey)
-            if (file.exists()) {
-                val list = try {
-                    ServerPhoto.listFromJsonArray(JSONArray(file.readText())).toMutableList()
-                } catch (_: Exception) {
-                    mutableListOf()
-                }
-                val changed = list.removeAll { it.hash.trim().lowercase() in targetSet }
+            val current = loadIndexLocked(file).toMutableList()
+            if (current.isNotEmpty()) {
+                val changed = current.removeAll { it.hash.trim().lowercase() in targetSet }
                 if (changed) {
-                    file.writeText(ServerPhoto.listToJsonArray(list).toString())
+                    indexMemoryCache[file.absolutePath] = current
+                    scheduleIndexFlushLocked(file, immediate = true)
                 }
             }
             for (h in targetSet) {
@@ -127,17 +163,10 @@ class LocalProxyStore private constructor(context: Context) {
         synchronized(lock) {
             ensureDirsLocked()
             val file = indexFile(baseUrl, scopeKey)
-            val list = if (file.exists()) {
-                try {
-                    ServerPhoto.listFromJsonArray(JSONArray(file.readText())).toMutableList()
-                } catch (_: Exception) {
-                    mutableListOf()
-                }
-            } else {
-                mutableListOf()
-            }
+            val list = loadIndexLocked(file).toMutableList()
             block(list)
-            file.writeText(ServerPhoto.listToJsonArray(list).toString())
+            indexMemoryCache[file.absolutePath] = list
+            scheduleIndexFlushLocked(file, immediate = false)
         }
         if (notify) {
             _changes.tryEmit(Unit)
@@ -149,12 +178,45 @@ class LocalProxyStore private constructor(context: Context) {
         if (!file.exists()) null else runCatching { file.readBytes() }.getOrNull()
     }
 
+    /**
+     * Decodes a compact downsampled RGB_565 grid thumbnail (default 320px) directly from the cached
+     * preview file, using ~50% less RAM per pixel than ARGB_8888 and avoiding full-size allocations.
+     */
+    fun decodeGridThumbnailBitmap(hash: String, maxPixelSize: Int = 320): Bitmap? {
+        val data = previewData(hash) ?: return null
+        return decodeGridThumbnailFromBytes(data, maxPixelSize)
+    }
+
+    fun decodeGridThumbnailFromBytes(rawData: ByteArray, maxPixelSize: Int = 320): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(rawData, 0, rawData.size, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+        val maxDim = maxOf(bounds.outWidth, bounds.outHeight)
+        var inSample = 1
+        while (maxDim / inSample > maxPixelSize * 2) {
+            inSample *= 2
+        }
+        val opts = BitmapFactory.Options().apply {
+            inSampleSize = inSample
+            inPreferredConfig = Bitmap.Config.RGB_565
+        }
+        return BitmapFactory.decodeByteArray(rawData, 0, rawData.size, opts)
+    }
+
     fun savePreviewData(data: ByteArray, hash: String) {
         if (data.isEmpty()) return
+        var shouldTrim = false
         synchronized(lock) {
             ensureDirsLocked()
             previewFile(hash).writeBytes(data)
+            cacheWriteCounter++
+            if (cacheWriteCounter % 32 == 0 && !isTrimmingDiskCache) {
+                isTrimmingDiskCache = true
+                shouldTrim = true
+            }
         }
+        if (shouldTrim) scheduleDiskCacheTrim()
     }
 
     fun copyPreviewFile(source: File, hash: String) {
@@ -229,13 +291,49 @@ class LocalProxyStore private constructor(context: Context) {
 
     fun copyVideoProxy(source: File, hash: String): File? {
         if (!source.exists()) return null
-        return synchronized(lock) {
+        var shouldTrim = false
+        val copied = synchronized(lock) {
             ensureDirsLocked()
             val dest = videoFile(hash)
             runCatching {
                 source.copyTo(dest, overwrite = true)
+                cacheWriteCounter++
+                if (!isTrimmingDiskCache) {
+                    isTrimmingDiskCache = true
+                    shouldTrim = true
+                }
                 dest
             }.getOrNull()
+        }
+        if (shouldTrim) scheduleDiskCacheTrim()
+        return copied
+    }
+
+    private fun scheduleDiskCacheTrim() {
+        ioExecutor.execute {
+            try {
+                val files = mutableListOf<File>()
+                var totalBytes = 0L
+                for (dir in listOf(previewsDir, videosDir)) {
+                    dir.listFiles()?.forEach { f ->
+                        if (f.isFile) {
+                            files.add(f)
+                            totalBytes += f.length()
+                        }
+                    }
+                }
+                if (totalBytes <= MAX_DISK_CACHE_BYTES) return@execute
+                files.sortBy { it.lastModified() }
+                for (f in files) {
+                    if (totalBytes <= TRIM_TARGET_DISK_BYTES) break
+                    val len = f.length()
+                    if (runCatching { f.delete() }.getOrDefault(false)) {
+                        totalBytes -= len
+                    }
+                }
+            } finally {
+                synchronized(lock) { isTrimmingDiskCache = false }
+            }
         }
     }
 
@@ -251,6 +349,9 @@ class LocalProxyStore private constructor(context: Context) {
 
     fun clearAll() {
         synchronized(lock) {
+            pendingIndexFlushes.values.forEach { it.cancel(false) }
+            pendingIndexFlushes.clear()
+            indexMemoryCache.clear()
             previewsDir.deleteRecursively()
             videosDir.deleteRecursively()
             ensureDirsLocked()
@@ -263,6 +364,9 @@ class LocalProxyStore private constructor(context: Context) {
     }
 
     companion object {
+        private const val MAX_DISK_CACHE_BYTES = 600L * 1024L * 1024L // 600 MB LRU cap
+        private const val TRIM_TARGET_DISK_BYTES = 480L * 1024L * 1024L
+
         @Volatile
         private var instance: LocalProxyStore? = null
 

@@ -25,6 +25,15 @@ const MAX_BATCH_DELETE_COUNT = 500;
 
 const gzipAsync = promisify(zlib.gzip);
 
+async function fileExistsAsync(filePath) {
+  try {
+    await fsp.access(filePath, fs.constants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function acceptsGzip(req) {
   return /\bgzip\b/i.test(String((req.headers && req.headers['accept-encoding']) || ''));
 }
@@ -192,6 +201,19 @@ function createPhotoController({ config }) {
         }
         const limit = Math.min(1000, Math.max(1, Number(req.query.limit) || 200));
         const offset = Math.max(0, Number(req.query.offset) || 0);
+        const yearParam = req.query.year ? String(req.query.year).trim() : '';
+        const mediaTypeParam = req.query.mediaType ? String(req.query.mediaType).trim() : '';
+        const prefixParam = req.query.prefix ? String(req.query.prefix).trim().toLowerCase() : '';
+        const orderParam = req.query.order === 'asc' ? 'asc' : 'desc';
+
+        const etag = `W/"v${hashIndex.version || 1}-${hashIndex.size()}-${offset}-${limit}-${yearParam}-${mediaTypeParam}-${prefixParam}-${orderParam}"`;
+        res.setHeader('ETag', etag);
+        res.setHeader('Cache-Control', 'private, no-cache');
+        const ifNoneMatch = String(req.headers['if-none-match'] || '').trim();
+        if (ifNoneMatch && (ifNoneMatch === etag || ifNoneMatch.split(',').map((s) => s.trim()).includes(etag))) {
+          return res.status(304).end();
+        }
+
         let all = hashIndex.listMasters();
 
         const yearCountsMap = new Map();
@@ -249,7 +271,7 @@ function createPhotoController({ config }) {
         const record = lookupResult.record;
         if (record.proxyRelativePath) {
           const proxyPath = path.join(storageDir, record.proxyRelativePath);
-          if (fs.existsSync(proxyPath)) {
+          if (await fileExistsAsync(proxyPath)) {
             return sendImmutableMediaFile(res, proxyPath, {
               variant: 'proxy',
               masterHash: lookupResult.masterHash,
@@ -268,7 +290,7 @@ function createPhotoController({ config }) {
         if (redirectIfS3(res, record)) return undefined;
 
         const fullPath = path.join(storageDir, record.relativePath);
-        if (!fs.existsSync(fullPath)) {
+        if (!(await fileExistsAsync(fullPath))) {
           return res.status(404).json({
             success: false,
             error: 'Photo file not found on disk',
@@ -295,7 +317,7 @@ function createPhotoController({ config }) {
         const record = lookupResult.record;
         if (record.videoProxyRelativePath) {
           const videoProxyPath = path.join(storageDir, record.videoProxyRelativePath);
-          if (fs.existsSync(videoProxyPath)) {
+          if (await fileExistsAsync(videoProxyPath)) {
             return sendImmutableMediaFile(res, videoProxyPath, {
               variant: 'video-proxy',
               masterHash: lookupResult.masterHash,

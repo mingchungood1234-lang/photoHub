@@ -9,6 +9,49 @@ extension Notification.Name {
     static let photoHubOpenCleanupPrompt = Notification.Name("photoHub.openCleanupPrompt")
 }
 
+private final class SilentBatchCounters: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _uploadedNewCount: Int = 0
+    private var _hitQuota: Bool = false
+    private var _failedIds: [String] = []
+
+    func incrementUploaded() {
+        lock.lock()
+        _uploadedNewCount += 1
+        lock.unlock()
+    }
+
+    func markQuotaHit() {
+        lock.lock()
+        _hitQuota = true
+        lock.unlock()
+    }
+
+    func appendFailed(_ id: String) {
+        lock.lock()
+        _failedIds.append(id)
+        lock.unlock()
+    }
+
+    var isQuotaHit: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return _hitQuota
+    }
+
+    var uploadedNewCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _uploadedNewCount
+    }
+
+    var failedIds: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return _failedIds
+    }
+}
+
 struct StagedCleanupItem: Codable, Identifiable, Equatable, Sendable {
     let id: String // PHAsset.localIdentifier of verified original ready for 1-tap deletion
     let filename: String
@@ -483,17 +526,19 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
 
         let work = Task.detached(priority: .utility) { [weak self] in
             var hasMoreEligible = false
-            var failedIds: [String] = []
+            let counters = SilentBatchCounters()
             defer {
                 taskHolder.endBackgroundTask()
+                let failedSnapshot = counters.failedIds
+                let moreSnapshot = hasMoreEligible && !counters.isQuotaHit
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     let retryAt = Date().addingTimeInterval(180)
-                    for id in failedIds {
+                    for id in failedSnapshot {
                         self.recentFailureCooldownUntil[id] = retryAt
                     }
                     self.isSilentUploadRunning = false
-                    let shouldFollowUp = self.pendingRescanAfterSilentRun || (hasMoreEligible && !isMovingToBackground)
+                    let shouldFollowUp = self.pendingRescanAfterSilentRun || (moreSnapshot && !isMovingToBackground)
                     self.pendingRescanAfterSilentRun = false
                     if shouldFollowUp {
                         self.scheduleDebouncedSilentCheck(delayNanoseconds: 1_000_000_000)
@@ -513,8 +558,8 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
             let rawCandidates = photoService.scanCandidates(
                 tracker: tracker,
                 knownServerPhotos: cachedServerPhotos,
-                maxResults: 30,
-                maxInspect: 400
+                maxResults: 60,
+                maxInspect: 3000
             )
             let activeIds = AssetUploadCoordinator.shared.activeAssetIds()
             let eligible = PhotoBackupPipeline
@@ -524,25 +569,24 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                     !activeIds.contains($0.id) &&
                     !cooldownIds.contains($0.id)
                 }
-            let batchLimit = isMovingToBackground ? 6 : 12
+            let batchLimit = isMovingToBackground ? 16 : 24
             hasMoreEligible = eligible.count > batchLimit
-            let prioritized = eligible.prefix(batchLimit)
+            let prioritized = Array(eligible.prefix(batchLimit))
 
             let videoSemaphore = AsyncSemaphore(value: 1)
             let photosSaveSemaphore = AsyncSemaphore(value: 1)
-            var uploadedNewCount = 0
 
+            // Separate items handed off to OS-managed URLSession.background (no 30s background limit)
+            // vs items uploaded concurrently in-process (3-way parallelism for faster small-photo batches).
+            var inProcessCandidates: [PhotoCandidate] = []
             for candidate in prioritized {
-                if Task.isCancelled { break }
-                guard AssetUploadCoordinator.shared.tryClaimAsset(candidate.id, owner: .background) else {
-                    continue
-                }
-
-                // Hand off large direct-VPS uploads (or when app just backgrounded) straight to URLSession.background
-                // so the OS daemon uploads silently with zero app time limit & zero screen banners.
+                if Task.isCancelled || counters.isQuotaHit { break }
                 let useOSBackgroundSession = (effectiveUploadMode == .directVPS)
                     && (isMovingToBackground || candidate.isVideo || candidate.estimatedBytes > 8_000_000)
                 if useOSBackgroundSession {
+                    guard AssetUploadCoordinator.shared.tryClaimAsset(candidate.id, owner: .background) else {
+                        continue
+                    }
                     let outcome = await BackgroundUploadTransport.shared.enqueueSilentUpload(
                         candidate: candidate,
                         photoService: photoService,
@@ -554,57 +598,83 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                         break
                     case .finalizedLocally:
                         AssetUploadCoordinator.shared.releaseAsset(candidate.id, owner: .background)
-                        uploadedNewCount += 1
+                        counters.incrementUploaded()
                     case .skippedAlreadyHandled:
                         AssetUploadCoordinator.shared.releaseAsset(candidate.id, owner: .background)
                     case .failed:
                         AssetUploadCoordinator.shared.releaseAsset(candidate.id, owner: .background)
-                        failedIds.append(candidate.id)
+                        counters.appendFailed(candidate.id)
                     }
-                    continue
-                }
-
-                defer { AssetUploadCoordinator.shared.releaseAsset(candidate.id, owner: .background) }
-
-                do {
-                    let result = try await PhotoBackupPipeline.backupAndProxyAsset(
-                        candidate: candidate,
-                        photoService: photoService,
-                        apiClient: apiClient,
-                        tracker: tracker,
-                        format: format,
-                        maxPixelSize: maxPx,
-                        quality: quality,
-                        uploadMode: effectiveUploadMode,
-                        keepLocalProxy: keepLocal,
-                        normalizedBaseURL: baseURL,
-                        cacheScopeKey: cacheScope,
-                        videoSemaphore: videoSemaphore,
-                        photosSaveSemaphore: photosSaveSemaphore,
-                        onStageChange: { _ in }
-                    )
-
-                    if case .backedUp(let outcome) = result {
-                        let entry = StagedCleanupItem(
-                            id: candidate.id,
-                            filename: outcome.filename,
-                            masterSha256: outcome.masterSha256,
-                            savedBytes: outcome.savedBytes,
-                            verifiedAt: Date()
-                        )
-                        await MainActor.run {
-                            self?.appendStagedItem(entry)
-                        }
-                        uploadedNewCount += 1
-                    }
-                } catch APIClientError.httpError(507, _) {
-                    break
-                } catch {
-                    failedIds.append(candidate.id)
-                    continue
+                } else {
+                    inProcessCandidates.append(candidate)
                 }
             }
 
+            if !inProcessCandidates.isEmpty && !Task.isCancelled && !counters.isQuotaHit {
+                let queue = AsyncWorkQueue(inProcessCandidates)
+                let workerCount = min(3, inProcessCandidates.count)
+                await withTaskGroup(of: Void.self) { group in
+                    for _ in 0..<workerCount {
+                        group.addTask { [weak self] in
+                            while !Task.isCancelled && !counters.isQuotaHit {
+                                guard let candidate = await queue.next() else { break }
+                                guard AssetUploadCoordinator.shared.tryClaimAsset(candidate.id, owner: .background) else {
+                                    continue
+                                }
+                                defer { AssetUploadCoordinator.shared.releaseAsset(candidate.id, owner: .background) }
+
+                                do {
+                                    let result = try await PhotoBackupPipeline.backupAndProxyAsset(
+                                        candidate: candidate,
+                                        photoService: photoService,
+                                        apiClient: apiClient,
+                                        tracker: tracker,
+                                        format: format,
+                                        maxPixelSize: maxPx,
+                                        quality: quality,
+                                        uploadMode: effectiveUploadMode,
+                                        keepLocalProxy: keepLocal,
+                                        normalizedBaseURL: baseURL,
+                                        cacheScopeKey: cacheScope,
+                                        videoSemaphore: videoSemaphore,
+                                        photosSaveSemaphore: photosSaveSemaphore,
+                                        onStageChange: { _ in }
+                                    )
+
+                                    if case .backedUp(let outcome) = result {
+                                        let entry = StagedCleanupItem(
+                                            id: candidate.id,
+                                            filename: outcome.filename,
+                                            masterSha256: outcome.masterSha256,
+                                            savedBytes: outcome.savedBytes,
+                                            verifiedAt: Date()
+                                        )
+                                        await MainActor.run {
+                                            self?.appendStagedItem(entry)
+                                        }
+                                        counters.incrementUploaded()
+                                    }
+                                } catch APIClientError.httpError(507, _) {
+                                    counters.markQuotaHit()
+                                    break
+                                } catch {
+                                    counters.appendFailed(candidate.id)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if hasMoreEligible && isMovingToBackground {
+                await MainActor.run {
+                    if let cur = self?.settingsRef {
+                        self?.scheduleNightlyBackupIfEnabled(settings: cur)
+                    }
+                }
+            }
+
+            let uploadedNewCount = counters.uploadedNewCount
             if uploadedNewCount > 0 {
                 await MainActor.run {
                     guard let self else { return }
@@ -631,11 +701,11 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
     // MARK: - Scheduled Background Tasks (BGProcessingTask + BGAppRefreshTask)
 
     private func handleBackgroundProcessingTask(_ task: BGProcessingTask) {
-        runScheduledTask(task: task, maxItems: 40, isOvernight: true)
+        runScheduledTask(task: task, maxItems: 100, isOvernight: true)
     }
 
     private func handleBackgroundRefreshTask(_ task: BGAppRefreshTask) {
-        runScheduledTask(task: task, maxItems: 6, isOvernight: false)
+        runScheduledTask(task: task, maxItems: 16, isOvernight: false)
     }
 
     private func runScheduledTask(task: BGTask, maxItems: Int, isOvernight: Bool) {
@@ -690,8 +760,8 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
             let photoService = PhotoLibraryService()
             let tracker = LocalProxyTracker.shared
             let cachedServerPhotos = LocalProxyStore.shared.cachedPhotos(baseURL: baseURL, apiKey: cacheScope)
-            let scanCap = isOvernight ? 250 : 40
-            let inspectCap = isOvernight ? 2500 : 300
+            let scanCap = isOvernight ? 500 : 80
+            let inspectCap = isOvernight ? 10000 : 3000
             let rawCandidates = photoService.scanCandidates(
                 tracker: tracker,
                 knownServerPhotos: cachedServerPhotos,
@@ -713,8 +783,9 @@ final class BackgroundBackupManager: NSObject, ObservableObject, UNUserNotificat
                     continue
                 }
 
+                // In scheduled background execution, hand off ALL Direct-VPS items (photos & videos)
+                // to URLSession.background so uploads finish reliably even after the brief BGTask window closes.
                 if effectiveUploadMode == .directVPS,
-                   (candidate.isVideo || candidate.estimatedBytes > 8_000_000),
                    let uploadConfig {
                     let outcome = await BackgroundUploadTransport.shared.enqueueSilentUpload(
                         candidate: candidate,
