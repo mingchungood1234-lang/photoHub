@@ -127,20 +127,32 @@ function verifyPkceCodeChallenge(codeVerifier, expectedChallenge) {
   return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
 }
 
-function isAllowedAppRedirectUri(rawUri, allowedWebOrigin = null) {
+function isAllowedAppRedirectUri(rawUri, allowedWebOrigins = null) {
   if (!rawUri || typeof rawUri !== 'string') return false;
   try {
     const u = new URL(rawUri);
     if (u.protocol === 'photohub:' && u.hostname === 'auth') {
       return true;
     }
-    if (allowedWebOrigin && (u.protocol === 'http:' || u.protocol === 'https:')) {
-      const expected = new URL(allowedWebOrigin);
-      if (
-        u.origin === expected.origin &&
-        (u.pathname === '/' || u.pathname === '/auth/callback')
-      ) {
-        return true;
+    const originsList = Array.isArray(allowedWebOrigins)
+      ? allowedWebOrigins
+      : allowedWebOrigins
+        ? [allowedWebOrigins]
+        : [];
+    if (
+      originsList.length > 0 &&
+      (u.protocol === 'http:' || u.protocol === 'https:') &&
+      (u.pathname === '/' || u.pathname === '/auth/callback')
+    ) {
+      for (const candidate of originsList) {
+        if (!candidate) continue;
+        try {
+          if (u.origin === new URL(candidate).origin) {
+            return true;
+          }
+        } catch {
+          // ignore invalid candidate origin
+        }
       }
     }
     return false;

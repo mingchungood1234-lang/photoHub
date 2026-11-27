@@ -232,12 +232,16 @@ function getConfig(overrides = {}) {
 
   return {
     port: Number(overrides.port ?? process.env.PORT ?? 3000),
+    webPort: Number(overrides.webPort ?? process.env.WEB_PORT ?? 4000),
     protocol: String(overrides.protocol ?? process.env.PROTOCOL ?? 'http')
       .trim()
       .toLowerCase(),
     sslCertPath: (overrides.sslCertPath ?? process.env.SSL_CERT_PATH ?? '').trim(),
     sslKeyPath: (overrides.sslKeyPath ?? process.env.SSL_KEY_PATH ?? '').trim(),
     publicUrl: String(overrides.publicUrl ?? process.env.PUBLIC_URL ?? '')
+      .trim()
+      .replace(/\/+$/, ''),
+    publicWebUrl: String(overrides.publicWebUrl ?? process.env.PUBLIC_WEB_URL ?? '')
       .trim()
       .replace(/\/+$/, ''),
     storageDir,

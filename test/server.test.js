@@ -2053,9 +2053,9 @@ test('Web frontend assets serve cleanly and Google PKCE allows same-origin web c
     );
     assert.equal(evilRes.status, 400);
 
-    // Accept same-origin web redirect URI & complete PKCE exchange
+    // Accept webpage on dedicated WEB_PORT (4000) redirect URI & complete PKCE exchange
     const startRes = await ctx.request(
-      `/api/auth/google/start?code_challenge=${encodeURIComponent(challenge)}&redirect_uri=${encodeURIComponent('https://photohub.example.com/auth/callback')}`
+      `/api/auth/google/start?code_challenge=${encodeURIComponent(challenge)}&redirect_uri=${encodeURIComponent('https://photohub.example.com:4000/auth/callback')}`
     );
     assert.equal(startRes.status, 302);
     const googleUrl = new URL(startRes.headers.location);
@@ -2067,7 +2067,7 @@ test('Web frontend assets serve cleanly and Google PKCE allows same-origin web c
     );
     assert.equal(cbRes.status, 302);
     const webRedirect = new URL(cbRes.headers.location);
-    assert.equal(webRedirect.origin, 'https://photohub.example.com');
+    assert.equal(webRedirect.origin, 'https://photohub.example.com:4000');
     assert.equal(webRedirect.pathname, '/auth/callback');
     const oneTimeCode = webRedirect.searchParams.get('code');
     assert.ok(oneTimeCode);

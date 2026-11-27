@@ -26,6 +26,35 @@ const {
 } = require('../models/userModel');
 const { isS3Configured } = require('../services/s3Service');
 
+function buildAllowedWebOrigins(baseUrl, config, req = null) {
+  const origins = new Set();
+  const addUrl = (raw) => {
+    if (!raw) return;
+    try {
+      const parsed = new URL(raw);
+      origins.add(parsed.origin);
+      if (config && config.webPort > 0) {
+        origins.add(`${parsed.protocol}//${parsed.hostname}:${config.webPort}`);
+        if (parsed.protocol === 'https:') {
+          origins.add(`http://${parsed.hostname}:${config.webPort}`);
+        }
+      }
+    } catch {
+      // ignore invalid URL
+    }
+  };
+  addUrl(baseUrl);
+  addUrl(config && config.publicUrl);
+  addUrl(config && config.publicWebUrl);
+  if (req && req.headers && req.headers.host) {
+    const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http')
+      .split(',')[0]
+      .trim();
+    addUrl(`${proto}://${req.headers.host}`);
+  }
+  return Array.from(origins);
+}
+
 function createAuthController({
   config,
   sessionSecret,
@@ -68,8 +97,13 @@ function createAuthController({
         req.query.redirect_uri || 'photohub://auth/callback'
       ).trim();
       const baseUrl = contextService.resolveRequestBaseUrl(req);
+      const allowedWebOrigins = buildAllowedWebOrigins(baseUrl, config, req);
 
-      if (!codeChallenge || codeChallenge.length < 32 || !isAllowedAppRedirectUri(redirectUri, baseUrl)) {
+      if (
+        !codeChallenge ||
+        codeChallenge.length < 32 ||
+        !isAllowedAppRedirectUri(redirectUri, allowedWebOrigins)
+      ) {
         return res.status(400).json({
           success: false,
           error: 'Valid PKCE code_challenge and allowed redirect_uri are required.',
@@ -101,10 +135,13 @@ function createAuthController({
 
     async handleGoogleCallback(req, res) {
       const statePayload = verifyToken(String(req.query.state || ''), sessionSecret);
+      const allowedWebOrigins = statePayload
+        ? buildAllowedWebOrigins(statePayload.baseUrl, config, req)
+        : [];
       if (
         !statePayload ||
         statePayload.typ !== 'oauth_state' ||
-        !isAllowedAppRedirectUri(statePayload.redirectUri, statePayload.baseUrl)
+        !isAllowedAppRedirectUri(statePayload.redirectUri, allowedWebOrigins)
       ) {
         return res.status(400).send('Invalid or expired OAuth state.');
       }
