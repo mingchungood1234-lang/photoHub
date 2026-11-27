@@ -201,7 +201,7 @@ async function createApp(configOverrides = {}) {
   // Same-origin Gateway proxy for web gallery users assigned to a remote STORAGE_NODE
   // (eliminates CORS, HTTPS->HTTP mixed-content blocks, and private LAN/Tailscale node reachability issues).
   const WEB_PROXY_ALLOWED_PATH_RE =
-    /^\/(whoami|storage|photos(?:\/(?:delete|trash|trash\/restore|trash\/empty|download-zip|memories|map|cleanup-suggestions))?|photo\/[^/]+(?:\/(?:preview|video-proxy|protect-original|favorite))?|albums(?:\/[^/]+(?:\/photos(?:\/remove)?)?)?|shares(?:\/[^/]+)?|upload(?:\/chunked\/(?:init|[^/]+(?:\/(?:complete|part\/\d+))?))?|check(?:\/[^/]+)?)$/;
+    /^\/(whoami|storage|photos(?:\/(?:delete|protect-original|trash|trash\/restore|trash\/empty|download-zip|memories|map|cleanup-suggestions))?|photo\/[^/]+(?:\/(?:preview|video-proxy|protect-original|favorite))?|albums(?:\/[^/]+(?:\/photos(?:\/remove)?)?)?|shares(?:\/[^/]+)?|upload(?:\/chunked\/(?:init|[^/]+(?:\/(?:complete|part\/\d+))?))?|check(?:\/[^/]+)?)$/;
   app.use(async (req, res, next) => {
     if (!req.path.startsWith('/api/web-node/')) return next();
     const subPath = req.path.slice('/api/web-node'.length);

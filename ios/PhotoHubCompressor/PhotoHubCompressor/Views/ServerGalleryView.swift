@@ -3168,7 +3168,20 @@ private struct ServerPhotoDetailView: View {
             let client = PhotoHubAPIClient(settings: settings)
             let (updated, fileSize) = try await PhotoLibraryService.restoreMasterToPhotos(
                 photo: currentPhoto,
-                client: client
+                client: client,
+                onProgress: { downloaded, total in
+                    let downStr = ByteCountFormatter.string(fromByteCount: max(0, downloaded), countStyle: .file)
+                    let label: String
+                    if let total, total > 0 {
+                        let totalStr = ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
+                        label = "Downloading original... (\(downStr) / \(totalStr))"
+                    } else {
+                        label = "Downloading original... (\(downStr))"
+                    }
+                    Task { @MainActor in
+                        busyLabel = label
+                    }
+                }
             )
             if let updated {
                 replaceCurrentPhoto(updated)

@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 import Security
 
@@ -285,6 +286,14 @@ private struct ProtectOriginalResponse: Decodable {
     let photo: ServerPhoto?
 }
 
+private struct BatchProtectOriginalResponse: Decodable {
+    let success: Bool
+    let keepOriginalOnDevice: Bool?
+    let updatedCount: Int?
+    let photos: [ServerPhoto]?
+    let missing: [String]?
+}
+
 struct DeletePhotosResult: Decodable, Sendable {
     let success: Bool
     let deleted: [String]?
@@ -490,7 +499,7 @@ final class PhotoHubAPIClient {
 
     private static func makeSharedSession(allowSelfSigned: Bool) -> URLSession {
         let config = URLSessionConfiguration.default
-        config.httpMaximumConnectionsPerHost = 10
+        config.httpMaximumConnectionsPerHost = 16
         config.waitsForConnectivity = true
         config.timeoutIntervalForRequest = 600
         config.timeoutIntervalForResource = 3600
@@ -906,10 +915,329 @@ final class PhotoHubAPIClient {
         case unsupported
     }
 
-    private static let smallSingleStreamThresholdBytes: Int64 = 1_500_000
-    private static let largeSequentialStreamingThresholdBytes: Int64 = 64 * 1024 * 1024
+    private static let smallSingleStreamThresholdBytes: Int64 = 4 * 1024 * 1024
     private static let initialRangeBytes: Int64 = 1_048_576
     private static let maxExtraParallelSegments: Int = 4
+
+    /// Thread-safe POSIX file descriptor wrapper so parallel HTTP Range segments can `pwrite`
+    /// straight into their final byte offsets (zero duplicate temp files, safe under cancellation).
+    private final class SharedFileDescriptor: @unchecked Sendable {
+        private let lock = NSLock()
+        private var fd: Int32
+
+        init(fd: Int32) {
+            self.fd = fd
+        }
+
+        func preallocate(size: Int64) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard fd >= 0 else { return false }
+            return ftruncate(fd, off_t(size)) == 0
+        }
+
+        func pwriteAll(_ data: Data, at offset: Int64) throws {
+            guard !data.isEmpty else { return }
+            lock.lock()
+            defer { lock.unlock() }
+            guard fd >= 0 else {
+                throw CancellationError()
+            }
+            try data.withUnsafeBytes { rawBuf in
+                guard let base = rawBuf.baseAddress else { return }
+                var sent = 0
+                let count = rawBuf.count
+                while sent < count {
+                    let wrote = pwrite(
+                        fd,
+                        base.advanced(by: sent),
+                        count - sent,
+                        off_t(offset + Int64(sent))
+                    )
+                    if wrote < 0 {
+                        if errno == EINTR { continue }
+                        throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+                    }
+                    sent += wrote
+                }
+            }
+        }
+
+        func closeDescriptor() {
+            lock.lock()
+            defer { lock.unlock() }
+            if fd >= 0 {
+                Darwin.close(fd)
+                fd = -1
+            }
+        }
+
+        deinit {
+            closeDescriptor()
+        }
+    }
+
+    /// Streams an HTTP GET / Range response straight into a `SharedFileDescriptor` via `pwrite`,
+    /// exposing an immediate `awaitHeaders()` hook so parallel range segments can launch the instant
+    /// segment 0's `206 Partial Content` headers arrive (zero temp files, zero head-of-line body wait).
+    private final class DirectRangePWriteDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+        private let lock = NSLock()
+        private let sharedFD: SharedFileDescriptor
+        private let startOffset: Int64
+        private let expectedStatus206Only: Bool
+        private let preallocateFromContentRange: Bool
+        private let progressTracker: DownloadProgressTracker?
+
+        private var headerContinuation: CheckedContinuation<HTTPURLResponse, Error>?
+        private var pendingHeaderResult: Result<HTTPURLResponse, Error>?
+        private var completionContinuation: CheckedContinuation<Int64, Error>?
+        private var pendingCompletionResult: Result<Int64, Error>?
+
+        private var httpResponse: HTTPURLResponse?
+        private var errorBuffer = Data()
+        private var currentOffset: Int64
+        private var bytesWritten: Int64 = 0
+        private var writeError: Error?
+        private var cancelled = false
+
+        init(
+            sharedFD: SharedFileDescriptor,
+            startOffset: Int64,
+            expectedStatus206Only: Bool,
+            preallocateFromContentRange: Bool = false,
+            progressTracker: DownloadProgressTracker?
+        ) {
+            self.sharedFD = sharedFD
+            self.startOffset = startOffset
+            self.currentOffset = startOffset
+            self.expectedStatus206Only = expectedStatus206Only
+            self.preallocateFromContentRange = preallocateFromContentRange
+            self.progressTracker = progressTracker
+        }
+
+        func awaitHeaders() async throws -> HTTPURLResponse {
+            try await withCheckedThrowingContinuation { cont in
+                lock.lock()
+                if let ready = pendingHeaderResult {
+                    pendingHeaderResult = nil
+                    lock.unlock()
+                    cont.resume(with: ready)
+                    return
+                }
+                headerContinuation = cont
+                lock.unlock()
+            }
+        }
+
+        func awaitCompletion() async throws -> Int64 {
+            try await withCheckedThrowingContinuation { cont in
+                lock.lock()
+                if let ready = pendingCompletionResult {
+                    pendingCompletionResult = nil
+                    lock.unlock()
+                    cont.resume(with: ready)
+                    return
+                }
+                completionContinuation = cont
+                lock.unlock()
+            }
+        }
+
+        func cancel(with error: Error = CancellationError()) {
+            lock.lock()
+            cancelled = true
+            lock.unlock()
+            resumeHeaderOnce(.failure(error))
+            resumeCompletionOnce(.failure(error))
+        }
+
+        private func resumeHeaderOnce(_ result: Result<HTTPURLResponse, Error>) {
+            lock.lock()
+            if let cont = headerContinuation {
+                headerContinuation = nil
+                lock.unlock()
+                cont.resume(with: result)
+                return
+            }
+            if pendingHeaderResult == nil {
+                pendingHeaderResult = result
+            }
+            lock.unlock()
+        }
+
+        private func resumeCompletionOnce(_ result: Result<Int64, Error>) {
+            lock.lock()
+            if let cont = completionContinuation {
+                completionContinuation = nil
+                lock.unlock()
+                cont.resume(with: result)
+                return
+            }
+            if pendingCompletionResult == nil {
+                pendingCompletionResult = result
+            }
+            lock.unlock()
+        }
+
+        private static func parseTotalFromContentRange(_ header: String?) -> Int64? {
+            guard let header else { return nil }
+            let trimmed = header.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.lowercased().hasPrefix("bytes ") else { return nil }
+            let parts = trimmed.dropFirst(6).split(separator: "/", maxSplits: 1)
+            guard parts.count == 2,
+                  let total = Int64(parts[1].trimmingCharacters(in: .whitespaces)),
+                  total > 0 else {
+                return nil
+            }
+            return total
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            dataTask: URLSessionDataTask,
+            didReceive response: URLResponse,
+            completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+        ) {
+            guard let http = response as? HTTPURLResponse else {
+                let err = APIClientError.invalidResponse
+                resumeHeaderOnce(.failure(err))
+                resumeCompletionOnce(.failure(err))
+                completionHandler(.cancel)
+                return
+            }
+
+            lock.lock()
+            if cancelled {
+                lock.unlock()
+                completionHandler(.cancel)
+                return
+            }
+            httpResponse = http
+            lock.unlock()
+
+            if http.statusCode == 401 {
+                let err = APIClientError.httpError(401, "Session expired")
+                resumeHeaderOnce(.failure(err))
+                resumeCompletionOnce(.failure(err))
+                completionHandler(.cancel)
+                return
+            }
+
+            if http.statusCode == 416 {
+                resumeHeaderOnce(.failure(SegmentedDownloadFallback.unsupported))
+                resumeCompletionOnce(.failure(SegmentedDownloadFallback.unsupported))
+                completionHandler(.cancel)
+                return
+            }
+
+            if expectedStatus206Only && http.statusCode != 206 {
+                resumeHeaderOnce(.failure(SegmentedDownloadFallback.unsupported))
+                resumeCompletionOnce(.failure(SegmentedDownloadFallback.unsupported))
+                completionHandler(.cancel)
+                return
+            }
+
+            if (200...299).contains(http.statusCode) {
+                if preallocateFromContentRange,
+                   http.statusCode == 206,
+                   let totalSize = Self.parseTotalFromContentRange(http.value(forHTTPHeaderField: "Content-Range")) {
+                    if !sharedFD.preallocate(size: totalSize) {
+                        resumeHeaderOnce(.failure(SegmentedDownloadFallback.unsupported))
+                        resumeCompletionOnce(.failure(SegmentedDownloadFallback.unsupported))
+                        completionHandler(.cancel)
+                        return
+                    }
+                    progressTracker?.setTotalBytes(totalSize)
+                }
+                resumeHeaderOnce(.success(http))
+                completionHandler(.allow)
+                return
+            }
+
+            // Allow error response body to collect for HTTP error message, deferring header rejection to completion
+            completionHandler(.allow)
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+            lock.lock()
+            let isCancelled = cancelled
+            let http = httpResponse
+            let writePos = currentOffset
+            lock.unlock()
+
+            guard !isCancelled, let http else { return }
+
+            if !(200...299).contains(http.statusCode) {
+                lock.lock()
+                if errorBuffer.count < 65_536 {
+                    errorBuffer.append(data.prefix(65_536 - errorBuffer.count))
+                }
+                lock.unlock()
+                return
+            }
+
+            do {
+                try sharedFD.pwriteAll(data, at: writePos)
+                let len = Int64(data.count)
+                lock.lock()
+                currentOffset += len
+                bytesWritten += len
+                lock.unlock()
+                progressTracker?.add(len)
+            } catch {
+                lock.lock()
+                writeError = error
+                lock.unlock()
+                dataTask.cancel()
+            }
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            dataTask: URLSessionDataTask,
+            willCacheResponse proposedResponse: CachedURLResponse,
+            completionHandler: @escaping (CachedURLResponse?) -> Void
+        ) {
+            completionHandler(nil)
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            lock.lock()
+            let savedWriteErr = writeError
+            let http = httpResponse
+            let errBuf = errorBuffer
+            let totalWritten = bytesWritten
+            lock.unlock()
+
+            if let savedWriteErr {
+                resumeHeaderOnce(.failure(savedWriteErr))
+                resumeCompletionOnce(.failure(savedWriteErr))
+                return
+            }
+            if let error {
+                resumeHeaderOnce(.failure(error))
+                resumeCompletionOnce(.failure(error))
+                return
+            }
+            guard let http else {
+                let err = APIClientError.invalidResponse
+                resumeHeaderOnce(.failure(err))
+                resumeCompletionOnce(.failure(err))
+                return
+            }
+            guard (200...299).contains(http.statusCode) else {
+                let msg = (try? JSONSerialization.jsonObject(with: errBuf) as? [String: Any])?["error"] as? String
+                    ?? String(data: errBuf, encoding: .utf8)
+                    ?? "Unknown error"
+                let err = APIClientError.httpError(http.statusCode, msg)
+                resumeHeaderOnce(.failure(err))
+                resumeCompletionOnce(.failure(err))
+                return
+            }
+            resumeHeaderOnce(.success(http))
+            resumeCompletionOnce(.success(totalWritten))
+        }
+    }
 
     private final class DownloadProgressTracker: @unchecked Sendable {
         private let lock = NSLock()
@@ -922,6 +1250,13 @@ final class PhotoHubAPIClient {
         init(totalBytes: Int64?, onProgress: (@Sendable (Int64, Int64?) -> Void)?) {
             self.totalBytes = totalBytes
             self.onProgress = onProgress
+        }
+
+        func setTotalBytes(_ total: Int64) {
+            guard total > 0 else { return }
+            lock.lock()
+            totalBytes = total
+            lock.unlock()
         }
 
         func add(_ delta: Int64) {
@@ -1163,6 +1498,7 @@ final class PhotoHubAPIClient {
         preferredFilename: String? = nil,
         expectedSizeBytes: Int64? = nil,
         isVideo: Bool = false,
+        allowParallelRanges: Bool = true,
         onProgress: (@Sendable (Int64, Int64?) -> Void)? = nil
     ) async throws -> URL {
         let shareDir = FileManager.default.temporaryDirectory
@@ -1173,6 +1509,7 @@ final class PhotoHubAPIClient {
             preferredFilename: preferredFilename,
             expectedSizeBytes: expectedSizeBytes,
             isVideo: isVideo,
+            allowParallelRanges: allowParallelRanges,
             onProgress: onProgress
         )
     }
@@ -1183,6 +1520,7 @@ final class PhotoHubAPIClient {
         preferredFilename: String? = nil,
         expectedSizeBytes: Int64? = nil,
         isVideo: Bool = false,
+        allowParallelRanges: Bool = true,
         onProgress: (@Sendable (Int64, Int64?) -> Void)? = nil
     ) async throws -> URL {
         let path = "/api/photo/\(hash)"
@@ -1190,18 +1528,26 @@ final class PhotoHubAPIClient {
             ? "video_\(String(hash.prefix(8))).mp4"
             : "photo_\(String(hash.prefix(8))).jpg"
 
-        if let expectedSizeBytes, expectedSizeBytes > 0 {
-            if expectedSizeBytes < Self.smallSingleStreamThresholdBytes
-                || expectedSizeBytes >= Self.largeSequentialStreamingThresholdBytes {
-                return try await downloadToDirectory(
-                    path: path,
-                    destinationDir: destinationDir,
-                    preferredFilename: preferredFilename,
-                    fallbackFilename: inferredFallback,
-                    expectedSizeBytes: expectedSizeBytes,
-                    onProgress: onProgress
-                )
-            }
+        if !allowParallelRanges {
+            return try await downloadToDirectory(
+                path: path,
+                destinationDir: destinationDir,
+                preferredFilename: preferredFilename,
+                fallbackFilename: inferredFallback,
+                expectedSizeBytes: expectedSizeBytes,
+                onProgress: onProgress
+            )
+        }
+
+        if let expectedSizeBytes, expectedSizeBytes > 0, expectedSizeBytes < Self.smallSingleStreamThresholdBytes {
+            return try await downloadToDirectory(
+                path: path,
+                destinationDir: destinationDir,
+                preferredFilename: preferredFilename,
+                fallbackFilename: inferredFallback,
+                expectedSizeBytes: expectedSizeBytes,
+                onProgress: onProgress
+            )
         }
 
         do {
@@ -1210,6 +1556,7 @@ final class PhotoHubAPIClient {
                 destinationDir: destinationDir,
                 preferredFilename: preferredFilename,
                 fallbackFilename: inferredFallback,
+                expectedSizeBytes: expectedSizeBytes,
                 onProgress: onProgress
             )
         } catch SegmentedDownloadFallback.unsupported {
@@ -1271,254 +1618,199 @@ final class PhotoHubAPIClient {
         destinationDir: URL,
         preferredFilename: String?,
         fallbackFilename: String,
+        expectedSizeBytes: Int64? = nil,
         onProgress: (@Sendable (Int64, Int64?) -> Void)? = nil
     ) async throws -> URL {
         let url = try makeURL(path)
+        let fm = FileManager.default
+        try fm.createDirectory(at: destinationDir, withIntermediateDirectories: true)
+
+        let partURL = destinationDir.appendingPathComponent(".part_\(UUID().uuidString.prefix(8))")
+        try? fm.removeItem(at: partURL)
+        defer {
+            try? fm.removeItem(at: partURL)
+        }
+
+        let rawFD = open(partURL.path, O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR)
+        guard rawFD >= 0 else {
+            throw SegmentedDownloadFallback.unsupported
+        }
+        let sharedFD = SharedFileDescriptor(fd: rawFD)
+        defer {
+            sharedFD.closeDescriptor()
+        }
+
+        let initialWindow: Int64 = {
+            if let exp = expectedSizeBytes, exp >= 16 * 1024 * 1024 {
+                return min(4 * 1024 * 1024, max(Self.initialRangeBytes, exp / 5))
+            }
+            return Self.initialRangeBytes
+        }()
+
         var initialReq = URLRequest(url: url)
         initialReq.httpMethod = "GET"
         initialReq.cachePolicy = .reloadIgnoringLocalCacheData
         applyAuth(to: &initialReq)
-        initialReq.setValue("bytes=0-\(Self.initialRangeBytes - 1)", forHTTPHeaderField: "Range")
+        initialReq.setValue("bytes=0-\(initialWindow - 1)", forHTTPHeaderField: "Range")
 
-        let (initialTempURL, response) = try await pooledSession.download(for: initialReq)
-        var cleanupInitial = true
-        defer {
-            if cleanupInitial {
-                try? FileManager.default.removeItem(at: initialTempURL)
-            }
-        }
+        let progressTracker = DownloadProgressTracker(
+            totalBytes: expectedSizeBytes.flatMap { $0 > 0 ? $0 : nil },
+            onProgress: onProgress
+        )
+        let initialDelegate = DirectRangePWriteDelegate(
+            sharedFD: sharedFD,
+            startOffset: 0,
+            expectedStatus206Only: false,
+            preallocateFromContentRange: true,
+            progressTracker: progressTracker
+        )
+        let session = pooledSession
+        let initialTask = session.dataTask(with: initialReq)
+        initialTask.delegate = initialDelegate
+        initialTask.resume()
 
-        if let http = response as? HTTPURLResponse {
-            if http.statusCode == 416 {
-                throw SegmentedDownloadFallback.unsupported
-            }
-            if !(200...299).contains(http.statusCode) {
-                let errData = (try? Data(contentsOf: initialTempURL, options: .mappedIfSafe)) ?? Data()
-                try validateHTTP(response: response, data: errData)
-            }
+        let http: HTTPURLResponse = try await withTaskCancellationHandler {
+            try await initialDelegate.awaitHeaders()
+        } onCancel: {
+            initialTask.cancel()
+            initialDelegate.cancel(with: CancellationError())
         }
 
         let destFilename = resolveDestinationFilename(
-            response: response,
+            response: http,
             preferredFilename: preferredFilename,
             fallbackFilename: fallbackFilename
         )
-        try FileManager.default.createDirectory(at: destinationDir, withIntermediateDirectories: true)
         let destURL = destinationDir.appendingPathComponent(destFilename)
-
-        guard let http = response as? HTTPURLResponse else {
-            throw APIClientError.invalidResponse
-        }
 
         let rangeInfo = (http.statusCode == 206)
             ? parseContentRange(http.value(forHTTPHeaderField: "Content-Range"))
             : nil
 
-        // If server sent full 200 OK or the whole file fit inside the initial 1 MB segment, move directly.
+        // If server sent full 200 OK or full file fit inside segment 0, just await segment 0 completion.
         if rangeInfo == nil || rangeInfo!.start != 0 || rangeInfo!.end + 1 >= rangeInfo!.total {
             if http.statusCode != 200 && rangeInfo == nil {
+                initialTask.cancel()
+                initialDelegate.cancel(with: SegmentedDownloadFallback.unsupported)
                 throw SegmentedDownloadFallback.unsupported
             }
-            try? FileManager.default.removeItem(at: destURL)
-            cleanupInitial = false
-            try FileManager.default.moveItem(at: initialTempURL, to: destURL)
-            if let attrs = try? FileManager.default.attributesOfItem(atPath: destURL.path),
-               let sz = (attrs[.size] as? NSNumber)?.int64Value {
-                onProgress?(sz, sz)
+            let written = try await withTaskCancellationHandler {
+                try await initialDelegate.awaitCompletion()
+            } onCancel: {
+                initialTask.cancel()
+                initialDelegate.cancel(with: CancellationError())
             }
+            sharedFD.closeDescriptor()
+            if let rangeInfo, written != rangeInfo.total {
+                throw SegmentedDownloadFallback.unsupported
+            }
+            try? fm.removeItem(at: destURL)
+            try fm.moveItem(at: partURL, to: destURL)
+            onProgress?(written, written)
             return destURL
         }
 
         let parsedRange = rangeInfo!
         let totalSize = parsedRange.total
-
-        let partURL = destinationDir.appendingPathComponent(".part_\(UUID().uuidString.prefix(8))")
-        try? FileManager.default.removeItem(at: partURL)
-        defer {
-            try? FileManager.default.removeItem(at: partURL)
-        }
-
-        let resolvedURL = http.url ?? url
-        let sameHost = (resolvedURL.host?.lowercased() == url.host?.lowercased())
-        let bearerToken = sameHost ? settings.authToken.trimmingCharacters(in: .whitespacesAndNewlines) : ""
-
-        // If Content-Range reveals a huge file (>= 64 MB), switch immediately to zero-duplicate sequential streaming
-        // starting right after the initial 1 MB segment we already have (eliminates 2x disk usage & HDD seek thrashing).
-        if totalSize >= Self.largeSequentialStreamingThresholdBytes {
-            try FileManager.default.moveItem(at: initialTempURL, to: partURL)
-            cleanupInitial = false
-            let nextStart = parsedRange.end + 1
-            onProgress?(nextStart, totalSize)
-
-            var tailReq = URLRequest(url: resolvedURL)
-            tailReq.httpMethod = "GET"
-            tailReq.setValue("bytes=\(nextStart)-\(totalSize - 1)", forHTTPHeaderField: "Range")
-            if !bearerToken.isEmpty {
-                tailReq.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
-            }
-
-            _ = try await streamRequest(
-                tailReq,
-                toPartURL: partURL,
-                appendOffset: nextStart,
-                knownTotalBytes: totalSize,
-                expectedStatus206Only: true,
-                onProgress: onProgress
-            )
-
-            let finalAttrs = try? FileManager.default.attributesOfItem(atPath: partURL.path)
-            let writtenTotal = (finalAttrs?[.size] as? NSNumber)?.int64Value ?? 0
-            guard writtenTotal == totalSize else {
-                throw SegmentedDownloadFallback.unsupported
-            }
-
-            try? FileManager.default.removeItem(at: destURL)
-            try FileManager.default.moveItem(at: partURL, to: destURL)
-            return destURL
-        }
-
-        let maxSegs = totalSize >= 32 * 1024 * 1024 ? 2 : Self.maxExtraParallelSegments
+        let expectedInitialBytes = (parsedRange.end - parsedRange.start) + 1
+        let maxSegs = totalSize >= 12 * 1024 * 1024 ? Self.maxExtraParallelSegments : 3
         let remainingRanges = Self.buildRemainingRanges(
             startOffset: parsedRange.end + 1,
             totalSize: totalSize,
             maxSegments: maxSegs
         )
 
-        let fd = open(partURL.path, O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR)
-        guard fd >= 0 else {
-            throw SegmentedDownloadFallback.unsupported
-        }
-        var fdClosed = false
-        defer {
-            if !fdClosed {
-                close(fd)
-            }
-        }
+        let resolvedURL = http.url ?? url
+        let sameHost = (resolvedURL.host?.lowercased() == url.host?.lowercased())
+        let bearerToken = sameHost ? settings.authToken.trimmingCharacters(in: .whitespacesAndNewlines) : ""
 
-        if ftruncate(fd, off_t(totalSize)) != 0 {
-            throw SegmentedDownloadFallback.unsupported
-        }
-
-        let progressTracker = DownloadProgressTracker(totalBytes: totalSize, onProgress: onProgress)
-        let expectedInitialBytes = parsedRange.end - parsedRange.start + 1
-        let wroteInitial = try Self.streamFile(initialTempURL, toDescriptor: fd, atOffset: 0)
-        if wroteInitial != expectedInitialBytes {
-            throw SegmentedDownloadFallback.unsupported
-        }
-        progressTracker.add(wroteInitial)
-
-        let session = pooledSession
-
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            for segRange in remainingRanges {
+        // Stream segment 0 (already in flight!) AND all remaining byte ranges directly into `sharedFD`
+        // via POSIX `pwrite` — zero intermediate segment files, zero double disk copy, works for 4K videos too!
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
                 group.addTask {
-                    try await Self.downloadRangeSegment(
-                        session: session,
-                        targetURL: resolvedURL,
-                        bearerToken: bearerToken,
-                        range: segRange,
-                        fd: fd,
-                        progressTracker: progressTracker
-                    )
+                    let initialWritten = try await withTaskCancellationHandler {
+                        try await initialDelegate.awaitCompletion()
+                    } onCancel: {
+                        initialTask.cancel()
+                        initialDelegate.cancel(with: CancellationError())
+                    }
+                    guard initialWritten == expectedInitialBytes else {
+                        throw SegmentedDownloadFallback.unsupported
+                    }
                 }
+                for segRange in remainingRanges {
+                    group.addTask {
+                        try await Self.streamRangeSegmentDirect(
+                            session: session,
+                            targetURL: resolvedURL,
+                            bearerToken: bearerToken,
+                            range: segRange,
+                            sharedFD: sharedFD,
+                            progressTracker: progressTracker
+                        )
+                    }
+                }
+                try await group.waitForAll()
             }
-            try await group.waitForAll()
+        } catch {
+            initialTask.cancel()
+            initialDelegate.cancel(with: error)
+            throw error
         }
 
-        close(fd)
-        fdClosed = true
+        sharedFD.closeDescriptor()
 
-        let finalAttrs = try? FileManager.default.attributesOfItem(atPath: partURL.path)
+        let finalAttrs = try? fm.attributesOfItem(atPath: partURL.path)
         let writtenTotal = (finalAttrs?[.size] as? NSNumber)?.int64Value ?? 0
         guard writtenTotal == totalSize else {
             throw SegmentedDownloadFallback.unsupported
         }
 
-        try? FileManager.default.removeItem(at: destURL)
-        try FileManager.default.moveItem(at: partURL, to: destURL)
+        try? fm.removeItem(at: destURL)
+        try fm.moveItem(at: partURL, to: destURL)
         onProgress?(totalSize, totalSize)
         return destURL
     }
 
-    private static func downloadRangeSegment(
+    private static func streamRangeSegmentDirect(
         session: URLSession,
         targetURL: URL,
         bearerToken: String,
         range: ClosedRange<Int64>,
-        fd: Int32,
+        sharedFD: SharedFileDescriptor,
         progressTracker: DownloadProgressTracker
     ) async throws {
         var req = URLRequest(url: targetURL)
         req.httpMethod = "GET"
+        req.cachePolicy = .reloadIgnoringLocalCacheData
         req.setValue("bytes=\(range.lowerBound)-\(range.upperBound)", forHTTPHeaderField: "Range")
         if !bearerToken.isEmpty {
             req.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
         }
 
-        let (segTempURL, response) = try await session.download(for: req)
-        defer {
-            try? FileManager.default.removeItem(at: segTempURL)
-        }
+        let delegate = DirectRangePWriteDelegate(
+            sharedFD: sharedFD,
+            startOffset: range.lowerBound,
+            expectedStatus206Only: true,
+            preallocateFromContentRange: false,
+            progressTracker: progressTracker
+        )
+        let task = session.dataTask(with: req)
+        task.delegate = delegate
+        task.resume()
 
-        guard let http = response as? HTTPURLResponse else {
-            throw SegmentedDownloadFallback.unsupported
-        }
-        if http.statusCode == 401 {
-            throw APIClientError.httpError(401, "Session expired")
-        }
-        guard http.statusCode == 206 else {
-            throw SegmentedDownloadFallback.unsupported
+        let written = try await withTaskCancellationHandler {
+            try await delegate.awaitCompletion()
+        } onCancel: {
+            task.cancel()
+            delegate.cancel(with: CancellationError())
         }
 
         let expectedLen = (range.upperBound - range.lowerBound) + 1
-        let written = try streamFile(segTempURL, toDescriptor: fd, atOffset: range.lowerBound)
         guard written == expectedLen else {
             throw SegmentedDownloadFallback.unsupported
         }
-        progressTracker.add(written)
-    }
-
-    private static func streamFile(_ fileURL: URL, toDescriptor fd: Int32, atOffset offset: Int64) throws -> Int64 {
-        let handle = try FileHandle(forReadingFrom: fileURL)
-        defer { try? handle.close() }
-
-        var cursor = offset
-        var totalWritten: Int64 = 0
-        let chunkSize = 256 * 1024
-
-        while true {
-            var shouldBreak = false
-            try autoreleasepool {
-                let chunk = handle.readData(ofLength: chunkSize)
-                if chunk.isEmpty {
-                    shouldBreak = true
-                    return
-                }
-                try chunk.withUnsafeBytes { rawBuf in
-                    guard let base = rawBuf.baseAddress else { return }
-                    var sent = 0
-                    let count = rawBuf.count
-                    while sent < count {
-                        let wrote = pwrite(
-                            fd,
-                            base.advanced(by: sent),
-                            count - sent,
-                            off_t(cursor + Int64(sent))
-                        )
-                        if wrote < 0 {
-                            if errno == EINTR { continue }
-                            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
-                        }
-                        sent += wrote
-                    }
-                }
-                let len = Int64(chunk.count)
-                cursor += len
-                totalWritten += len
-            }
-            if shouldBreak { break }
-        }
-        return totalWritten
     }
 
     private func parseContentRange(_ header: String?) -> (start: Int64, end: Int64, total: Int64)? {
@@ -1746,6 +2038,66 @@ final class PhotoHubAPIClient {
             notify: true
         )
         return updated
+    }
+
+    /// Marks up to hundreds of restored originals protected in a single HTTP request + atomic server persist,
+    /// automatically falling back to single-item calls when connected to an older backend.
+    func setOriginalsProtectedBatch(
+        masterHashes: [String],
+        protected: Bool,
+        notifyStore: Bool = false
+    ) async throws -> [ServerPhoto] {
+        var seen = Set<String>()
+        let cleaned = masterHashes.compactMap { raw -> String? in
+            let norm = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !norm.isEmpty, seen.insert(norm).inserted else { return nil }
+            return norm
+        }
+        guard !cleaned.isEmpty else { return [] }
+
+        var allUpdated: [ServerPhoto] = []
+        var idx = 0
+        while idx < cleaned.count {
+            let end = min(cleaned.count, idx + 200)
+            let chunk = Array(cleaned[idx..<end])
+            idx = end
+
+            let url = try makeURL("/api/photos/protect-original")
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            applyAuth(to: &request)
+            request.httpBody = try JSONSerialization.data(withJSONObject: [
+                "hashes": chunk,
+                "keepOriginalOnDevice": protected,
+            ])
+
+            let (data, response) = try await pooledSession.data(for: request)
+            if let http = response as? HTTPURLResponse, http.statusCode == 404 {
+                // Graceful fallback for older servers without batch protect endpoint
+                for h in chunk {
+                    if let single = try? await setOriginalProtected(masterHash: h, protected: protected) {
+                        allUpdated.append(single)
+                    }
+                }
+                continue
+            }
+            try validateHTTP(response: response, data: data)
+            let decoded = try JSONDecoder().decode(BatchProtectOriginalResponse.self, from: data)
+            if let photos = decoded.photos {
+                allUpdated.append(contentsOf: photos)
+            }
+        }
+
+        if !allUpdated.isEmpty {
+            LocalProxyStore.shared.updatePhotos(
+                allUpdated,
+                baseURL: settings.normalizedBaseURL,
+                apiKey: settings.apiKey,
+                notify: notifyStore
+            )
+        }
+        return allUpdated
     }
 
     func deleteServerPhoto(hash: String) async throws {

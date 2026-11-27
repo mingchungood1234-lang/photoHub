@@ -17,6 +17,7 @@ import com.photohub.compressor.network.DownloadRangePlanner
 import com.photohub.compressor.provider.PhotoHubDocumentIdParser
 import com.photohub.compressor.viewmodel.BatchRestoreExecutor
 import com.photohub.compressor.viewmodel.BatchRestorePlanner
+import com.photohub.compressor.viewmodel.OrderedRestorePipelineBuffer
 import com.photohub.compressor.viewmodel.ServerGalleryFilter
 import com.photohub.compressor.viewmodel.ServerMediaTypeFilter
 import com.photohub.compressor.viewmodel.ServerTimelineBuilder
@@ -426,5 +427,48 @@ class PhotoHubUnitTest {
         )
         assertTrue(backupOnlyState.hasCompletedOnboarding)
         assertTrue(backupOnlyState.isBackupOnlyMode)
+    }
+
+    @Test
+    fun `ordered restore pipeline buffer decouples parallel downloads while preserving strict oldest-first commit order`() = runBlocking {
+        val discarded = java.util.Collections.synchronizedList(mutableListOf<Int>())
+        val buffer = OrderedRestorePipelineBuffer<Int>(
+            totalCount = 5,
+            maxBufferedAhead = 4,
+            maxBufferedBytes = 10_000L,
+            onDiscard = { discarded.add(it) }
+        )
+
+        val committed = mutableListOf<Int>()
+        val consumer = launch {
+            while (true) {
+                val next = buffer.takeNextInOrder() ?: break
+                committed.add(next)
+            }
+        }
+
+        // Simulate 5 concurrent downloads finishing completely out of order (item 0 slowest, like an old 4K video)
+        val producers = listOf(
+            launch { delay(5); assertTrue(buffer.waitForDownloadSlot(3)); buffer.submit(3, 30, 100L) },
+            launch { delay(8); assertTrue(buffer.waitForDownloadSlot(1)); buffer.submit(1, 10, 100L) },
+            launch { delay(12); assertTrue(buffer.waitForDownloadSlot(2)); buffer.submit(2, 20, 100L) },
+            launch { delay(25); assertTrue(buffer.waitForDownloadSlot(0)); buffer.submit(0, 0, 500L) },
+            launch { delay(15); assertTrue(buffer.waitForDownloadSlot(4)); buffer.submit(4, 40, 100L) }
+        )
+        producers.joinAll()
+        consumer.join()
+
+        assertEquals(listOf(0, 10, 20, 30, 40), committed)
+        assertTrue(discarded.isEmpty())
+
+        // Stopping a partially filled buffer cleans up buffered items & wakes waiting consumers
+        val cancelBuf = OrderedRestorePipelineBuffer<Int>(
+            totalCount = 3,
+            onDiscard = { discarded.add(it) }
+        )
+        cancelBuf.submit(1, 99, 50L)
+        cancelBuf.stop()
+        assertEquals(listOf(99), discarded)
+        assertNull(cancelBuf.takeNextInOrder())
     }
 }

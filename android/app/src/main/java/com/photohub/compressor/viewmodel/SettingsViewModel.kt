@@ -593,6 +593,10 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 },
                 onFinished = { result ->
                     withContext(Dispatchers.IO) {
+                        val refreshed = store.cachedPhotos(cur.normalizedBaseUrl, cur.apiKeyCacheScope)
+                        if (refreshed.isNotEmpty()) {
+                            cachedServerPhotos = refreshed
+                        }
                         applyRestoreSummary(
                             cachedServerPhotos,
                             markLoaded = _uiState.value.hasLoadedRestoreSummary || cachedServerPhotos.isNotEmpty()

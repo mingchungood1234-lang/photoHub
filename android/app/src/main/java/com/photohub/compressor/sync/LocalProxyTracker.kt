@@ -48,6 +48,16 @@ class LocalProxyTracker private constructor(context: Context) {
         MasterMatch(master, assetToFilename[assetId])
     }
 
+    fun anyMasterHash(assetId: String): String? = synchronized(lock) {
+        assetToMaster[assetId]?.takeIf { it.isNotEmpty() }
+            ?: restoredAssetToMaster[assetId]?.takeIf { it.isNotEmpty() }
+            ?: if (uploadedOriginalAssetIds.contains(assetId)) {
+                uploadedOriginalMasterToAsset.entries.firstOrNull { it.value == assetId }?.key
+            } else {
+                null
+            }
+    }
+
     fun masterHashForProxySha256(sha256: String): String? = synchronized(lock) {
         proxyHashToMaster[sha256.lowercase()]
     }

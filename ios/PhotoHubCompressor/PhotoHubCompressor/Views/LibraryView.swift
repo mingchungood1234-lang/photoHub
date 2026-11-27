@@ -9,6 +9,7 @@ struct LibraryView: View {
     @AppStorage("backupStorageMode") private var backupStorageModeRaw: String = BackupStorageMode.optimizeStorage.rawValue
     @State private var showingProxyDetectorPicker: Bool = false
     @State private var showingCleanupPreviewSheet: Bool = false
+    @State private var showingDuplicateCleanerSheet: Bool = false
 
     private var isBackupOnlyMode: Bool {
         (BackupStorageMode(rawValue: backupStorageModeRaw) ?? .optimizeStorage) == .backupOnly
@@ -169,6 +170,14 @@ struct LibraryView: View {
 
                 ToolbarItemGroup(placement: .navigationBarTrailing) {
                     Button {
+                        showingDuplicateCleanerSheet = true
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                    }
+                    .accessibilityLabel("Remove Duplicates")
+                    .disabled(viewModel.isProcessing)
+
+                    Button {
                         showingProxyDetectorPicker = true
                     } label: {
                         Image(systemName: "magnifyingglass")
@@ -218,6 +227,20 @@ struct LibraryView: View {
                     },
                     onCancel: {
                         showingCleanupPreviewSheet = false
+                    }
+                )
+            }
+            .sheet(isPresented: $showingDuplicateCleanerSheet) {
+                DuplicateCleanerSheet(
+                    onDuplicatesRemoved: { count, freedBytes in
+                        let freedStr = ByteCountFormatter.string(fromByteCount: freedBytes, countStyle: .file)
+                        viewModel.recentlyDeletedNoticeCount += count
+                        viewModel.recentlyDeletedNoticeBytes += freedBytes
+                        viewModel.statusBanner = "Removed \(count) duplicate photo(s) (~\(freedStr) freed)."
+                        viewModel.scanLibrary()
+                    },
+                    onClose: {
+                        showingDuplicateCleanerSheet = false
                     }
                 )
             }
@@ -380,6 +403,15 @@ struct LibraryView: View {
                         .buttonStyle(PhotoHubSoftButtonStyle())
                         .disabled(viewModel.isInspectingGalleryPicks || viewModel.isProcessing)
                     }
+
+                    Button {
+                        showingDuplicateCleanerSheet = true
+                    } label: {
+                        Label("Remove Duplicates", systemImage: "doc.on.doc")
+                            .frame(minWidth: 210)
+                    }
+                    .buttonStyle(PhotoHubSoftButtonStyle())
+                    .disabled(viewModel.isProcessing)
                 }
             }
 

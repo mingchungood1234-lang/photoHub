@@ -208,6 +208,9 @@ class HashIndex {
     this.version = 1;
     this._cachedMasters = null;
     this._cachedStorageUsage = null;
+    // Short-TTL stat verification cache (3s) so parallel HTTP Range segments for the same
+    // original don't repeat identical `fsp.stat` syscalls milliseconds apart.
+    this._statCache = new Map(); // fullPath -> { stat, size, mtimeMs, expiresAt }
     this.writePromise = Promise.resolve();
     this._isPersisting = false;
     this._dirtyWhilePersisting = false;
@@ -219,6 +222,7 @@ class HashIndex {
     this.version += 1;
     this._cachedMasters = null;
     this._cachedStorageUsage = null;
+    this._statCache.clear();
   }
 
   _deleteIndexedRecord(hash, entry) {
@@ -479,21 +483,35 @@ class HashIndex {
    * Checks if a hash exists in the index AND verifies that the file still physically exists on disk.
    * Pass `allowStatFastPath: true` for already-verified routes like proxy registration or streaming reads
    * so large video files aren't re-hashed when byte size and mtimeMs match cleanly.
+   * Pass `withStat: true` to receive `{ record, stat }` so streaming callers avoid a duplicate `fsp.stat`.
    */
-  async verifyExisting(rawHash, { allowStatFastPath = false } = {}) {
-    if (!rawHash || typeof rawHash !== 'string') return null;
+  async verifyExisting(rawHash, { allowStatFastPath = false, withStat = false } = {}) {
+    if (!rawHash || typeof rawHash !== 'string') return withStat ? null : null;
     const hash = rawHash.trim().toLowerCase();
     const record = this.records.get(hash);
     if (!record) return null;
 
     if (record.storageType === 's3') {
-      return record;
+      return withStat ? { record, stat: null } : record;
     }
 
     const fullPath = path.join(this.storageDir, record.relativePath);
+    if (allowStatFastPath && typeof record.mtimeMs === 'number') {
+      const cached = this._statCache.get(fullPath);
+      if (
+        cached &&
+        cached.expiresAt > Date.now() &&
+        cached.size === record.size &&
+        cached.mtimeMs === record.mtimeMs
+      ) {
+        return withStat ? { record, stat: cached.stat } : record;
+      }
+    }
+
     try {
       const stat = await fsp.stat(fullPath);
       if (!stat.isFile() || stat.size !== record.size) {
+        this._statCache.delete(fullPath);
         this._deleteIndexedRecord(hash, record);
         this._markDirty();
         await this.persist();
@@ -504,19 +522,39 @@ class HashIndex {
         typeof record.mtimeMs === 'number' &&
         stat.mtimeMs === record.mtimeMs
       ) {
-        return record;
+        if (this._statCache.size > 2048) {
+          this._statCache.clear();
+        }
+        this._statCache.set(fullPath, {
+          stat,
+          size: stat.size,
+          mtimeMs: stat.mtimeMs,
+          expiresAt: Date.now() + 3000,
+        });
+        return withStat ? { record, stat } : record;
       }
       const diskHash = await computeFileSha256(fullPath);
       const expectedDiskHash = record.diskHash || hash;
       if (diskHash !== expectedDiskHash) {
+        this._statCache.delete(fullPath);
         this._deleteIndexedRecord(hash, record);
         this._markDirty();
         await this.persist();
         return null;
       }
       record.mtimeMs = stat.mtimeMs;
-      return record;
+      if (this._statCache.size > 2048) {
+        this._statCache.clear();
+      }
+      this._statCache.set(fullPath, {
+        stat,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        expiresAt: Date.now() + 3000,
+      });
+      return withStat ? { record, stat } : record;
     } catch {
+      this._statCache.delete(fullPath);
       this._deleteIndexedRecord(hash, record);
       this._markDirty();
       await this.persist();
@@ -529,28 +567,36 @@ class HashIndex {
    */
   async lookup(rawHash, options = {}) {
     if (!rawHash || typeof rawHash !== 'string') {
-      return { status: 'missing', record: null, masterHash: null };
+      return { status: 'missing', record: null, masterHash: null, stat: null };
     }
     const normalized = rawHash.trim().toLowerCase();
     const includeTrashed = Boolean(options.includeTrashed);
+    const includeStat = Boolean(options.includeStat);
+    const verifyOpts = includeStat ? { ...options, withStat: true } : options;
 
-    const masterRecord = await this.verifyExisting(normalized, options);
+    const masterRes = await this.verifyExisting(normalized, verifyOpts);
+    const masterRecord = includeStat ? (masterRes && masterRes.record) : masterRes;
+    const masterStat = includeStat ? (masterRes && masterRes.stat) || null : null;
     if (masterRecord && (includeTrashed || !masterRecord.deletedAt)) {
       return {
         status: 'master',
         record: masterRecord,
         masterHash: masterRecord.diskHash || masterRecord.hash || normalized,
+        stat: masterStat,
       };
     }
 
     const mappedMasterHash = this.proxyToMaster.get(normalized);
     if (mappedMasterHash) {
-      const verifiedMaster = await this.verifyExisting(mappedMasterHash, options);
+      const proxyRes = await this.verifyExisting(mappedMasterHash, verifyOpts);
+      const verifiedMaster = includeStat ? (proxyRes && proxyRes.record) : proxyRes;
+      const verifiedStat = includeStat ? (proxyRes && proxyRes.stat) || null : null;
       if (verifiedMaster && (includeTrashed || !verifiedMaster.deletedAt)) {
         return {
           status: 'proxy',
           record: verifiedMaster,
           masterHash: verifiedMaster.diskHash || verifiedMaster.hash || mappedMasterHash,
+          stat: verifiedStat,
         };
       }
       if (!verifiedMaster) {
@@ -558,7 +604,7 @@ class HashIndex {
       }
     }
 
-    return { status: 'missing', record: null, masterHash: null };
+    return { status: 'missing', record: null, masterHash: null, stat: null };
   }
 
   async registerProxy(masterHash, proxyHash, assetId = '', proxyMeta = {}) {
@@ -628,6 +674,51 @@ class HashIndex {
     this._markDirty();
     await this.persist();
     return record;
+  }
+
+  /**
+   * Batch version of `setOriginalProtected`: updates up to hundreds of restored photos in one
+   * atomic `hash-index.json` persist instead of N separate HTTP round-trips & disk rewrites.
+   */
+  async setOriginalsProtectedBatch(rawHashes, keepOriginal = true) {
+    const flag = Boolean(keepOriginal);
+    const nowIso = flag ? new Date().toISOString() : null;
+    const updated = [];
+    const missing = [];
+    const seenCanonical = new Set();
+    let changed = false;
+
+    for (const raw of rawHashes || []) {
+      const norm = String(raw || '').trim().toLowerCase();
+      if (!norm) continue;
+      const mapped = this.proxyToMaster.get(norm);
+      const targetKey = this.records.has(norm) ? norm : mapped || norm;
+      const found = this.findMasterRecordKeys(targetKey);
+      if (!found || !found.record) {
+        missing.push(norm);
+        continue;
+      }
+      if (seenCanonical.has(found.canonicalHash)) continue;
+      seenCanonical.add(found.canonicalHash);
+
+      for (const k of found.keys) {
+        const entry = this.records.get(k);
+        if (entry) {
+          if (Boolean(entry.keepOriginalOnDevice) !== flag) {
+            changed = true;
+          }
+          entry.keepOriginalOnDevice = flag;
+          entry.originalProtectedAt = nowIso;
+        }
+      }
+      updated.push(this.formatMasterSummary(found.record, found.canonicalHash));
+    }
+
+    if (changed) {
+      this._markDirty();
+      await this.persist();
+    }
+    return { updated, missing };
   }
 
   /**

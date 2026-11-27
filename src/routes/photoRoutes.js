@@ -27,6 +27,7 @@ function createPhotoRoutes({ photoController, shareController, albumController }
   router.post('/photos/trash/restore', photoController.restoreFromTrash);
   router.post('/photos/trash/empty', photoController.emptyTrash);
   router.post('/photos/download-zip', photoController.downloadZip);
+  router.post('/photos/protect-original', photoController.setProtectOriginalsBatch);
   router.post('/photos/delete', photoController.deletePhotosBatch);
   router.delete('/photos', photoController.deletePhotosBatch);
 

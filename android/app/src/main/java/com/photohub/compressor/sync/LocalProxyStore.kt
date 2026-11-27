@@ -112,12 +112,28 @@ class LocalProxyStore private constructor(context: Context) {
     }
 
     fun updatePhoto(photo: ServerPhoto, baseUrl: String?, scopeKey: String, notify: Boolean = false) {
+        updatePhotos(listOf(photo), baseUrl, scopeKey, notify)
+    }
+
+    fun updatePhotos(photos: List<ServerPhoto>, baseUrl: String?, scopeKey: String, notify: Boolean = false) {
+        if (photos.isEmpty()) return
         mutateIndex(baseUrl, scopeKey, notify = notify) { list ->
-            val idx = list.indexOfFirst { it.hash.equals(photo.hash, ignoreCase = true) }
-            if (idx >= 0) {
-                list[idx] = photo
-            } else {
-                list.add(0, photo)
+            val indexByHash = HashMap<String, Int>(list.size * 2)
+            for (i in list.indices) {
+                indexByHash[list[i].hash.lowercase()] = i
+            }
+            val toPrepend = mutableListOf<ServerPhoto>()
+            for (photo in photos) {
+                val key = photo.hash.lowercase()
+                val idx = indexByHash[key]
+                if (idx != null) {
+                    list[idx] = photo
+                } else {
+                    toPrepend.add(photo)
+                }
+            }
+            if (toPrepend.isNotEmpty()) {
+                list.addAll(0, toPrepend)
             }
         }
     }

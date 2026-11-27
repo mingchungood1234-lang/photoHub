@@ -2913,3 +2913,123 @@ test('Auto-proxy queue, EXIF GPS map & search, Memories, Custom Albums, Share up
   });
   assert.equal(adminBackfill.status, 200);
 });
+
+test('High-throughput GET /api/photo/:hash Range streaming and POST /api/photos/protect-original batch API work accurately', async (t) => {
+  const ctx = await startTestServer({
+    userKeys: 'restore_key:restore_user',
+  });
+  t.after(() => ctx.cleanup());
+
+  const headers = { 'X-API-Key': 'restore_key' };
+
+  // Upload a 1.5 MB payload + two small photos to test parallel multi-range reassembly & batch protect
+  const bigBuf = crypto.randomBytes(1536 * 1024); // 1.5 MB
+  const bigSha = crypto.createHash('sha256').update(bigBuf).digest('hex');
+  const small1 = Buffer.from('small-restore-photo-one-payload');
+  const small2 = Buffer.from('small-restore-photo-two-payload');
+
+  const upBig = await (
+    await ctx.request('/api/upload', {
+      method: 'POST',
+      headers: {
+        ...headers,
+        'Content-Type': 'video/mp4',
+        'X-File-Name': 'BIG_4K_RESTORE.MP4',
+        'X-File-Sha256': bigSha,
+        'X-Verify-Checksum': 'strict',
+      },
+      body: bigBuf,
+    })
+  ).json();
+  assert.equal(upBig.success, true);
+
+  const up1 = await (
+    await ctx.request('/api/upload', {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'image/jpeg', 'X-File-Name': 'R1.JPG' },
+      body: small1,
+    })
+  ).json();
+  const up2 = await (
+    await ctx.request('/api/upload', {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'image/jpeg', 'X-File-Name': 'R2.JPG' },
+      body: small2,
+    })
+  ).json();
+
+  // 1. HEAD returns exact Content-Length, Accept-Ranges, ETag, and empty body
+  const headRes = await ctx.request(`/api/photo/${bigSha}`, {
+    method: 'HEAD',
+    headers,
+  });
+  assert.equal(headRes.status, 200);
+  assert.equal(headRes.headers['accept-ranges'], 'bytes');
+  assert.equal(Number(headRes.headers['content-length']), bigBuf.length);
+  assert.equal(headRes.buffer.length, 0);
+  const etag = headRes.headers.etag;
+  assert.ok(etag, 'Expected ETag header on downloadMaster');
+
+  // 2. Conditional GET with If-None-Match returns 304 Not Modified
+  const notMod = await ctx.request(`/api/photo/${bigSha}`, {
+    headers: { ...headers, 'If-None-Match': etag },
+  });
+  assert.equal(notMod.status, 304);
+  assert.equal(notMod.buffer.length, 0);
+
+  // 3. Parallel multi-range HTTP 206 fetch reassembles byte-for-byte identical payload
+  const segSize = 384 * 1024; // 4 segments of 384 KB = 1536 KB
+  const segRanges = [
+    [0, segSize - 1],
+    [segSize, segSize * 2 - 1],
+    [segSize * 2, segSize * 3 - 1],
+    [segSize * 3, bigBuf.length - 1],
+  ];
+  const segResponses = await Promise.all(
+    segRanges.map(([start, end]) =>
+      ctx.request(`/api/photo/${bigSha}`, {
+        headers: { ...headers, Range: `bytes=${start}-${end}` },
+      })
+    )
+  );
+  for (let i = 0; i < segResponses.length; i += 1) {
+    const r = segResponses[i];
+    const [start, end] = segRanges[i];
+    assert.equal(r.status, 206);
+    assert.equal(r.headers['content-range'], `bytes ${start}-${end}/${bigBuf.length}`);
+    assert.equal(r.buffer.length, end - start + 1);
+  }
+  const reassembled = Buffer.concat(segResponses.map((r) => r.buffer));
+  assert.equal(Buffer.compare(reassembled, bigBuf), 0);
+
+  // 4. Out-of-bounds Range returns 416 Range Not Satisfiable
+  const badRange = await ctx.request(`/api/photo/${bigSha}`, {
+    headers: { ...headers, Range: `bytes=${bigBuf.length + 100}-` },
+  });
+  assert.equal(badRange.status, 416);
+  assert.equal(badRange.headers['content-range'], `bytes */${bigBuf.length}`);
+
+  // 5. Batch protect-original updates multiple items in one call & reports missing hashes
+  const missingHash = 'f'.repeat(64);
+  const batchProtect = await ctx.request('/api/photos/protect-original', {
+    method: 'POST',
+    headers: { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      hashes: [bigSha, up1.hash, up2.hash, up1.hash, missingHash],
+      keepOriginalOnDevice: true,
+    }),
+  });
+  assert.equal(batchProtect.status, 200);
+  const protectBody = await batchProtect.json();
+  assert.equal(protectBody.success, true);
+  assert.equal(protectBody.keepOriginalOnDevice, true);
+  assert.equal(protectBody.updatedCount, 3);
+  assert.equal(protectBody.photos.length, 3);
+  assert.ok(protectBody.photos.every((p) => p.keepOriginalOnDevice === true));
+  assert.deepEqual(protectBody.missing, [missingHash]);
+
+  // Verify persisted state via /api/photos
+  const listAfter = await (await ctx.request('/api/photos', { headers })).json();
+  assert.equal(listAfter.photos.length, 3);
+  assert.ok(listAfter.photos.every((p) => p.keepOriginalOnDevice === true));
+});

@@ -54,6 +54,7 @@ fun CompressScreen(
 ) {
     val context = LocalContext.current
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val duplicateState by viewModel.duplicateCleanerState.collectAsStateWithLifecycle()
     val settingsState by settings.state.collectAsStateWithLifecycle()
     val bgState by bgManager.state.collectAsStateWithLifecycle()
 
@@ -130,6 +131,34 @@ fun CompressScreen(
         trashLauncher.launch(IntentSenderRequest.Builder(req.intentSender).build())
     }
 
+    val duplicateTrashLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        val pendingIds = duplicateState.trashPromptRequest?.targetIds ?: emptyList()
+        viewModel.clearDuplicateTrashPrompt()
+        if (result.resultCode == Activity.RESULT_OK) {
+            viewModel.onDuplicateTrashConfirmed(pendingIds)
+        } else {
+            viewModel.onDuplicateTrashCancelled()
+        }
+    }
+
+    LaunchedEffect(duplicateState.trashPromptRequest) {
+        val req = duplicateState.trashPromptRequest ?: return@LaunchedEffect
+        duplicateTrashLauncher.launch(IntentSenderRequest.Builder(req.intentSender).build())
+    }
+
+    if (duplicateState.isOpen) {
+        DuplicateCleanerDialog(
+            state = duplicateState,
+            onRescan = { viewModel.startDuplicateScan() },
+            onToggleItem = { viewModel.toggleDuplicateItemSelection(it) },
+            onLoadThumb = { viewModel.loadDuplicateThumbnailIfNeeded(it) },
+            onAutoRemove = { viewModel.removeSelectedDuplicates() },
+            onDismiss = { viewModel.dismissDuplicateCleaner() }
+        )
+    }
+
     LaunchedEffect(Unit) {
         viewModel.refreshPermissionsAndSync()
         if (uiState.candidates.isEmpty()) {
@@ -189,6 +218,13 @@ fun CompressScreen(
                     }
                 },
                 actions = {
+                    IconButton(
+                        onClick = { viewModel.openDuplicateCleaner() },
+                        enabled = !uiState.isProcessing
+                    ) {
+                        Icon(Icons.Rounded.ContentCopy, contentDescription = "Remove Duplicates")
+                    }
+
                     IconButton(
                         onClick = {
                             detectProxyPicker.launch(
@@ -530,6 +566,14 @@ fun CompressScreen(
                                     }
                                 )
                             }
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SoftOrangeButton(
+                                text = "Remove Duplicates",
+                                icon = Icons.Rounded.ContentCopy,
+                                enabled = !uiState.isProcessing,
+                                onClick = { viewModel.openDuplicateCleaner() },
+                                modifier = Modifier.widthIn(min = 210.dp)
+                            )
                         }
                     }
                 } else {
@@ -1073,6 +1117,348 @@ private fun CleanupPreviewConfirmDialog(
             }
         }
     )
+}
+
+@Composable
+private fun DuplicateCleanerDialog(
+    state: com.photohub.compressor.viewmodel.DuplicateCleanerUiState,
+    onRescan: () -> Unit,
+    onToggleItem: (String) -> Unit,
+    onLoadThumb: (String) -> Unit,
+    onAutoRemove: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    val selectedCount = state.selectedDeleteItems.size
+    val freedStr = Formatter.formatFileSize(context, state.selectedFreedBytes)
+
+    androidx.compose.ui.window.Dialog(
+        onDismissRequest = { if (!state.isDeleting) onDismiss() },
+        properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(top = 18.dp),
+            shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+            color = MaterialTheme.colorScheme.background
+        ) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    TextButton(onClick = onDismiss, enabled = !state.isDeleting) {
+                        Text("Close", fontWeight = FontWeight.Bold)
+                    }
+                    Text(
+                        text = "Duplicate Cleaner",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.ExtraBold,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(onClick = onRescan, enabled = !state.isScanning && !state.isDeleting) {
+                        Icon(Icons.Rounded.Refresh, contentDescription = "Rescan")
+                    }
+                }
+                HorizontalDivider()
+
+                when {
+                    state.isScanning -> {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(28.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.Center
+                        ) {
+                            SunnyMascot(mood = MascotMood.UPLOADING, size = 116.dp)
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text(
+                                text = "Scanning for Duplicates…",
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.ExtraBold
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = state.progressLabel,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.Center
+                            )
+                            Spacer(modifier = Modifier.height(16.dp))
+                            val frac = (state.progressCurrent.toFloat() / state.progressTotal.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f)
+                            LinearProgressIndicator(
+                                progress = { frac },
+                                color = PhotoHubOrange,
+                                trackColor = PhotoHubOrange.copy(alpha = 0.18f),
+                                modifier = Modifier
+                                    .width(240.dp)
+                                    .height(7.dp)
+                                    .clip(CircleShape)
+                            )
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Text(
+                                text = "Checks duplicate proxies, exact SHA-256 files & visually identical copies locally on your phone.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.Center
+                            )
+                        }
+                    }
+
+                    state.result?.groups.isNullOrEmpty() -> {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(28.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.Center
+                        ) {
+                            SunnyMascot(mood = MascotMood.CELEBRATE, size = 124.dp)
+                            Spacer(modifier = Modifier.height(16.dp))
+                            if (state.completedRemovedCount > 0) {
+                                val doneSize = Formatter.formatFileSize(context, state.completedFreedBytes)
+                                Text(
+                                    text = "Duplicates Removed!",
+                                    style = MaterialTheme.typography.headlineSmall,
+                                    fontWeight = FontWeight.ExtraBold
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                WarmStatChip(
+                                    text = "Moved ${state.completedRemovedCount} duplicate(s) · ~$doneSize",
+                                    tint = PhotoHubMint,
+                                    icon = Icons.Rounded.AutoAwesome
+                                )
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Text(
+                                    text = "Moved safely to Trash (recoverable for 30 days). The best copy of every photo was kept.",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    textAlign = TextAlign.Center
+                                )
+                            } else {
+                                Text(
+                                    text = "No Duplicates Found",
+                                    style = MaterialTheme.typography.headlineSmall,
+                                    fontWeight = FontWeight.ExtraBold
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                    text = state.errorMessage
+                                        ?: "Scanned ${state.result?.scannedCount ?: 0} item(s) on your phone. Your photo gallery is spotless!",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    textAlign = TextAlign.Center
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(22.dp))
+                            GradientPrimaryButton(
+                                text = "Done",
+                                icon = Icons.Rounded.Check,
+                                onClick = onDismiss,
+                                modifier = Modifier.widthIn(min = 180.dp)
+                            )
+                        }
+                    }
+
+                    else -> {
+                        val groups = state.result!!.groups
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(MaterialTheme.colorScheme.surface)
+                                .padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                WarmStatChip(
+                                    text = "${groups.size} group(s) · $selectedCount dup(s)",
+                                    tint = PhotoHubOrange,
+                                    icon = Icons.Rounded.ContentCopy
+                                )
+                                WarmStatChip(
+                                    text = "Free ~$freedStr",
+                                    tint = PhotoHubMint,
+                                    icon = Icons.Rounded.AutoAwesome
+                                )
+                            }
+                            state.statusMessage?.let {
+                                Text(it, style = MaterialTheme.typography.labelMedium, color = PhotoHubMint)
+                            }
+                            state.errorMessage?.let {
+                                Text(it, style = MaterialTheme.typography.labelMedium, color = PhotoHubRed)
+                            }
+                        }
+
+                        LazyColumn(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth(),
+                            contentPadding = PaddingValues(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            items(groups, key = { it.id }) { group ->
+                                Surface(
+                                    shape = RoundedCornerShape(18.dp),
+                                    color = MaterialTheme.colorScheme.surface,
+                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                                ) {
+                                    Column(
+                                        modifier = Modifier.padding(12.dp),
+                                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            WarmStatChip(text = group.reason.label, tint = PhotoHubOrange)
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Text(
+                                                text = "${group.items.size} copies",
+                                                style = MaterialTheme.typography.labelMedium,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                            Spacer(modifier = Modifier.weight(1f))
+                                            Text(
+                                                text = "Save ~${Formatter.formatFileSize(context, group.reclaimableBytes)}",
+                                                style = MaterialTheme.typography.labelMedium,
+                                                fontWeight = FontWeight.Bold,
+                                                color = PhotoHubMint
+                                            )
+                                        }
+
+                                        androidx.compose.foundation.lazy.LazyRow(
+                                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                        ) {
+                                            items(group.items.size) { idx ->
+                                                val item = group.items[idx]
+                                                LaunchedEffect(item.id) { onLoadThumb(item.id) }
+                                                val isMarked = !item.isKeep && item.id in state.selectedDeleteIds
+                                                val borderColor = when {
+                                                    item.isKeep -> PhotoHubMint
+                                                    isMarked -> PhotoHubRed
+                                                    else -> MaterialTheme.colorScheme.outlineVariant
+                                                }
+                                                Column(
+                                                    modifier = Modifier
+                                                        .width(96.dp)
+                                                        .clickable(enabled = !item.isKeep) { onToggleItem(item.id) },
+                                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                                ) {
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .size(96.dp)
+                                                            .clip(RoundedCornerShape(12.dp))
+                                                            .background(MaterialTheme.colorScheme.surfaceVariant)
+                                                            .clickable(enabled = !item.isKeep) { onToggleItem(item.id) },
+                                                        contentAlignment = Alignment.Center
+                                                    ) {
+                                                        val bmp = state.thumbnails[item.id]
+                                                        if (bmp != null) {
+                                                            Image(
+                                                                bitmap = bmp.asImageBitmap(),
+                                                                contentDescription = item.filename,
+                                                                contentScale = ContentScale.Crop,
+                                                                modifier = Modifier.fillMaxSize()
+                                                            )
+                                                        } else {
+                                                            Icon(
+                                                                if (item.isVideo) Icons.Rounded.Videocam else Icons.Rounded.Photo,
+                                                                contentDescription = null,
+                                                                tint = PhotoHubOrange
+                                                            )
+                                                        }
+                                                        Surface(
+                                                            modifier = Modifier
+                                                                .align(Alignment.TopStart)
+                                                                .padding(5.dp),
+                                                            shape = CircleShape,
+                                                            color = when {
+                                                                item.isKeep -> PhotoHubMint
+                                                                isMarked -> PhotoHubRed
+                                                                else -> Color.Black.copy(alpha = 0.65f)
+                                                            }
+                                                        ) {
+                                                            Text(
+                                                                text = when {
+                                                                    item.isKeep -> "KEEP"
+                                                                    isMarked -> "REMOVE"
+                                                                    else -> "SKIP"
+                                                                },
+                                                                style = MaterialTheme.typography.labelSmall,
+                                                                fontWeight = FontWeight.ExtraBold,
+                                                                color = Color.White,
+                                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                            )
+                                                        }
+                                                        Surface(
+                                                            modifier = Modifier.fillMaxSize(),
+                                                            shape = RoundedCornerShape(12.dp),
+                                                            color = Color.Transparent,
+                                                            border = BorderStroke(2.5.dp, borderColor)
+                                                        ) {}
+                                                    }
+                                                    Text(
+                                                        text = Formatter.formatFileSize(context, item.sizeBytes.coerceAtLeast(0L)),
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        fontWeight = FontWeight.Bold,
+                                                        maxLines = 1
+                                                    )
+                                                    Text(
+                                                        text = if (item.isProxy) "Proxy" else "${item.width}×${item.height}",
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                        maxLines = 1
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Surface(
+                            color = MaterialTheme.colorScheme.surface,
+                            tonalElevation = 4.dp,
+                            shadowElevation = 8.dp
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                GradientPrimaryButton(
+                                    text = if (state.isDeleting) {
+                                        "Removing Duplicates…"
+                                    } else {
+                                        "Auto Remove $selectedCount Duplicate${if (selectedCount == 1) "" else "s"} (~$freedStr)"
+                                    },
+                                    icon = Icons.Rounded.DeleteSweep,
+                                    enabled = selectedCount > 0 && !state.isDeleting,
+                                    loading = state.isDeleting,
+                                    onClick = onAutoRemove,
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                                Text(
+                                    text = "Always keeps the best original · Removed copies stay in Trash for 30 days",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    textAlign = TextAlign.Center
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 private fun openAppSettings(context: android.content.Context) {

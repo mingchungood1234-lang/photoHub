@@ -88,6 +88,11 @@ final class LocalProxyTracker {
         if let restored = restoredAssetToMaster[assetId], !restored.isEmpty {
             return (restored, nil)
         }
+        if uploadedOriginalAssetIds.contains(assetId) {
+            for (master, mappedId) in uploadedOriginalMasterToAsset where mappedId == assetId {
+                return (master, nil)
+            }
+        }
         return nil
     }
 

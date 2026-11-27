@@ -561,6 +561,195 @@ struct RestoreConfirmPrompt: Identifiable {
     }
 }
 
+private enum RestorePipelineSlot: Sendable {
+    case downloaded(photo: ServerPhoto, fileURL: URL, fileSize: Int64, cleanupDir: URL?)
+    case failed(photo: ServerPhoto)
+    case lowStorage(photo: ServerPhoto)
+}
+
+/// Decouples 6 concurrent network downloaders from the ordered Apple Photos batch committer so
+/// a slow 4K video at index 0 never stalls subsequent photo downloads, while bounding temporary
+/// disk headroom to `maxBufferedAhead` items / `maxBufferedBytes`.
+private actor RestorePipelineBuffer {
+    private let totalCount: Int
+    private let maxBufferedAhead: Int
+    private let maxBufferedBytes: Int64
+
+    private var nextCommitIndex: Int = 0
+    private var slots: [Int: RestorePipelineSlot] = [:]
+    private var bufferedBytes: Int64 = 0
+    private var consumerWaiter: CheckedContinuation<[RestorePipelineSlot], Never>?
+    private var producerWaiters: [(id: UUID, index: Int, cont: CheckedContinuation<Bool, Never>)] = []
+    private var stopped: Bool = false
+
+    init(
+        totalCount: Int,
+        maxBufferedAhead: Int = 18,
+        maxBufferedBytes: Int64 = 320 * 1024 * 1024
+    ) {
+        self.totalCount = totalCount
+        self.maxBufferedAhead = maxBufferedAhead
+        self.maxBufferedBytes = maxBufferedBytes
+    }
+
+    private func canDownloadNow(index: Int) -> Bool {
+        if index <= nextCommitIndex { return true }
+        return (index - nextCommitIndex < maxBufferedAhead) && (bufferedBytes < maxBufferedBytes)
+    }
+
+    func waitForDownloadSlot(index: Int) async -> Bool {
+        if stopped || Task.isCancelled { return false }
+        if canDownloadNow(index: index) { return true }
+
+        let waiterId = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { cont in
+                if stopped || Task.isCancelled {
+                    cont.resume(returning: false)
+                    return
+                }
+                if canDownloadNow(index: index) {
+                    cont.resume(returning: true)
+                    return
+                }
+                producerWaiters.append((id: waiterId, index: index, cont: cont))
+            }
+        } onCancel: {
+            Task { await self.cancelProducerWaiter(id: waiterId) }
+        }
+    }
+
+    private func cancelProducerWaiter(id: UUID) {
+        if let idx = producerWaiters.firstIndex(where: { $0.id == id }) {
+            let entry = producerWaiters.remove(at: idx)
+            entry.cont.resume(returning: false)
+        }
+    }
+
+    func submit(index: Int, slot: RestorePipelineSlot) {
+        if stopped {
+            Self.cleanupTempDir(for: slot)
+            return
+        }
+        slots[index] = slot
+        if case .downloaded(_, _, let size, _) = slot {
+            bufferedBytes += max(0, size)
+        }
+        if let waiter = consumerWaiter, slots[nextCommitIndex] != nil {
+            consumerWaiter = nil
+            let batch = drainContiguousBatch()
+            waiter.resume(returning: batch)
+        }
+    }
+
+    func takeNextContiguousBatch() async -> [RestorePipelineSlot] {
+        if nextCommitIndex >= totalCount {
+            return []
+        }
+        if slots[nextCommitIndex] != nil {
+            return drainContiguousBatch()
+        }
+        if stopped || Task.isCancelled {
+            return []
+        }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { cont in
+                if nextCommitIndex >= totalCount {
+                    cont.resume(returning: [])
+                    return
+                }
+                if slots[nextCommitIndex] != nil {
+                    cont.resume(returning: drainContiguousBatch())
+                    return
+                }
+                if stopped || Task.isCancelled {
+                    cont.resume(returning: [])
+                    return
+                }
+                consumerWaiter = cont
+            }
+        } onCancel: {
+            Task { await self.stop() }
+        }
+    }
+
+    func stop() {
+        guard !stopped else { return }
+        stopped = true
+        for (_, slot) in slots {
+            Self.cleanupTempDir(for: slot)
+        }
+        slots.removeAll()
+        bufferedBytes = 0
+
+        if let waiter = consumerWaiter {
+            consumerWaiter = nil
+            waiter.resume(returning: [])
+        }
+        let waitingProducers = producerWaiters
+        producerWaiters.removeAll()
+        for entry in waitingProducers {
+            entry.cont.resume(returning: false)
+        }
+    }
+
+    private func drainContiguousBatch(
+        maxImages: Int = 12,
+        maxBatchBytes: Int64 = 64 * 1024 * 1024
+    ) -> [RestorePipelineSlot] {
+        guard let first = slots.removeValue(forKey: nextCommitIndex) else {
+            return []
+        }
+        nextCommitIndex += 1
+        var batch: [RestorePipelineSlot] = [first]
+        var batchBytes: Int64 = 0
+
+        switch first {
+        case .downloaded(let photo, _, let size, _):
+            bufferedBytes = max(0, bufferedBytes - max(0, size))
+            batchBytes = max(0, size)
+            // Videos commit individually in their exact chronological slot; contiguous photos group up to 12 per performChanges!
+            if !photo.isVideo {
+                while batch.count < maxImages,
+                      let nextSlot = slots[nextCommitIndex],
+                      case .downloaded(let nextPhoto, _, let nextSize, _) = nextSlot,
+                      !nextPhoto.isVideo,
+                      batchBytes + max(0, nextSize) <= maxBatchBytes {
+                    _ = slots.removeValue(forKey: nextCommitIndex)
+                    nextCommitIndex += 1
+                    bufferedBytes = max(0, bufferedBytes - max(0, nextSize))
+                    batchBytes += max(0, nextSize)
+                    batch.append(nextSlot)
+                }
+            }
+        case .failed, .lowStorage:
+            break
+        }
+
+        wakeEligibleProducers()
+        return batch
+    }
+
+    private func wakeEligibleProducers() {
+        guard !producerWaiters.isEmpty else { return }
+        var remaining: [(id: UUID, index: Int, cont: CheckedContinuation<Bool, Never>)] = []
+        for entry in producerWaiters {
+            if stopped || canDownloadNow(index: entry.index) {
+                entry.cont.resume(returning: !stopped)
+            } else {
+                remaining.append(entry)
+            }
+        }
+        producerWaiters = remaining
+    }
+
+    static func cleanupTempDir(for slot: RestorePipelineSlot) {
+        if case .downloaded(_, _, _, let cleanupDir) = slot, let cleanupDir {
+            try? FileManager.default.removeItem(at: cleanupDir)
+        }
+    }
+}
+
 enum BatchRestoreRunner {
     struct Summary {
         let succeeded: Int
@@ -587,61 +776,207 @@ enum BatchRestoreRunner {
         // Insert restored originals chronologically (oldest first, newest LAST) so Apple Photos
         // "Recents" and share sheets show the newest photo first — matching the native Library tab.
         let orderedTargets = PhotoChronologicalOrder.sortServerPhotosOldestFirst(targets)
-        let indexedTargets = orderedTargets.enumerated().map { (index: $0.offset, photo: $0.element) }
-        let queue = AsyncWorkQueue(indexedTargets)
-        let photosWriteSemaphore = AsyncSemaphore(value: 1)
-        let commitGate = OrderedCommitGate()
-        let workerCount = min(3, orderedTargets.count)
+        let totalCount = orderedTargets.count
+
+        // Warm network connection & build the Apple Photos duplicate-guard map ONCE upfront
+        // (eliminates catastrophic O(N^2) per-photo full-library PhotoKit rescans!).
+        await onPhaseChange?("Scanning library...")
+        async let warmTask: Void = client.warmConnectionIfNeeded()
+        let existingOriginalMap: [String: String] = await Task.detached(priority: .userInitiated) {
+            PhotoLibraryService.scanExistingOriginalMapInPhotos()
+        }.value
+        _ = await warmTask
 
         var succeeded = 0
         var failed = 0
         var completed = 0
         var hitLowStorage = false
         var succeededMasterHashes: [String] = []
+        var pendingProtectHashes: [String] = []
+        var downloadTargets: [ServerPhoto] = []
+        downloadTargets.reserveCapacity(orderedTargets.count)
 
-        await withTaskGroup(of: BatchRestoreOutcome?.self) { group in
-            for _ in 0..<workerCount {
-                group.addTask {
-                    await processNextItem(
-                        queue: queue,
-                        client: client,
-                        photoWriteSemaphore: photosWriteSemaphore,
-                        commitGate: commitGate
-                    )
-                }
-            }
-
-            for await outcome in group {
-                guard let outcome else { continue }
-                var updatedPhoto: ServerPhoto?
-                switch outcome {
-                case .restored(let updated, let masterHash, _):
-                    updatedPhoto = updated
-                    succeeded += 1
-                    succeededMasterHashes.append(masterHash)
-                case .failed:
-                    failed += 1
-                case .lowStorage:
-                    hitLowStorage = true
-                    await commitGate.cancelAll()
-                    group.cancelAll()
-                }
+        // Fast-path: instantly link any originals already sitting in Apple Photos (0 downloads, 0 Photos writes)
+        for photo in orderedTargets {
+            if Task.isCancelled { break }
+            if let existingId = PhotoLibraryService.findExistingLiveOriginalAssetId(
+                for: photo,
+                precomputedOriginalMap: existingOriginalMap
+            ) {
+                LocalProxyTracker.shared.markRestoredOriginal(assetId: existingId, masterHash: photo.hash)
+                succeeded += 1
                 completed += 1
-                await onProgress(completed, orderedTargets.count, outcome.displayName, updatedPhoto)
-
-                if !Task.isCancelled && !hitLowStorage {
-                    group.addTask {
-                        await processNextItem(
-                            queue: queue,
-                            client: client,
-                            photoWriteSemaphore: photosWriteSemaphore,
-                            commitGate: commitGate
-                        )
-                    }
-                }
+                succeededMasterHashes.append(photo.hash)
+                pendingProtectHashes.append(photo.hash)
+                await onProgress(completed, totalCount, photo.originalName, nil)
+            } else {
+                downloadTargets.append(photo)
             }
         }
-        await commitGate.cancelAll()
+
+        // Flush batch-protect in chunks of 50 so we do ~10 fast batch HTTP calls instead of 500 serial POSTs!
+        func flushProtectChunkIfNeeded(force: Bool) async {
+            let threshold = force ? 1 : 50
+            guard pendingProtectHashes.count >= threshold else { return }
+            let chunk = pendingProtectHashes
+            pendingProtectHashes.removeAll(keepingCapacity: true)
+            _ = try? await client.setOriginalsProtectedBatch(
+                masterHashes: chunk,
+                protected: true,
+                notifyStore: false
+            )
+        }
+
+        await flushProtectChunkIfNeeded(force: false)
+
+        if !Task.isCancelled && !downloadTargets.isEmpty {
+            let indexedDownloads = downloadTargets.enumerated().map { (index: $0.offset, photo: $0.element) }
+            let queue = AsyncWorkQueue(indexedDownloads)
+            let buffer = RestorePipelineBuffer(totalCount: downloadTargets.count)
+            let workerCount = min(6, downloadTargets.count)
+
+            let producerTask = Task {
+                await withTaskGroup(of: Void.self) { group in
+                    for _ in 0..<workerCount {
+                        group.addTask {
+                            while !Task.isCancelled {
+                                guard let work = await queue.next() else { break }
+                                let allowed = await buffer.waitForDownloadSlot(index: work.index)
+                                if !allowed || Task.isCancelled { break }
+
+                                let item = work.photo
+                                if let freeBytes = DeviceStorageHelper.availableBytes() {
+                                    let needed = max(Int64(250 * 1024 * 1024), max(0, item.size) + 150 * 1024 * 1024)
+                                    if freeBytes < needed {
+                                        await buffer.submit(index: work.index, slot: .lowStorage(photo: item))
+                                        break
+                                    }
+                                }
+
+                                let slot = await downloadForBatch(photo: item, client: client)
+                                await buffer.submit(index: work.index, slot: slot)
+                            }
+                        }
+                    }
+                    await group.waitForAll()
+                }
+                await buffer.stop()
+            }
+
+            // Dedicated ordered batch committer: drains contiguous oldest-first items and commits
+            // up to 12 photos inside a SINGLE `PHPhotoLibrary.performChanges` transaction!
+            var committedIndices = 0
+            while committedIndices < downloadTargets.count && !Task.isCancelled && !hitLowStorage {
+                let batch = await buffer.takeNextContiguousBatch()
+                if batch.isEmpty { break }
+                committedIndices += batch.count
+
+                if batch.count == 1 {
+                    switch batch[0] {
+                    case .lowStorage(let photo):
+                        hitLowStorage = true
+                        await buffer.stop()
+                        producerTask.cancel()
+                        completed += 1
+                        await onProgress(completed, totalCount, photo.originalName, nil)
+                        continue
+                    case .failed(let photo):
+                        failed += 1
+                        completed += 1
+                        await onProgress(completed, totalCount, photo.originalName, nil)
+                        continue
+                    case .downloaded:
+                        break
+                    }
+                }
+
+                // Extract downloaded items (preserving exact oldest-first chronological order)
+                let readyItems: [(photo: ServerPhoto, fileURL: URL, fileSize: Int64, cleanupDir: URL?)] = batch.compactMap { slot in
+                    if case .downloaded(let p, let u, let sz, let dir) = slot {
+                        return (p, u, sz, dir)
+                    }
+                    return nil
+                }
+                guard !readyItems.isEmpty else { continue }
+
+                // Pre-mark all master hashes in this chunk BEFORE committing so background backup never races
+                var wasAlreadyRestoredFlags: [Bool] = []
+                wasAlreadyRestoredFlags.reserveCapacity(readyItems.count)
+                for item in readyItems {
+                    wasAlreadyRestoredFlags.append(LocalProxyTracker.shared.isRestoredMasterHash(item.photo.hash))
+                    LocalProxyTracker.shared.markRestoredOriginal(assetId: nil, masterHash: item.photo.hash)
+                }
+
+                do {
+                    let createdIds = try await PhotoLibraryService.saveRestoredOriginalsBatchToPhotosAsync(
+                        readyItems.map { ($0.photo, $0.fileURL) }
+                    )
+                    for (idx, item) in readyItems.enumerated() {
+                        let createdId = idx < createdIds.count ? createdIds[idx] : ""
+                        LocalProxyTracker.shared.markRestoredOriginal(
+                            assetId: createdId.isEmpty ? nil : createdId,
+                            masterHash: item.photo.hash
+                        )
+                        if let dir = item.cleanupDir {
+                            try? FileManager.default.removeItem(at: dir)
+                        }
+                        succeeded += 1
+                        completed += 1
+                        succeededMasterHashes.append(item.photo.hash)
+                        pendingProtectHashes.append(item.photo.hash)
+                        await onProgress(completed, totalCount, item.photo.originalName, nil)
+                    }
+                } catch {
+                    // Fallback: commit items one-by-one in exact chronological order so one bad file never breaks the chunk
+                    for (idx, item) in readyItems.enumerated() {
+                        defer {
+                            if let dir = item.cleanupDir {
+                                try? FileManager.default.removeItem(at: dir)
+                            }
+                        }
+                        do {
+                            let createdId = try await PhotoLibraryService.saveRestoredOriginalToPhotosAsync(
+                                photo: item.photo,
+                                fileURL: item.fileURL
+                            )
+                            LocalProxyTracker.shared.markRestoredOriginal(
+                                assetId: createdId.isEmpty ? nil : createdId,
+                                masterHash: item.photo.hash
+                            )
+                            succeeded += 1
+                            succeededMasterHashes.append(item.photo.hash)
+                            pendingProtectHashes.append(item.photo.hash)
+                        } catch {
+                            if !wasAlreadyRestoredFlags[idx] {
+                                LocalProxyTracker.shared.clearRestoredProtection(masterHash: item.photo.hash)
+                            }
+                            failed += 1
+                        }
+                        completed += 1
+                        await onProgress(completed, totalCount, item.photo.originalName, nil)
+                    }
+                }
+
+                await flushProtectChunkIfNeeded(force: false)
+            }
+
+            await buffer.stop()
+            producerTask.cancel()
+            await producerTask.value
+        }
+
+        // Flush any remaining restored hashes in ONE batch protect call (runs even on cancel / low storage)
+        if !pendingProtectHashes.isEmpty {
+            let finalHashes = pendingProtectHashes
+            pendingProtectHashes.removeAll()
+            _ = await Task.detached(priority: .userInitiated) {
+                try? await client.setOriginalsProtectedBatch(
+                    masterHashes: finalHashes,
+                    protected: true,
+                    notifyStore: true
+                )
+            }.value
+        }
 
         let cancelled = Task.isCancelled
         var deletedProxyCount = 0
@@ -693,35 +1028,39 @@ enum BatchRestoreRunner {
         )
     }
 
-    private static func processNextItem(
-        queue: AsyncWorkQueue<(index: Int, photo: ServerPhoto)>,
-        client: PhotoHubAPIClient,
-        photoWriteSemaphore: AsyncSemaphore,
-        commitGate: OrderedCommitGate
-    ) async -> BatchRestoreOutcome? {
-        guard !Task.isCancelled, let work = await queue.next() else {
-            return nil
+    private static func downloadForBatch(
+        photo: ServerPhoto,
+        client: PhotoHubAPIClient
+    ) async -> RestorePipelineSlot {
+        let expectedSize: Int64? = photo.size > 0 ? photo.size : nil
+        // Reuse existing OriginalDownloadCache hit immediately with zero network I/O
+        if let cached = OriginalDownloadCache.shared.getCachedOriginal(
+            hash: photo.hash,
+            expectedSizeBytes: expectedSize
+        ) {
+            let sz = (try? cached.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { Int64($0) } ?? photo.size
+            return .downloaded(photo: photo, fileURL: cached, fileSize: sz, cleanupDir: nil)
         }
-        let item = work.photo
-        if let freeBytes = DeviceStorageHelper.availableBytes() {
-            let needed = max(Int64(250 * 1024 * 1024), max(0, item.size) + 150 * 1024 * 1024)
-            if freeBytes < needed {
-                await commitGate.completeTurn(work.index)
-                return .lowStorage(item.originalName)
-            }
-        }
+
+        // Stream directly to a disposable temp folder (bypasses 400 MB LRU cache pruning & APFS extra copy).
+        // When 6 batch workers run concurrently, single-stream keeps server disk reads sequential for photos;
+        // parallel HTTP Ranges activate automatically for large >= 24 MB videos!
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("photohub_restore_\(UUID().uuidString.prefix(8))", isDirectory: true)
         do {
-            let (updated, _) = try await PhotoLibraryService.restoreMasterToPhotos(
-                photo: item,
-                client: client,
-                photoWriteSemaphore: photoWriteSemaphore,
-                commitGate: commitGate,
-                commitIndex: work.index
+            let fileURL = try await client.downloadMasterToDirectory(
+                hash: photo.hash,
+                destinationDir: tempDir,
+                preferredFilename: photo.originalName,
+                expectedSizeBytes: expectedSize,
+                isVideo: photo.isVideo,
+                allowParallelRanges: photo.size >= 24 * 1024 * 1024
             )
-            return .restored(updated, item.hash, item.originalName)
+            let sz = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { Int64($0) } ?? photo.size
+            return .downloaded(photo: photo, fileURL: fileURL, fileSize: sz, cleanupDir: tempDir)
         } catch {
-            await commitGate.completeTurn(work.index)
-            return .failed(item.originalName)
+            try? FileManager.default.removeItem(at: tempDir)
+            return .failed(photo: photo)
         }
     }
 }
@@ -899,6 +1238,10 @@ final class OriginalRestoreManager: ObservableObject {
             isRestoring = false
             currentItemName = ""
             restoreTask = nil
+            let refreshedPhotos = LocalProxyStore.shared.cachedPhotos(baseURL: baseURL, apiKey: apiKey)
+            if !refreshedPhotos.isEmpty {
+                cachedPhotos = refreshedPhotos
+            }
             applySummary(photos: cachedPhotos, markLoaded: hasLoadedSummary || !cachedPhotos.isEmpty)
             NotificationCenter.default.post(name: .localProxyStoreDidChange, object: nil)
             if turnedOffAutoBackup {

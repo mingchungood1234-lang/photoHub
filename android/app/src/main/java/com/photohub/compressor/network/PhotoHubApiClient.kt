@@ -83,10 +83,10 @@ private class StreamingFileRequestBody(
  * matching iOS URLSession pooling so TLS handshakes and connections stay warm.
  */
 private object SharedHttpClientPool {
-    private val sharedConnectionPool = ConnectionPool(12, 5, TimeUnit.MINUTES)
+    private val sharedConnectionPool = ConnectionPool(16, 5, TimeUnit.MINUTES)
     private val sharedDispatcher = Dispatcher().apply {
-        maxRequests = 40
-        maxRequestsPerHost = 12
+        maxRequests = 48
+        maxRequestsPerHost = 16
     }
 
     private val baseClient: OkHttpClient = OkHttpClient.Builder()
@@ -842,10 +842,11 @@ class PhotoHubApiClient(
         preferredFilename: String? = null,
         expectedSizeBytes: Long? = null,
         isVideo: Boolean = false,
+        allowParallelRanges: Boolean = true,
         onProgress: ((downloadedBytes: Long, totalBytes: Long?) -> Unit)? = null
     ): File {
         val shareDir = File(context.cacheDir, "photohub_share_${UUID.randomUUID().toString().take(8)}")
-        return downloadMasterToDirectory(hash, shareDir, preferredFilename, expectedSizeBytes, isVideo, onProgress).file
+        return downloadMasterToDirectory(hash, shareDir, preferredFilename, expectedSizeBytes, isVideo, allowParallelRanges, onProgress).file
     }
 
     suspend fun downloadMasterToDirectory(
@@ -854,17 +855,18 @@ class PhotoHubApiClient(
         preferredFilename: String? = null,
         expectedSizeBytes: Long? = null,
         isVideo: Boolean = false,
+        allowParallelRanges: Boolean = true,
         onProgress: ((downloadedBytes: Long, totalBytes: Long?) -> Unit)? = null
     ): DownloadedFileResult {
         val path = "/api/photo/$hash"
         val fallback = if (isVideo) "video_${hash.take(8)}.mp4" else "photo_${hash.take(8)}.jpg"
-        // Small files finish faster in a single keep-alive HTTP request; larger or unknown files
-        // try 2 MB ranged fetch + up to 3 parallel segments immediately (zero extra HEAD RTT).
-        if (expectedSizeBytes != null && expectedSizeBytes in 1L until SMALL_SINGLE_STREAM_THRESHOLD_BYTES) {
+        // During batch restore with 6 concurrent files, single-stream avoids 24-30 competing range sockets
+        // and keeps server disk reads sequential; small files (< 4 MB) also finish faster in 1 keep-alive GET.
+        if (!allowParallelRanges || (expectedSizeBytes != null && expectedSizeBytes in 1L until SMALL_SINGLE_STREAM_THRESHOLD_BYTES)) {
             return streamDownloadToDirectory(path, destDir, preferredFilename, fallback, onProgress)
         }
         return try {
-            downloadWithParallelRanges(path, destDir, preferredFilename, fallback, onProgress)
+            downloadWithParallelRanges(path, destDir, preferredFilename, fallback, expectedSizeBytes, onProgress)
         } catch (_: SegmentedFallbackException) {
             streamDownloadToDirectory(path, destDir, preferredFilename, fallback, onProgress)
         }
@@ -886,14 +888,20 @@ class PhotoHubApiClient(
         destDir: File,
         preferredFilename: String?,
         fallbackFilename: String,
+        expectedSizeBytes: Long?,
         onProgress: ((downloadedBytes: Long, totalBytes: Long?) -> Unit)?
     ): DownloadedFileResult = withContext(Dispatchers.IO) {
         val origUrl = makeUrl(path)
+        val initialWindow = if (expectedSizeBytes != null && expectedSizeBytes >= 16L * 1024L * 1024L) {
+            minOf(4L * 1024L * 1024L, maxOf(INITIAL_RANGE_BYTES, expectedSizeBytes / 5L))
+        } else {
+            INITIAL_RANGE_BYTES
+        }
         val req = Request.Builder()
             .url(origUrl)
             .get()
             .applyAuth()
-            .header("Range", "bytes=0-${INITIAL_RANGE_BYTES - 1L}")
+            .header("Range", "bytes=0-${initialWindow - 1L}")
             .build()
 
         destDir.mkdirs()
@@ -1158,10 +1166,10 @@ class PhotoHubApiClient(
     }
 
     companion object {
-        private const val SMALL_SINGLE_STREAM_THRESHOLD_BYTES = 1_500_000L
+        private const val SMALL_SINGLE_STREAM_THRESHOLD_BYTES = 4_000_000L
         private const val INITIAL_RANGE_BYTES = 1L * 1024L * 1024L
         private const val MAX_EXTRA_PARALLEL_SEGMENTS = 4
-        private const val PROGRESS_STEP_BYTES = 64L * 1024L
+        private const val PROGRESS_STEP_BYTES = 128L * 1024L
     }
 
     suspend fun setOriginalProtected(masterHash: String, protected: Boolean): ServerPhoto = withContext(Dispatchers.IO) {
@@ -1190,6 +1198,65 @@ class PhotoHubApiClient(
             )
             updated
         }
+    }
+
+    /**
+     * Marks up to hundreds of restored originals protected in one HTTP call + atomic server persist,
+     * falling back gracefully to single-item calls on older backends that return HTTP 404.
+     */
+    suspend fun setOriginalsProtectedBatch(
+        masterHashes: List<String>,
+        protected: Boolean,
+        notifyStore: Boolean = false
+    ): List<ServerPhoto> = withContext(Dispatchers.IO) {
+        val cleaned = masterHashes
+            .map { it.trim().lowercase(Locale.ROOT) }
+            .filter { it.isNotEmpty() }
+            .distinct()
+        if (cleaned.isEmpty()) return@withContext emptyList()
+
+        val allUpdated = mutableListOf<ServerPhoto>()
+        for (chunk in cleaned.chunked(200)) {
+            val payload = JSONObject().apply {
+                put("hashes", JSONArray(chunk))
+                put("keepOriginalOnDevice", protected)
+            }.toString()
+            val req = Request.Builder()
+                .url(makeUrl("/api/photos/protect-original"))
+                .applyAuth()
+                .post(payload.toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull()))
+                .build()
+
+            var needFallback = false
+            client.newCall(req).execute().use { resp ->
+                if (resp.code == 404) {
+                    needFallback = true
+                    return@use
+                }
+                val text = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) throw ApiHttpException(resp.code, parseErrorMessage(resp.code, text))
+                val json = JSONObject(text)
+                val photos = ServerPhoto.listFromJsonArray(json.optJSONArray("photos"))
+                allUpdated.addAll(photos)
+            }
+
+            if (needFallback) {
+                for (h in chunk) {
+                    runCatching { setOriginalProtected(h, protected) }.getOrNull()?.let(allUpdated::add)
+                }
+            }
+        }
+
+        if (allUpdated.isNotEmpty()) {
+            val cur = settings.current
+            LocalProxyStore.getInstance(context).updatePhotos(
+                allUpdated,
+                cur.normalizedBaseUrl,
+                cur.apiKeyCacheScope,
+                notify = notifyStore
+            )
+        }
+        allUpdated
     }
 
     suspend fun setPhotoFavorite(masterHash: String, isFavorite: Boolean): ServerPhoto = withContext(Dispatchers.IO) {

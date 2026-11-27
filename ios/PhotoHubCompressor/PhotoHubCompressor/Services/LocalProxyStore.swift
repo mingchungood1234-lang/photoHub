@@ -189,11 +189,28 @@ final class LocalProxyStore {
     }
 
     func updatePhoto(_ photo: ServerPhoto, baseURL: URL?, apiKey: String, notify: Bool = false) {
+        updatePhotos([photo], baseURL: baseURL, apiKey: apiKey, notify: notify)
+    }
+
+    func updatePhotos(_ photos: [ServerPhoto], baseURL: URL?, apiKey: String, notify: Bool = false) {
+        guard !photos.isEmpty else { return }
         mutateIndex(baseURL: baseURL, apiKey: apiKey, notify: notify) { current in
-            if let idx = current.firstIndex(where: { $0.hash.lowercased() == photo.hash.lowercased() }) {
-                current[idx] = photo
-            } else {
-                current.insert(photo, at: 0)
+            var indexByHash: [String: Int] = [:]
+            indexByHash.reserveCapacity(current.count)
+            for (idx, item) in current.enumerated() {
+                indexByHash[item.hash.lowercased()] = idx
+            }
+            var toPrepend: [ServerPhoto] = []
+            for photo in photos {
+                let key = photo.hash.lowercased()
+                if let idx = indexByHash[key] {
+                    current[idx] = photo
+                } else {
+                    toPrepend.append(photo)
+                }
+            }
+            if !toPrepend.isEmpty {
+                current.insert(contentsOf: toPrepend, at: 0)
             }
         }
     }

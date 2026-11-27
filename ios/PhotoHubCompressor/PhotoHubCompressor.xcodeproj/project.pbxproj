@@ -19,6 +19,8 @@
 		AA0001100000000000000001 /* LibraryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0001100000000000000001 /* LibraryView.swift */; };
 		AA0001110000000000000001 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0001110000000000000001 /* SettingsView.swift */; };
 		AA0001140000000000000001 /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0001140000000000000001 /* OnboardingView.swift */; };
+		AA0001150000000000000001 /* LocalDuplicateCleaner.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0001150000000000000001 /* LocalDuplicateCleaner.swift */; };
+		AA0001160000000000000001 /* DuplicateCleanerSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0001160000000000000001 /* DuplicateCleanerSheet.swift */; };
 		AA0001120000000000000001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = BB0001120000000000000001 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
@@ -36,6 +38,8 @@
 		BB0001100000000000000001 /* LibraryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryView.swift; sourceTree = "<group>"; };
 		BB0001110000000000000001 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		BB0001140000000000000001 /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingView.swift; sourceTree = "<group>"; };
+		BB0001150000000000000001 /* LocalDuplicateCleaner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalDuplicateCleaner.swift; sourceTree = "<group>"; };
+		BB0001160000000000000001 /* DuplicateCleanerSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DuplicateCleanerSheet.swift; sourceTree = "<group>"; };
 		BB0001120000000000000001 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		BB0001130000000000000001 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -97,6 +101,7 @@
 				BB0001050000000000000001 /* ProxyGenerator.swift */,
 				BB0001060000000000000001 /* PhotoLibraryService.swift */,
 				BB0001070000000000000001 /* PhotoHubAPIClient.swift */,
+				BB0001150000000000000001 /* LocalDuplicateCleaner.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -116,6 +121,7 @@
 				BB0001100000000000000001 /* LibraryView.swift */,
 				BB0001110000000000000001 /* SettingsView.swift */,
 				BB0001140000000000000001 /* OnboardingView.swift */,
+				BB0001160000000000000001 /* DuplicateCleanerSheet.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -201,6 +207,8 @@
 				AA00011000000000000001 /* LibraryView.swift in Sources */,
 				AA0001110000000000000001 /* SettingsView.swift in Sources */,
 				AA0001140000000000000001 /* OnboardingView.swift in Sources */,
+				AA0001150000000000000001 /* LocalDuplicateCleaner.swift in Sources */,
+				AA0001160000000000000001 /* DuplicateCleanerSheet.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

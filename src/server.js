@@ -39,11 +39,14 @@ if (require.main === module) {
         } else {
           srv = http.createServer(app);
         }
-        // Keep TCP/TLS sockets warm longer (65s vs Node's 5s default) and allow slow
-        // large-video uploads over Tailscale/WAN without hitting Node 22's 5-min requestTimeout.
+        // Keep TCP/TLS sockets warm longer (65s vs Node's 5s default), disable Nagle's algorithm
+        // for snappy Range/keep-alive transfers, and allow slow large-video uploads over Tailscale/WAN.
         srv.keepAliveTimeout = 65_000;
         srv.headersTimeout = 66_000;
         srv.requestTimeout = 0;
+        srv.on('connection', (socket) => {
+          socket.setNoDelay(true);
+        });
         return srv;
       };
 

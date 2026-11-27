@@ -24,7 +24,9 @@ import com.photohub.compressor.sync.LocalProxyTracker
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import java.io.File
 import java.text.SimpleDateFormat
@@ -379,6 +381,136 @@ data class BatchRestoreResult(
     val summaryMessage: String
 )
 
+/**
+ * Bounded out-of-order download buffer feeding a strict oldest-first sequential Gallery committer.
+ * Prevents head-of-line stalls when index 0 is a huge 4K video while capping temp disk headroom.
+ */
+class OrderedRestorePipelineBuffer<T>(
+    private val totalCount: Int,
+    private val maxBufferedAhead: Int = 18,
+    private val maxBufferedBytes: Long = 320L * 1024L * 1024L,
+    private val onDiscard: ((T) -> Unit)? = null
+) {
+    private val mutex = kotlinx.coroutines.sync.Mutex()
+    private var nextCommitIndex = 0
+    private val slots = HashMap<Int, Pair<T, Long>>()
+    private var bufferedBytes = 0L
+    private var stopped = false
+    private var consumerWaiter: CompletableDeferred<T?>? = null
+    private val producerWaiters = mutableListOf<Pair<Int, CompletableDeferred<Boolean>>>()
+
+    private fun canDownloadLocked(index: Int): Boolean {
+        if (index <= nextCommitIndex) return true
+        return (index - nextCommitIndex < maxBufferedAhead) && (bufferedBytes < maxBufferedBytes)
+    }
+
+    suspend fun waitForDownloadSlot(index: Int): Boolean {
+        val waiter: CompletableDeferred<Boolean> = mutex.withLock {
+            if (stopped) return false
+            if (canDownloadLocked(index)) return true
+            CompletableDeferred<Boolean>().also { producerWaiters.add(index to it) }
+        }
+        return try {
+            waiter.await()
+        } catch (c: CancellationException) {
+            mutex.withLock { producerWaiters.removeAll { it.second === waiter } }
+            throw c
+        }
+    }
+
+    suspend fun submit(index: Int, item: T, sizeBytes: Long) {
+        var discardNow = false
+        mutex.withLock {
+            if (stopped) {
+                discardNow = true
+            } else {
+                val safeBytes = sizeBytes.coerceAtLeast(0L)
+                slots[index] = item to safeBytes
+                bufferedBytes += safeBytes
+                val waiter = consumerWaiter
+                if (waiter != null && slots.containsKey(nextCommitIndex)) {
+                    consumerWaiter = null
+                    val (ready, bytes) = slots.remove(nextCommitIndex)!!
+                    nextCommitIndex++
+                    bufferedBytes = (bufferedBytes - bytes).coerceAtLeast(0L)
+                    wakeEligibleProducersLocked()
+                    waiter.complete(ready)
+                }
+            }
+        }
+        if (discardNow) {
+            onDiscard?.invoke(item)
+        }
+    }
+
+    suspend fun takeNextInOrder(): T? {
+        val waiter: CompletableDeferred<T?> = mutex.withLock {
+            if (nextCommitIndex >= totalCount) return null
+            val existing = slots.remove(nextCommitIndex)
+            if (existing != null) {
+                nextCommitIndex++
+                bufferedBytes = (bufferedBytes - existing.second).coerceAtLeast(0L)
+                wakeEligibleProducersLocked()
+                return existing.first
+            }
+            if (stopped) return null
+            CompletableDeferred<T?>().also { consumerWaiter = it }
+        }
+        return try {
+            waiter.await()
+        } catch (c: CancellationException) {
+            stop()
+            throw c
+        }
+    }
+
+    suspend fun stop() {
+        val toDiscard = mutableListOf<T>()
+        mutex.withLock {
+            if (stopped) return
+            stopped = true
+            for ((_, pair) in slots) {
+                toDiscard.add(pair.first)
+            }
+            slots.clear()
+            bufferedBytes = 0L
+            consumerWaiter?.complete(null)
+            consumerWaiter = null
+            for ((_, d) in producerWaiters) {
+                d.complete(false)
+            }
+            producerWaiters.clear()
+        }
+        for (item in toDiscard) {
+            onDiscard?.invoke(item)
+        }
+    }
+
+    private fun wakeEligibleProducersLocked() {
+        if (producerWaiters.isEmpty()) return
+        val iter = producerWaiters.iterator()
+        while (iter.hasNext()) {
+            val (idx, deferred) = iter.next()
+            if (stopped || canDownloadLocked(idx)) {
+                iter.remove()
+                deferred.complete(!stopped)
+            }
+        }
+    }
+}
+
+private sealed class BatchDownloadSlot {
+    data class Downloaded(
+        val photo: ServerPhoto,
+        val file: File,
+        val sizeBytes: Long,
+        val cleanupDir: File?
+    ) : BatchDownloadSlot()
+
+    data class Failed(val photo: ServerPhoto) : BatchDownloadSlot()
+    data class LowStorage(val photo: ServerPhoto) : BatchDownloadSlot()
+}
+
 object BatchRestoreExecutor {
     suspend fun restoreSinglePhotoToGallery(
         context: android.content.Context,
@@ -388,6 +520,8 @@ object BatchRestoreExecutor {
         photo: ServerPhoto,
         commitGate: OrderedCommitGate? = null,
         commitIndex: Int? = null,
+        precomputedOriginalMap: Map<String, String>? = null,
+        skipServerProtect: Boolean = false,
         onProgress: ((Long, Long?) -> Unit)? = null
     ): Pair<ServerPhoto?, Long> {
         var didCompleteTurn = false
@@ -401,12 +535,16 @@ object BatchRestoreExecutor {
             // Strict duplicate guard: if the full-resolution original ALREADY exists in Gallery,
             // link and protect it without writing a duplicate copy into MediaStore.
             val existingOrigUri = withContext(Dispatchers.IO) {
-                mediaService.findExistingLiveOriginalUri(photo, tracker)
+                mediaService.findExistingLiveOriginalUri(photo, tracker, precomputedOriginalMap)
             }
             if (existingOrigUri != null) {
                 releaseTurnIfNeeded()
                 tracker.markRestoredOriginal(existingOrigUri, photo.hash)
-                val updated = runCatching { client.setOriginalProtected(photo.hash, true) }.getOrNull()
+                val updated = if (skipServerProtect) {
+                    null
+                } else {
+                    runCatching { client.setOriginalProtected(photo.hash, true) }.getOrNull()
+                }
                 return updated to photo.size.coerceAtLeast(0L)
             }
 
@@ -416,6 +554,7 @@ object BatchRestoreExecutor {
                 masterHash = photo.hash,
                 preferredFilename = photo.originalName,
                 expectedSizeBytes = photo.size,
+                isVideo = photo.isVideo,
                 onProgress = onProgress
             )
             val fileSize = originalFile.length()
@@ -430,7 +569,7 @@ object BatchRestoreExecutor {
             bgManager.beginRestorePause()
             // Pre-mark master hash before writing into MediaStore to eliminate any race window.
             tracker.markRestoredOriginal(null, photo.hash)
-            val savedId = try {
+            try {
                 val id = mediaService.saveRestoredOriginalToGallery(
                     file = originalFile,
                     isVideo = photo.isVideo,
@@ -438,7 +577,6 @@ object BatchRestoreExecutor {
                     creationDateMs = photo.parsedCreationDateMs
                 )
                 tracker.markRestoredOriginal(id, photo.hash)
-                id
             } catch (err: Exception) {
                 if (!wasAlreadyRestored) {
                     tracker.clearRestoredProtection(photo.hash)
@@ -448,10 +586,64 @@ object BatchRestoreExecutor {
                 releaseTurnIfNeeded()
                 bgManager.endRestorePause()
             }
-            val updated = runCatching { client.setOriginalProtected(photo.hash, true) }.getOrNull()
+            val updated = if (skipServerProtect) {
+                null
+            } else {
+                runCatching { client.setOriginalProtected(photo.hash, true) }.getOrNull()
+            }
             return updated to fileSize
         } finally {
             releaseTurnIfNeeded()
+        }
+    }
+
+    private suspend fun downloadItemForBatch(
+        context: android.content.Context,
+        client: PhotoHubApiClient,
+        photo: ServerPhoto
+    ): BatchDownloadSlot {
+        val expectedSize = photo.size.takeIf { it > 0L }
+        // Reuse existing OriginalDownloadCache hit immediately with zero network I/O
+        val cached = OriginalDownloadCache.getCachedOriginal(
+            context = context,
+            masterHash = photo.hash,
+            preferredFilename = photo.originalName,
+            expectedSizeBytes = expectedSize
+        )
+        if (cached != null) {
+            return BatchDownloadSlot.Downloaded(
+                photo = photo,
+                file = cached,
+                sizeBytes = cached.length().coerceAtLeast(photo.size),
+                cleanupDir = null
+            )
+        }
+
+        // Stream directly to a disposable temp folder (bypasses OriginalDownloadCache LRU tree walks).
+        // With 6 concurrent batch workers, single-stream keeps server reads sequential for photos;
+        // parallel HTTP Ranges activate automatically for large >= 24 MB videos!
+        val tempDir = File(context.cacheDir, "photohub_restore_${UUID.randomUUID().toString().take(8)}")
+        return try {
+            val res = client.downloadMasterToDirectory(
+                hash = photo.hash,
+                destDir = tempDir,
+                preferredFilename = photo.originalName,
+                expectedSizeBytes = expectedSize,
+                isVideo = photo.isVideo,
+                allowParallelRanges = photo.size >= 24L * 1024L * 1024L
+            )
+            BatchDownloadSlot.Downloaded(
+                photo = photo,
+                file = res.file,
+                sizeBytes = res.file.length().coerceAtLeast(res.bytesWritten),
+                cleanupDir = tempDir
+            )
+        } catch (c: CancellationException) {
+            runCatching { tempDir.deleteRecursively() }
+            throw c
+        } catch (_: Exception) {
+            runCatching { tempDir.deleteRecursively() }
+            BatchDownloadSlot.Failed(photo)
         }
     }
 
@@ -473,75 +665,186 @@ object BatchRestoreExecutor {
         // Insert restored originals chronologically oldest-first and newest LAST so third-party
         // share pickers (WhatsApp, Telegram, Instagram, Android Photo Picker) show the newest photo first.
         val orderedTargets = PhotoBackupPipeline.sortServerPhotosOldestFirst(targets)
-        val queue = Channel<Pair<Int, ServerPhoto>>(Channel.UNLIMITED)
-        orderedTargets.forEachIndexed { idx, photo -> queue.trySend(idx to photo) }
-        queue.close()
-        val commitGate = OrderedCommitGate()
+        val totalCount = orderedTargets.size
 
         val succeeded = AtomicInteger(0)
         val failed = AtomicInteger(0)
         val completed = AtomicInteger(0)
         val lowStorageHit = java.util.concurrent.atomic.AtomicBoolean(false)
-        val succeededHashes = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val succeededHashes = Collections.synchronizedList(mutableListOf<String>())
+        val pendingProtectHashes = mutableListOf<String>()
         var cancelled = false
 
+        suspend fun flushProtectChunk(force: Boolean) {
+            val threshold = if (force) 1 else 50
+            if (pendingProtectHashes.size < threshold) return
+            val chunk = pendingProtectHashes.toList()
+            pendingProtectHashes.clear()
+            runCatching {
+                client.setOriginalsProtectedBatch(
+                    masterHashes = chunk,
+                    protected = true,
+                    notifyStore = false
+                )
+            }
+        }
+
         try {
-            coroutineScope {
-                val workerCount = minOf(3, orderedTargets.size)
-                val workers = List(workerCount) {
-                    launch(Dispatchers.IO) {
-                        for ((workIndex, item) in queue) {
-                            if (!isActive || lowStorageHit.get()) {
-                                commitGate.completeTurn(workIndex)
-                                break
-                            }
-                            val freeBytes = DeviceStorageHelper.availableBytes()
-                            val neededBytes = maxOf(250L * 1024L * 1024L, maxOf(0L, item.size) + 150L * 1024L * 1024L)
-                            if (freeBytes != null && freeBytes < neededBytes) {
-                                lowStorageHit.set(true)
-                                commitGate.cancelAll()
-                                break
-                            }
-                            var updatedPhoto: ServerPhoto? = null
-                            try {
-                                updatedPhoto = restoreSinglePhotoToGallery(
-                                    context = context,
-                                    client = client,
-                                    mediaService = mediaService,
-                                    tracker = tracker,
-                                    photo = item,
-                                    commitGate = commitGate,
-                                    commitIndex = workIndex
-                                ).first
-                                succeeded.incrementAndGet()
-                                succeededHashes.add(item.hash)
-                            } catch (c: CancellationException) {
-                                commitGate.cancelAll()
-                                throw c
-                            } catch (_: Exception) {
-                                commitGate.completeTurn(workIndex)
-                                failed.incrementAndGet()
-                            }
-                            val done = completed.incrementAndGet()
-                            onItemComplete(
-                                BatchRestoreProgress(
-                                    completed = done,
-                                    total = orderedTargets.size,
-                                    currentName = item.originalName,
-                                    updatedPhoto = updatedPhoto
-                                )
-                            )
+            // Warm TLS/HTTP2 socket & scan existing MediaStore originals ONCE upfront (eliminates O(N^2) scans!)
+            onPhaseChange?.invoke("Scanning gallery…")
+            val existingOriginalMap: Map<String, String> = coroutineScope {
+                val warmJob = launch(Dispatchers.IO) { client.warmConnectionIfNeeded() }
+                val mapDeferred = async(Dispatchers.IO) { mediaService.scanExistingOriginalMapInGallery() }
+                warmJob.join()
+                mapDeferred.await()
+            }
+
+            // Fast-path: instantly link any originals already on device without network or MediaStore writes
+            val downloadTargets = ArrayList<ServerPhoto>(orderedTargets.size)
+            for (photo in orderedTargets) {
+                currentCoroutineContext().ensureActive()
+                val existingOrigUri = mediaService.findExistingLiveOriginalUri(photo, tracker, existingOriginalMap)
+                if (existingOrigUri != null) {
+                    tracker.markRestoredOriginal(existingOrigUri, photo.hash)
+                    succeeded.incrementAndGet()
+                    succeededHashes.add(photo.hash)
+                    pendingProtectHashes.add(photo.hash)
+                    val done = completed.incrementAndGet()
+                    onItemComplete(
+                        BatchRestoreProgress(
+                            completed = done,
+                            total = totalCount,
+                            currentName = photo.originalName,
+                            updatedPhoto = null
+                        )
+                    )
+                } else {
+                    downloadTargets.add(photo)
+                }
+            }
+            flushProtectChunk(force = false)
+
+            if (downloadTargets.isNotEmpty()) {
+                val queue = Channel<Pair<Int, ServerPhoto>>(Channel.UNLIMITED)
+                downloadTargets.forEachIndexed { idx, photo -> queue.trySend(idx to photo) }
+                queue.close()
+
+                val buffer = OrderedRestorePipelineBuffer<BatchDownloadSlot>(
+                    totalCount = downloadTargets.size,
+                    onDiscard = { slot ->
+                        if (slot is BatchDownloadSlot.Downloaded) {
+                            runCatching { slot.cleanupDir?.deleteRecursively() }
                         }
                     }
+                )
+
+                coroutineScope {
+                    val workerCount = minOf(6, downloadTargets.size)
+                    val producerJob = launch(Dispatchers.IO) {
+                        try {
+                            coroutineScope {
+                                val workers = List(workerCount) {
+                                    launch(Dispatchers.IO) {
+                                        for ((workIndex, item) in queue) {
+                                            if (!isActive || lowStorageHit.get()) break
+                                            val allowed = buffer.waitForDownloadSlot(workIndex)
+                                            if (!allowed || !isActive || lowStorageHit.get()) break
+
+                                            val freeBytes = DeviceStorageHelper.availableBytes()
+                                            val neededBytes = maxOf(
+                                                250L * 1024L * 1024L,
+                                                maxOf(0L, item.size) + 150L * 1024L * 1024L
+                                            )
+                                            if (freeBytes != null && freeBytes < neededBytes) {
+                                                buffer.submit(workIndex, BatchDownloadSlot.LowStorage(item), 0L)
+                                                break
+                                            }
+
+                                            val slot = downloadItemForBatch(context, client, item)
+                                            val sz = (slot as? BatchDownloadSlot.Downloaded)?.sizeBytes ?: 0L
+                                            buffer.submit(workIndex, slot, sz)
+                                        }
+                                    }
+                                }
+                                workers.joinAll()
+                            }
+                        } finally {
+                            buffer.stop()
+                        }
+                    }
+
+                    // Dedicated ordered MediaStore committer: writes 0, 1, 2... oldest-first
+                    // while 6 workers download ahead without head-of-line blocking!
+                    try {
+                        for (commitIdx in downloadTargets.indices) {
+                            currentCoroutineContext().ensureActive()
+                            val slot = buffer.takeNextInOrder() ?: break
+                            when (slot) {
+                                is BatchDownloadSlot.LowStorage -> {
+                                    lowStorageHit.set(true)
+                                    buffer.stop()
+                                    producerJob.cancel()
+                                    break
+                                }
+                                is BatchDownloadSlot.Failed -> {
+                                    failed.incrementAndGet()
+                                    val done = completed.incrementAndGet()
+                                    onItemComplete(
+                                        BatchRestoreProgress(
+                                            completed = done,
+                                            total = totalCount,
+                                            currentName = slot.photo.originalName,
+                                            updatedPhoto = null
+                                        )
+                                    )
+                                }
+                                is BatchDownloadSlot.Downloaded -> {
+                                    val item = slot.photo
+                                    val wasAlreadyRestored = tracker.isRestoredMasterHash(item.hash)
+                                    tracker.markRestoredOriginal(null, item.hash)
+                                    try {
+                                        val savedId = mediaService.saveRestoredOriginalToGallery(
+                                            file = slot.file,
+                                            isVideo = item.isVideo,
+                                            originalFilename = item.originalName,
+                                            creationDateMs = item.parsedCreationDateMs
+                                        )
+                                        tracker.markRestoredOriginal(savedId, item.hash)
+                                        succeeded.incrementAndGet()
+                                        succeededHashes.add(item.hash)
+                                        pendingProtectHashes.add(item.hash)
+                                    } catch (c: CancellationException) {
+                                        if (!wasAlreadyRestored) tracker.clearRestoredProtection(item.hash)
+                                        throw c
+                                    } catch (_: Exception) {
+                                        if (!wasAlreadyRestored) tracker.clearRestoredProtection(item.hash)
+                                        failed.incrementAndGet()
+                                    } finally {
+                                        runCatching { slot.cleanupDir?.deleteRecursively() }
+                                    }
+                                    val done = completed.incrementAndGet()
+                                    onItemComplete(
+                                        BatchRestoreProgress(
+                                            completed = done,
+                                            total = totalCount,
+                                            currentName = item.originalName,
+                                            updatedPhoto = null
+                                        )
+                                    )
+                                    flushProtectChunk(force = false)
+                                }
+                            }
+                        }
+                    } finally {
+                        buffer.stop()
+                        producerJob.cancel()
+                    }
                 }
-                workers.joinAll()
             }
         } catch (c: CancellationException) {
             cancelled = true
-            commitGate.cancelAll()
             throw c
         } finally {
-            commitGate.cancelAll()
             val ok = succeeded.get()
             val errCount = failed.get()
             val stoppedLowStorage = lowStorageHit.get()
@@ -549,6 +852,19 @@ object BatchRestoreExecutor {
             var pendingPrompt: com.photohub.compressor.media.CompressedProxyDeleteResult.NeedsSystemConfirmation? = null
 
             withContext(NonCancellable) {
+                // Flush any remaining restored hashes in ONE batch protect call (runs even on cancel / low storage)
+                if (pendingProtectHashes.isNotEmpty()) {
+                    val remaining = pendingProtectHashes.toList()
+                    pendingProtectHashes.clear()
+                    runCatching {
+                        client.setOriginalsProtectedBatch(
+                            masterHashes = remaining,
+                            protected = true,
+                            notifyStore = true
+                        )
+                    }
+                }
+
                 if (deleteCompressedProxies) {
                     val cleanupHashes = succeededHashes
                         .map { it.trim().lowercase(Locale.ROOT) }

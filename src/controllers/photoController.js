@@ -29,9 +29,77 @@ const {
 } = require('../services/zipStreamService');
 
 const MAX_BATCH_DELETE_COUNT = 500;
+const MAX_BATCH_PROTECT_COUNT = 1000;
 const MAX_ZIP_ITEMS = 250;
 const TRASH_RETENTION_DAYS = 30;
 const TRASH_RETENTION_MS = TRASH_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+const STREAM_HIGH_WATER_MARK = 512 * 1024; // 512 KB read chunks for fast LAN/WAN/NAS original restores
+
+const MEDIA_MIME_BY_EXT = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.heic': 'image/heic',
+  '.heif': 'image/heif',
+  '.avif': 'image/avif',
+  '.bmp': 'image/bmp',
+  '.tif': 'image/tiff',
+  '.tiff': 'image/tiff',
+  '.dng': 'image/x-adobe-dng',
+  '.mp4': 'video/mp4',
+  '.m4v': 'video/mp4',
+  '.mov': 'video/quicktime',
+  '.3gp': 'video/3gpp',
+  '.avi': 'video/x-msvideo',
+  '.mkv': 'video/x-matroska',
+  '.webm': 'video/webm',
+};
+
+function inferMediaContentType(filePath) {
+  const ext = path.extname(String(filePath || '')).toLowerCase();
+  return MEDIA_MIME_BY_EXT[ext] || 'application/octet-stream';
+}
+
+function parseSingleByteRange(rangeHeader, fileSize) {
+  if (!rangeHeader || typeof rangeHeader !== 'string') return null;
+  const trimmed = rangeHeader.trim();
+  if (!/^bytes=/i.test(trimmed)) return null;
+  const spec = trimmed.slice(6).trim();
+  // Multiple ranges (comma-separated) aren't used by our clients; treat as invalid/ignore
+  if (!spec || spec.includes(',')) return null;
+  const dashIdx = spec.indexOf('-');
+  if (dashIdx < 0) return { invalid: true };
+  const startStr = spec.slice(0, dashIdx).trim();
+  const endStr = spec.slice(dashIdx + 1).trim();
+
+  if (fileSize <= 0) return { invalid: true };
+
+  if (startStr === '') {
+    // Suffix range: bytes=-N
+    const suffixLen = Number(endStr);
+    if (!Number.isInteger(suffixLen) || suffixLen <= 0) return { invalid: true };
+    const start = Math.max(0, fileSize - suffixLen);
+    return { start, end: fileSize - 1 };
+  }
+
+  const start = Number(startStr);
+  if (!Number.isInteger(start) || start < 0 || start >= fileSize) {
+    return { invalid: true };
+  }
+
+  if (endStr === '') {
+    return { start, end: fileSize - 1 };
+  }
+
+  const rawEnd = Number(endStr);
+  if (!Number.isInteger(rawEnd) || rawEnd < start) {
+    return { invalid: true };
+  }
+  const end = Math.min(fileSize - 1, rawEnd);
+  return { start, end };
+}
 
 const MONTH_KEYWORDS = [
   ['january', 'jan'],
@@ -152,12 +220,132 @@ function sendImmutableMediaFile(
   );
 }
 
+/**
+ * High-throughput direct file streamer for full-resolution original downloads (`GET /api/photo/:hash`).
+ * Uses 512 KB `fs.createReadStream` chunks (8x larger than Express `sendFile`'s 64 KB default),
+ * reuses the already-fetched `stat` (zero duplicate `stat` syscalls), enables `TCP_NODELAY`,
+ * and serves full RFC 7233 HTTP 206 `Range` segments + `ETag` 304 + `HEAD`.
+ */
+async function streamImmutableFileFast(
+  req,
+  res,
+  filePath,
+  { stat = null, variant = null, masterHash = null, contentType = null, contentDisposition = null } = {}
+) {
+  const absPath = path.resolve(filePath);
+  let fileStat = stat;
+  if (!fileStat) {
+    try {
+      fileStat = await fsp.stat(absPath);
+    } catch (err) {
+      const isNotFound = err && err.code === 'ENOENT';
+      return res.status(isNotFound ? 404 : 500).json({
+        success: false,
+        error: isNotFound ? 'Photo file not found on disk' : err.message,
+      });
+    }
+  }
+
+  if (req.socket && typeof req.socket.setNoDelay === 'function') {
+    req.socket.setNoDelay(true);
+  }
+
+  const totalSize = Number(fileStat.size) || 0;
+  const mtimeMs = Math.trunc(Number(fileStat.mtimeMs) || 0);
+  const etag = `W/"${totalSize.toString(16)}-${mtimeMs.toString(16)}"`;
+  const lastModified = new Date(fileStat.mtimeMs || Date.now()).toUTCString();
+
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+  res.setHeader('ETag', etag);
+  res.setHeader('Last-Modified', lastModified);
+  res.setHeader('Content-Type', contentType || inferMediaContentType(absPath));
+  if (variant) res.setHeader('X-Photo-Variant', variant);
+  if (masterHash) res.setHeader('X-Master-Sha256', masterHash);
+  if (contentDisposition) res.setHeader('Content-Disposition', contentDisposition);
+
+  const ifNoneMatch = String((req.headers && req.headers['if-none-match']) || '').trim();
+  if (
+    ifNoneMatch &&
+    !req.headers.range &&
+    (ifNoneMatch === etag || ifNoneMatch.split(',').map((s) => s.trim()).includes(etag))
+  ) {
+    return res.status(304).end();
+  }
+
+  let statusCode = 200;
+  let start = 0;
+  let end = totalSize > 0 ? totalSize - 1 : 0;
+
+  if (req.headers && req.headers.range) {
+    const parsed = parseSingleByteRange(req.headers.range, totalSize);
+    if (parsed && parsed.invalid) {
+      res.setHeader('Content-Range', `bytes */${totalSize}`);
+      return res.status(416).end();
+    }
+    if (parsed) {
+      statusCode = 206;
+      start = parsed.start;
+      end = parsed.end;
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${totalSize}`);
+    }
+  }
+
+  const chunkLength = totalSize === 0 ? 0 : end - start + 1;
+  res.setHeader('Content-Length', String(chunkLength));
+  res.status(statusCode);
+
+  if (req.method === 'HEAD' || chunkLength === 0) {
+    return res.end();
+  }
+
+  return new Promise((resolve) => {
+    const readStream = fs.createReadStream(absPath, {
+      start,
+      end,
+      highWaterMark: STREAM_HIGH_WATER_MARK,
+    });
+
+    let finished = false;
+    const done = () => {
+      if (finished) return;
+      finished = true;
+      resolve();
+    };
+
+    const cleanup = () => {
+      if (!readStream.destroyed) readStream.destroy();
+      done();
+    };
+
+    res.on('close', cleanup);
+    res.on('finish', done);
+
+    readStream.on('error', (err) => {
+      res.off('close', cleanup);
+      if (!res.headersSent) {
+        const isNotFound = err && err.code === 'ENOENT';
+        res.status(isNotFound ? 404 : 500).json({
+          success: false,
+          error: isNotFound ? 'Photo file not found on disk' : err.message,
+        });
+      } else if (!res.writableEnded) {
+        res.destroy(err);
+      }
+      done();
+    });
+
+    readStream.pipe(res);
+  });
+}
+
 function createPhotoController({ config }) {
-  async function lookupPhotoOr404(req, res, { includeTrashed = true } = {}) {
+  async function lookupPhotoOr404(req, res, { includeTrashed = true, includeStat = false } = {}) {
     const { hashIndex } = req.userContext;
     const lookupResult = await hashIndex.lookup(req.params.hash, {
       allowStatFastPath: true,
       includeTrashed,
+      includeStat,
     });
     if (lookupResult.status === 'missing' || !lookupResult.record) {
       res.status(404).json({
@@ -564,6 +752,45 @@ function createPhotoController({ config }) {
       }
     },
 
+    async setProtectOriginalsBatch(req, res) {
+      try {
+        const { hashIndex } = req.userContext;
+        const body = req.body || {};
+        const rawHashes = Array.isArray(body.hashes) ? body.hashes : null;
+        if (!rawHashes || rawHashes.length === 0) {
+          return res.status(400).json({
+            success: false,
+            error: 'JSON body must include a non-empty "hashes" array.',
+          });
+        }
+        const keepOriginal =
+          body.keepOriginalOnDevice !== undefined
+            ? Boolean(body.keepOriginalOnDevice)
+            : body.protected !== undefined
+              ? Boolean(body.protected)
+              : true;
+
+        const cleaned = rawHashes.slice(0, MAX_BATCH_PROTECT_COUNT);
+        const { updated, missing } = await hashIndex.setOriginalsProtectedBatch(
+          cleaned,
+          keepOriginal
+        );
+
+        return sendJsonOptimized(req, res, {
+          success: true,
+          keepOriginalOnDevice: keepOriginal,
+          updatedCount: updated.length,
+          photos: updated,
+          missing,
+        });
+      } catch (err) {
+        return res.status(err.statusCode || 500).json({
+          success: false,
+          error: err.message,
+        });
+      }
+    },
+
     async setFavorite(req, res) {
       try {
         const { hashIndex } = req.userContext;
@@ -939,7 +1166,7 @@ function createPhotoController({ config }) {
 
     async downloadMaster(req, res) {
       try {
-        const lookupResult = await lookupPhotoOr404(req, res);
+        const lookupResult = await lookupPhotoOr404(req, res, { includeStat: true });
         if (!lookupResult) return undefined;
 
         const { storageDir } = req.userContext;
@@ -948,15 +1175,19 @@ function createPhotoController({ config }) {
 
         const fullPath = path.join(storageDir, record.relativePath);
         const safeName = encodeURIComponent(record.originalName || path.basename(fullPath));
-        return sendImmutableMediaFile(res, fullPath, {
+        return await streamImmutableFileFast(req, res, fullPath, {
+          stat: lookupResult.stat || null,
           masterHash: lookupResult.masterHash,
           contentDisposition: `inline; filename="${safeName}"`,
         });
       } catch (err) {
-        return res.status(500).json({
-          success: false,
-          error: err.message,
-        });
+        if (!res.headersSent) {
+          return res.status(500).json({
+            success: false,
+            error: err.message,
+          });
+        }
+        return undefined;
       }
     },
   };

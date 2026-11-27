@@ -35,6 +35,32 @@ data class CleanupPreviewItem(
     val thumbnail: Bitmap?
 )
 
+data class DuplicateCleanerUiState(
+    val isOpen: Boolean = false,
+    val isScanning: Boolean = false,
+    val isDeleting: Boolean = false,
+    val progressCurrent: Int = 0,
+    val progressTotal: Int = 1,
+    val progressLabel: String = "Preparing duplicate scan…",
+    val result: LocalDuplicateScanResult? = null,
+    val selectedDeleteIds: Set<String> = emptySet(),
+    val thumbnails: Map<String, Bitmap> = emptyMap(),
+    val trashPromptRequest: TrashPromptRequest? = null,
+    val completedRemovedCount: Int = 0,
+    val completedFreedBytes: Long = 0L,
+    val statusMessage: String? = null,
+    val errorMessage: String? = null
+) {
+    val selectedDeleteItems: List<LocalDuplicateItem>
+        get() = result?.groups
+            ?.flatMap { it.items }
+            ?.filter { !it.isKeep && it.id in selectedDeleteIds }
+            ?: emptyList()
+
+    val selectedFreedBytes: Long
+        get() = selectedDeleteItems.sumOf { it.sizeBytes.coerceAtLeast(0L) }
+}
+
 data class CompressUiState(
     val candidates: List<PhotoCandidate> = emptyList(),
     val thumbnails: Map<String, Bitmap> = emptyMap(),
@@ -91,10 +117,14 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
     )
     val uiState: StateFlow<CompressUiState> = _uiState.asStateFlow()
 
+    private val _duplicateCleanerState = MutableStateFlow(DuplicateCleanerUiState())
+    val duplicateCleanerState: StateFlow<DuplicateCleanerUiState> = _duplicateCleanerState.asStateFlow()
+
     private val itemProgress = ConcurrentHashMap<String, Double>()
     private var hasAutoStartedThisSession = false
     private var activeUploadJob: Job? = null
     private var deepProxyScanJob: Job? = null
+    private var duplicateScanJob: Job? = null
 
     init {
         viewModelScope.launch {
@@ -952,6 +982,195 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
 
     fun clearShareFileReady() {
         _uiState.update { it.copy(shareFileReady = null) }
+    }
+
+    // ==================== ON-DEVICE AUTO DUPLICATE PHOTO CLEANER ====================
+
+    fun openDuplicateCleaner() {
+        _duplicateCleanerState.value = DuplicateCleanerUiState(
+            isOpen = true,
+            isScanning = true,
+            progressLabel = "Reading gallery metadata…"
+        )
+        startDuplicateScan()
+    }
+
+    fun startDuplicateScan() {
+        duplicateScanJob?.cancel()
+        val level = mediaService.currentAccessLevel()
+        _uiState.update { it.copy(accessLevel = level) }
+        if (level == MediaAccessLevel.DENIED) {
+            _duplicateCleanerState.update {
+                it.copy(
+                    isScanning = false,
+                    result = LocalDuplicateScanResult(0, emptyList()),
+                    errorMessage = "Please allow Photos & Videos access to scan for duplicates."
+                )
+            }
+            return
+        }
+
+        _duplicateCleanerState.update {
+            it.copy(
+                isScanning = true,
+                errorMessage = null,
+                statusMessage = null,
+                progressCurrent = 0,
+                progressTotal = 1,
+                progressLabel = "Scanning your gallery…"
+            )
+        }
+
+        duplicateScanJob = viewModelScope.launch(Dispatchers.IO) {
+            val scanResult = LocalDuplicateCleaner.scanForDuplicates(
+                context = context,
+                tracker = tracker
+            ) { current, total, label ->
+                _duplicateCleanerState.update {
+                    it.copy(
+                        progressCurrent = current,
+                        progressTotal = total.coerceAtLeast(1),
+                        progressLabel = label
+                    )
+                }
+            }
+            val defaultDeleteIds = scanResult.groups
+                .flatMap { it.removableItems }
+                .map { it.id }
+                .toSet()
+            _duplicateCleanerState.update {
+                it.copy(
+                    isScanning = false,
+                    result = scanResult,
+                    selectedDeleteIds = defaultDeleteIds
+                )
+            }
+        }
+    }
+
+    fun loadDuplicateThumbnailIfNeeded(itemId: String) {
+        if (_duplicateCleanerState.value.thumbnails.containsKey(itemId)) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val bmp = LocalDuplicateCleaner.loadThumbnailBitmap(context, itemId, 192) ?: return@launch
+            _duplicateCleanerState.update { prev ->
+                if (!prev.isOpen || prev.thumbnails.containsKey(itemId)) prev
+                else prev.copy(thumbnails = prev.thumbnails + (itemId to bmp))
+            }
+        }
+    }
+
+    fun toggleDuplicateItemSelection(itemId: String) {
+        _duplicateCleanerState.update { prev ->
+            val next = if (itemId in prev.selectedDeleteIds) {
+                prev.selectedDeleteIds - itemId
+            } else {
+                prev.selectedDeleteIds + itemId
+            }
+            prev.copy(selectedDeleteIds = next)
+        }
+    }
+
+    fun removeSelectedDuplicates() {
+        val current = _duplicateCleanerState.value
+        val targets = current.selectedDeleteItems
+        if (targets.isEmpty() || current.isDeleting) return
+
+        val targetIds = targets.map { it.id }
+        _duplicateCleanerState.update {
+            it.copy(isDeleting = true, errorMessage = null, statusMessage = null)
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                when (val res = mediaService.prepareTrashOrDeleteOriginals(targetIds)) {
+                    is TrashOrDeleteRequestResult.DeletedImmediately -> {
+                        withContext(Dispatchers.Main) {
+                            onDuplicateTrashConfirmed(res.deletedIds)
+                        }
+                    }
+                    is TrashOrDeleteRequestResult.NeedsSystemConfirmation -> {
+                        _duplicateCleanerState.update {
+                            it.copy(
+                                trashPromptRequest = TrashPromptRequest(
+                                    intentSender = res.intentSender,
+                                    targetIds = res.targetIds
+                                )
+                            )
+                        }
+                    }
+                }
+            } catch (err: Exception) {
+                _duplicateCleanerState.update {
+                    it.copy(
+                        isDeleting = false,
+                        errorMessage = err.localizedMessage ?: "Could not remove duplicate photos."
+                    )
+                }
+            }
+        }
+    }
+
+    fun clearDuplicateTrashPrompt() {
+        _duplicateCleanerState.update { it.copy(trashPromptRequest = null) }
+    }
+
+    fun onDuplicateTrashConfirmed(deletedIds: List<String>) {
+        val deletedSet = deletedIds.toSet()
+        val prev = _duplicateCleanerState.value
+        val deletedItems = prev.result?.groups
+            ?.flatMap { it.items }
+            ?.filter { it.id in deletedSet }
+            ?: emptyList()
+        val freedBytes = deletedItems.sumOf { it.sizeBytes.coerceAtLeast(0L) }
+        val deletedProxyIds = deletedItems.filter { it.isProxy }.map { it.id }
+        if (deletedProxyIds.isNotEmpty()) {
+            tracker.clearProxyMappings(deletedProxyIds)
+        }
+
+        val updatedGroups = prev.result?.groups?.mapNotNull { grp ->
+            val remaining = grp.items.filterNot { it.id in deletedSet }
+            if (remaining.size >= 2) grp.copy(items = remaining) else null
+        } ?: emptyList()
+
+        _duplicateCleanerState.update {
+            it.copy(
+                isDeleting = false,
+                trashPromptRequest = null,
+                selectedDeleteIds = it.selectedDeleteIds - deletedSet,
+                completedRemovedCount = it.completedRemovedCount + deletedSet.size,
+                completedFreedBytes = it.completedFreedBytes + freedBytes,
+                result = it.result?.copy(groups = updatedGroups)
+            )
+        }
+
+        val freedStr = Formatter.formatFileSize(context, freedBytes)
+        _uiState.update {
+            it.copy(
+                candidates = it.candidates.filterNot { c -> c.id in deletedSet },
+                recentlyDeletedNoticeCount = it.recentlyDeletedNoticeCount + deletedSet.size,
+                recentlyDeletedNoticeBytes = it.recentlyDeletedNoticeBytes + freedBytes,
+                statusBanner = "Removed ${deletedSet.size} duplicate photo(s) (~$freedStr freed)."
+            )
+        }
+    }
+
+    fun onDuplicateTrashCancelled() {
+        _duplicateCleanerState.update {
+            it.copy(
+                isDeleting = false,
+                trashPromptRequest = null,
+                statusMessage = "Removal cancelled — no duplicates were deleted."
+            )
+        }
+    }
+
+    fun dismissDuplicateCleaner() {
+        duplicateScanJob?.cancel()
+        val hadRemovals = _duplicateCleanerState.value.completedRemovedCount > 0
+        _duplicateCleanerState.value = DuplicateCleanerUiState(isOpen = false)
+        if (hadRemovals) {
+            scanLibrary()
+        }
     }
 
     fun inspectGalleryUris(uris: List<android.net.Uri>) {

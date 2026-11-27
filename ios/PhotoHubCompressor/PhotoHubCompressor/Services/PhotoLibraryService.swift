@@ -200,13 +200,23 @@ final class PhotoLibraryService {
 
     /// Scans local Apple Photos metadata (zero iCloud download) for existing non-proxy originals,
     /// returning `matchKey -> PHAsset.localIdentifier` so proxies and restores never duplicate originals.
-    static func scanExistingOriginalMapInPhotos() -> [String: String] {
+    /// Pass `aroundDate` to restrict the fetch to a narrow ±36h window for instant single-photo duplicate checks.
+    static func scanExistingOriginalMapInPhotos(aroundDate: Date? = nil) -> [String: String] {
         let auth = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         guard auth == .authorized || auth == .limited else { return [:] }
 
         let tracker = LocalProxyTracker.shared
         let options = PHFetchOptions()
         options.includeHiddenAssets = false
+        if let aroundDate {
+            let start = aroundDate.addingTimeInterval(-36 * 3600)
+            let end = aroundDate.addingTimeInterval(36 * 3600)
+            options.predicate = NSPredicate(
+                format: "creationDate >= %@ AND creationDate <= %@",
+                start as NSDate,
+                end as NSDate
+            )
+        }
         let assets = PHAsset.fetchAssets(with: options)
         var map: [String: String] = [:]
         map.reserveCapacity(assets.count * 3)
@@ -253,7 +263,11 @@ final class PhotoLibraryService {
     }
 
     /// Checks whether a server photo already has a matching non-proxy original physically in Apple Photos.
-    static func findMatchingOriginalAssetIdInPhotos(for photo: ServerPhoto) -> String? {
+    /// Pass `precomputedOriginalMap` during batch restores to avoid O(N²) full-library PhotoKit rescans.
+    static func findMatchingOriginalAssetIdInPhotos(
+        for photo: ServerPhoto,
+        precomputedOriginalMap: [String: String]? = nil
+    ) -> String? {
         let keys = originalMatchKeys(
             filename: photo.originalName,
             creationDate: photo.parsedCreationDate,
@@ -261,7 +275,15 @@ final class PhotoLibraryService {
             isVideo: photo.isVideo
         )
         guard !keys.isEmpty else { return nil }
-        let existing = scanExistingOriginalMapInPhotos()
+        let existing: [String: String]
+        if let precomputedOriginalMap {
+            existing = precomputedOriginalMap
+        } else if let targetDate = photo.parsedCreationDate {
+            // Fast ±36h windowed query inspects ~10 assets instead of scanning tens of thousands of photos
+            existing = scanExistingOriginalMapInPhotos(aroundDate: targetDate)
+        } else {
+            existing = scanExistingOriginalMapInPhotos()
+        }
         for key in keys {
             if let found = existing[key] {
                 return found
@@ -272,7 +294,10 @@ final class PhotoLibraryService {
 
     /// Checks if a live full-resolution original (never a compressed proxy) for `photo` already exists
     /// in Apple Photos, so Restore never inserts a duplicate original copy.
-    static func findExistingLiveOriginalAssetId(for photo: ServerPhoto) -> String? {
+    static func findExistingLiveOriginalAssetId(
+        for photo: ServerPhoto,
+        precomputedOriginalMap: [String: String]? = nil
+    ) -> String? {
         let tracker = LocalProxyTracker.shared
         if let restoredId = tracker.liveRestoredAssetId(forMasterHash: photo.hash),
            !tracker.isKnownProxy(assetId: restoredId) {
@@ -282,7 +307,7 @@ final class PhotoLibraryService {
            !tracker.isKnownProxy(assetId: uploadedId) {
             return uploadedId
         }
-        if let matchedId = findMatchingOriginalAssetIdInPhotos(for: photo),
+        if let matchedId = findMatchingOriginalAssetIdInPhotos(for: photo, precomputedOriginalMap: precomputedOriginalMap),
            !tracker.isKnownProxy(assetId: matchedId) {
             return matchedId
         }
@@ -1181,6 +1206,42 @@ final class PhotoLibraryService {
         }
     }
 
+    /// Commits a chronologically ordered batch of restored originals inside a SINGLE
+    /// `PHPhotoLibrary.performChanges` transaction (preserving exact oldest-first insertion order
+    /// while eliminating 10x-15x per-asset `photolibraryd` IPC overhead during Restore All).
+    static func saveRestoredOriginalsBatchToPhotosAsync(
+        _ items: [(photo: ServerPhoto, fileURL: URL)]
+    ) async throws -> [String] {
+        guard !items.isEmpty else { return [] }
+        return try await withCheckedThrowingContinuation { continuation in
+            var placeholderIds: [String] = []
+            placeholderIds.reserveCapacity(items.count)
+            PHPhotoLibrary.shared().performChanges({
+                for item in items {
+                    let request: PHAssetChangeRequest?
+                    if item.photo.isVideo {
+                        request = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: item.fileURL)
+                    } else {
+                        let creationReq = PHAssetCreationRequest.forAsset()
+                        let options = PHAssetResourceCreationOptions()
+                        options.originalFilename = item.photo.originalName
+                        creationReq.addResource(with: .photo, fileURL: item.fileURL, options: options)
+                        request = creationReq
+                    }
+                    request?.creationDate = item.photo.parsedCreationDate
+                    placeholderIds.append(request?.placeholderForCreatedAsset?.localIdentifier ?? "")
+                }
+            }) { success, error in
+                if success {
+                    continuation.resume(returning: placeholderIds)
+                } else {
+                    let msg = error?.localizedDescription ?? "Unknown error"
+                    continuation.resume(throwing: PhotoLibraryError.proxyReplacementFailed(msg))
+                }
+            }
+        }
+    }
+
     /// Downloads the master original for `photo`, saves it into Apple Photos (optionally throttled
     /// via `photoWriteSemaphore` or ordered chronologically via `commitGate` for batch jobs),
     /// marks it restored locally, and protects it on the server.
@@ -1189,7 +1250,10 @@ final class PhotoLibraryService {
         client: PhotoHubAPIClient,
         photoWriteSemaphore: AsyncSemaphore? = nil,
         commitGate: OrderedCommitGate? = nil,
-        commitIndex: Int? = nil
+        commitIndex: Int? = nil,
+        precomputedOriginalMap: [String: String]? = nil,
+        skipServerProtect: Bool = false,
+        onProgress: (@Sendable (Int64, Int64?) -> Void)? = nil
     ) async throws -> (updatedPhoto: ServerPhoto?, savedBytes: Int64) {
         func releaseCommitTurnIfNeeded() async {
             if let commitGate, let commitIndex {
@@ -1199,37 +1263,36 @@ final class PhotoLibraryService {
 
         // Strict duplicate guard: if the full-resolution original ALREADY exists in Apple Photos,
         // link and protect it immediately without downloading or writing a second duplicate copy.
-        if let existingOriginalId = findExistingLiveOriginalAssetId(for: photo) {
+        if let existingOriginalId = findExistingLiveOriginalAssetId(for: photo, precomputedOriginalMap: precomputedOriginalMap) {
             await releaseCommitTurnIfNeeded()
             LocalProxyTracker.shared.markRestoredOriginal(assetId: existingOriginalId, masterHash: photo.hash)
-            let updated = try? await client.setOriginalProtected(masterHash: photo.hash, protected: true)
+            let updated: ServerPhoto?
+            if skipServerProtect {
+                updated = nil
+            } else {
+                updated = try? await client.setOriginalProtected(masterHash: photo.hash, protected: true)
+            }
             return (updated, max(0, photo.size))
         }
 
         await client.warmConnectionIfNeeded()
-        let tempURL: URL
+        // Read directly from OriginalDownloadCache (zero unnecessary APFS temp copy before PhotoKit import)
+        let cachedURL: URL
         do {
-            tempURL = try await OriginalDownloadCache.shared.getOrFetchShareCopy(
+            cachedURL = try await OriginalDownloadCache.shared.getOrFetchOriginal(
                 hash: photo.hash,
                 preferredFilename: photo.originalName,
                 expectedSizeBytes: photo.size > 0 ? photo.size : nil,
                 isVideo: photo.isVideo,
-                client: client
+                client: client,
+                onProgress: onProgress
             )
         } catch {
             await releaseCommitTurnIfNeeded()
             throw error
         }
-        defer {
-            let parent = tempURL.deletingLastPathComponent()
-            if parent.lastPathComponent.hasPrefix("photohub_share_") {
-                try? FileManager.default.removeItem(at: parent)
-            } else {
-                try? FileManager.default.removeItem(at: tempURL)
-            }
-        }
 
-        let fileSize = (try? tempURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { Int64($0) } ?? photo.size
+        let fileSize = (try? cachedURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { Int64($0) } ?? photo.size
         let wasAlreadyRestored = LocalProxyTracker.shared.isRestoredMasterHash(photo.hash)
 
         if let commitGate, let commitIndex {
@@ -1250,7 +1313,7 @@ final class PhotoLibraryService {
         }
         let createdLocalId: String
         do {
-            createdLocalId = try await saveRestoredOriginalToPhotosAsync(photo: photo, fileURL: tempURL)
+            createdLocalId = try await saveRestoredOriginalToPhotosAsync(photo: photo, fileURL: cachedURL)
             if let sem = photoWriteSemaphore {
                 await sem.release()
             }
@@ -1273,7 +1336,12 @@ final class PhotoLibraryService {
             masterHash: photo.hash
         )
         await MainActor.run { BackgroundBackupManager.shared.endRestorePause() }
-        let updated = try? await client.setOriginalProtected(masterHash: photo.hash, protected: true)
+        let updated: ServerPhoto?
+        if skipServerProtect {
+            updated = nil
+        } else {
+            updated = try? await client.setOriginalProtected(masterHash: photo.hash, protected: true)
+        }
         return (updated, fileSize)
     }
 
