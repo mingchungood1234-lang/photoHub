@@ -344,18 +344,6 @@ struct SettingsView: View {
             Toggle("Keep Proxy", isOn: $settings.keepLocalProxyInPhotos)
                 .tint(PhotoHubPalette.orange)
 
-            HStack {
-                Text("Upload")
-                    .font(.subheadline)
-                    .foregroundColor(PhotoHubPalette.ink)
-                Spacer()
-                WarmStatPill(
-                    icon: settings.serverS3Enabled ? "externaldrive.connected.to.line.below" : "server.rack",
-                    text: settings.serverS3Enabled ? "Auto · S3" : "Auto · Direct",
-                    tint: settings.serverS3Enabled ? PhotoHubPalette.warmAmber : PhotoHubPalette.mint
-                )
-            }
-
             pickerRow("Format") {
                 Picker("Format", selection: $settings.proxyFormatRaw) {
                     ForEach(ProxyFormat.allCases) { fmt in

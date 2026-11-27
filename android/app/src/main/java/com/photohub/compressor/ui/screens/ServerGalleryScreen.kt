@@ -809,10 +809,6 @@ private fun CloudHeroStorageCard(
         val first = uiState.userName.trim().split(" ").firstOrNull().orEmpty()
         if (first.isNotEmpty()) "Hi, $first" else "Your Cloud Photos"
     }
-    val folderBadge = remember(uiState.userFolder) {
-        val f = uiState.userFolder.trim()
-        if (f.isEmpty()) "/ root" else "/$f"
-    }
     val mood = when {
         uiState.isBatchProxying || uiState.isBatchRestoring || isSyncing || uiState.isLoading -> MascotMood.UPLOADING
         uiState.errorMessage != null -> MascotMood.ALERT
@@ -888,37 +884,6 @@ private fun CloudHeroStorageCard(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Surface(
-                                shape = CircleShape,
-                                color = PhotoHubOrange.copy(alpha = 0.14f)
-                            ) {
-                                Text(
-                                    text = folderBadge,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    fontWeight = FontWeight.Bold,
-                                    color = PhotoHubOrange,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 3.dp)
-                                )
-                            }
-                            Surface(
-                                shape = CircleShape,
-                                color = PhotoHubMint.copy(alpha = 0.14f)
-                            ) {
-                                Text(
-                                    text = if (uiState.serverS3Enabled) "Auto · S3" else "Auto · Direct",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    fontWeight = FontWeight.Bold,
-                                    color = PhotoHubMint,
-                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 3.dp)
-                                )
-                            }
-                        }
                         Text(
                             text = "${uiState.photos.size} total · ${uiState.photoCount} photos · ${uiState.videoCount} videos",
                             style = MaterialTheme.typography.labelSmall,

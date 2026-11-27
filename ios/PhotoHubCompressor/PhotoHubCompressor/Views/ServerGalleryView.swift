@@ -145,11 +145,6 @@ struct ServerGalleryView: View {
         return "Your Cloud Photos"
     }
 
-    private var folderBadgeLabel: String {
-        let folder = settings.userFolder.trimmingCharacters(in: .whitespacesAndNewlines)
-        return folder.isEmpty ? "/ root" : "/\(folder)"
-    }
-
     private var hasActiveFilter: Bool {
         filterMode != .all || mediaTypeFilter != .all || !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -1186,24 +1181,6 @@ struct ServerGalleryView: View {
                         .font(.title3.weight(.heavy))
                         .foregroundColor(PhotoHubPalette.ink)
                         .lineLimit(1)
-
-                    HStack(spacing: 6) {
-                        Text(folderBadgeLabel)
-                            .font(.caption2.weight(.bold))
-                            .foregroundColor(PhotoHubPalette.orange)
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 3.5)
-                            .background(PhotoHubPalette.orange.opacity(0.14), in: Capsule())
-                            .lineLimit(1)
-
-                        Text(settings.serverS3Enabled ? "Auto · S3" : "Auto · Direct")
-                            .font(.caption2.weight(.bold))
-                            .foregroundColor(PhotoHubPalette.mint)
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 3.5)
-                            .background(PhotoHubPalette.mint.opacity(0.14), in: Capsule())
-                            .lineLimit(1)
-                    }
 
                     Text("\(photos.count) total · \(photoCount) photos · \(videoCount) videos")
                         .font(.caption.weight(.semibold).monospacedDigit())

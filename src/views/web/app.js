@@ -10,7 +10,6 @@
   const state = {
     serverConfig: {
       googleEnabled: false,
-      s3Enabled: false,
     },
     session: null, // { token, serverUrl, authMode, user }
     whoami: null,
@@ -396,17 +395,13 @@
 
     if (signedIn) {
       const displayName =
-        (state.whoami && (state.whoami.name || state.whoami.email || state.whoami.userFolder)) ||
+        (state.whoami && (state.whoami.name || state.whoami.email)) ||
         (state.session.user && (state.session.user.name || state.session.user.email)) ||
         'PhotoHub User';
       $('navUserName').textContent = displayName;
       $('navUserInitial').textContent = String(displayName).trim().charAt(0).toUpperCase() || 'P';
       $('galleryGreeting').textContent =
         state.whoami && state.whoami.name ? `Hi, ${state.whoami.name.split(' ')[0]}` : 'Your Cloud Photos';
-      $('galleryFolderBadge').textContent =
-        state.whoami && state.whoami.userFolder ? `/${state.whoami.userFolder}` : '/ root';
-      const s3 = state.whoami ? Boolean(state.whoami.s3Enabled) : Boolean(state.serverConfig.s3Enabled);
-      $('galleryModeBadge').textContent = s3 ? 'Auto · S3' : 'Auto · Direct';
       updateStorageBanner(state.whoami && state.whoami.storage);
     }
   }
@@ -1967,13 +1962,10 @@
         const cfg = await cfgRes.json();
         state.serverConfig = {
           googleEnabled: Boolean(cfg.googleEnabled),
-          s3Enabled: Boolean(cfg.s3Enabled),
         };
         const pill = $('navServerPill');
         pill.classList.add('is-online');
-        $('navServerLabel').textContent = state.serverConfig.s3Enabled ? 'Online · S3' : 'Online · Direct';
-        $('heroStorageModePill').textContent = state.serverConfig.s3Enabled ? 'Auto · S3 Storage' : 'Auto · Direct VPS';
-        $('mockUploadBadge').textContent = state.serverConfig.s3Enabled ? 'Auto · S3' : 'Auto · Direct';
+        $('navServerLabel').textContent = 'Online';
       }
     } catch {
       $('navServerLabel').textContent = 'Offline';

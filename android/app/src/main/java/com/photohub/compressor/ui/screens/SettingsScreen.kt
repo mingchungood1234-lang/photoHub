@@ -414,15 +414,6 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
                         viewModel.settings.setKeepLocalProxyInPhotos(it)
                     }
 
-                    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Text("Upload", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-                        WarmStatChip(
-                            text = if (settingsState.serverS3Enabled) "Auto · S3" else "Auto · Direct",
-                            tint = if (settingsState.serverS3Enabled) PhotoHubAmber else PhotoHubMint,
-                            icon = if (settingsState.serverS3Enabled) Icons.Rounded.Cloud else Icons.Rounded.Dns
-                        )
-                    }
-
                     Box {
                         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                             Text("Format", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)

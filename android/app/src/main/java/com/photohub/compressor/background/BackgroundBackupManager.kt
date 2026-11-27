@@ -8,6 +8,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.database.ContentObserver
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -671,8 +673,15 @@ class BackgroundBackupManager private constructor(context: Context) {
         val piFlags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         val pendingIntent = PendingIntent.getActivity(appContext, notificationId, intent, piFlags)
 
+        val largeIcon = loadNotificationLargeIcon()
         val notification = NotificationCompat.Builder(appContext, CHANNEL_ID)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_stat_photohub)
+            .setColor(NOTIFICATION_ACCENT_COLOR)
+            .apply {
+                if (largeIcon != null) {
+                    setLargeIcon(largeIcon)
+                }
+            }
             .setContentTitle(title)
             .setContentText(body)
             .setStyle(NotificationCompat.BigTextStyle().bigText(body))
@@ -682,6 +691,33 @@ class BackgroundBackupManager private constructor(context: Context) {
             .build()
 
         NotificationManagerCompat.from(appContext).notify(notificationId, notification)
+    }
+
+    @Volatile
+    private var cachedNotificationLargeIcon: Bitmap? = null
+
+    private fun loadNotificationLargeIcon(): Bitmap? {
+        cachedNotificationLargeIcon?.takeIf { !it.isRecycled }?.let { return it }
+        return runCatching {
+            val sizePx = appContext.resources
+                .getDimensionPixelSize(android.R.dimen.notification_large_icon_width)
+                .coerceIn(96, 256)
+            val baseDrawable = runCatching {
+                appContext.packageManager.getApplicationIcon(appContext.applicationInfo)
+            }.getOrNull()
+                ?: ContextCompat.getDrawable(appContext, R.mipmap.ic_launcher_round)
+                ?: ContextCompat.getDrawable(appContext, R.mipmap.ic_launcher)
+                ?: return@runCatching null
+
+            val drawable = baseDrawable.constantState?.newDrawable(appContext.resources)?.mutate()
+                ?: baseDrawable
+            val bitmap = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bitmap)
+            drawable.setBounds(0, 0, sizePx, sizePx)
+            drawable.draw(canvas)
+            cachedNotificationLargeIcon = bitmap
+            bitmap
+        }.getOrNull()
     }
 
     private fun ensureNotificationChannel() {
@@ -698,6 +734,7 @@ class BackgroundBackupManager private constructor(context: Context) {
 
     companion object {
         private const val CHANNEL_ID = "photohub_delete_ready"
+        private const val NOTIFICATION_ACCENT_COLOR = 0xFFF97316.toInt()
         private const val NOTIFICATION_ID_DELETE_READY = 4101
         private const val NOTIFICATION_ID_TEST = 4102
         private const val UNIQUE_PERIODIC_WORK = "photohub_periodic_backup"

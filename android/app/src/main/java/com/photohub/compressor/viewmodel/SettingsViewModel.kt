@@ -128,11 +128,9 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 if (!settings.current.isSignedIn) return@launch
                 val info = PhotoHubApiClient(context, settings).whoami()
                 settings.updateServerCapabilities(info.storage, info.s3Enabled)
-                val folderNote = info.userFolder?.let { "/$it" } ?: "/ (root)"
-                val s3Note = if (info.s3Enabled == true) "S3" else "Direct"
                 _uiState.update {
                     it.copy(
-                        connectionStatus = "Connected · Folder: $folderNote · ${info.indexedPhotos} items ($s3Note)",
+                        connectionStatus = "Connected · ${info.indexedPhotos} items",
                         deviceAvailableBytes = DeviceStorageHelper.availableBytes()
                     )
                 }

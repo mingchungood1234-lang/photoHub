@@ -575,8 +575,6 @@ data class ServerGalleryUiState(
     val searchQuery: String = "",
     val selectedYearAnchor: String? = null,
     val userName: String = "",
-    val userFolder: String = "",
-    val serverS3Enabled: Boolean = false,
     val serverStorage: ServerStorageInfo? = null,
     val isSelectionMode: Boolean = false,
     val selectedHashes: Set<String> = emptySet(),
@@ -675,8 +673,6 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                 _uiState.update { prev ->
                     prev.copy(
                         userName = cfg.userName,
-                        userFolder = cfg.userFolder,
-                        serverS3Enabled = cfg.serverS3Enabled,
                         serverStorage = cfg.serverStorage
                     )
                 }
