@@ -592,6 +592,7 @@ function createContextService(config, { userDirectory = null } = {}) {
     getOrCreateFolderContext,
     getTotalIndexedCount,
     resolveRequestBaseUrl,
+    resolveEffectiveLocalNodeId,
     getQuotaBytesForContext,
     buildStorageSummary,
     getServerCapacitySummary,

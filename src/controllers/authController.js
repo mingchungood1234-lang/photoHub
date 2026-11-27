@@ -110,6 +110,15 @@ function createAuthController({
         });
       }
 
+      let validatedWebOrigin = null;
+      if (/^https?:/i.test(redirectUri)) {
+        try {
+          validatedWebOrigin = new URL(redirectUri).origin;
+        } catch {
+          validatedWebOrigin = null;
+        }
+      }
+
       const state = signToken(
         {
           typ: 'oauth_state',
@@ -117,6 +126,7 @@ function createAuthController({
           codeChallenge,
           redirectUri,
           baseUrl,
+          webOrigin: validatedWebOrigin,
         },
         sessionSecret,
         600
@@ -134,15 +144,25 @@ function createAuthController({
     },
 
     async handleGoogleCallback(req, res) {
-      const statePayload = verifyToken(String(req.query.state || ''), sessionSecret);
+      const rawState = String(req.query.state || '');
+      const statePayload = verifyToken(rawState, sessionSecret);
       const allowedWebOrigins = statePayload
         ? buildAllowedWebOrigins(statePayload.baseUrl, config, req)
         : [];
+      if (statePayload && statePayload.webOrigin && !allowedWebOrigins.includes(statePayload.webOrigin)) {
+        allowedWebOrigins.push(statePayload.webOrigin);
+      }
       if (
         !statePayload ||
         statePayload.typ !== 'oauth_state' ||
         !isAllowedAppRedirectUri(statePayload.redirectUri, allowedWebOrigins)
       ) {
+        console.warn(
+          '[Auth] OAuth callback rejected:',
+          !statePayload
+            ? 'state token invalid, expired (>10m), or signed with a different AUTH_SESSION_SECRET'
+            : `redirect_uri not allowed (${statePayload.redirectUri})`
+        );
         return res.status(400).send('Invalid or expired OAuth state.');
       }
 
@@ -205,12 +225,26 @@ function createAuthController({
           config.sessionTtlSeconds
         );
 
+        const nodes = Array.isArray(config.storageNodes) ? config.storageNodes : [];
+        const localNodeId = contextService.resolveEffectiveLocalNodeId(
+          null,
+          statePayload.baseUrl
+        );
+        const assignedUrl = user.assignedUrl || statePayload.baseUrl;
+        const isLocalNode =
+          nodes.length === 0 ||
+          !user.nodeId ||
+          user.nodeId === 'primary' ||
+          (Boolean(localNodeId) && user.nodeId === localNodeId) ||
+          assignedUrl === statePayload.baseUrl;
+
         const oneTimeCode = exchangeStore.issue({
           codeChallenge: statePayload.codeChallenge,
           sessionPayload: {
             token: sessionToken,
-            serverUrl: user.assignedUrl || statePayload.baseUrl,
+            serverUrl: assignedUrl,
             nodeId: user.nodeId,
+            isLocalNode,
             user: {
               email: user.email,
               name: user.name,
@@ -242,6 +276,7 @@ function createAuthController({
         token: session.token,
         serverUrl: session.serverUrl,
         nodeId: session.nodeId,
+        isLocalNode: session.isLocalNode !== false,
         user: session.user,
       });
     },

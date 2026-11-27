@@ -19,9 +19,11 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const { Readable } = require('stream');
 const { getConfig } = require('./config/env');
 const {
   resolveSessionSecret,
+  verifyToken,
   UserDirectory,
   OneTimeExchangeStore,
 } = require('./models/userModel');
@@ -111,23 +113,49 @@ async function createApp(configOverrides = {}) {
     adminController: createAdminController({ config, contextService, userDirectory, nodeAllocationService }),
   };
 
-  // Allow browser web gallery sessions on gateway/storage-node origins to call `/api/*` cleanly
+  // Allow browser web gallery sessions on gateway/web-port/storage-node origins to call `/api/*` cleanly
   const allowedOrigins = new Set();
   const tryAddOrigin = (rawUrl) => {
     if (!rawUrl) return;
     try {
-      allowedOrigins.add(new URL(rawUrl).origin);
+      const parsed = new URL(rawUrl);
+      allowedOrigins.add(parsed.origin);
+      if (config.webPort > 0) {
+        allowedOrigins.add(`${parsed.protocol}//${parsed.hostname}:${config.webPort}`);
+        if (parsed.protocol === 'https:') {
+          allowedOrigins.add(`http://${parsed.hostname}:${config.webPort}`);
+        }
+      }
     } catch {
       // ignore invalid URL
     }
   };
   tryAddOrigin(config.publicUrl);
+  tryAddOrigin(config.publicWebUrl);
   for (const node of config.storageNodes || []) {
     tryAddOrigin(node && node.url);
   }
+  const isAllowedCorsOrigin = (origin, req) => {
+    if (!origin) return false;
+    if (allowedOrigins.size === 0 || allowedOrigins.has(origin)) return true;
+    try {
+      const parsed = new URL(origin);
+      const host = parsed.hostname.toLowerCase();
+      if (host === 'localhost' || host === '127.0.0.1' || host === '[::1]') {
+        return true;
+      }
+      if (req && req.headers && req.headers.host) {
+        const reqHost = String(req.headers.host).split(':')[0].toLowerCase();
+        if (reqHost && host === reqHost) return true;
+      }
+    } catch {
+      // ignore invalid origin
+    }
+    return false;
+  };
   app.use('/api', (req, res, next) => {
     const origin = req.headers.origin;
-    if (origin && (allowedOrigins.size === 0 || allowedOrigins.has(origin))) {
+    if (origin && isAllowedCorsOrigin(origin, req)) {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Vary', 'Origin');
       res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
@@ -140,6 +168,123 @@ async function createApp(configOverrides = {}) {
     return next();
   });
 
+  // Same-origin Gateway proxy for web gallery users assigned to a remote STORAGE_NODE
+  // (eliminates CORS, HTTPS->HTTP mixed-content blocks, and private LAN/Tailscale node reachability issues).
+  const WEB_PROXY_ALLOWED_PATH_RE =
+    /^\/(whoami|storage|photos|photos\/delete|photo\/[^/]+(?:\/(?:preview|video-proxy|protect-original))?)$/;
+  app.use(async (req, res, next) => {
+    if (!req.path.startsWith('/api/web-node/')) return next();
+    const subPath = req.path.slice('/api/web-node'.length);
+    if (!WEB_PROXY_ALLOWED_PATH_RE.test(subPath) || subPath.includes('..')) {
+      return res.status(404).json({ success: false, error: 'Unsupported web proxy endpoint.' });
+    }
+
+    const authHeader = String(req.headers.authorization || '').trim();
+    const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const token = String(bearer || req.query.apiKey || '').trim();
+    const payload = token ? verifyToken(token, sessionSecret) : null;
+    if (!payload || payload.typ !== 'session') {
+      return res.status(401).json({
+        success: false,
+        error: 'Unauthorized: Sign in with Google or provide a valid session token.',
+      });
+    }
+
+    const nodes = Array.isArray(config.storageNodes) ? config.storageNodes : [];
+    const targetNode = nodes.find((n) => n && n.id === payload.nodeId) || null;
+    const localNodeId = contextService.resolveEffectiveLocalNodeId(
+      null,
+      contextService.resolveRequestBaseUrl(req)
+    );
+    const isLocalTarget =
+      !targetNode ||
+      !payload.nodeId ||
+      payload.nodeId === 'primary' ||
+      (Boolean(localNodeId) && targetNode.id === localNodeId);
+
+    if (isLocalTarget) {
+      // Rewrite cleanly to local `/api/*` so local routes serve it directly with zero extra hop
+      req.url = `/api${req.url.slice('/api/web-node'.length)}`;
+      return next();
+    }
+
+    const queryIdx = req.url.indexOf('?');
+    const qsParams = new URLSearchParams(queryIdx >= 0 ? req.url.slice(queryIdx + 1) : '');
+    qsParams.delete('apiKey');
+    const cleanQs = qsParams.toString();
+    const upstreamUrl = `${targetNode.url.replace(/\/+$/, '')}/api${subPath}${cleanQs ? `?${cleanQs}` : ''}`;
+
+    const upstreamHeaders = {
+      Authorization: `Bearer ${token}`,
+    };
+    if (req.headers.accept) upstreamHeaders.Accept = req.headers.accept;
+    if (req.headers['if-none-match']) upstreamHeaders['If-None-Match'] = req.headers['if-none-match'];
+    if (req.headers.range) upstreamHeaders.Range = req.headers.range;
+
+    const fetchOpts = {
+      method: req.method,
+      headers: upstreamHeaders,
+    };
+    if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
+      upstreamHeaders['Content-Type'] = 'application/json';
+      fetchOpts.body = JSON.stringify(req.body || {});
+    }
+
+    const abortController = new AbortController();
+    fetchOpts.signal = abortController.signal;
+    const onClientClose = () => {
+      if (!res.writableEnded) abortController.abort();
+    };
+    req.on('close', onClientClose);
+
+    try {
+      const upstreamRes = await fetch(upstreamUrl, fetchOpts);
+      res.status(upstreamRes.status);
+      const passthroughHeaders = [
+        'content-type',
+        'content-length',
+        'content-range',
+        'accept-ranges',
+        'content-disposition',
+        'etag',
+        'cache-control',
+        'x-photo-variant',
+        'x-master-sha256',
+      ];
+      for (const h of passthroughHeaders) {
+        const val = upstreamRes.headers.get(h);
+        if (val !== null) res.setHeader(h, val);
+      }
+
+      if (upstreamRes.status === 204 || upstreamRes.status === 304 || !upstreamRes.body) {
+        req.off('close', onClientClose);
+        return res.end();
+      }
+
+      const nodeStream = Readable.fromWeb(upstreamRes.body);
+      nodeStream.on('error', () => {
+        if (!res.headersSent) {
+          res.status(502).end();
+        } else if (!res.writableEnded) {
+          res.end();
+        }
+      });
+      res.on('finish', () => req.off('close', onClientClose));
+      return nodeStream.pipe(res);
+    } catch (err) {
+      req.off('close', onClientClose);
+      if (abortController.signal.aborted) return;
+      console.warn(`[WebProxy] Failed to reach storage node ${targetNode.id} (${targetNode.url}):`, err.message);
+      if (!res.headersSent) {
+        return res.status(502).json({
+          success: false,
+          error: `Assigned storage node (${targetNode.id}) is currently unreachable.`,
+        });
+      }
+      return res.end();
+    }
+  });
+
   // Mount web frontend (landing showcase + responsive authenticated photo gallery)
   const webDir = path.join(__dirname, 'views', 'web');
   const webIndexPath = path.join(webDir, 'index.html');
@@ -147,7 +292,7 @@ async function createApp(configOverrides = {}) {
     '/web',
     express.static(webDir, {
       dotfiles: 'ignore',
-      maxAge: '1h',
+      maxAge: 0,
       index: false,
     })
   );

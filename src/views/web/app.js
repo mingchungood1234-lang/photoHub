@@ -305,9 +305,22 @@
     }
   }
 
-  function apiBaseUrl() {
-    const custom = state.session && state.session.serverUrl ? String(state.session.serverUrl).replace(/\/+$/, '') : '';
-    return custom || window.location.origin;
+  function apiUrlFor(path) {
+    // Always call same-origin (`window.location.origin`) to avoid CORS & HTTPS->HTTP mixed-content blocks.
+    // When assigned to a remote storage node, route through Gateway's authenticated `/api/web-node/*` proxy.
+    const needsProxy = Boolean(
+      state.session &&
+        (state.session.useGatewayProxy === true ||
+          (state.session.isLocalNode === false) ||
+          (state.session.useGatewayProxy === undefined &&
+            state.session.nodeId &&
+            state.session.nodeId !== 'primary'))
+    );
+    const resolvedPath =
+      needsProxy && path.startsWith('/api/')
+        ? `/api/web-node/${path.slice(5)}`
+        : path;
+    return `${window.location.origin}${resolvedPath}`;
   }
 
   function authHeaders(extra = {}) {
@@ -320,7 +333,7 @@
   }
 
   async function apiFetch(path, options = {}) {
-    const url = `${apiBaseUrl()}${path}`;
+    const url = apiUrlFor(path);
     const res = await fetch(url, {
       ...options,
       headers: authHeaders(options.headers || {}),
@@ -329,13 +342,15 @@
       signOut(false);
       showToast('Session expired — please sign in again.', 'rose');
       openLoginModal();
-      throw new Error('Unauthorized');
+      const err = new Error('Unauthorized');
+      err.isUnauthorized = true;
+      throw err;
     }
     return res;
   }
 
   function mediaUrlWithAuth(path) {
-    const base = `${apiBaseUrl()}${path}`;
+    const base = apiUrlFor(path);
     const token = state.session && state.session.token;
     if (!token) return base;
     const sep = base.includes('?') ? '&' : '?';
@@ -354,6 +369,18 @@
     $('galleryView').classList.toggle('hidden', !isGallery);
     $('tabGuideBtn').classList.toggle('is-active', !isGallery);
     $('tabGalleryBtn').classList.toggle('is-active', isGallery);
+
+    const targetPath = isGallery ? '/gallery' : '/';
+    if (
+      window.location.pathname === '/' ||
+      window.location.pathname === '/gallery' ||
+      window.location.pathname === '/about' ||
+      window.location.pathname === '/auth/callback'
+    ) {
+      if (window.location.pathname !== targetPath || window.location.search) {
+        window.history.replaceState({}, document.title, targetPath);
+      }
+    }
 
     if (isGallery && state.photos.length === 0 && !state.isLoadingPhotos) {
       loadGallery(false);
@@ -433,6 +460,50 @@
     $('loginModal').classList.add('hidden');
   }
 
+  function storePkceVerifier(verifier) {
+    const payload = JSON.stringify({ v: verifier, exp: Date.now() + 10 * 60 * 1000 });
+    try {
+      sessionStorage.setItem(PKCE_KEY, payload);
+    } catch {
+      // ignore storage quota/privacy restrictions
+    }
+    try {
+      localStorage.setItem(PKCE_KEY, payload);
+    } catch {
+      // ignore storage quota/privacy restrictions
+    }
+  }
+
+  function consumePkceVerifier() {
+    let raw = null;
+    try {
+      raw = sessionStorage.getItem(PKCE_KEY);
+      sessionStorage.removeItem(PKCE_KEY);
+    } catch {
+      // ignore
+    }
+    let fallbackRaw = null;
+    try {
+      fallbackRaw = localStorage.getItem(PKCE_KEY);
+      localStorage.removeItem(PKCE_KEY);
+    } catch {
+      // ignore
+    }
+    const candidate = raw || fallbackRaw;
+    if (!candidate) return null;
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed.v === 'string') {
+        if (parsed.exp && Date.now() > parsed.exp) return null;
+        return parsed.v;
+      }
+    } catch {
+      // Support legacy raw string value
+      return candidate;
+    }
+    return null;
+  }
+
   async function startGoogleLogin() {
     if (!state.serverConfig.googleEnabled) {
       openLoginModal('Google Login is not configured on this server yet.');
@@ -441,7 +512,7 @@
     try {
       const verifier = randomPkceVerifier();
       const challenge = await computePkceChallenge(verifier);
-      sessionStorage.setItem(PKCE_KEY, verifier);
+      storePkceVerifier(verifier);
       const redirectUri = `${window.location.origin}/auth/callback`;
       const startUrl = new URL('/api/auth/google/start', window.location.origin);
       startUrl.searchParams.set('code_challenge', challenge);
@@ -466,33 +537,40 @@
       return false;
     }
 
-    const verifier = sessionStorage.getItem(PKCE_KEY);
-    sessionStorage.removeItem(PKCE_KEY);
+    const verifier = consumePkceVerifier();
     if (!verifier) {
       openLoginModal('Sign-in session expired. Please try Google Sign-In again.');
       return false;
     }
 
     $('splashStatusText').textContent = 'Completing Google sign-in…';
-    const res = await fetch('/api/auth/exchange', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code, codeVerifier: verifier }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.success || !data.token) {
-      openLoginModal(data.error || 'Could not exchange login code.');
+    try {
+      const res = await fetch('/api/auth/exchange', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code, codeVerifier: verifier }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success || !data.token) {
+        openLoginModal(data.error || 'Could not exchange login code.');
+        return false;
+      }
+
+      saveSession({
+        token: data.token,
+        serverUrl: data.serverUrl || window.location.origin,
+        nodeId: data.nodeId || 'primary',
+        isLocalNode: data.isLocalNode !== false,
+        useGatewayProxy: data.isLocalNode === false,
+        authMode: 'google',
+        user: data.user || null,
+      });
+      showToast('Signed in with Google!', 'mint');
+      return true;
+    } catch (err) {
+      openLoginModal(err.message || 'Network error while completing Google sign-in.');
       return false;
     }
-
-    saveSession({
-      token: data.token,
-      serverUrl: data.serverUrl || window.location.origin,
-      authMode: 'google',
-      user: data.user || null,
-    });
-    showToast('Signed in with Google!', 'mint');
-    return true;
   }
 
   function signOut(notify = true) {
@@ -511,16 +589,27 @@
   }
 
   async function verifySession() {
-    if (!state.session) return false;
+    if (!state.session) return { ok: false, unauthorized: false };
     try {
       const res = await apiFetch('/api/whoami');
-      if (!res.ok) return false;
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return {
+          ok: false,
+          unauthorized: res.status === 401,
+          error: body.error || `Server returned HTTP ${res.status}`,
+        };
+      }
       const data = await res.json();
       state.whoami = data;
       updateAuthUI();
-      return true;
-    } catch {
-      return false;
+      return { ok: true, unauthorized: false };
+    } catch (err) {
+      return {
+        ok: false,
+        unauthorized: Boolean(err && err.isUnauthorized),
+        error: (err && err.message) || 'Connection error',
+      };
     }
   }
 
@@ -1435,9 +1524,11 @@
 
     if (state.session) {
       $('splashStatusText').textContent = 'Syncing your gallery…';
-      const valid = await verifySession();
-      if (!valid) {
+      const check = await verifySession();
+      if (check.unauthorized) {
         saveSession(null);
+      } else if (!check.ok && check.error) {
+        showToast(check.error, 'amber');
       }
     }
 

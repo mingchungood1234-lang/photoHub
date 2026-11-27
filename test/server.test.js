@@ -1858,6 +1858,39 @@ test('Ordered node allocation prefers node1 and spills new users to node2 when n
   });
   assert.equal(upNode2Res.status, 200);
 
+  // Web gallery same-origin Gateway proxy (`/api/web-node/*`) works for BOTH local node1 and remote node2!
+  assert.equal(res1.session.isLocalNode, true);
+  assert.equal(res2.session.isLocalNode, false);
+
+  const webWhoNode1 = await fetch(`${gwBaseUrl}/api/web-node/whoami`, {
+    headers: { Authorization: `Bearer ${res1.session.token}` },
+  });
+  assert.equal(webWhoNode1.status, 200);
+  const webWhoNode1Json = await webWhoNode1.json();
+  assert.equal(webWhoNode1Json.email, 'u1@gmail.com');
+
+  const webWhoNode2 = await fetch(`${gwBaseUrl}/api/web-node/whoami`, {
+    headers: { Authorization: `Bearer ${res2.session.token}` },
+  });
+  assert.equal(webWhoNode2.status, 200);
+  const webWhoNode2Json = await webWhoNode2.json();
+  assert.equal(webWhoNode2Json.email, 'u2@gmail.com');
+
+  const webPhotosNode2 = await fetch(`${gwBaseUrl}/api/web-node/photos`, {
+    headers: { Authorization: `Bearer ${res2.session.token}` },
+  });
+  assert.equal(webPhotosNode2.status, 200);
+  const webPhotosNode2Json = await webPhotosNode2.json();
+  assert.equal(webPhotosNode2Json.photos.length, 1);
+  assert.equal(webPhotosNode2Json.photos[0].originalName, 'SPILL2.JPG');
+
+  // Streaming original download via `/api/web-node/photo/:hash?apiKey=<jwt>` (as used by browser <video> / download)
+  const webFileNode2 = await fetch(
+    `${gwBaseUrl}/api/web-node/photo/${encodeURIComponent(webPhotosNode2Json.photos[0].hash)}?apiKey=${encodeURIComponent(res2.session.token)}`
+  );
+  assert.equal(webFileNode2.status, 200);
+  assert.equal(await webFileNode2.text(), 'ordered-spillover-node2-bytes');
+
   // 3. User 3 exceeds both node1 (1/1) and node2 (1/1) -> signup blocked with clear reason
   const res3 = await oauthSignInViaGateway({
     sub: 'sub-order-3',
@@ -2082,6 +2115,41 @@ test('Web frontend assets serve cleanly and Google PKCE allows same-origin web c
     assert.equal(exBody.success, true);
     assert.ok(exBody.token);
     assert.equal(exBody.user.email, 'webuser@example.com');
+
+    // Regression: webpage accessed via LAN IP / localhost on port 4000 while PUBLIC_URL is a domain
+    const lanStart = await ctx.request(
+      `/api/auth/google/start?code_challenge=${encodeURIComponent(challenge)}&redirect_uri=${encodeURIComponent('http://192.168.1.50:4000/auth/callback')}`,
+      { headers: { Host: '192.168.1.50:4000' } }
+    );
+    assert.equal(lanStart.status, 302);
+    const lanState = new URL(lanStart.headers.location).searchParams.get('state');
+    assert.ok(lanState);
+
+    // Google calls back on PUBLIC_URL host (photohub.example.com), NOT 192.168.1.50:4000
+    const lanCb = await ctx.request(
+      `/api/auth/google/callback?code=mock_web_code&state=${encodeURIComponent(lanState)}`,
+      { headers: { Host: 'photohub.example.com' } }
+    );
+    assert.equal(lanCb.status, 302);
+    const lanRedirect = new URL(lanCb.headers.location);
+    assert.equal(lanRedirect.origin, 'http://192.168.1.50:4000');
+    assert.equal(lanRedirect.pathname, '/auth/callback');
+    assert.ok(lanRedirect.searchParams.get('code'));
+
+    // CORS preflight from WEB_PORT=4000 and localhost:4000 must succeed with 204
+    const corsWebPort = await ctx.request('/api/whoami', {
+      method: 'OPTIONS',
+      headers: { Origin: 'https://photohub.example.com:4000' },
+    });
+    assert.equal(corsWebPort.status, 204);
+    assert.equal(corsWebPort.headers['access-control-allow-origin'], 'https://photohub.example.com:4000');
+
+    const corsLocalhost = await ctx.request('/api/whoami', {
+      method: 'OPTIONS',
+      headers: { Origin: 'http://localhost:4000' },
+    });
+    assert.equal(corsLocalhost.status, 204);
+    assert.equal(corsLocalhost.headers['access-control-allow-origin'], 'http://localhost:4000');
   } finally {
     await ctx.cleanup();
   }
