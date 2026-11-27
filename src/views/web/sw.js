@@ -1,10 +1,10 @@
-const CACHE_NAME = 'photohub-shell-v5';
+const CACHE_NAME = 'photohub-shell-v6';
 const SHELL_ASSETS = [
   '/',
   '/gallery',
   '/web/icon.png',
-  '/web/styles.css?v=5',
-  '/web/app.js?v=5',
+  '/web/styles.css?v=6',
+  '/web/app.js?v=6',
   '/manifest.webmanifest',
 ];
 

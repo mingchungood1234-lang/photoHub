@@ -2083,6 +2083,19 @@ test('Web frontend assets serve cleanly and Google PKCE allows same-origin web c
     const css = await ctx.request('/web/styles.css');
     assert.equal(css.status, 200);
     assert.ok(String(css.headers['content-type'] || '').includes('text/css'));
+    const cssText = css.buffer.toString('utf8');
+    const modalZMatch = cssText.match(/\.modal-backdrop\s*\{[^}]*z-index:\s*(\d+)/);
+    const lightboxZMatch = cssText.match(/\.lightbox\s*\{[^}]*z-index:\s*(\d+)/);
+    const toastZMatch = cssText.match(/\.toast-stack\s*\{[^}]*z-index:\s*(\d+)/);
+    assert.ok(modalZMatch && lightboxZMatch && toastZMatch, 'Expected modal, lightbox, and toast z-index rules');
+    assert.ok(
+      Number(modalZMatch[1]) > Number(lightboxZMatch[1]),
+      `Expected .modal-backdrop z-index (${modalZMatch[1]}) > .lightbox z-index (${lightboxZMatch[1]})`
+    );
+    assert.ok(
+      Number(toastZMatch[1]) > Number(modalZMatch[1]),
+      `Expected .toast-stack z-index (${toastZMatch[1]}) > .modal-backdrop z-index (${modalZMatch[1]})`
+    );
 
     const js = await ctx.request('/web/app.js');
     assert.equal(js.status, 200);

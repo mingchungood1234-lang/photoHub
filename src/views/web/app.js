@@ -2518,7 +2518,23 @@
     });
 
     document.addEventListener('keydown', (e) => {
+      if (!$('confirmModal').classList.contains('hidden')) {
+        if (e.key === 'Escape') closeConfirmModal();
+        return;
+      }
+      if (!$('shareModal').classList.contains('hidden')) {
+        if (e.key === 'Escape') closeShareModal();
+        return;
+      }
+      if (!$('loginModal').classList.contains('hidden')) {
+        if (e.key === 'Escape') closeLoginModal();
+        return;
+      }
       if ($('lightbox').classList.contains('hidden')) return;
+      const tag = e.target && e.target.tagName ? e.target.tagName.toUpperCase() : '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (e.target && e.target.isContentEditable)) {
+        return;
+      }
       if (e.key === 'Escape') closeLightbox();
       else if (e.key === 'ArrowLeft' && state.lightboxIndex > 0) {
         state.lightboxIndex--;
