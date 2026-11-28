@@ -4183,7 +4183,56 @@
     }
   }
 
-  function uploadFileWithProgress(file, sha256, onProgress) {
+  function parseRetryAfterMs(rawHeader, data, attempt = 0) {
+    const fromHeader = Number(rawHeader);
+    const fromBody = data && Number(data.retryAfterSeconds);
+    const sec =
+      Number.isFinite(fromHeader) && fromHeader > 0
+        ? fromHeader
+        : Number.isFinite(fromBody) && fromBody > 0
+          ? fromBody
+          : Math.min(12, 1.5 * (attempt + 1));
+    return Math.min(30_000, Math.max(800, Math.round(sec * 1000)));
+  }
+
+  async function sleepAbortableUpload(ms) {
+    const deadline = Date.now() + ms;
+    while (!uploadState.cancelled && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, Math.min(200, Math.max(20, deadline - Date.now()))));
+    }
+    if (uploadState.cancelled) {
+      const err = new Error('Cancelled');
+      err.isAbort = true;
+      throw err;
+    }
+  }
+
+  async function apiFetchUploadWithBackoff(urlPath, options = {}, label = '') {
+    let lastRes = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      if (uploadState.cancelled) {
+        const err = new Error('Cancelled');
+        err.isAbort = true;
+        throw err;
+      }
+      const res = await apiFetch(urlPath, options);
+      lastRes = res;
+      if ((res.status === 429 || res.status === 502 || res.status === 503) && attempt < 4) {
+        const bodyData = await res.clone().json().catch(() => ({}));
+        const waitMs = parseRetryAfterMs(res.headers.get('Retry-After'), bodyData, attempt);
+        if (label) {
+          uploadState.currentFilename = `${label} (pausing ${Math.ceil(waitMs / 1000)}s…)`;
+          renderUploadTray();
+        }
+        await sleepAbortableUpload(waitMs);
+        continue;
+      }
+      return res;
+    }
+    return lastRes;
+  }
+
+  function sendUploadOnce(file, sha256, onProgress) {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       uploadState.activeXhrs.add(xhr);
@@ -4219,7 +4268,12 @@
         } catch {
           data = {};
         }
-        resolve({ status: xhr.status, ok: xhr.status >= 200 && xhr.status < 300, data });
+        resolve({
+          status: xhr.status,
+          ok: xhr.status >= 200 && xhr.status < 300,
+          retryAfter: xhr.getResponseHeader('Retry-After'),
+          data,
+        });
       };
       xhr.onerror = () => {
         cleanup();
@@ -4236,24 +4290,68 @@
     });
   }
 
+  async function uploadFileWithProgress(file, sha256, onProgress) {
+    let lastRes = null;
+    let lastErr = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      if (uploadState.cancelled) {
+        const err = new Error('Cancelled');
+        err.isAbort = true;
+        throw err;
+      }
+      try {
+        const res = await sendUploadOnce(file, sha256, onProgress);
+        lastRes = res;
+        if ((res.status === 429 || res.status === 502 || res.status === 503) && attempt < 4) {
+          const waitMs = parseRetryAfterMs(res.retryAfter, res.data, attempt);
+          if (typeof onProgress === 'function') onProgress(0);
+          uploadState.currentFilename = `${file.name} (pausing ${Math.ceil(waitMs / 1000)}s…)`;
+          renderUploadTray();
+          await sleepAbortableUpload(waitMs);
+          uploadState.currentFilename = file.name;
+          renderUploadTray();
+          continue;
+        }
+        return res;
+      } catch (err) {
+        if (err && err.isAbort) throw err;
+        lastErr = err;
+        if (attempt < 3) {
+          const waitMs = parseRetryAfterMs(null, null, attempt);
+          if (typeof onProgress === 'function') onProgress(0);
+          uploadState.currentFilename = `${file.name} (retrying in ${Math.ceil(waitMs / 1000)}s…)`;
+          renderUploadTray();
+          await sleepAbortableUpload(waitMs);
+          continue;
+        }
+        throw lastErr;
+      }
+    }
+    return lastRes;
+  }
+
   async function uploadFileChunkedResumable(file, sha256, onProgress) {
     const fileKey = `${file.name}|${file.size}|${file.lastModified || 0}`;
     const resumeEntry = loadChunkResumeMap()[fileKey];
     const resumeUploadId = resumeEntry && resumeEntry.uploadId ? resumeEntry.uploadId : null;
 
-    const initRes = await apiFetch('/api/upload/chunked/init', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        fileName: file.name,
-        mimeType: file.type || 'application/octet-stream',
-        fileSize: file.size,
-        chunkSize: CHUNK_SIZE_BYTES,
-        expectedHash: sha256 || '',
-        createdAt: file.lastModified ? new Date(file.lastModified).toISOString() : '',
-        resumeUploadId,
-      }),
-    });
+    const initRes = await apiFetchUploadWithBackoff(
+      '/api/upload/chunked/init',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fileName: file.name,
+          mimeType: file.type || 'application/octet-stream',
+          fileSize: file.size,
+          chunkSize: CHUNK_SIZE_BYTES,
+          expectedHash: sha256 || '',
+          createdAt: file.lastModified ? new Date(file.lastModified).toISOString() : '',
+          resumeUploadId,
+        }),
+      },
+      file.name
+    );
     const initData = await initRes.json().catch(() => ({}));
     if (!initRes.ok || !initData.success) {
       return { status: initRes.status, ok: false, data: initData };
@@ -4309,7 +4407,15 @@
             emitTotal();
             resolve();
           } else {
-            reject(new Error(`Chunk ${idx} failed with HTTP ${xhr.status}`));
+            const err = new Error(`Chunk ${idx} failed with HTTP ${xhr.status}`);
+            err.status = xhr.status;
+            err.retryAfter = xhr.getResponseHeader('Retry-After');
+            try {
+              err.data = JSON.parse(xhr.responseText || '{}');
+            } catch {
+              err.data = {};
+            }
+            reject(err);
           }
         };
         xhr.onerror = () => {
@@ -4330,7 +4436,7 @@
       const end = Math.min(file.size, start + chunkSize);
       const blob = file.slice(start, end);
       let lastErr;
-      for (let attempt = 0; attempt < 3; attempt++) {
+      for (let attempt = 0; attempt < 5; attempt++) {
         if (uploadState.cancelled) {
           const e = new Error('Cancelled');
           e.isAbort = true;
@@ -4341,8 +4447,21 @@
           return;
         } catch (err) {
           if (err && err.isAbort) throw err;
+          // Do not retry non-retryable client/quota errors
+          if (err && err.status && err.status >= 400 && err.status < 500 && err.status !== 429 && err.status !== 408) {
+            throw err;
+          }
+          if (err && err.status === 507) throw err;
           lastErr = err;
-          await new Promise((r) => setTimeout(r, 600 * (attempt + 1)));
+          const waitMs =
+            err && err.status === 429
+              ? parseRetryAfterMs(err.retryAfter, err.data, attempt)
+              : 800 * (attempt + 1);
+          if (err && err.status === 429) {
+            uploadState.currentFilename = `${file.name} (part ${idx + 1}/${totalChunks} · pausing ${Math.ceil(waitMs / 1000)}s…)`;
+            renderUploadTray();
+          }
+          await sleepAbortableUpload(waitMs);
         }
       }
       throw lastErr || new Error(`Chunk ${idx} failed`);
@@ -4372,14 +4491,18 @@
 
       uploadState.currentFilename = `${file.name} (verifying SHA-256…)`;
       renderUploadTray();
-      const compRes = await apiFetch(`/api/upload/chunked/${encodeURIComponent(uploadId)}/complete`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Upload-Source': 'chunked-web',
+      const compRes = await apiFetchUploadWithBackoff(
+        `/api/upload/chunked/${encodeURIComponent(uploadId)}/complete`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Upload-Source': 'chunked-web',
+          },
+          body: JSON.stringify({ expectedHash: sha256 || '' }),
         },
-        body: JSON.stringify({ expectedHash: sha256 || '' }),
-      });
+        file.name
+      );
       const compData = await compRes.json().catch(() => ({}));
       if (compRes.ok && compData.success) {
         saveChunkResumeId(fileKey, null);
@@ -4419,8 +4542,12 @@
       // Fast pre-upload duplicate & proxy check so already-backed-up files finish instantly with zero upload bandwidth
       if (sha256) {
         try {
-          const checkRes = await apiFetch(`/api/check/${encodeURIComponent(sha256)}`);
-          if (checkRes.ok) {
+          const checkRes = await apiFetchUploadWithBackoff(
+            `/api/check/${encodeURIComponent(sha256)}`,
+            {},
+            file.name
+          );
+          if (checkRes && checkRes.ok) {
             const checkData = await checkRes.json().catch(() => ({}));
             if (checkData.exists && (checkData.isMaster || checkData.isProxy)) {
               uploadState.duplicateCount++;
@@ -4428,6 +4555,7 @@
             }
           }
         } catch (err) {
+          if (err && err.isAbort) throw err;
           if (err && err.isUnauthorized) {
             uploadState.cancelled = true;
             return;

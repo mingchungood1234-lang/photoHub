@@ -30,12 +30,23 @@ try {
 const VIDEO_EXTENSIONS = new Set(['.mov', '.mp4', '.m4v', '.3gp', '.avi']);
 
 let cachedFfmpegAvailable = null;
+let cachedNvencAvailable = null;
+let ffmpegProbePromise = null;
+let nvencProbePromise = null;
+let transcodeSettings = {
+  hwaccel: 'auto', // 'auto' | 'nvenc' | 'cpu'
+  nvencPreset: 'p4',
+  ffmpegConcurrency: 0, // 0 = auto (3 on NVENC, 1 on CPU)
+};
 
-function createConcurrencyGate(maxConcurrent) {
+function createConcurrencyGate(getMaxConcurrent) {
   let active = 0;
   const queue = [];
+  const resolveLimit = () =>
+    Math.max(1, Number(typeof getMaxConcurrent === 'function' ? getMaxConcurrent() : getMaxConcurrent) || 1);
+
   return async function runLimited(fn) {
-    if (active >= maxConcurrent) {
+    if (active >= resolveLimit()) {
       await new Promise((resolve) => queue.push(resolve));
     }
     active += 1;
@@ -43,16 +54,45 @@ function createConcurrencyGate(maxConcurrent) {
       return await fn();
     } finally {
       active -= 1;
-      const next = queue.shift();
-      if (next) next();
+      const limit = resolveLimit();
+      if (active < limit && queue.length > 0) {
+        const next = queue.shift();
+        if (next) next();
+      }
     }
   };
 }
 
+function getEffectiveFfmpegConcurrency() {
+  if (transcodeSettings.ffmpegConcurrency > 0) {
+    return transcodeSettings.ffmpegConcurrency;
+  }
+  return cachedNvencAvailable === true ? 3 : 1;
+}
+
 const sharpGate = createConcurrencyGate(2);
 const thumbGate = createConcurrencyGate(4);
-const ffmpegGate = createConcurrencyGate(1);
+const ffmpegGate = createConcurrencyGate(() => getEffectiveFfmpegConcurrency());
 const thumbInFlight = new Map(); // cachePath -> Promise<Buffer|null>
+
+function configureProxyService(videoTranscode = {}) {
+  if (!videoTranscode || typeof videoTranscode !== 'object') return;
+  const prevHwaccel = transcodeSettings.hwaccel;
+  if (videoTranscode.hwaccel) {
+    transcodeSettings.hwaccel = videoTranscode.hwaccel;
+  }
+  if (videoTranscode.nvencPreset && /^p[1-7]$/.test(String(videoTranscode.nvencPreset))) {
+    transcodeSettings.nvencPreset = String(videoTranscode.nvencPreset);
+  }
+  if (videoTranscode.ffmpegConcurrency !== undefined) {
+    const num = Number(videoTranscode.ffmpegConcurrency);
+    transcodeSettings.ffmpegConcurrency = Number.isFinite(num) && num > 0 ? Math.min(8, Math.floor(num)) : 0;
+  }
+  if (prevHwaccel !== transcodeSettings.hwaccel) {
+    cachedNvencAvailable = null;
+    nvencProbePromise = null;
+  }
+}
 
 function isVideoFilename(name = '') {
   return VIDEO_EXTENSIONS.has(path.extname(String(name)).toLowerCase());
@@ -62,21 +102,123 @@ async function hasFfmpeg() {
   if (cachedFfmpegAvailable !== null) {
     return cachedFfmpegAvailable;
   }
-  cachedFfmpegAvailable = await new Promise((resolve) => {
-    execFile('ffmpeg', ['-version'], { timeout: 3000 }, (err) => {
-      resolve(!err);
+  if (!ffmpegProbePromise) {
+    ffmpegProbePromise = new Promise((resolve) => {
+      execFile('ffmpeg', ['-version'], { timeout: 3000 }, (err) => {
+        cachedFfmpegAvailable = !err;
+        ffmpegProbePromise = null;
+        resolve(cachedFfmpegAvailable);
+      });
     });
-  });
-  return cachedFfmpegAvailable;
+  }
+  return ffmpegProbePromise;
+}
+
+/**
+ * Probes real NVIDIA NVENC hardware encoding (`h264_nvenc`) with a tiny 1-frame 256x256 test
+ * (above Turing's 145px minimum frame dimension). Automatically returns `false` on CPU-only VPS nodes.
+ */
+async function hasNvenc() {
+  if (transcodeSettings.hwaccel === 'cpu') {
+    return false;
+  }
+  if (cachedNvencAvailable !== null) {
+    return cachedNvencAvailable;
+  }
+  if (!(await hasFfmpeg())) {
+    cachedNvencAvailable = false;
+    return false;
+  }
+  if (!nvencProbePromise) {
+    nvencProbePromise = new Promise((resolve) => {
+      execFile(
+        'ffmpeg',
+        [
+          '-hide_banner',
+          '-loglevel', 'error',
+          '-f', 'lavfi',
+          '-i', 'color=c=black:s=256x256:d=0.1',
+          '-frames:v', '1',
+          '-pix_fmt', 'yuv420p',
+          '-c:v', 'h264_nvenc',
+          '-preset', transcodeSettings.nvencPreset || 'p4',
+          '-f', 'null',
+          '-',
+        ],
+        { timeout: 8000 },
+        (err) => {
+          cachedNvencAvailable = !err;
+          nvencProbePromise = null;
+          resolve(cachedNvencAvailable);
+        }
+      );
+    });
+  }
+  return nvencProbePromise;
 }
 
 async function getCapabilities() {
   const ffmpeg = await hasFfmpeg();
+  const nvenc = ffmpeg ? await hasNvenc() : false;
   return {
     sharp: Boolean(sharpModule),
     ffmpeg,
+    nvenc,
+    videoEncoder: nvenc ? 'h264_nvenc' : ffmpeg ? 'libx264' : null,
+    hwaccelMode: transcodeSettings.hwaccel,
+    nvencPreset: transcodeSettings.nvencPreset,
+    ffmpegConcurrency: getEffectiveFfmpegConcurrency(),
     available: Boolean(sharpModule) || ffmpeg,
   };
+}
+
+function buildVideoEncodeArgs({
+  sourcePath,
+  videoTmp,
+  targetHeight = 720,
+  qualityNum = 0.72,
+  normMaster = '',
+  useNvenc = false,
+  nvencPreset = 'p4',
+}) {
+  const cqOrCrf = qualityNum >= 0.78 ? '24' : qualityNum < 0.59 ? '31' : '28';
+  const videoScaleFilter = `scale='if(gte(iw,ih),-2,min(${targetHeight},iw))':'if(gte(iw,ih),min(${targetHeight},ih),-2)'`;
+
+  if (useNvenc) {
+    return [
+      '-y',
+      '-i', sourcePath,
+      '-c:v', 'h264_nvenc',
+      '-preset', nvencPreset || 'p4',
+      '-rc', 'vbr',
+      '-cq', cqOrCrf,
+      '-b:v', '0',
+      '-pix_fmt', 'yuv420p',
+      '-vf', videoScaleFilter,
+      '-c:a', 'aac',
+      '-b:a', '96k',
+      '-metadata', `description=PhotoHubProxy:${normMaster}`,
+      '-metadata', `comment=PhotoHubProxy:${normMaster}`,
+      '-movflags', '+faststart',
+      videoTmp,
+    ];
+  }
+
+  return [
+    '-y',
+    '-i', sourcePath,
+    '-c:v', 'libx264',
+    '-preset', 'veryfast',
+    '-crf', cqOrCrf,
+    '-pix_fmt', 'yuv420p',
+    '-vf', videoScaleFilter,
+    '-c:a', 'aac',
+    '-b:a', '96k',
+    '-metadata', `description=PhotoHubProxy:${normMaster}`,
+    '-metadata', `comment=PhotoHubProxy:${normMaster}`,
+    '-movflags', '+faststart',
+    videoTmp,
+  ];
 }
 
 function runFfmpeg(args, timeoutMs = 120000) {
@@ -199,31 +341,61 @@ async function generateServerSideProxy({
         ], 30000).catch(() => {});
       }
 
-      // Encode lightweight compressed H.264 + AAC proxy MP4 honoring user's resolution/detail preference
+      // Encode lightweight compressed H.264 + AAC proxy MP4 honoring user's resolution/detail preference.
+      // Uses NVIDIA NVENC (`h264_nvenc`) on GPU storage nodes with automatic per-file CPU `libx264` fallback.
       const targetHeight =
         maxPx >= 2400 ? 1440 :
         maxPx >= 1800 ? 1080 :
         maxPx >= 1100 ? 720 :
         maxPx > 0 ? 480 :
         qualityNum < 0.59 ? 540 : 720;
-      const crfVal = qualityNum >= 0.78 ? '24' : qualityNum < 0.59 ? '31' : '28';
-      const videoScaleFilter = `scale='if(gte(iw,ih),-2,min(${targetHeight},iw))':'if(gte(iw,ih),min(${targetHeight},ih),-2)'`;
 
-      await runFfmpeg([
-        '-y',
-        '-i', sourcePath,
-        '-c:v', 'libx264',
-        '-preset', 'veryfast',
-        '-crf', crfVal,
-        '-pix_fmt', 'yuv420p',
-        '-vf', videoScaleFilter,
-        '-c:a', 'aac',
-        '-b:a', '96k',
-        '-metadata', `description=PhotoHubProxy:${normMaster}`,
-        '-metadata', `comment=PhotoHubProxy:${normMaster}`,
-        '-movflags', '+faststart',
-        videoTmp,
-      ], 180000);
+      const useNvenc = await hasNvenc();
+      if (useNvenc) {
+        try {
+          await runFfmpeg(
+            buildVideoEncodeArgs({
+              sourcePath,
+              videoTmp,
+              targetHeight,
+              qualityNum,
+              normMaster,
+              useNvenc: true,
+              nvencPreset: transcodeSettings.nvencPreset,
+            }),
+            180000
+          );
+        } catch (nvencErr) {
+          console.warn(
+            `[proxy] NVENC encode failed for ${path.basename(originalName || sourcePath)}, falling back to CPU libx264:`,
+            nvencErr && nvencErr.message ? nvencErr.message.slice(0, 180) : nvencErr
+          );
+          await fsp.unlink(videoTmp).catch(() => {});
+          await runFfmpeg(
+            buildVideoEncodeArgs({
+              sourcePath,
+              videoTmp,
+              targetHeight,
+              qualityNum,
+              normMaster,
+              useNvenc: false,
+            }),
+            180000
+          );
+        }
+      } else {
+        await runFfmpeg(
+          buildVideoEncodeArgs({
+            sourcePath,
+            videoTmp,
+            targetHeight,
+            qualityNum,
+            normMaster,
+            useNvenc: false,
+          }),
+          180000
+        );
+      }
 
       let proxyRelativePath = null;
       let proxySize = null;
@@ -371,7 +543,11 @@ async function generateGridThumbnail({
 
 module.exports = {
   isVideoFilename,
+  configureProxyService,
+  hasFfmpeg,
+  hasNvenc,
   getCapabilities,
+  buildVideoEncodeArgs,
   generateServerSideProxy,
   generateGridThumbnail,
 };

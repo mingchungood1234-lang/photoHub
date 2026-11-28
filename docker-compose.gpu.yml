@@ -1,0 +1,50 @@
+# Standalone Docker Compose for NVIDIA GPU Storage Nodes (Windows Docker Desktop WSL2 & Linux)
+# Run with:
+#   docker compose -f docker-compose.gpu.yml up -d --build
+#
+# Windows prerequisites:
+#   1. Install latest NVIDIA Windows Driver (535+ recommended for RTX 2060)
+#   2. Docker Desktop with WSL 2 backend enabled
+#   3. Set HOST_STORAGE_DIR in .env (e.g., HOST_STORAGE_DIR=D:/PhotoHubStorage or ./uploads)
+
+services:
+  photohub:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    container_name: photohub-gpu
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:${PORT:-3000}"
+      - "${WEB_PORT:-4000}:${WEB_PORT:-4000}"
+    env_file:
+      - .env
+    environment:
+      - PORT=${PORT:-3000}
+      - WEB_PORT=${WEB_PORT:-4000}
+      - STORAGE_DIR=/storage
+      - DATA_DIR=/app/data
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+      - VIDEO_HWACCEL=${VIDEO_HWACCEL:-nvenc}
+      - NVENC_PRESET=${NVENC_PRESET:-p4}
+      - FFMPEG_CONCURRENCY=${FFMPEG_CONCURRENCY:-3}
+      - PROXY_QUEUE_CONCURRENCY=${PROXY_QUEUE_CONCURRENCY:-3}
+    volumes:
+      # On Windows Docker Desktop, set HOST_STORAGE_DIR in .env (e.g. D:/PhotoHubStorage)
+      - ${HOST_STORAGE_DIR:-./uploads}:/storage
+      # Persist the SHA-256 hash index & fast 360px SSD thumbnail cache on the host
+      - ./data:/app/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "node", "-e", "const http = require('http'); const req = http.get({ host: '127.0.0.1', port: process.env.PORT || 3000, path: '/api/health', timeout: 4000 }, (res) => process.exit(res.statusCode === 200 ? 0 : 1)); req.on('error', () => process.exit(1));"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

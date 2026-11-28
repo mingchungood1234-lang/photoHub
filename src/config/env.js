@@ -331,6 +331,10 @@ function getConfig(overrides = {}) {
         30,
         Number(overrides.rateLimitApiMaxPerMin ?? process.env.RATE_LIMIT_MAX_PER_MIN ?? 1500) || 1500
       ),
+      mediaMaxPerMin: Math.max(
+        60,
+        Number(overrides.rateLimitMediaMaxPerMin ?? process.env.MEDIA_RATE_LIMIT_MAX_PER_MIN ?? 6000) || 6000
+      ),
       authFailMaxPer15Min: Math.max(
         3,
         Number(overrides.rateLimitAuthFailMax ?? process.env.AUTH_FAIL_MAX_PER_15M ?? 25) || 25
@@ -399,6 +403,42 @@ function getConfig(overrides = {}) {
         1024 *
         1024,
     },
+    // Hardware-accelerated video proxy transcoding (NVIDIA NVENC on GPU storage nodes, auto CPU fallback on VPS)
+    videoTranscode: (() => {
+      const rawMode = String(overrides.videoHwaccel ?? process.env.VIDEO_HWACCEL ?? 'auto')
+        .trim()
+        .toLowerCase();
+      let hwaccel = 'auto';
+      if (rawMode === 'nvenc' || rawMode === 'cuda' || rawMode === 'nvidia' || rawMode === 'gpu' || rawMode === 'h264_nvenc') {
+        hwaccel = 'nvenc';
+      } else if (rawMode === 'cpu' || rawMode === 'none' || rawMode === 'off' || rawMode === 'software' || rawMode === 'libx264') {
+        hwaccel = 'cpu';
+      }
+
+      const rawPreset = String(overrides.nvencPreset ?? process.env.NVENC_PRESET ?? 'p4')
+        .trim()
+        .toLowerCase();
+      const nvencPreset = /^p[1-7]$/.test(rawPreset) ? rawPreset : 'p4';
+
+      const rawFfmpegConc = Number(overrides.ffmpegConcurrency ?? process.env.FFMPEG_CONCURRENCY ?? 0);
+      const ffmpegConcurrency =
+        Number.isFinite(rawFfmpegConc) && rawFfmpegConc > 0
+          ? Math.min(8, Math.max(1, Math.floor(rawFfmpegConc)))
+          : 0; // 0 = auto (3 when NVENC active, 1 on CPU)
+
+      const rawQueueConc = Number(overrides.proxyQueueConcurrency ?? process.env.PROXY_QUEUE_CONCURRENCY ?? 0);
+      const proxyQueueConcurrency =
+        Number.isFinite(rawQueueConc) && rawQueueConc > 0
+          ? Math.min(8, Math.max(1, Math.floor(rawQueueConc)))
+          : 0; // 0 = auto (3 when NVENC requested/active, 2 on CPU)
+
+      return {
+        hwaccel,
+        nvencPreset,
+        ffmpegConcurrency,
+        proxyQueueConcurrency,
+      };
+    })(),
   };
 }
 

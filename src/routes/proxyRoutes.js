@@ -13,12 +13,11 @@ const express = require('express');
 function createProxyRoutes({ proxyController, securityGuards = {} }) {
   const router = express.Router();
   const noop = (_req, _res, next) => next();
-  const heavyLimit = securityGuards.heavyOpLimiter || noop;
   const proxyGenGuard = securityGuards.proxyGenConcurrencyGuard || noop;
 
   router.post('/proxy/register', proxyController.registerProxy);
   router.post('/proxy/:masterHash/video', proxyController.uploadVideoProxyStream);
-  router.post('/proxy/generate', heavyLimit, proxyGenGuard, proxyController.generateProxy);
+  router.post('/proxy/generate', proxyGenGuard, proxyController.generateProxy);
 
   return router;
 }

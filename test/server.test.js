@@ -4353,3 +4353,181 @@ test('46. STORAGE_BACKEND=disk (default) preserves direct-to-server local storag
   assert.equal(dlS3.status, 200);
   assert.equal(Buffer.compare(dlS3.buffer, hybridS3Bytes), 0);
 });
+
+test('47. Bulk-upload rate limits isolate verified users on the same IP, allow rapid chunked init & queued proxy gen, while keeping heavy/unauth protections strict', async (t) => {
+  const ctx = await startTestServer({
+    userKeys: 'alice_bulk:alice,bob_bulk:bob',
+    rateLimitEnabled: true,
+    rateLimitApiMaxPerMin: 30,
+    rateLimitMediaMaxPerMin: 80,
+    rateLimitHeavyMaxPerMin: 5,
+    rateLimitAuthFailMax: 3,
+  });
+  t.after(() => ctx.cleanup());
+
+  const aliceHeaders = { 'X-API-Key': 'alice_bulk' };
+  const bobHeaders = { 'X-API-Key': 'bob_bulk' };
+
+  // 1. Rapid chunked upload init+abort (12 consecutive videos > HEAVY_OP_MAX_PER_MIN=5) does NOT trigger 429
+  for (let i = 0; i < 12; i++) {
+    const initRes = await ctx.request('/api/upload/chunked/init', {
+      method: 'POST',
+      headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fileName: `bulk_4k_${i}.mp4`, fileSize: 20 * 1024 * 1024 }),
+    });
+    assert.equal(initRes.status, 201, `Chunked init #${i} should succeed without hitting 5/min heavy limiter`);
+    const { uploadId } = await initRes.json();
+    const abortRes = await ctx.request(`/api/upload/chunked/${uploadId}`, {
+      method: 'DELETE',
+      headers: aliceHeaders,
+    });
+    assert.equal(abortRes.status, 200);
+  }
+
+  // 2. Per-user bucket isolation on the same IP: exhausting Alice's general /api/albums limit (30/min)
+  //    never blocks Bob on the same IP, and never blocks Alice's dedicated media-transfer bucket!
+  for (let i = 0; i < 30; i++) {
+    const r = await ctx.request('/api/albums', { headers: aliceHeaders });
+    assert.equal(r.status, 200);
+  }
+  const aliceLimited = await ctx.request('/api/albums', { headers: aliceHeaders });
+  assert.equal(aliceLimited.status, 429);
+  assert.ok(aliceLimited.headers['retry-after']);
+
+  const bobUnaffected = await ctx.request('/api/albums', { headers: bobHeaders });
+  assert.equal(bobUnaffected.status, 200, 'Bob on the same IP must have an independent per-user rate limit bucket');
+
+  const aliceMediaStillFlows = await ctx.request(`/api/check/${'a'.repeat(64)}`, { headers: aliceHeaders });
+  assert.equal(aliceMediaStillFlows.status, 200, 'Authenticated media bucket stays available during bulk uploads');
+
+  // 3. POST /api/proxy/generate queues 4 concurrent requests cleanly without premature 2-concurrent 429
+  const sharp = require('sharp');
+  const uploadedHashes = [];
+  for (let i = 0; i < 4; i++) {
+    const jpg = await sharp({
+      create: { width: 400, height: 300, channels: 3, background: { r: 40 * i + 20, g: 120, b: 200 } },
+    })
+      .jpeg({ quality: 82 })
+      .toBuffer();
+    const h = crypto.createHash('sha256').update(jpg).digest('hex');
+    const up = await ctx.request('/api/upload', {
+      method: 'POST',
+      headers: {
+        ...bobHeaders,
+        'Content-Type': 'image/jpeg',
+        'X-File-Name': `BULK_PROXY_${i}.JPG`,
+        'X-File-Sha256': h,
+        'X-Skip-Auto-Proxy': '1',
+      },
+      body: jpg,
+    });
+    assert.equal(up.status, 200);
+    uploadedHashes.push(h);
+  }
+  const genResponses = await Promise.all(
+    uploadedHashes.map((h) =>
+      ctx.request('/api/proxy/generate', {
+        method: 'POST',
+        headers: { ...bobHeaders, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ masterHash: h }),
+      })
+    )
+  );
+  for (const r of genResponses) {
+    assert.equal(r.status, 200, '4 concurrent proxy/generate requests should queue smoothly without 429');
+  }
+
+  // 4. Genuinely heavy endpoints (cleanup-suggestions) still strictly enforce heavyOpLimiter (5/min)
+  for (let i = 0; i < 5; i++) {
+    const c = await ctx.request('/api/photos/cleanup-suggestions?scan=0', { headers: bobHeaders });
+    assert.equal(c.status, 200);
+  }
+  const heavyBlocked = await ctx.request('/api/photos/cleanup-suggestions?scan=0', { headers: bobHeaders });
+  assert.equal(heavyBlocked.status, 429);
+
+  // 5. Unauthenticated attacker varying fake API keys still hits IP-based brute-force lockout (429)
+  for (let i = 0; i < 3; i++) {
+    const bad = await ctx.request('/api/albums', { headers: { 'X-API-Key': `fake_key_${i}` } });
+    assert.equal(bad.status, 401);
+  }
+  const lockedAttacker = await ctx.request('/api/albums', { headers: { 'X-API-Key': 'fake_key_999' } });
+  assert.equal(lockedAttacker.status, 429);
+});
+
+test('48. NVIDIA NVENC transcode config, FFmpeg arg builder, capabilities telemetry, and Windows/WSL2 GPU Docker files are configured cleanly', async (t) => {
+  const { getConfig } = require('../src/config/env');
+  const {
+    buildVideoEncodeArgs,
+    configureProxyService,
+    getCapabilities,
+  } = require('../src/services/proxyService');
+
+  // 1. Env normalization for VIDEO_HWACCEL, NVENC_PRESET, and concurrency
+  const nvCfg = getConfig({ videoHwaccel: 'CUDA', nvencPreset: 'p5', ffmpegConcurrency: 3, proxyQueueConcurrency: 4 });
+  assert.equal(nvCfg.videoTranscode.hwaccel, 'nvenc');
+  assert.equal(nvCfg.videoTranscode.nvencPreset, 'p5');
+  assert.equal(nvCfg.videoTranscode.ffmpegConcurrency, 3);
+  assert.equal(nvCfg.videoTranscode.proxyQueueConcurrency, 4);
+
+  const cpuCfg = getConfig({ videoHwaccel: 'software', nvencPreset: 'invalid' });
+  assert.equal(cpuCfg.videoTranscode.hwaccel, 'cpu');
+  assert.equal(cpuCfg.videoTranscode.nvencPreset, 'p4');
+
+  // 2. FFmpeg argument builder produces valid Turing NVENC args and CPU libx264 fallback args
+  const nvencArgs = buildVideoEncodeArgs({
+    sourcePath: '/storage/in.mov',
+    videoTmp: '/storage/.proxies/abc.tmp.mp4',
+    targetHeight: 720,
+    qualityNum: 0.72,
+    normMaster: 'deadbeef',
+    useNvenc: true,
+    nvencPreset: 'p4',
+  });
+  assert.ok(nvencArgs.includes('h264_nvenc'));
+  assert.ok(nvencArgs.includes('-rc') && nvencArgs.includes('vbr'));
+  assert.ok(nvencArgs.includes('-cq') && nvencArgs.includes('28'));
+  assert.ok(nvencArgs.includes('-b:v') && nvencArgs.includes('0'));
+  assert.ok(nvencArgs.includes('-preset') && nvencArgs.includes('p4'));
+  assert.ok(nvencArgs.includes('+faststart'));
+
+  const cpuArgs = buildVideoEncodeArgs({
+    sourcePath: '/storage/in.mov',
+    videoTmp: '/storage/.proxies/abc.tmp.mp4',
+    targetHeight: 720,
+    qualityNum: 0.85,
+    normMaster: 'deadbeef',
+    useNvenc: false,
+  });
+  assert.ok(cpuArgs.includes('libx264'));
+  assert.ok(cpuArgs.includes('-crf') && cpuArgs.includes('24'));
+  assert.ok(!cpuArgs.includes('h264_nvenc'));
+
+  // 3. Forced CPU mode disables NVENC cleanly and exposes telemetry on /api/health
+  const ctx = await startTestServer({ videoHwaccel: 'cpu', ffmpegConcurrency: 2 });
+  t.after(async () => {
+    configureProxyService({ hwaccel: 'auto', nvencPreset: 'p4', ffmpegConcurrency: 0 });
+    await ctx.cleanup();
+  });
+
+  const caps = await getCapabilities();
+  assert.equal(caps.nvenc, false);
+  assert.equal(caps.hwaccelMode, 'cpu');
+  assert.equal(caps.ffmpegConcurrency, 2);
+
+  const health = await (await ctx.request('/api/health')).json();
+  assert.equal(health.success, true);
+  assert.equal(health.nvencEnabled, false);
+  assert.ok('videoEncoder' in health);
+
+  // 4. Verify Windows/WSL2-ready Dockerfile.gpu and docker-compose.gpu.yml exist with NVIDIA glibc setup
+  const dockerfileGpu = await fsp.readFile(path.resolve(__dirname, '..', 'Dockerfile.gpu'), 'utf8');
+  assert.ok(dockerfileGpu.includes('node:22-bookworm-slim'), 'Dockerfile.gpu must use glibc Debian base for NVIDIA libraries');
+  assert.ok(dockerfileGpu.includes('NVIDIA_DRIVER_CAPABILITIES=compute,video,utility'));
+  assert.ok(dockerfileGpu.includes('ffmpeg'));
+
+  const composeGpu = await fsp.readFile(path.resolve(__dirname, '..', 'docker-compose.gpu.yml'), 'utf8');
+  assert.ok(composeGpu.includes('dockerfile: Dockerfile.gpu'));
+  assert.ok(composeGpu.includes('driver: nvidia'));
+  assert.ok(composeGpu.includes('NVIDIA_DRIVER_CAPABILITIES=compute,video,utility'));
+  assert.ok(composeGpu.includes('VIDEO_HWACCEL'));
+});

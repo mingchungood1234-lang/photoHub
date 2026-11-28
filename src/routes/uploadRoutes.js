@@ -10,10 +10,8 @@
 
 const express = require('express');
 
-function createUploadRoutes({ checkController, uploadController, uploadMiddleware, securityGuards = {} }) {
+function createUploadRoutes({ checkController, uploadController, uploadMiddleware }) {
   const router = express.Router();
-  const noop = (_req, _res, next) => next();
-  const heavyLimit = securityGuards.heavyOpLimiter || noop;
 
   router.get('/check/:hash', checkController.checkByParam);
   router.post('/check', checkController.checkByBody);
@@ -23,8 +21,8 @@ function createUploadRoutes({ checkController, uploadController, uploadMiddlewar
   router.post('/upload/presign', uploadController.presignUpload);
   router.post('/upload/confirm', uploadController.confirmUpload);
 
-  // Resumable chunked uploads for large 4K videos
-  router.post('/upload/chunked/init', heavyLimit, uploadController.initChunkedUpload);
+  // Resumable chunked uploads for large 4K videos (bounded by auth, media rate limit, quota & 10 active sessions/user)
+  router.post('/upload/chunked/init', uploadController.initChunkedUpload);
   router.get('/upload/chunked/:uploadId', uploadController.getChunkedUploadStatus);
   router.put('/upload/chunked/:uploadId/part/:chunkIndex', uploadController.uploadChunkPart);
   router.post('/upload/chunked/:uploadId/part/:chunkIndex', uploadController.uploadChunkPart);

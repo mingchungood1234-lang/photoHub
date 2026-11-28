@@ -11,6 +11,7 @@ const fs = require('fs');
 const http = require('http');
 const https = require('https');
 const { createApp } = require('./app');
+const { getCapabilities: getProxyCapabilities } = require('./services/proxyService');
 
 // `require.main === module` is true ONLY when you run `node src/server.js` directly
 // (and false when another file like a test imports `./server` via `require`).
@@ -112,6 +113,19 @@ if (require.main === module) {
             `Multi-user folders active: ${Array.from(new Set(userKeyMap.values())).join(', ')}`
           );
         }
+        getProxyCapabilities()
+          .then((caps) => {
+            if (caps.nvenc) {
+              console.log(
+                `Video transcoding: NVIDIA NVENC (h264_nvenc, preset=${caps.nvencPreset}, concurrency=${caps.ffmpegConcurrency})`
+              );
+            } else if (caps.ffmpeg) {
+              console.log(
+                `Video transcoding: CPU libx264 (mode=${caps.hwaccelMode}, concurrency=${caps.ffmpegConcurrency})`
+              );
+            }
+          })
+          .catch(() => {});
       });
 
       if (webServer) {

@@ -8,10 +8,12 @@
  */
 
 const { isS3Configured, isPrimaryS3Backend } = require('../services/s3Service');
+const { getCapabilities: getProxyCapabilities } = require('../services/proxyService');
 
 function createHealthController({ config, contextService, nodeAllocationService = null }) {
   return {
-    getHealth(req, res) {
+    async getHealth(req, res) {
+      const caps = await getProxyCapabilities().catch(() => null);
       res.json({
         success: true,
         status: 'ok',
@@ -20,6 +22,8 @@ function createHealthController({ config, contextService, nodeAllocationService 
         storageDir: config.storageDir,
         storageBackend: isPrimaryS3Backend(config) ? 's3' : 'disk',
         s3Enabled: isS3Configured(config.s3),
+        videoEncoder: caps ? caps.videoEncoder : null,
+        nvencEnabled: Boolean(caps && caps.nvenc),
       });
     },
 

@@ -35,6 +35,7 @@ const { createAdminAuthMiddleware } = require('./middleware/adminAuthMiddleware'
 const { createUploadMiddleware } = require('./middleware/uploadMiddleware');
 const {
   getClientIp,
+  timingSafeEqualStr,
   securityHeadersMiddleware,
   requestSanityMiddleware,
   sanitizeJsonBodyMiddleware,
@@ -55,6 +56,7 @@ const { createAdminController } = require('./controllers/adminController');
 const { ShareStore } = require('./services/shareService');
 const { AlbumStore } = require('./services/albumService');
 const { ProxyQueueService } = require('./services/proxyQueueService');
+const { configureProxyService } = require('./services/proxyService');
 const { ChunkedUploadService } = require('./services/chunkedUploadService');
 const { mountRoutes } = require('./routes');
 
@@ -81,7 +83,11 @@ async function createApp(configOverrides = {}) {
   const albumStore = new AlbumStore(config.dataDir);
   await albumStore.init();
 
-  const proxyQueue = new ProxyQueueService({ concurrency: 2, config });
+  configureProxyService(config.videoTranscode);
+  const queueConcurrency =
+    (config.videoTranscode && config.videoTranscode.proxyQueueConcurrency) ||
+    (config.videoTranscode && config.videoTranscode.hwaccel === 'nvenc' ? 3 : 2);
+  const proxyQueue = new ProxyQueueService({ concurrency: queueConcurrency, config });
   const chunkedUploadService = new ChunkedUploadService();
 
   const nodeAllocationService = createNodeAllocationService({
@@ -119,6 +125,66 @@ async function createApp(configOverrides = {}) {
   });
 
   // Security rate limiters & per-user heavy-operation concurrency guards
+  // Verified authenticated users get isolated per-user buckets (so family members sharing one Wi-Fi IP
+  // never block each other) and a high-throughput media bucket for first-time bulk uploads (1k+ items).
+  const isOpenLocalMode =
+    !config.requireAuth &&
+    !config.apiKey &&
+    config.userKeyMap.size === 0 &&
+    !config.googleClientId;
+
+  const BULK_MEDIA_PATH_RE =
+    /^\/(?:web-node\/)?(?:upload(?:\/|$)|check(?:\/|$)|proxy(?:\/|$)|photo\/[^/]+(?:\/(?:preview|video-proxy))?$)/;
+
+  const isBulkMediaTransferPath = (req) => {
+    const p = String((req && req.path) || '');
+    if (p.startsWith('/photo/') && !p.endsWith('/preview') && !p.endsWith('/video-proxy')) {
+      return req.method === 'GET' || req.method === 'HEAD';
+    }
+    if (p.startsWith('/web-node/photo/') && !p.endsWith('/preview') && !p.endsWith('/video-proxy')) {
+      return req.method === 'GET' || req.method === 'HEAD';
+    }
+    return BULK_MEDIA_PATH_RE.test(p);
+  };
+
+  const resolveVerifiedRateLimitIdentity = (req) => {
+    if (req && req._rlIdentity) return req._rlIdentity;
+    let identity = { authenticated: false, key: `ip:${getClientIp(req)}` };
+
+    const authHeader = String((req && req.headers && req.headers.authorization) || '').trim();
+    const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const candidateKey = String(
+      (req && req.headers && req.headers['x-api-key']) ||
+        bearer ||
+        (req && req.query && req.query.apiKey) ||
+        ''
+    ).trim();
+
+    if (candidateKey) {
+      if (candidateKey.includes('.')) {
+        const payload = verifyToken(candidateKey, sessionSecret);
+        if (payload && payload.typ === 'session') {
+          const userId = String(payload.sub || payload.email || payload.folderName || 'session').slice(0, 80);
+          identity = { authenticated: true, key: `user:${userId}` };
+        }
+      }
+      if (!identity.authenticated && config.userKeyMap.size > 0) {
+        for (const [configuredKey, folderName] of config.userKeyMap.entries()) {
+          if (timingSafeEqualStr(candidateKey, configuredKey)) {
+            identity = { authenticated: true, key: `user:${folderName}` };
+            break;
+          }
+        }
+      }
+      if (!identity.authenticated && config.apiKey && timingSafeEqualStr(candidateKey, config.apiKey)) {
+        identity = { authenticated: true, key: 'user:__ROOT__' };
+      }
+    }
+
+    if (req) req._rlIdentity = identity;
+    return identity;
+  };
+
   const rlCfg = config.rateLimit || {};
   const rlEnabled = rlCfg.enabled !== false;
   const securityGuards = {
@@ -126,8 +192,30 @@ async function createApp(configOverrides = {}) {
       windowMs: 60_000,
       max: rlCfg.apiMaxPerMin || 1500,
       enabled: rlEnabled,
-      skip: (req) => req.path === '/health' || req.path === '/api/health',
+      keyGenerator: (req) => resolveVerifiedRateLimitIdentity(req).key,
+      skip: (req) => {
+        if (req.path === '/health' || req.path === '/api/health') return true;
+        if (
+          isBulkMediaTransferPath(req) &&
+          (resolveVerifiedRateLimitIdentity(req).authenticated || isOpenLocalMode)
+        ) {
+          return true;
+        }
+        return false;
+      },
       message: 'Rate limit exceeded. Please slow down and try again shortly.',
+    }),
+    mediaTransferLimiter: createRateLimiter({
+      windowMs: 60_000,
+      max: rlCfg.mediaMaxPerMin || 6000,
+      enabled: rlEnabled,
+      keyGenerator: (req) => resolveVerifiedRateLimitIdentity(req).key,
+      skip: (req) =>
+        !(
+          isBulkMediaTransferPath(req) &&
+          (resolveVerifiedRateLimitIdentity(req).authenticated || isOpenLocalMode)
+        ),
+      message: 'Bulk upload rate limit exceeded. Pausing briefly before retrying.',
     }),
     authBruteForceLimiter: createRateLimiter({
       windowMs: 15 * 60_000,
@@ -148,12 +236,14 @@ async function createApp(configOverrides = {}) {
       windowMs: 60_000,
       max: rlCfg.heavyMaxPerMin || 30,
       enabled: rlEnabled,
+      keyGenerator: (req) => resolveVerifiedRateLimitIdentity(req).key,
       message: 'Too many heavy requests. Please wait a moment and try again.',
     }),
     mapRescanLimiter: createRateLimiter({
       windowMs: 60_000,
       max: rlCfg.heavyMaxPerMin || 30,
       enabled: rlEnabled,
+      keyGenerator: (req) => resolveVerifiedRateLimitIdentity(req).key,
       skip: (req) => req.query.rescan !== '1' && req.query.rescan !== 'true',
       message: 'Too many GPS rescan requests. Please wait a moment.',
     }),
@@ -170,8 +260,10 @@ async function createApp(configOverrides = {}) {
       skip: (req) => req.query.rescan !== '1' && req.query.rescan !== 'true',
       message: 'A GPS scan is already running for your account.',
     }),
+    // `proxyService.js` already serializes CPU/RAM safely via `sharpGate(2)` & `ffmpegGate(1)`,
+    // so allow up to 12 queued proxy requests per user before rejecting with 429.
     proxyGenConcurrencyGuard: createConcurrencyGuard({
-      maxConcurrent: 2,
+      maxConcurrent: 12,
       message: 'Too many simultaneous proxy generation requests.',
     }),
   };
@@ -180,8 +272,9 @@ async function createApp(configOverrides = {}) {
   app.use(['/api/proxy/register', '/api/web-node/proxy/register'], express.json({ limit: '25mb' }));
   app.use(express.json({ limit: '2mb' }));
   app.use(sanitizeJsonBodyMiddleware);
-  // General API flood guard across `/api/*` and brute-force guard on gateway `/api/web-node/*`
+  // Layered API flood guards (general API + high-throughput authenticated media bucket) & brute-force guard
   app.use('/api', securityGuards.generalApiLimiter);
+  app.use('/api', securityGuards.mediaTransferLimiter);
   app.use('/api/web-node', securityGuards.authBruteForceLimiter);
   // Raw binary `/api/upload` bodies stream directly to storage inside `uploadController.uploadDirect`
   // after `authMiddleware` resolves `req.userContext.storageDir` (avoids 100MB+ RAM buffering).
@@ -267,7 +360,10 @@ async function createApp(configOverrides = {}) {
         'Access-Control-Allow-Headers',
         'Authorization,Content-Type,X-API-Key,If-None-Match,X-File-Name,X-File-Sha256,X-File-Hash,X-Created-At,X-Photo-Date,X-Verify-Checksum,X-Share-Passcode,X-Upload-Source,X-Skip-Auto-Proxy,X-Chunk-Sha256,X-Gps-Lat,X-Gps-Lng,X-Location-Label'
       );
-      res.setHeader('Access-Control-Expose-Headers', 'ETag,X-Photo-Variant,X-Master-Sha256,Content-Disposition');
+      res.setHeader(
+        'Access-Control-Expose-Headers',
+        'ETag,X-Photo-Variant,X-Master-Sha256,Content-Disposition,Retry-After'
+      );
       if (req.method === 'OPTIONS') {
         return res.status(204).end();
       }
@@ -388,6 +484,7 @@ async function createApp(configOverrides = {}) {
         'x-photo-variant',
         'x-master-sha256',
         'x-thumb-cache',
+        'retry-after',
       ];
       for (const h of passthroughHeaders) {
         const val = upstreamRes.headers.get(h);
