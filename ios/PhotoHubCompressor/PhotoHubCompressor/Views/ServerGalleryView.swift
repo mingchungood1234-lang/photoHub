@@ -105,6 +105,7 @@ struct ServerGalleryView: View {
     @State private var isBatchDeleting: Bool = false
     @State private var deleteBannerMessage: String?
     @State private var deleteConfirmPrompt: DeleteConfirmPrompt?
+    @State private var isBatchUpdatingProtection: Bool = false
 
     private let columns = [
         GridItem(.adaptive(minimum: 102, maximum: 145), spacing: 6)
@@ -290,7 +291,7 @@ struct ServerGalleryView: View {
                                             .padding(.bottom, 8)
                                     }
 
-                                    if isBatchRestoring || restoreBannerMessage != nil {
+                                    if isBatchRestoring || isBatchUpdatingProtection || restoreBannerMessage != nil {
                                         restoreBannerView
                                             .padding(.horizontal, 12)
                                             .padding(.bottom, 8)
@@ -469,7 +470,7 @@ struct ServerGalleryView: View {
                         Button("Select") {
                             enterSelectionMode()
                         }
-                        .disabled(activeSourcePhotos.isEmpty || isBatchRestoring || isBatchProxying || isBatchDeleting)
+                        .disabled(activeSourcePhotos.isEmpty || isBatchRestoring || isBatchProxying || isBatchDeleting || isBatchUpdatingProtection)
 
                         Menu {
                             if !photos.isEmpty {
@@ -478,7 +479,7 @@ struct ServerGalleryView: View {
                                 } label: {
                                     Label("Select Photos to Restore or Delete", systemImage: "checkmark.circle")
                                 }
-                                .disabled(isBatchRestoring || isBatchProxying || isBatchDeleting)
+                                .disabled(isBatchRestoring || isBatchProxying || isBatchDeleting || isBatchUpdatingProtection)
 
                                 Divider()
                             }
@@ -670,7 +671,7 @@ struct ServerGalleryView: View {
                             .background(PhotoHubPalette.orangeGradient, in: Capsule())
                     }
                     .buttonStyle(.plain)
-                    .disabled(isBatchRestoring || isBatchDeleting)
+                    .disabled(isBatchRestoring || isBatchDeleting || isBatchUpdatingProtection)
                 } else if let msg = batchBannerMessage {
                     Image(systemName: "checkmark.circle.fill")
                         .font(.subheadline)
@@ -742,6 +743,15 @@ struct ServerGalleryView: View {
                     }
                     .font(.caption.weight(.bold))
                     .foregroundColor(PhotoHubPalette.deepOrange)
+                } else if isBatchUpdatingProtection {
+                    ProgressView()
+                        .tint(PhotoHubPalette.mint)
+                        .scaleEffect(0.85)
+                    Text("Allowing re-proxy for selected items...")
+                        .font(.caption.weight(.bold))
+                        .foregroundColor(PhotoHubPalette.ink)
+                        .lineLimit(1)
+                    Spacer()
                 } else if let msg = restoreBannerMessage {
                     Image(systemName: "checkmark.circle.fill")
                         .font(.subheadline)
@@ -882,6 +892,7 @@ struct ServerGalleryView: View {
     @ViewBuilder
     private var selectionRestoreBottomBar: some View {
         let selectedList = selectedPhotos
+        let selectedProtected = selectedList.filter { isRestoredOrProtected($0) }
         let unrestored = selectedList.filter { !isRestoredOrProtected($0) }
         let targetBytes = isViewingTrash
             ? selectedList.reduce(into: Int64(0)) { $0 += max(0, $1.size) }
@@ -889,90 +900,153 @@ struct ServerGalleryView: View {
                 ? selectedList.reduce(into: Int64(0)) { $0 += max(0, $1.size) }
                 : unrestored.reduce(into: Int64(0)) { $0 += max(0, $1.size) })
         let sizeStr = ByteCountFormatter.string(fromByteCount: targetBytes, countStyle: .file)
-        let actionsDisabled = selectedList.isEmpty || isBatchRestoring || isBatchProxying || isBatchDeleting
+        let isBusyBatch = isBatchRestoring || isBatchProxying || isBatchDeleting || isBatchUpdatingProtection
+        let actionsDisabled = selectedList.isEmpty || isBusyBatch
+        let showAllowReproxy = !isViewingTrash && (!selectedProtected.isEmpty || mediaTypeFilter == .protectedOnly)
+        let allowReproxyDisabled = selectedProtected.isEmpty || isBusyBatch
 
-        HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(selectedList.isEmpty ? "Tap photos to select" : "\(selectedList.count) selected")
-                    .font(.subheadline.weight(.heavy).monospacedDigit())
-                    .foregroundColor(PhotoHubPalette.ink)
-                if !selectedList.isEmpty {
-                    if isViewingTrash {
-                        Text("~\(sizeStr) in Trash")
+        let trashButton = Button {
+            requestDeleteSelected()
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "trash")
+                    .font(.caption.weight(.bold))
+                Text(isViewingTrash ? "Delete" : "Trash")
+                    .font(.caption.weight(.bold))
+            }
+            .foregroundColor(PhotoHubPalette.rose)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(PhotoHubPalette.rose.opacity(0.14), in: Capsule())
+            .overlay(Capsule().stroke(PhotoHubPalette.rose.opacity(0.32), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .opacity(actionsDisabled ? 0.45 : 1.0)
+        .disabled(actionsDisabled)
+
+        let restoreButton = Button {
+            if isViewingTrash {
+                restoreSelectedFromTrash()
+            } else {
+                requestRestoreSelected()
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: isViewingTrash ? "arrow.uturn.backward" : "icloud.and.arrow.down")
+                    .font(.caption.weight(.bold))
+                Text("Restore")
+                    .font(.caption.weight(.bold))
+            }
+            .foregroundColor(.white)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
+            .background(PhotoHubPalette.orangeGradient, in: Capsule())
+            .shadow(color: PhotoHubPalette.orange.opacity(actionsDisabled ? 0 : 0.30), radius: 8, y: 3)
+        }
+        .buttonStyle(.plain)
+        .opacity(actionsDisabled ? 0.45 : 1.0)
+        .disabled(actionsDisabled)
+
+        if showAllowReproxy {
+            VStack(spacing: 9) {
+                HStack(spacing: 8) {
+                    Text(selectedList.isEmpty ? "Tap protected photos to select" : "\(selectedList.count) selected")
+                        .font(.subheadline.weight(.heavy).monospacedDigit())
+                        .foregroundColor(PhotoHubPalette.ink)
+                    if !selectedList.isEmpty {
+                        Text("· ~\(sizeStr) · \(selectedProtected.count) protected")
                             .font(.caption2.weight(.semibold).monospacedDigit())
                             .foregroundColor(PhotoHubPalette.muted)
                             .lineLimit(1)
-                    } else {
-                        let alreadyCount = selectedList.count - unrestored.count
-                        Text(
-                            alreadyCount > 0
-                            ? "~\(sizeStr) · \(unrestored.count) new"
-                            : "~\(sizeStr) · \(unrestored.count) original\(unrestored.count == 1 ? "" : "s")"
-                        )
-                        .font(.caption2.weight(.semibold).monospacedDigit())
-                        .foregroundColor(PhotoHubPalette.muted)
-                        .lineLimit(1)
+                    }
+                    Spacer(minLength: 4)
+                }
+
+                HStack(spacing: 8) {
+                    trashButton
+
+                    Button {
+                        allowReproxySelected()
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: "lock.open.fill")
+                                .font(.caption.weight(.bold))
+                            Text(
+                                selectedProtected.count > 0 && selectedProtected.count < selectedList.count
+                                ? "Allow Re-Proxy (\(selectedProtected.count))"
+                                : "Allow Re-Proxy"
+                            )
+                            .font(.caption.weight(.bold))
+                            .lineLimit(1)
+                        }
+                        .foregroundColor(PhotoHubPalette.mint)
+                        .frame(maxWidth: .infinity)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 9)
+                        .background(PhotoHubPalette.mint.opacity(0.15), in: Capsule())
+                        .overlay(Capsule().stroke(PhotoHubPalette.mint.opacity(0.40), lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                    .opacity(allowReproxyDisabled ? 0.45 : 1.0)
+                    .disabled(allowReproxyDisabled)
+
+                    restoreButton
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 11)
+            .background(PhotoHubPalette.card, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .stroke(PhotoHubPalette.orange.opacity(0.75), lineWidth: 1.5)
+            )
+            .shadow(color: Color.black.opacity(0.18), radius: 18, y: 8)
+            .padding(.horizontal, 14)
+            .padding(.bottom, 8)
+        } else {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(selectedList.isEmpty ? "Tap photos to select" : "\(selectedList.count) selected")
+                        .font(.subheadline.weight(.heavy).monospacedDigit())
+                        .foregroundColor(PhotoHubPalette.ink)
+                    if !selectedList.isEmpty {
+                        if isViewingTrash {
+                            Text("~\(sizeStr) in Trash")
+                                .font(.caption2.weight(.semibold).monospacedDigit())
+                                .foregroundColor(PhotoHubPalette.muted)
+                                .lineLimit(1)
+                        } else {
+                            let alreadyCount = selectedList.count - unrestored.count
+                            Text(
+                                alreadyCount > 0
+                                ? "~\(sizeStr) · \(unrestored.count) new"
+                                : "~\(sizeStr) · \(unrestored.count) original\(unrestored.count == 1 ? "" : "s")"
+                            )
+                            .font(.caption2.weight(.semibold).monospacedDigit())
+                            .foregroundColor(PhotoHubPalette.muted)
+                            .lineLimit(1)
+                        }
                     }
                 }
+                Spacer(minLength: 4)
+                trashButton
+                restoreButton
             }
-            Spacer(minLength: 4)
-
-            Button {
-                requestDeleteSelected()
-            } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "trash")
-                        .font(.caption.weight(.bold))
-                    Text(isViewingTrash ? "Delete" : "Trash")
-                        .font(.caption.weight(.bold))
-                }
-                .foregroundColor(PhotoHubPalette.rose)
-                .padding(.horizontal, 13)
-                .padding(.vertical, 9)
-                .background(PhotoHubPalette.rose.opacity(0.14), in: Capsule())
-                .overlay(Capsule().stroke(PhotoHubPalette.rose.opacity(0.32), lineWidth: 1))
-            }
-            .buttonStyle(.plain)
-            .opacity(actionsDisabled ? 0.45 : 1.0)
-            .disabled(actionsDisabled)
-
-            Button {
-                if isViewingTrash {
-                    restoreSelectedFromTrash()
-                } else {
-                    requestRestoreSelected()
-                }
-            } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: isViewingTrash ? "arrow.uturn.backward" : "icloud.and.arrow.down")
-                        .font(.caption.weight(.bold))
-                    Text("Restore")
-                        .font(.caption.weight(.bold))
-                }
-                .foregroundColor(.white)
-                .padding(.horizontal, 15)
-                .padding(.vertical, 9)
-                .background(PhotoHubPalette.orangeGradient, in: Capsule())
-                .shadow(color: PhotoHubPalette.orange.opacity(actionsDisabled ? 0 : 0.30), radius: 8, y: 3)
-            }
-            .buttonStyle(.plain)
-            .opacity(actionsDisabled ? 0.45 : 1.0)
-            .disabled(actionsDisabled)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 11)
+            .background(PhotoHubPalette.card, in: Capsule())
+            .overlay(
+                Capsule()
+                    .stroke(PhotoHubPalette.orange.opacity(0.75), lineWidth: 1.5)
+            )
+            .shadow(color: Color.black.opacity(0.18), radius: 18, y: 8)
+            .padding(.horizontal, 14)
+            .padding(.bottom, 8)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 11)
-        .background(PhotoHubPalette.card, in: Capsule())
-        .overlay(
-            Capsule()
-                .stroke(PhotoHubPalette.orange.opacity(0.75), lineWidth: 1.5)
-        )
-        .shadow(color: Color.black.opacity(0.18), radius: 18, y: 8)
-        .padding(.horizontal, 14)
-        .padding(.bottom, 8)
     }
 
     private func enterSelectionMode(initialPhoto: ServerPhoto? = nil) {
-        guard !isBatchRestoring, !isBatchProxying, !isBatchDeleting, !activeSourcePhotos.isEmpty else { return }
+        guard !isBatchRestoring, !isBatchProxying, !isBatchDeleting, !isBatchUpdatingProtection, !activeSourcePhotos.isEmpty else { return }
         if let initialPhoto {
             selectedPhotoHashes = [initialPhoto.hash.lowercased()]
         } else {
@@ -995,9 +1069,78 @@ struct ServerGalleryView: View {
         }
     }
 
+    private func allowReproxySelected() {
+        let targets = selectedPhotos.filter { isRestoredOrProtected($0) }
+        guard !isBatchRestoring, !isBatchProxying, !isBatchDeleting, !isBatchUpdatingProtection, !targets.isEmpty else { return }
+        exitSelectionMode()
+        isBatchUpdatingProtection = true
+        restoreBannerMessage = nil
+
+        let targetHashes = targets.map { $0.hash.lowercased() }
+        let settings = self.settings
+        Task {
+            for hash in targetHashes {
+                LocalProxyTracker.shared.clearRestoredProtection(masterHash: hash)
+            }
+            do {
+                let client = PhotoHubAPIClient(settings: settings)
+                let updatedPhotos = try await client.setOriginalsProtectedBatch(
+                    masterHashes: targetHashes,
+                    protected: false,
+                    notifyStore: true
+                )
+                let updatedByHash = Dictionary(
+                    uniqueKeysWithValues: updatedPhotos.map { ($0.hash.lowercased(), $0) }
+                )
+                let targetSet = Set(targetHashes)
+                for idx in photos.indices {
+                    let key = photos[idx].hash.lowercased()
+                    if let updated = updatedByHash[key] {
+                        photos[idx] = updated
+                    } else if targetSet.contains(key), photos[idx].keepOriginalOnDevice == true {
+                        let p = photos[idx]
+                        photos[idx] = ServerPhoto(
+                            hash: p.hash,
+                            originalName: p.originalName,
+                            size: p.size,
+                            photoDate: p.photoDate,
+                            takenAt: p.takenAt,
+                            uploadedAt: p.uploadedAt,
+                            savedPath: p.savedPath,
+                            hasProxy: p.hasProxy,
+                            hasPreview: p.hasPreview,
+                            proxyHash: p.proxyHash,
+                            proxySize: p.proxySize,
+                            hasVideoProxy: p.hasVideoProxy,
+                            videoProxySize: p.videoProxySize,
+                            keepOriginalOnDevice: false,
+                            isFavorite: p.isFavorite,
+                            deletedAt: p.deletedAt,
+                            daysRemaining: p.daysRemaining,
+                            cameraModel: p.cameraModel
+                        )
+                    }
+                }
+                refreshLocallyProtectedHashes()
+                rebuildTimeline()
+                isBatchUpdatingProtection = false
+                restoreBannerMessage = "Unlocked \(targetHashes.count) item(s) — allowed to re-proxy."
+            } catch APIClientError.httpError(401, _) {
+                isBatchUpdatingProtection = false
+                LocalProxySyncManager.shared.cancel()
+                settings.signOut()
+            } catch {
+                refreshLocallyProtectedHashes()
+                rebuildTimeline()
+                isBatchUpdatingProtection = false
+                restoreBannerMessage = "Allow re-proxy failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
     private func requestRestoreSelected() {
         let targets = selectedPhotos
-        guard !isBatchRestoring, !isBatchProxying, !isBatchDeleting, !targets.isEmpty else { return }
+        guard !isBatchRestoring, !isBatchProxying, !isBatchDeleting, !isBatchUpdatingProtection, !targets.isEmpty else { return }
         restoreConfirmPrompt = buildRestoreConfirmPrompt(
             title: "Restore Selected Originals",
             targets: targets,
@@ -1007,7 +1150,7 @@ struct ServerGalleryView: View {
 
     private func requestDeleteSelected() {
         let targets = selectedPhotos
-        guard !isBatchRestoring, !isBatchProxying, !isBatchDeleting, !targets.isEmpty else { return }
+        guard !isBatchRestoring, !isBatchProxying, !isBatchDeleting, !isBatchUpdatingProtection, !targets.isEmpty else { return }
         let totalBytes = targets.reduce(into: Int64(0)) { $0 += max(0, $1.size) }
         deleteConfirmPrompt = DeleteConfirmPrompt(targets: targets, totalBytes: totalBytes, isPermanent: isViewingTrash)
     }
@@ -1062,7 +1205,7 @@ struct ServerGalleryView: View {
     }
 
     private func startBatchDelete(targets: [ServerPhoto], permanent: Bool) {
-        guard !isBatchDeleting, !isBatchRestoring, !isBatchProxying, !targets.isEmpty else { return }
+        guard !isBatchDeleting, !isBatchRestoring, !isBatchProxying, !isBatchUpdatingProtection, !targets.isEmpty else { return }
         deleteConfirmPrompt = nil
         exitSelectionMode()
         deleteBannerMessage = nil
@@ -1134,7 +1277,7 @@ struct ServerGalleryView: View {
     }
 
     private func startBatchRestore(targets: [ServerPhoto], exitSelectionAfter: Bool) {
-        guard !isBatchRestoring, !isBatchProxying, !targets.isEmpty else { return }
+        guard !isBatchRestoring, !isBatchProxying, !isBatchUpdatingProtection, !targets.isEmpty else { return }
         restoreConfirmPrompt = nil
         if exitSelectionAfter {
             exitSelectionMode()
@@ -1184,7 +1327,7 @@ struct ServerGalleryView: View {
     }
 
     private func startBatchProxy() {
-        guard !isBatchProxying, !isBatchRestoring else { return }
+        guard !isBatchProxying, !isBatchRestoring, !isBatchUpdatingProtection else { return }
         let targets = unproxiedPhotos
         guard !targets.isEmpty else { return }
 

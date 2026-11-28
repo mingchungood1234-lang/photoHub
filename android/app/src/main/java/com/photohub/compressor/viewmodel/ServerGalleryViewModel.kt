@@ -988,6 +988,7 @@ data class ServerGalleryUiState(
     val restoreBannerMessage: String? = null,
     val restoreConfirmRequest: BatchRestoreConfirmRequest? = null,
     val isBatchDeleting: Boolean = false,
+    val isBatchUpdatingProtection: Boolean = false,
     val deleteBannerMessage: String? = null,
     val deleteConfirmTargets: List<ServerPhoto>? = null,
     val deleteConfirmIsPermanent: Boolean = false,
@@ -1460,7 +1461,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
     fun startBatchProxy() {
         val targets = _uiState.value.photos.filter { it.needsProxy }
-        if (_uiState.value.isBatchProxying || _uiState.value.isBatchRestoring || _uiState.value.isBatchDeleting || targets.isEmpty()) return
+        if (_uiState.value.isBatchProxying || _uiState.value.isBatchRestoring || _uiState.value.isBatchDeleting || _uiState.value.isBatchUpdatingProtection || targets.isEmpty()) return
 
         batchJob?.cancel()
         _uiState.update {
@@ -1996,7 +1997,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
     fun enterSelectionMode(initialHash: String? = null) {
         val prev = _uiState.value
-        if (prev.isBatchRestoring || prev.isBatchProxying || prev.isBatchDeleting || prev.activeSourcePhotos.isEmpty()) return
+        if (prev.isBatchRestoring || prev.isBatchProxying || prev.isBatchDeleting || prev.isBatchUpdatingProtection || prev.activeSourcePhotos.isEmpty()) return
         val initial = initialHash?.let(::normHash)?.takeIf { it.isNotEmpty() }
         _uiState.update {
             it.copy(
@@ -2047,9 +2048,115 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
         }
     }
 
+    fun allowReproxySelected() {
+        val state = _uiState.value
+        if (state.isBatchRestoring || state.isBatchProxying || state.isBatchDeleting || state.isBatchUpdatingProtection || state.selectedHashes.isEmpty()) {
+            return
+        }
+        val targets = state.photos.filter {
+            normHash(it.hash) in state.selectedHashes && state.isRestoredOrProtected(it)
+        }
+        if (targets.isEmpty()) return
+        val targetHashes = targets.map { normHash(it.hash) }
+        val targetSet = targetHashes.toSet()
+
+        _uiState.update {
+            it.copy(
+                isBatchUpdatingProtection = true,
+                restoreBannerMessage = null,
+                isSelectionMode = false,
+                selectedHashes = emptySet()
+            )
+        }
+
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                for (h in targetHashes) {
+                    tracker.clearRestoredProtection(h)
+                }
+            }
+            try {
+                val updatedPhotos = PhotoHubApiClient(context, settings).setOriginalsProtectedBatch(
+                    masterHashes = targetHashes,
+                    protected = false,
+                    notifyStore = true
+                )
+                val updatedMap = updatedPhotos.associateBy { normHash(it.hash) }
+                _uiState.update { prev ->
+                    val nextPhotos = prev.photos.map { p ->
+                        val k = normHash(p.hash)
+                        updatedMap[k] ?: if (k in targetSet) p.copy(keepOriginalOnDevice = false) else p
+                    }
+                    val nextProtected = computeLocallyProtectedHashes(nextPhotos)
+                    val rebuilt = rebuildTimelineData(
+                        nextPhotos,
+                        prev.filterMode,
+                        prev.mediaTypeFilter,
+                        prev.timelineGrouping,
+                        prev.selectedYearAnchor,
+                        prev.searchQuery,
+                        nextProtected
+                    )
+                    prev.copy(
+                        photos = nextPhotos,
+                        locallyProtectedHashes = nextProtected,
+                        timeline = rebuilt.first,
+                        selectedYearAnchor = rebuilt.second,
+                        isBatchUpdatingProtection = false,
+                        restoreBannerMessage = "Unlocked ${targetHashes.size} item(s) — allowed to re-proxy."
+                    )
+                }
+            } catch (err: ApiHttpException) {
+                if (err.statusCode == 401) {
+                    syncManager.cancel()
+                    settings.signOut()
+                }
+                _uiState.update { prev ->
+                    val nextProtected = computeLocallyProtectedHashes(prev.photos)
+                    val rebuilt = rebuildTimelineData(
+                        prev.photos,
+                        prev.filterMode,
+                        prev.mediaTypeFilter,
+                        prev.timelineGrouping,
+                        prev.selectedYearAnchor,
+                        prev.searchQuery,
+                        nextProtected
+                    )
+                    prev.copy(
+                        locallyProtectedHashes = nextProtected,
+                        timeline = rebuilt.first,
+                        selectedYearAnchor = rebuilt.second,
+                        isBatchUpdatingProtection = false,
+                        restoreBannerMessage = "Allow re-proxy failed: ${err.message}"
+                    )
+                }
+            } catch (err: Exception) {
+                _uiState.update { prev ->
+                    val nextProtected = computeLocallyProtectedHashes(prev.photos)
+                    val rebuilt = rebuildTimelineData(
+                        prev.photos,
+                        prev.filterMode,
+                        prev.mediaTypeFilter,
+                        prev.timelineGrouping,
+                        prev.selectedYearAnchor,
+                        prev.searchQuery,
+                        nextProtected
+                    )
+                    prev.copy(
+                        locallyProtectedHashes = nextProtected,
+                        timeline = rebuilt.first,
+                        selectedYearAnchor = rebuilt.second,
+                        isBatchUpdatingProtection = false,
+                        restoreBannerMessage = "Allow re-proxy failed: ${err.localizedMessage ?: "Unknown error"}"
+                    )
+                }
+            }
+        }
+    }
+
     fun requestRestoreSelected() {
         val state = _uiState.value
-        if (state.isBatchRestoring || state.isBatchProxying || state.isBatchDeleting || state.selectedHashes.isEmpty()) return
+        if (state.isBatchRestoring || state.isBatchProxying || state.isBatchDeleting || state.isBatchUpdatingProtection || state.selectedHashes.isEmpty()) return
         val targets = state.photos.filter { normHash(it.hash) in state.selectedHashes }
         if (targets.isEmpty()) return
         openRestoreConfirm(
@@ -2061,7 +2168,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
     fun requestDeleteSelected() {
         val state = _uiState.value
-        if (state.isBatchRestoring || state.isBatchProxying || state.isBatchDeleting || state.selectedHashes.isEmpty()) return
+        if (state.isBatchRestoring || state.isBatchProxying || state.isBatchDeleting || state.isBatchUpdatingProtection || state.selectedHashes.isEmpty()) return
         val targets = state.activeSourcePhotos.filter { normHash(it.hash) in state.selectedHashes }
         if (targets.isEmpty()) return
         _uiState.update {
@@ -2127,7 +2234,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
     fun executeDeleteSelected() {
         val targets = _uiState.value.deleteConfirmTargets ?: return
         val permanent = _uiState.value.deleteConfirmIsPermanent
-        if (_uiState.value.isBatchDeleting || _uiState.value.isBatchRestoring || _uiState.value.isBatchProxying) return
+        if (_uiState.value.isBatchDeleting || _uiState.value.isBatchRestoring || _uiState.value.isBatchProxying || _uiState.value.isBatchUpdatingProtection) return
         _uiState.update {
             it.copy(
                 deleteConfirmTargets = null,
@@ -2326,7 +2433,7 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
         exitSelectionAfter: Boolean
     ) {
         val curState = _uiState.value
-        if (curState.isBatchRestoring || curState.isBatchProxying || curState.isBatchDeleting || targets.isEmpty()) return
+        if (curState.isBatchRestoring || curState.isBatchProxying || curState.isBatchDeleting || curState.isBatchUpdatingProtection || targets.isEmpty()) return
         if (!mediaService.canWriteGallery()) {
             reportRestorePermissionDenied()
             return

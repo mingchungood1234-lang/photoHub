@@ -3028,8 +3028,40 @@ test('High-throughput GET /api/photo/:hash Range streaming and POST /api/photos/
   assert.ok(protectBody.photos.every((p) => p.keepOriginalOnDevice === true));
   assert.deepEqual(protectBody.missing, [missingHash]);
 
-  // Verify persisted state via /api/photos
+  // Verify persisted state via /api/photos + protected=1 filter + protectedCount
   const listAfter = await (await ctx.request('/api/photos', { headers })).json();
   assert.equal(listAfter.photos.length, 3);
+  assert.equal(listAfter.protectedCount, 3);
   assert.ok(listAfter.photos.every((p) => p.keepOriginalOnDevice === true));
+
+  const protectedOnly = await (await ctx.request('/api/photos?protected=1', { headers })).json();
+  assert.equal(protectedOnly.total, 3);
+  assert.equal(protectedOnly.protectedCount, 3);
+
+  // 6. Batch Allow Re-Proxy (keepOriginalOnDevice: false) unlocks multiple selected photos at once
+  const batchUnlock = await ctx.request('/api/photos/protect-original', {
+    method: 'POST',
+    headers: { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      hashes: [up1.hash, up2.hash],
+      keepOriginalOnDevice: false,
+    }),
+  });
+  assert.equal(batchUnlock.status, 200);
+  const unlockBody = await batchUnlock.json();
+  assert.equal(unlockBody.success, true);
+  assert.equal(unlockBody.keepOriginalOnDevice, false);
+  assert.equal(unlockBody.updatedCount, 2);
+  assert.ok(unlockBody.photos.every((p) => p.keepOriginalOnDevice === false));
+
+  const protectedAfterUnlock = await (await ctx.request('/api/photos?protected=1', { headers })).json();
+  assert.equal(protectedAfterUnlock.total, 1);
+  assert.equal(protectedAfterUnlock.protectedCount, 1);
+  assert.equal(protectedAfterUnlock.photos[0].hash, bigSha);
+
+  // 7. Webpage exposes Protected banner & multi-select Allow Re-Proxy controls
+  const webHtml = (await ctx.request('/')).buffer.toString('utf8');
+  assert.ok(webHtml.includes('id="protectedBanner"'));
+  assert.ok(webHtml.includes('id="allowReproxySelectedBtn"'));
+  assert.ok(webHtml.includes('id="protectedCountBadge"'));
 });

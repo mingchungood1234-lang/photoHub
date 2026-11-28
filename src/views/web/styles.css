@@ -1472,7 +1472,93 @@ button:disabled {
 }
 
 .tile-badge--protected {
-  background: rgba(16, 185, 129, 0.9);
+  background: rgba(16, 185, 129, 0.94);
+  box-shadow: 0 2px 8px rgba(16, 185, 129, 0.38);
+}
+
+.photo-tile.is-protected-view {
+  box-shadow: inset 0 0 0 1.5px rgba(16, 185, 129, 0.45);
+}
+
+.f-pill--protected.is-active {
+  background: var(--mint);
+  border-color: var(--mint);
+  color: #FFFFFF;
+}
+
+.pill-count--mint {
+  background: rgba(16, 185, 129, 0.16);
+  color: var(--mint);
+}
+
+.f-pill.is-active .pill-count--mint {
+  background: rgba(255, 255, 255, 0.25);
+  color: #FFFFFF;
+}
+
+.btn-mint {
+  border: 1px solid rgba(16, 185, 129, 0.38);
+  background: rgba(16, 185, 129, 0.14);
+  color: var(--mint);
+  font: inherit;
+  font-weight: 700;
+  border-radius: 999px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition: transform 0.16s ease, background 0.18s ease, border-color 0.18s ease, opacity 0.18s ease;
+}
+
+.btn-mint:hover:not(:disabled) {
+  background: var(--mint);
+  border-color: var(--mint);
+  color: #FFFFFF;
+  transform: translateY(-1px);
+}
+
+.btn-mint:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.protected-banner {
+  background: rgba(16, 185, 129, 0.08);
+  border: 1px solid rgba(16, 185, 129, 0.32);
+  border-radius: var(--radius-lg);
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.protected-banner-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.protected-banner-text strong {
+  font-size: 0.88rem;
+  font-weight: 800;
+  color: var(--mint);
+}
+
+.protected-banner-text span {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.protected-banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .tile-select-check {
@@ -1593,6 +1679,8 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 /* ==================== MODALS ==================== */

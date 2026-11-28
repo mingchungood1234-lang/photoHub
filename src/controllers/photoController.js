@@ -483,10 +483,11 @@ function createPhotoController({ config }) {
         const mediaTypeParam = req.query.mediaType ? String(req.query.mediaType).trim() : '';
         const prefixParam = req.query.prefix ? String(req.query.prefix).trim().toLowerCase() : '';
         const favoriteParam = req.query.favorite === '1' || req.query.favorite === 'true' ? '1' : '';
+        const protectedParam = req.query.protected === '1' || req.query.protected === 'true' ? '1' : '';
         const searchParam = req.query.q ? String(req.query.q).trim() : '';
         const orderParam = req.query.order === 'asc' ? 'asc' : 'desc';
 
-        const etag = `W/"v${hashIndex.version || 1}-${hashIndex.size()}-${offset}-${limit}-${yearParam}-${mediaTypeParam}-${prefixParam}-${favoriteParam}-${encodeURIComponent(searchParam)}-${orderParam}"`;
+        const etag = `W/"v${hashIndex.version || 1}-${hashIndex.size()}-${offset}-${limit}-${yearParam}-${mediaTypeParam}-${prefixParam}-${favoriteParam}-${protectedParam}-${encodeURIComponent(searchParam)}-${orderParam}"`;
         res.setHeader('ETag', etag);
         res.setHeader('Cache-Control', 'private, no-cache');
         const ifNoneMatch = String(req.headers['if-none-match'] || '').trim();
@@ -498,10 +499,14 @@ function createPhotoController({ config }) {
         const storageUsage = hashIndex.getStorageUsage();
 
         const yearCountsMap = new Map();
+        let protectedCount = 0;
+        let favoriteCount = 0;
         for (const item of all) {
           if (item.year) {
             yearCountsMap.set(item.year, (yearCountsMap.get(item.year) || 0) + 1);
           }
+          if (item.keepOriginalOnDevice) protectedCount += 1;
+          if (item.isFavorite) favoriteCount += 1;
         }
         const years = Array.from(yearCountsMap.entries())
           .sort((a, b) => b[0] - a[0])
@@ -521,6 +526,9 @@ function createPhotoController({ config }) {
         if (favoriteParam === '1') {
           all = all.filter((item) => Boolean(item.isFavorite));
         }
+        if (protectedParam === '1') {
+          all = all.filter((item) => Boolean(item.keepOriginalOnDevice));
+        }
         if (searchParam) {
           all = all.filter((item) => matchesSmartSearchQuery(item, searchParam));
         }
@@ -538,6 +546,8 @@ function createPhotoController({ config }) {
           userFolder: folderName,
           total: all.length,
           trashCount: storageUsage.trashItemCount || 0,
+          protectedCount,
+          favoriteCount,
           hasMore: offset + photos.length < all.length,
           years,
           photos,

@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/web/styles.css?v=7" />
+  <link rel="stylesheet" href="/web/styles.css?v=8" />
 </head>
 <body>
   <!-- Animated Sunny Boot Splash Screen -->
@@ -318,7 +318,7 @@
             <button type="button" class="f-pill" data-filter="favorite">♥ Favorites</button>
             <button type="button" class="f-pill" data-filter="albums">Albums</button>
             <button type="button" class="f-pill" data-filter="map">📍 Map</button>
-            <button type="button" class="f-pill" data-filter="protected">Protected</button>
+            <button type="button" class="f-pill f-pill--protected" data-filter="protected" id="protectedFilterBtn">🛡 Protected <span id="protectedCountBadge" class="pill-count pill-count--mint hidden">0</span></button>
             <button type="button" class="f-pill f-pill--trash" data-filter="trash" id="trashFilterBtn">Trash <span id="trashCountBadge" class="pill-count hidden">0</span></button>
           </div>
 
@@ -349,6 +349,18 @@
 
         <!-- Year Quick Jump Bar -->
         <div class="year-pills hidden" id="yearJumpBar"></div>
+      </div>
+
+      <!-- Protected Originals Banner -->
+      <div id="protectedBanner" class="protected-banner hidden">
+        <div class="protected-banner-text">
+          <strong>🛡 Protected Originals</strong>
+          <span id="protectedBannerSub">Protected photos stay full-resolution on your phone and are skipped by auto-compression.</span>
+        </div>
+        <div class="protected-banner-actions">
+          <button type="button" class="btn-soft btn-sm" id="selectAllProtectedBtn">Select All</button>
+          <button type="button" class="btn-mint btn-sm" id="allowReproxyAllProtectedBtn">Allow Re-Proxy All</button>
+        </div>
       </div>
 
       <!-- 30-Day Trash Retention Banner -->
@@ -502,6 +514,8 @@
     </div>
     <div class="selection-actions">
       <button type="button" class="btn-soft btn-sm" id="selectAllVisibleBtn">All</button>
+      <button type="button" class="btn-mint btn-sm hidden" id="allowReproxySelectedBtn" disabled>Allow Re-Proxy</button>
+      <button type="button" class="btn-soft btn-sm hidden" id="protectSelectedBtn" disabled>Protect</button>
       <button type="button" class="btn-primary btn-sm" id="downloadZipBtn" disabled>ZIP</button>
       <button type="button" class="btn-soft btn-sm" id="addToAlbumSelectedBtn" disabled>+ Album</button>
       <button type="button" class="btn-soft btn-sm hidden" id="removeFromAlbumSelectedBtn" disabled>Remove</button>
@@ -785,6 +799,6 @@
     </div>
   </footer>
 
-  <script src="/web/app.js?v=7" defer></script>
+  <script src="/web/app.js?v=8" defer></script>
 </body>
 </html>

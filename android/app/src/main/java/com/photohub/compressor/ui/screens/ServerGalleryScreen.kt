@@ -208,7 +208,7 @@ fun ServerGalleryScreen(
     }
 
     val hasUnproxiedBanner = uiState.unproxiedCount > 0 || uiState.isBatchProxying || uiState.batchBannerMessage != null
-    val hasRestoreBanner = uiState.isBatchRestoring || uiState.restoreBannerMessage != null
+    val hasRestoreBanner = uiState.isBatchRestoring || uiState.isBatchUpdatingProtection || uiState.restoreBannerMessage != null
     val hasDeleteBanner = uiState.isBatchDeleting || uiState.deleteBannerMessage != null
 
     // Build flat index offsets for scrolling to years & scrubber positions (accounts for Hero + Control Bar + active banners)
@@ -292,7 +292,7 @@ fun ServerGalleryScreen(
                     actions = {
                         TextButton(
                             onClick = { viewModel.enterSelectionMode() },
-                            enabled = uiState.photos.isNotEmpty() && !uiState.isBatchRestoring && !uiState.isBatchProxying && !uiState.isBatchDeleting
+                            enabled = uiState.photos.isNotEmpty() && !uiState.isBatchRestoring && !uiState.isBatchProxying && !uiState.isBatchDeleting && !uiState.isBatchUpdatingProtection
                         ) {
                             Text("Select", fontWeight = FontWeight.Bold)
                         }
@@ -310,7 +310,7 @@ fun ServerGalleryScreen(
                                     DropdownMenuItem(
                                         text = { Text("Select Photos to Restore or Delete") },
                                         leadingIcon = { Icon(Icons.Rounded.CheckBox, null) },
-                                        enabled = !uiState.isBatchRestoring && !uiState.isBatchProxying && !uiState.isBatchDeleting,
+                                        enabled = !uiState.isBatchRestoring && !uiState.isBatchProxying && !uiState.isBatchDeleting && !uiState.isBatchUpdatingProtection,
                                         onClick = {
                                             showMenu = false
                                             viewModel.enterSelectionMode()
@@ -788,7 +788,7 @@ fun ServerGalleryScreen(
                                                 }
                                             },
                                             onLongClick = {
-                                                if (!uiState.isSelectionMode && !uiState.isBatchRestoring && !uiState.isBatchProxying && !uiState.isBatchDeleting) {
+                                                if (!uiState.isSelectionMode && !uiState.isBatchRestoring && !uiState.isBatchProxying && !uiState.isBatchDeleting && !uiState.isBatchUpdatingProtection) {
                                                     viewModel.enterSelectionMode(photo.hash)
                                                 }
                                             }
@@ -821,6 +821,7 @@ fun ServerGalleryScreen(
                                     if (uiState.isViewingTrash) viewModel.restoreSelectedFromTrash()
                                     else viewModel.requestRestoreSelected()
                                 },
+                                onAllowReproxySelected = { viewModel.allowReproxySelected() },
                                 onDeleteSelected = { viewModel.requestDeleteSelected() },
                                 modifier = Modifier
                                     .align(Alignment.BottomCenter)
@@ -1515,6 +1516,19 @@ private fun RestoreOriginalsBanner(
                     ) {
                         Text("Stop", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, color = PhotoHubDeepOrange)
                     }
+                } else if (uiState.isBatchUpdatingProtection) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = PhotoHubMint
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Text(
+                        "Allowing re-proxy for selected items…",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.weight(1f)
+                    )
                 } else if (uiState.restoreBannerMessage != null) {
                     Icon(Icons.Rounded.CheckCircle, null, tint = PhotoHubGreen, modifier = Modifier.size(18.dp))
                     Spacer(modifier = Modifier.width(8.dp))
@@ -1612,105 +1626,234 @@ private fun DeletePhotosBanner(
 private fun SelectionRestoreBottomBar(
     uiState: ServerGalleryUiState,
     onRestoreSelected: () -> Unit,
+    onAllowReproxySelected: () -> Unit,
     onDeleteSelected: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
     val selectedList = uiState.activeSourcePhotos.filter { it.hash.lowercase(Locale.ROOT) in uiState.selectedHashes }
+    val selectedProtected = selectedList.filter { uiState.isRestoredOrProtected(it) }
     val unrestored = selectedList.filter { !uiState.isRestoredOrProtected(it) }
     val targetBytes = (if (unrestored.isNotEmpty()) unrestored else selectedList).sumOf { maxOf(0L, it.size) }
     val sizeStr = Formatter.formatFileSize(context, targetBytes)
-    val actionsEnabled = selectedList.isNotEmpty() && !uiState.isBatchRestoring && !uiState.isBatchProxying && !uiState.isBatchDeleting
+    val isBusyBatch = uiState.isBatchRestoring || uiState.isBatchProxying || uiState.isBatchDeleting || uiState.isBatchUpdatingProtection
+    val actionsEnabled = selectedList.isNotEmpty() && !isBusyBatch
+    val showAllowReproxy = !uiState.isViewingTrash && (selectedProtected.isNotEmpty() || uiState.mediaTypeFilter == ServerMediaTypeFilter.PROTECTED)
+    val allowReproxyEnabled = selectedProtected.isNotEmpty() && !isBusyBatch
 
     Surface(
-        shape = CircleShape,
+        shape = if (showAllowReproxy) RoundedCornerShape(22.dp) else CircleShape,
         color = MaterialTheme.colorScheme.surface,
         border = BorderStroke(1.5.dp, PhotoHubOrange.copy(alpha = 0.8f)),
         shadowElevation = 10.dp,
         tonalElevation = 4.dp,
         modifier = modifier.fillMaxWidth()
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = if (selectedList.isEmpty()) "Tap photos to select" else "${selectedList.size} selected",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.ExtraBold
-                )
-                if (selectedList.isNotEmpty()) {
-                    val alreadyCount = selectedList.size - unrestored.size
-                    Text(
-                        text = if (alreadyCount > 0) {
-                            "~$sizeStr · ${unrestored.size} new"
-                        } else {
-                            "~$sizeStr · ${unrestored.size} original${if (unrestored.size == 1) "" else "s"}"
-                        },
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-            }
-            Spacer(modifier = Modifier.width(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Surface(
-                    onClick = onDeleteSelected,
-                    enabled = actionsEnabled,
-                    shape = CircleShape,
-                    color = PhotoHubRed.copy(alpha = if (actionsEnabled) 0.14f else 0.06f),
-                    border = BorderStroke(1.dp, PhotoHubRed.copy(alpha = if (actionsEnabled) 0.35f else 0.15f))
+        if (showAllowReproxy) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                        Icon(
-                            Icons.Rounded.DeleteOutline,
-                            contentDescription = "Delete from Server",
-                            tint = PhotoHubRed.copy(alpha = if (actionsEnabled) 1f else 0.45f),
-                            modifier = Modifier.size(16.dp)
-                        )
+                    Text(
+                        text = if (selectedList.isEmpty()) "Tap protected photos to select" else "${selectedList.size} selected",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                    if (selectedList.isNotEmpty()) {
                         Text(
-                            if (uiState.isViewingTrash) "Delete Forever" else "Trash",
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = PhotoHubRed.copy(alpha = if (actionsEnabled) 1f else 0.45f)
+                            text = "· ~$sizeStr · ${selectedProtected.size} protected",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
                 }
-
-                Box(
-                    modifier = Modifier
-                        .clip(CircleShape)
-                        .background(
-                            if (actionsEnabled) {
-                                Brush.horizontalGradient(listOf(Color(0xFFFF9840), PhotoHubOrange, PhotoHubDeepOrange))
-                            } else {
-                                Brush.horizontalGradient(listOf(PhotoHubOrange.copy(alpha = 0.4f), PhotoHubDeepOrange.copy(alpha = 0.4f)))
-                            }
-                        )
-                        .clickable(enabled = actionsEnabled, onClick = onRestoreSelected)
-                        .padding(horizontal = 14.dp, vertical = 8.dp)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                    Surface(
+                        onClick = onDeleteSelected,
+                        enabled = actionsEnabled,
+                        shape = CircleShape,
+                        color = PhotoHubRed.copy(alpha = if (actionsEnabled) 0.14f else 0.06f),
+                        border = BorderStroke(1.dp, PhotoHubRed.copy(alpha = if (actionsEnabled) 0.35f else 0.15f))
                     ) {
-                        Icon(Icons.Rounded.CloudDownload, null, tint = Color.White, modifier = Modifier.size(16.dp))
+                        Row(
+                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Icon(
+                                Icons.Rounded.DeleteOutline,
+                                contentDescription = "Move to Trash",
+                                tint = PhotoHubRed.copy(alpha = if (actionsEnabled) 1f else 0.45f),
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Text(
+                                "Trash",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = PhotoHubRed.copy(alpha = if (actionsEnabled) 1f else 0.45f)
+                            )
+                        }
+                    }
+
+                    Surface(
+                        onClick = onAllowReproxySelected,
+                        enabled = allowReproxyEnabled,
+                        shape = CircleShape,
+                        color = PhotoHubMint.copy(alpha = if (allowReproxyEnabled) 0.15f else 0.06f),
+                        border = BorderStroke(1.dp, PhotoHubMint.copy(alpha = if (allowReproxyEnabled) 0.42f else 0.18f)),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            Icon(
+                                Icons.Rounded.LockOpen,
+                                contentDescription = "Allow Re-Proxy",
+                                tint = PhotoHubMint.copy(alpha = if (allowReproxyEnabled) 1f else 0.45f),
+                                modifier = Modifier.size(15.dp)
+                            )
+                            Spacer(modifier = Modifier.width(5.dp))
+                            Text(
+                                text = if (selectedProtected.isNotEmpty() && selectedProtected.size < selectedList.size) {
+                                    "Allow Re-Proxy (${selectedProtected.size})"
+                                } else {
+                                    "Allow Re-Proxy"
+                                },
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = PhotoHubMint.copy(alpha = if (allowReproxyEnabled) 1f else 0.45f),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .background(
+                                if (actionsEnabled) {
+                                    Brush.horizontalGradient(listOf(Color(0xFFFF9840), PhotoHubOrange, PhotoHubDeepOrange))
+                                } else {
+                                    Brush.horizontalGradient(listOf(PhotoHubOrange.copy(alpha = 0.4f), PhotoHubDeepOrange.copy(alpha = 0.4f)))
+                                }
+                            )
+                            .clickable(enabled = actionsEnabled, onClick = onRestoreSelected)
+                            .padding(horizontal = 12.dp, vertical = 8.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Icon(Icons.Rounded.CloudDownload, null, tint = Color.White, modifier = Modifier.size(15.dp))
+                            Text(
+                                "Restore",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White
+                            )
+                        }
+                    }
+                }
+            }
+        } else {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = if (selectedList.isEmpty()) "Tap photos to select" else "${selectedList.size} selected",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                    if (selectedList.isNotEmpty()) {
+                        val alreadyCount = selectedList.size - unrestored.size
                         Text(
-                            "Restore",
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White
+                            text = if (alreadyCount > 0) {
+                                "~$sizeStr · ${unrestored.size} new"
+                            } else {
+                                "~$sizeStr · ${unrestored.size} original${if (unrestored.size == 1) "" else "s"}"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
+                    }
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Surface(
+                        onClick = onDeleteSelected,
+                        enabled = actionsEnabled,
+                        shape = CircleShape,
+                        color = PhotoHubRed.copy(alpha = if (actionsEnabled) 0.14f else 0.06f),
+                        border = BorderStroke(1.dp, PhotoHubRed.copy(alpha = if (actionsEnabled) 0.35f else 0.15f))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Icon(
+                                Icons.Rounded.DeleteOutline,
+                                contentDescription = "Delete from Server",
+                                tint = PhotoHubRed.copy(alpha = if (actionsEnabled) 1f else 0.45f),
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Text(
+                                if (uiState.isViewingTrash) "Delete Forever" else "Trash",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = PhotoHubRed.copy(alpha = if (actionsEnabled) 1f else 0.45f)
+                            )
+                        }
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .background(
+                                if (actionsEnabled) {
+                                    Brush.horizontalGradient(listOf(Color(0xFFFF9840), PhotoHubOrange, PhotoHubDeepOrange))
+                                } else {
+                                    Brush.horizontalGradient(listOf(PhotoHubOrange.copy(alpha = 0.4f), PhotoHubDeepOrange.copy(alpha = 0.4f)))
+                                }
+                            )
+                            .clickable(enabled = actionsEnabled, onClick = onRestoreSelected)
+                            .padding(horizontal = 14.dp, vertical = 8.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp)
+                        ) {
+                            Icon(Icons.Rounded.CloudDownload, null, tint = Color.White, modifier = Modifier.size(16.dp))
+                            Text(
+                                "Restore",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White
+                            )
+                        }
                     }
                 }
             }

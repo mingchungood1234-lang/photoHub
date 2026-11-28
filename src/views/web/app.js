@@ -18,6 +18,10 @@
     whoami: null,
     activeView: 'landing', // 'landing' | 'gallery'
     photos: [],
+    protectedPhotos: [],
+    protectedCount: 0,
+    isLoadingProtected: false,
+    protectedLoadedOnce: false,
     trashPhotos: [],
     trashCount: 0,
     isLoadingTrash: false,
@@ -674,6 +678,9 @@
     saveSession(null);
     state.whoami = null;
     state.photos = [];
+    state.protectedPhotos = [];
+    state.protectedCount = 0;
+    state.protectedLoadedOnce = false;
     state.trashPhotos = [];
     state.trashCount = 0;
     state.years = [];
@@ -755,8 +762,13 @@
       state.photos = Array.isArray(data.photos) ? data.photos : [];
       state.totalPhotos = Number(data.total) || state.photos.length;
       state.trashCount = Number(data.trashCount) || 0;
+      state.protectedCount =
+        typeof data.protectedCount === 'number'
+          ? data.protectedCount
+          : state.photos.filter((p) => Boolean(p.keepOriginalOnDevice)).length;
       state.hasMore = Boolean(data.hasMore);
       updateTrashBadge();
+      updateProtectedBadge();
       if (Array.isArray(data.years)) {
         state.years = data.years;
         renderYearPills();
@@ -856,6 +868,80 @@
     }
   }
 
+  function updateProtectedBadge() {
+    const badge = $('protectedCountBadge');
+    if (!badge) return;
+    if (state.protectedCount > 0) {
+      badge.textContent = String(state.protectedCount);
+      badge.classList.remove('hidden');
+    } else {
+      badge.classList.add('hidden');
+    }
+  }
+
+  function updateProtectedBannerUI() {
+    const list = state.protectedLoadedOnce
+      ? state.protectedPhotos
+      : state.photos.filter((p) => Boolean(p.keepOriginalOnDevice));
+    const totalBytes = list.reduce((sum, p) => sum + (Number(p.size) || 0), 0);
+    const sub = $('protectedBannerSub');
+    if (sub) {
+      sub.textContent =
+        list.length > 0
+          ? `${list.length} protected original(s) (${formatBytes(totalBytes)}) · Won't be auto-compressed into proxies on your phone.`
+          : 'No protected originals yet. Restored or protected photos appear here so they stay full-resolution on your phone.';
+    }
+    const selAllBtn = $('selectAllProtectedBtn');
+    const unlockAllBtn = $('allowReproxyAllProtectedBtn');
+    if (selAllBtn) selAllBtn.disabled = list.length === 0;
+    if (unlockAllBtn) unlockAllBtn.disabled = list.length === 0;
+  }
+
+  async function loadProtectedPhotos() {
+    if (!state.session || state.isLoadingProtected) return;
+    state.isLoadingProtected = true;
+    const sub = $('protectedBannerSub');
+    if (sub && !state.protectedLoadedOnce) {
+      sub.textContent = 'Loading all protected originals from server…';
+    }
+    try {
+      const collected = [];
+      const seen = new Set();
+      let offset = 0;
+      const limit = 1000;
+      let serverProtectedCount = null;
+      while (true) {
+        const res = await apiFetch(`/api/photos?protected=1&limit=${limit}&offset=${offset}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (typeof data.protectedCount === 'number') {
+          serverProtectedCount = data.protectedCount;
+        }
+        const page = Array.isArray(data.photos) ? data.photos : [];
+        for (const p of page) {
+          if (!p || !p.keepOriginalOnDevice) continue;
+          const k = String(p.hash || '').toLowerCase();
+          if (k && !seen.has(k)) {
+            seen.add(k);
+            collected.push(p);
+          }
+        }
+        offset += page.length;
+        if (!data.hasMore || page.length === 0) break;
+      }
+      state.protectedPhotos = collected;
+      state.protectedLoadedOnce = true;
+      state.protectedCount = serverProtectedCount !== null ? serverProtectedCount : collected.length;
+      updateProtectedBadge();
+      updateProtectedBannerUI();
+      renderGallery();
+    } catch (err) {
+      showToast(err.message || 'Could not load Protected photos', 'rose');
+    } finally {
+      state.isLoadingProtected = false;
+    }
+  }
+
   async function loadTrash() {
     if (!state.session || state.isLoadingTrash) return;
     state.isLoadingTrash = true;
@@ -926,6 +1012,22 @@
       }
       return list.filter((p) => !state.searchQuery || matchesSmartSearch(p, state.searchQuery));
     }
+    if (state.filterMedia === 'protected') {
+      const base = state.protectedLoadedOnce
+        ? state.protectedPhotos
+        : state.photos.filter((p) => Boolean(p.keepOriginalOnDevice));
+      return base.filter((p) => {
+        if (!p.keepOriginalOnDevice) return false;
+        if (state.selectedYear) {
+          const rawDate = String(p.photoDate || p.takenAt || p.uploadedAt || '');
+          const match = /^(\d{4})/.exec(rawDate);
+          const itemYear = match ? Number(match[1]) : null;
+          if (itemYear !== Number(state.selectedYear)) return false;
+        }
+        if (state.searchQuery && !matchesSmartSearch(p, state.searchQuery)) return false;
+        return true;
+      });
+    }
     const isTrash = state.filterMedia === 'trash';
     const source = isTrash ? state.trashPhotos : state.photos;
     return source.filter((p) => {
@@ -933,7 +1035,6 @@
       if (state.filterMedia === 'photo' && isVid) return false;
       if (state.filterMedia === 'video' && !isVid) return false;
       if (state.filterMedia === 'favorite' && !p.isFavorite) return false;
-      if (state.filterMedia === 'protected' && !p.keepOriginalOnDevice) return false;
       if (state.searchQuery && !matchesSmartSearch(p, state.searchQuery)) return false;
       return true;
     });
@@ -1088,12 +1189,17 @@
 
   function renderGallery() {
     const isTrashView = state.filterMedia === 'trash';
+    const isProtectedView = state.filterMedia === 'protected';
     const isAlbumsView = state.filterMedia === 'albums';
     const isMapView = state.filterMedia === 'map';
 
     $('trashBanner').classList.toggle('hidden', !isTrashView);
+    $('protectedBanner').classList.toggle('hidden', !isProtectedView);
     $('albumsViewSection').classList.toggle('hidden', !isAlbumsView);
     $('mapViewSection').classList.toggle('hidden', !isMapView);
+    if (isProtectedView) {
+      updateProtectedBannerUI();
+    }
 
     const showMemories = state.filterMedia === 'all' && !state.searchQuery && state.memories.length > 0;
     $('memoriesStrip').classList.toggle('hidden', !showMemories);
@@ -1117,11 +1223,13 @@
     const photoCount = state.photos.length - vidCount;
     $('galleryCountsText').textContent = isTrashView
       ? `${state.trashPhotos.length} item(s) in Trash`
-      : isAlbumsView && state.activeAlbum
-        ? `${state.activeAlbum.name} · ${items.length} item(s)`
-        : isMapView
-          ? `${items.length} mapped photo(s)`
-          : `${state.totalPhotos} total · ${photoCount} photos · ${vidCount} videos`;
+      : isProtectedView
+        ? `${items.length} protected original(s)`
+        : isAlbumsView && state.activeAlbum
+          ? `${state.activeAlbum.name} · ${items.length} item(s)`
+          : isMapView
+            ? `${items.length} mapped photo(s)`
+            : `${state.totalPhotos} total · ${photoCount} photos · ${vidCount} videos${state.protectedCount > 0 ? ` · ${state.protectedCount} protected` : ''}`;
 
     const container = $('galleryTimeline');
     container.innerHTML = '';
@@ -1132,6 +1240,11 @@
       if (isTrashView) {
         $('emptyStateTitle').textContent = 'Trash is Empty';
         $('emptyStateText').textContent = 'Deleted photos appear here for 30 days before permanent removal.';
+      } else if (isProtectedView) {
+        $('emptyStateTitle').textContent = state.isLoadingProtected ? 'Loading Protected Originals…' : 'No Protected Originals';
+        $('emptyStateText').textContent = state.isLoadingProtected
+          ? 'Fetching all protected items across your cloud library…'
+          : 'Restored or protected originals appear here so they stay full-resolution on your phone.';
       } else if (isAlbumsView && state.activeAlbum) {
         $('emptyStateTitle').textContent = 'Empty Album';
         $('emptyStateText').textContent = 'Select photos from All Photos and tap "+ Album" to add them here.';
@@ -1176,7 +1289,7 @@
         const isSelected = state.selectedHashes.has(normHash);
 
         const tile = document.createElement('div');
-        tile.className = `photo-tile${isSelected ? ' is-selected' : ''}`;
+        tile.className = `photo-tile${isSelected ? ' is-selected' : ''}${isProtectedView && photo.keepOriginalOnDevice ? ' is-protected-view' : ''}`;
         tile.dataset.hash = photo.hash;
         tile.dataset.video = isVid ? '1' : '0';
         tile.dataset.needsProxy = needsProxy ? '1' : '0';
@@ -1208,7 +1321,7 @@
             badges.innerHTML += `<span class="tile-badge tile-badge--fav" title="Favorite">♥</span>`;
           }
           if (photo.keepOriginalOnDevice) {
-            badges.innerHTML += `<span class="tile-badge tile-badge--protected" title="Restored original protected">✓</span>`;
+            badges.innerHTML += `<span class="tile-badge tile-badge--protected" title="Protected Original · Won't auto re-proxy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" width="13" height="13"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></span>`;
           }
           tile.appendChild(badges);
         }
@@ -1260,8 +1373,9 @@
     }
 
     container.appendChild(frag);
-    $('loadMoreWrap').classList.toggle('hidden', !state.hasMore);
-    if (state.hasMore) {
+    const canPaginateMain = !isTrashView && !isProtectedView && !isAlbumsView && !isMapView && state.hasMore;
+    $('loadMoreWrap').classList.toggle('hidden', !canPaginateMain);
+    if (canPaginateMain) {
       $('loadMoreLabel').textContent = `Showing ${state.photos.length} of ${state.totalPhotos} — scroll for more`;
     }
   }
@@ -1304,22 +1418,63 @@
     updateSelectionBar();
   }
 
+  function getActiveSelectionSource() {
+    if (state.filterMedia === 'trash') return state.trashPhotos;
+    if (state.filterMedia === 'protected') {
+      return state.protectedLoadedOnce
+        ? state.protectedPhotos
+        : state.photos.filter((p) => Boolean(p.keepOriginalOnDevice));
+    }
+    if (state.filterMedia === 'albums' && state.activeAlbum) return state.activeAlbumPhotos;
+    if (state.filterMedia === 'map' && state.mapData && Array.isArray(state.mapData.photos)) {
+      return state.mapData.photos;
+    }
+    return state.photos;
+  }
+
   function updateSelectionBar() {
     const bar = $('selectionBar');
     bar.classList.toggle('hidden', !state.isSelectionMode);
     if (!state.isSelectionMode) return;
     const isTrash = state.filterMedia === 'trash';
+    const isProtectedView = state.filterMedia === 'protected';
     const inCustomAlbum = state.filterMedia === 'albums' && Boolean(state.activeAlbum);
-    const source = isTrash ? state.trashPhotos : inCustomAlbum ? state.activeAlbumPhotos : state.photos;
+    const source = getActiveSelectionSource();
     const count = state.selectedHashes.size;
     let totalBytes = 0;
+    let protectedSelectedCount = 0;
+    let unprotectedSelectedCount = 0;
     for (const p of source) {
       if (state.selectedHashes.has(p.hash.toLowerCase())) {
         totalBytes += Number(p.size) || 0;
+        if (p.keepOriginalOnDevice) protectedSelectedCount += 1;
+        else unprotectedSelectedCount += 1;
       }
     }
     $('selectionCountText').textContent = `${count} selected`;
-    $('selectionSizeText').textContent = `${formatBytes(totalBytes)} · Shift+Click for range`;
+    $('selectionSizeText').textContent =
+      protectedSelectedCount > 0 && !isTrash
+        ? `${formatBytes(totalBytes)} · ${protectedSelectedCount} protected · Shift+Click for range`
+        : `${formatBytes(totalBytes)} · Shift+Click for range`;
+
+    const allowReproxyBtn = $('allowReproxySelectedBtn');
+    const protectBtn = $('protectSelectedBtn');
+    const showAllowReproxy = !isTrash && (protectedSelectedCount > 0 || isProtectedView);
+    const showProtect = !isTrash && protectedSelectedCount === 0 && unprotectedSelectedCount > 0 && !isProtectedView;
+
+    if (allowReproxyBtn) {
+      allowReproxyBtn.classList.toggle('hidden', !showAllowReproxy);
+      allowReproxyBtn.disabled = protectedSelectedCount === 0;
+      allowReproxyBtn.textContent =
+        protectedSelectedCount > 0 && protectedSelectedCount < count
+          ? `Allow Re-Proxy (${protectedSelectedCount})`
+          : 'Allow Re-Proxy';
+    }
+    if (protectBtn) {
+      protectBtn.classList.toggle('hidden', !showProtect);
+      protectBtn.disabled = unprotectedSelectedCount === 0;
+    }
+
     $('deleteSelectedBtn').disabled = count === 0;
     $('deleteSelectedBtn').textContent = isTrash ? 'Delete Forever' : 'Trash';
     $('downloadZipBtn').classList.toggle('hidden', isTrash);
@@ -1332,6 +1487,102 @@
     $('shareSelectedBtn').disabled = count === 0;
     $('restoreSelectedBtn').classList.toggle('hidden', !isTrash);
     $('restoreSelectedBtn').disabled = count === 0;
+  }
+
+  async function batchSetProtectOriginals(rawHashes, keepOriginal) {
+    const cleaned = Array.from(
+      new Set((rawHashes || []).map((h) => String(h || '').trim().toLowerCase()).filter(Boolean))
+    );
+    if (cleaned.length === 0) return;
+
+    const flag = Boolean(keepOriginal);
+    const updatedPhotos = [];
+    try {
+      for (let i = 0; i < cleaned.length; i += 200) {
+        const chunk = cleaned.slice(i, i + 200);
+        const res = await apiFetch('/api/photos/protect-original', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ hashes: chunk, keepOriginalOnDevice: flag }),
+        });
+        if (res.status === 404) {
+          for (const h of chunk) {
+            const singleRes = await apiFetch(`/api/photo/${encodeURIComponent(h)}/protect-original`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ keepOriginalOnDevice: flag }),
+            });
+            if (singleRes.ok) {
+              const singleData = await singleRes.json().catch(() => ({}));
+              if (singleData.photo) updatedPhotos.push(singleData.photo);
+            }
+          }
+          continue;
+        }
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || 'Could not update protection');
+        if (Array.isArray(data.photos)) {
+          updatedPhotos.push(...data.photos);
+        }
+      }
+
+      const targetSet = new Set(cleaned);
+      const updatedMap = new Map(updatedPhotos.map((p) => [String(p.hash || '').toLowerCase(), p]));
+      let delta = 0;
+
+      for (const list of [state.photos, state.activeAlbumPhotos]) {
+        for (const p of list) {
+          const k = String(p.hash || '').toLowerCase();
+          if (!targetSet.has(k)) continue;
+          const prev = Boolean(p.keepOriginalOnDevice);
+          const srv = updatedMap.get(k);
+          p.keepOriginalOnDevice = srv ? Boolean(srv.keepOriginalOnDevice) : flag;
+          if (list === state.photos && prev !== p.keepOriginalOnDevice) {
+            delta += p.keepOriginalOnDevice ? 1 : -1;
+          }
+        }
+      }
+
+      if (flag) {
+        const existingProtected = new Set(state.protectedPhotos.map((p) => String(p.hash || '').toLowerCase()));
+        for (const h of cleaned) {
+          if (existingProtected.has(h)) continue;
+          const item =
+            updatedMap.get(h) ||
+            state.photos.find((p) => String(p.hash || '').toLowerCase() === h);
+          if (item) {
+            state.protectedPhotos.unshift({ ...item, keepOriginalOnDevice: true });
+            existingProtected.add(h);
+          }
+        }
+      } else {
+        const beforeLen = state.protectedPhotos.length;
+        state.protectedPhotos = state.protectedPhotos.filter(
+          (p) => !targetSet.has(String(p.hash || '').toLowerCase())
+        );
+        if (state.protectedLoadedOnce) {
+          delta = state.protectedPhotos.length - beforeLen;
+        }
+      }
+
+      if (state.protectedLoadedOnce) {
+        state.protectedCount = state.protectedPhotos.length;
+      } else {
+        state.protectedCount = Math.max(0, state.protectedCount + (delta !== 0 ? delta : flag ? cleaned.length : -cleaned.length));
+      }
+      state.photosEtag = null;
+      updateProtectedBadge();
+      updateProtectedBannerUI();
+      toggleSelectionMode(false);
+      showToast(
+        flag
+          ? `Protected ${cleaned.length} original(s) from auto re-compression.`
+          : `Unlocked ${cleaned.length} photo(s) — allowed to re-proxy on your phone.`,
+        'mint'
+      );
+    } catch (err) {
+      showToast(err.message || 'Could not update protection', 'rose');
+    }
   }
 
   function openConfirmModal(title, text, onConfirm, okLabel = 'Confirm') {
@@ -1358,12 +1609,26 @@
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || 'Move to Trash failed');
       const moved = new Set((data.trashed || []).map((h) => String(h).toLowerCase()));
+      let removedProtected = 0;
+      for (const p of state.photos) {
+        if (moved.has(p.hash.toLowerCase()) && p.keepOriginalOnDevice) removedProtected += 1;
+      }
       state.photos = state.photos.filter((p) => !moved.has(p.hash.toLowerCase()));
+      const prevProtectedLen = state.protectedPhotos.length;
+      state.protectedPhotos = state.protectedPhotos.filter((p) => !moved.has(p.hash.toLowerCase()));
+      if (state.protectedLoadedOnce) {
+        state.protectedCount = state.protectedPhotos.length;
+      } else {
+        const protDelta = Math.max(removedProtected, prevProtectedLen - state.protectedPhotos.length);
+        state.protectedCount = Math.max(0, state.protectedCount - protDelta);
+      }
       state.totalPhotos = Math.max(0, state.totalPhotos - moved.size);
       state.trashCount += moved.size;
       state.photosEtag = null;
       for (const h of moved) state.selectedHashes.delete(h);
       updateTrashBadge();
+      updateProtectedBadge();
+      updateProtectedBannerUI();
       showToast(`Moved ${moved.size} item(s) to Trash (kept 30 days)`, 'amber');
       toggleSelectionMode(false);
     } catch (err) {
@@ -1385,6 +1650,7 @@
       state.trashPhotos = state.trashPhotos.filter((p) => !restored.has(p.hash.toLowerCase()));
       state.trashCount = state.trashPhotos.length;
       state.photosEtag = null;
+      state.protectedLoadedOnce = false;
       for (const h of restored) state.selectedHashes.delete(h);
       updateTrashBadge();
       showToast(`Restored ${restored.size} item(s) to library`, 'mint');
@@ -2351,7 +2617,7 @@
     $('lbShareBtn').classList.toggle('hidden', isTrash);
     $('lbAlbumBtn').classList.toggle('hidden', isTrash);
     $('lbRestoreBtn').classList.toggle('hidden', !isTrash);
-    $('lbProtectBtn').textContent = photo.keepOriginalOnDevice ? 'Unprotect' : 'Protect';
+    $('lbProtectBtn').textContent = photo.keepOriginalOnDevice ? 'Allow Re-Proxy' : 'Protect';
     $('lbDeleteBtn').textContent = isTrash ? 'Delete Forever' : 'Trash';
     renderLightboxInfoPanel(photo);
 
@@ -2504,10 +2770,40 @@
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || 'Update failed');
       photo.keepOriginalOnDevice = nextProtected;
+      const norm = String(photo.hash || '').toLowerCase();
+      for (const p of state.photos) {
+        if (String(p.hash || '').toLowerCase() === norm) p.keepOriginalOnDevice = nextProtected;
+      }
+      if (nextProtected) {
+        if (!state.protectedPhotos.some((p) => String(p.hash || '').toLowerCase() === norm)) {
+          state.protectedPhotos.unshift({ ...photo, keepOriginalOnDevice: true });
+        }
+        state.protectedCount = state.protectedLoadedOnce
+          ? state.protectedPhotos.length
+          : state.protectedCount + 1;
+      } else {
+        state.protectedPhotos = state.protectedPhotos.filter(
+          (p) => String(p.hash || '').toLowerCase() !== norm
+        );
+        state.protectedCount = state.protectedLoadedOnce
+          ? state.protectedPhotos.length
+          : Math.max(0, state.protectedCount - 1);
+      }
       state.photosEtag = null;
-      renderLightboxItem();
+      updateProtectedBadge();
+      updateProtectedBannerUI();
+      if (state.filterMedia === 'protected' && !nextProtected) {
+        closeLightbox();
+      } else {
+        renderLightboxItem();
+      }
       renderGallery();
-      showToast(nextProtected ? 'Protected from auto re-compression' : 'Unprotected original', 'mint');
+      showToast(
+        nextProtected
+          ? 'Protected from auto re-compression'
+          : 'Unlocked — allowed to re-proxy on your phone.',
+        'mint'
+      );
     } catch (err) {
       showToast(err.message || 'Could not update protection', 'rose');
     }
@@ -3299,6 +3595,9 @@
         updateSelectionBar();
         if (state.filterMedia === 'trash') {
           loadTrash();
+        } else if (state.filterMedia === 'protected') {
+          renderGallery();
+          loadProtectedPhotos();
         } else if (state.filterMedia === 'albums') {
           loadAlbums();
           renderGallery();
@@ -3326,6 +3625,40 @@
       }
     });
 
+    $('selectAllProtectedBtn').addEventListener('click', () => {
+      if (!state.isSelectionMode) {
+        state.isSelectionMode = true;
+        $('selectModeBtn').textContent = 'Done';
+      }
+      for (const p of state.visibleFlatPhotos) {
+        if (p.keepOriginalOnDevice) state.selectedHashes.add(p.hash.toLowerCase());
+      }
+      updateSelectionBar();
+      renderGallery();
+    });
+    $('allowReproxyAllProtectedBtn').addEventListener('click', () => {
+      const list = state.visibleFlatPhotos.filter((p) => Boolean(p.keepOriginalOnDevice));
+      if (list.length === 0) return;
+      openConfirmModal(
+        `Allow re-proxy for ${list.length} protected photo(s)?`,
+        'Your phone app will be allowed to compress these restored originals back into lightweight proxies to save local storage. Full-resolution originals stay safely backed up on your server.',
+        () => batchSetProtectOriginals(list.map((p) => p.hash), false),
+        `Allow Re-Proxy (${list.length})`
+      );
+    });
+    $('allowReproxySelectedBtn').addEventListener('click', () => {
+      const source = getActiveSelectionSource();
+      const targetHashes = source
+        .filter((p) => state.selectedHashes.has(p.hash.toLowerCase()) && Boolean(p.keepOriginalOnDevice))
+        .map((p) => p.hash);
+      if (targetHashes.length === 0) return;
+      batchSetProtectOriginals(targetHashes, false);
+    });
+    $('protectSelectedBtn').addEventListener('click', () => {
+      const hashes = Array.from(state.selectedHashes);
+      if (hashes.length === 0) return;
+      batchSetProtectOriginals(hashes, true);
+    });
     $('emptyTrashBtn').addEventListener('click', () => {
       if (state.trashPhotos.length === 0) return;
       openConfirmModal(
@@ -3402,10 +3735,12 @@
     });
     $('refreshGalleryBtn').addEventListener('click', () => {
       if (state.filterMedia === 'trash') loadTrash();
+      else if (state.filterMedia === 'protected') loadProtectedPhotos();
       else loadGallery(true);
     });
     $('emptyRetryBtn').addEventListener('click', () => {
       if (state.filterMedia === 'trash') loadTrash();
+      else if (state.filterMedia === 'protected') loadProtectedPhotos();
       else loadGallery(true);
     });
 
