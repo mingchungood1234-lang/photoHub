@@ -19,12 +19,17 @@ const {
 } = require('../services/storageService');
 const {
   isS3Configured,
+  isPrimaryS3Backend,
+  buildS3ObjectKey,
   createPresignedUrl,
   verifyS3ObjectChecksum,
 } = require('../services/s3Service');
 const { safeDecodeURIComponent } = require('../middleware/securityMiddleware');
 
 function createUploadController({ config, contextService, proxyQueue = null, chunkedUploadService = null }) {
+  function getPrimaryS3Config() {
+    return isPrimaryS3Backend(config) ? config.s3 : null;
+  }
   function maybeEnqueueAutoProxy({ req, result, hashIndex, storageDir, folderName, source = 'upload' }) {
     if (!proxyQueue || !result || !result.success || result.isProxy || !result.hash) {
       return false;
@@ -105,6 +110,8 @@ function createUploadController({ config, contextService, proxyQueue = null, chu
             gpsLat,
             gpsLng,
             locationLabel,
+            s3Config: getPrimaryS3Config(),
+            folderName,
           });
 
           result.userFolder = folderName;
@@ -116,9 +123,10 @@ function createUploadController({ config, contextService, proxyQueue = null, chu
             folderName,
             source: 'web',
           });
-          const displayPath = folderName
-            ? `${folderName}/${result.savedPath}`
-            : result.savedPath;
+          const displayPath =
+            result.storageType === 's3' || !folderName
+              ? result.savedPath
+              : `${folderName}/${result.savedPath}`;
 
           console.log(
             `[${new Date().toISOString()}] ${result.status.toUpperCase()}${folderName ? ` [${folderName}]` : ''}: ${displayPath} (${result.hash.slice(0, 12)}..., ${result.size} bytes) -> canDelete=${result.canDelete}`
@@ -207,12 +215,15 @@ function createUploadController({ config, contextService, proxyQueue = null, chu
               hashIndex,
               quotaBytes,
               minFreeDiskBytes: config.minFreeDiskBytes,
+              s3Config: getPrimaryS3Config(),
+              folderName,
             });
             itemResult.userFolder = folderName;
             results.push(itemResult);
-            const displayPath = folderName
-              ? `${folderName}/${itemResult.savedPath}`
-              : itemResult.savedPath;
+            const displayPath =
+              itemResult.storageType === 's3' || !folderName
+                ? itemResult.savedPath
+                : `${folderName}/${itemResult.savedPath}`;
             console.log(
               `[${new Date().toISOString()}] ${itemResult.status.toUpperCase()}${folderName ? ` [${folderName}]` : ''}: ${displayPath} (${itemResult.hash.slice(0, 12)}..., ${itemResult.size} bytes)`
             );
@@ -241,6 +252,8 @@ function createUploadController({ config, contextService, proxyQueue = null, chu
           gpsLat: bodyFields.gpsLat !== undefined ? Number(bodyFields.gpsLat) : null,
           gpsLng: bodyFields.gpsLng !== undefined ? Number(bodyFields.gpsLng) : null,
           locationLabel: bodyFields.locationLabel || null,
+          s3Config: getPrimaryS3Config(),
+          folderName,
         });
 
         result.userFolder = folderName;
@@ -252,9 +265,10 @@ function createUploadController({ config, contextService, proxyQueue = null, chu
           folderName,
           source: 'multipart',
         });
-        const displayPath = folderName
-          ? `${folderName}/${result.savedPath}`
-          : result.savedPath;
+        const displayPath =
+          result.storageType === 's3' || !folderName
+            ? result.savedPath
+            : `${folderName}/${result.savedPath}`;
 
         console.log(
           `[${new Date().toISOString()}] ${result.status.toUpperCase()}${folderName ? ` [${folderName}]` : ''}: ${displayPath} (${result.hash.slice(0, 12)}..., ${result.size} bytes) -> canDelete=${result.canDelete}`
@@ -320,12 +334,20 @@ function createUploadController({ config, contextService, proxyQueue = null, chu
 
         const quotaBytes = contextService.getQuotaBytesForContext(req.userContext);
         assertWithinQuota(hashIndex, quotaBytes, Number(fileSize) || 0);
-        await contextService.assertDiskFreeForUpload(Number(fileSize) || 0);
+        if (!isPrimaryS3Backend(config)) {
+          await contextService.assertDiskFreeForUpload(Number(fileSize) || 0);
+        }
 
         const { year, dateFolder } = parseDateFolder(createdAt);
         const safeName = sanitizeFilename(fileName, mimeType, cleanHash);
-        const prefix = folderName ? `${folderName}/` : '';
-        const objectKey = `${prefix}${year}/${dateFolder}/${cleanHash.slice(0, 8)}_${safeName}`;
+        const objectKey = buildS3ObjectKey({
+          folderName,
+          year,
+          dateFolder,
+          hash: cleanHash,
+          fileName: safeName,
+          prefix: config.s3.prefix,
+        });
 
         const uploadUrl = createPresignedUrl({
           s3Config: config.s3,
@@ -388,7 +410,12 @@ function createUploadController({ config, contextService, proxyQueue = null, chu
             error: 'Invalid S3 objectKey.',
           });
         }
-        if (folderName && !cleanObjectKey.startsWith(`${folderName}/`)) {
+        const cleanS3Prefix = String((config.s3 && config.s3.prefix) || '')
+          .trim()
+          .replace(/\\/g, '/')
+          .replace(/^\/+|\/+$/g, '');
+        const requiredPrefix = [cleanS3Prefix, folderName].filter(Boolean).join('/');
+        if (requiredPrefix && !cleanObjectKey.startsWith(`${requiredPrefix}/`)) {
           return res.status(403).json({
             success: false,
             checksumVerified: false,
@@ -419,18 +446,34 @@ function createUploadController({ config, contextService, proxyQueue = null, chu
           uploadedAt: new Date().toISOString(),
         });
 
+        const proxyQueued = maybeEnqueueAutoProxy({
+          req,
+          result: {
+            success: true,
+            hash: actualSha256,
+            serverSha256: actualSha256,
+            originalName: record.originalName,
+          },
+          hashIndex,
+          storageDir: req.userContext.storageDir,
+          folderName,
+          source: 's3-presign',
+        });
+
         return res.json({
           success: true,
           backedUp: true,
           canDelete: true,
           canReplaceWithProxy: true,
           checksumVerified: true,
+          storageType: 's3',
           serverSha256: actualSha256,
           hash: actualSha256,
           savedPath: record.relativePath,
           size: record.size,
           photoDate: record.photoDate,
           userFolder: folderName,
+          proxyQueued,
         });
       } catch (err) {
         const status = err.statusCode || 500;
@@ -543,6 +586,7 @@ function createUploadController({ config, contextService, proxyQueue = null, chu
           minFreeDiskBytes: config.minFreeDiskBytes,
           expectedHash: body.expectedHash || body.sha256 || '',
           strictChecksum: Boolean(body.strictChecksum),
+          s3Config: getPrimaryS3Config(),
         });
         result.userFolder = folderName;
         result.proxyQueued = maybeEnqueueAutoProxy({
@@ -553,9 +597,10 @@ function createUploadController({ config, contextService, proxyQueue = null, chu
           folderName,
           source: 'chunked-web',
         });
-        const displayPath = folderName
-          ? `${folderName}/${result.savedPath}`
-          : result.savedPath;
+        const displayPath =
+          result.storageType === 's3' || !folderName
+            ? result.savedPath
+            : `${folderName}/${result.savedPath}`;
         console.log(
           `[${new Date().toISOString()}] CHUNKED_${result.status.toUpperCase()}${folderName ? ` [${folderName}]` : ''}: ${displayPath} (${result.hash.slice(0, 12)}..., ${result.size} bytes)`
         );

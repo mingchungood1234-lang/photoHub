@@ -7,7 +7,7 @@
  * Used by: Docker health checks and Android/iOS apps pre-warming TLS sockets before downloads.
  */
 
-const { isS3Configured } = require('../services/s3Service');
+const { isS3Configured, isPrimaryS3Backend } = require('../services/s3Service');
 
 function createHealthController({ config, contextService, nodeAllocationService = null }) {
   return {
@@ -18,6 +18,7 @@ function createHealthController({ config, contextService, nodeAllocationService 
         indexedPhotos: contextService.getTotalIndexedCount(),
         configuredUsers: contextService.folderContexts.size,
         storageDir: config.storageDir,
+        storageBackend: isPrimaryS3Backend(config) ? 's3' : 'disk',
         s3Enabled: isS3Configured(config.s3),
       });
     },

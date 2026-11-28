@@ -24,7 +24,7 @@ const {
   isAllowedAppRedirectUri,
   selectNodeForUser,
 } = require('../models/userModel');
-const { isS3Configured } = require('../services/s3Service');
+const { isS3Configured, isPrimaryS3Backend } = require('../services/s3Service');
 
 function buildAllowedWebOrigins(baseUrl, config, req = null) {
   const origins = new Set();
@@ -76,6 +76,7 @@ function createAuthController({
         googleEnabled,
         apiKeyEnabled,
         authRequired,
+        storageBackend: isPrimaryS3Backend(config) ? 's3' : 'disk',
         s3Enabled: isS3Configured(config.s3),
         hasStorageNodes: config.storageNodes.length > 0,
         nodeCount: config.storageNodes.length || 1,

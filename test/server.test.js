@@ -82,6 +82,7 @@ async function startTestServer(extraOverrides = {}) {
   }
 
   return {
+    app,
     request,
     storageDir,
     dataDir,
@@ -3763,4 +3764,592 @@ test('Backend security hardening blocks path traversal, S3 tenant spoofing, JSON
   });
   assert.equal(lockedAdmin.status, 429);
   assert.ok(lockedAdmin.headers['retry-after']);
+});
+
+test('45. STORAGE_BACKEND=s3 (MEGA S4 full media + proxies mode) stores originals & proxies in S3, supports multipart, Range, 360px thumbs, shares, cleanup, and deletes', async (t) => {
+  const s3Objects = new Map(); // pathname -> { buf, contentType, etag }
+  const multipartUploads = new Map(); // uploadId -> { key, contentType, parts: Map<num, Buffer> }
+  const stats = {
+    puts: 0,
+    gets: 0,
+    heads: 0,
+    deletes: 0,
+    multipartInits: 0,
+    multipartParts: 0,
+    multipartCompletes: 0,
+  };
+
+  const mockMegaS4 = http.createServer((req, res) => {
+    const parsedUrl = new URL(req.url, 'http://127.0.0.1');
+    const key = parsedUrl.pathname;
+    const query = parsedUrl.searchParams;
+
+    if (req.method === 'POST' && query.has('uploads')) {
+      stats.multipartInits += 1;
+      const uploadId = `mpu_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+      multipartUploads.set(uploadId, {
+        key,
+        contentType: req.headers['content-type'] || 'application/octet-stream',
+        parts: new Map(),
+      });
+      res.writeHead(200, { 'Content-Type': 'application/xml' });
+      res.end(`<InitiateMultipartUploadResult><UploadId>${uploadId}</UploadId></InitiateMultipartUploadResult>`);
+      return;
+    }
+
+    if (req.method === 'POST' && query.has('uploadId')) {
+      const uploadId = query.get('uploadId');
+      const mpu = multipartUploads.get(uploadId);
+      const chunks = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        if (!mpu) {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        stats.multipartCompletes += 1;
+        const orderedNums = Array.from(mpu.parts.keys()).sort((a, b) => a - b);
+        const fullBuf = Buffer.concat(orderedNums.map((n) => mpu.parts.get(n)));
+        const etag = `"${crypto.createHash('md5').update(fullBuf).digest('hex')}-${orderedNums.length}"`;
+        s3Objects.set(mpu.key, { buf: fullBuf, contentType: mpu.contentType, etag });
+        multipartUploads.delete(uploadId);
+        res.writeHead(200, { 'Content-Type': 'application/xml', ETag: etag });
+        res.end(`<CompleteMultipartUploadResult><ETag>${etag}</ETag></CompleteMultipartUploadResult>`);
+      });
+      return;
+    }
+
+    if (req.method === 'PUT') {
+      const chunks = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        const body = Buffer.concat(chunks);
+        const uploadId = query.get('uploadId');
+        const partNumber = Number(query.get('partNumber'));
+        if (uploadId && Number.isInteger(partNumber) && partNumber >= 1) {
+          const mpu = multipartUploads.get(uploadId);
+          if (!mpu) {
+            res.writeHead(404);
+            res.end();
+            return;
+          }
+          stats.multipartParts += 1;
+          mpu.parts.set(partNumber, body);
+          const partEtag = `"${crypto.createHash('md5').update(body).digest('hex')}"`;
+          res.writeHead(200, { ETag: partEtag });
+          res.end();
+          return;
+        }
+        stats.puts += 1;
+        const etag = `"${crypto.createHash('md5').update(body).digest('hex')}"`;
+        s3Objects.set(key, {
+          buf: body,
+          contentType: req.headers['content-type'] || 'application/octet-stream',
+          etag,
+        });
+        res.writeHead(200, { ETag: etag });
+        res.end();
+      });
+      return;
+    }
+
+    if (req.method === 'HEAD') {
+      stats.heads += 1;
+      const obj = s3Objects.get(key);
+      if (!obj) {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Length': String(obj.buf.length),
+        'Content-Type': obj.contentType,
+        ETag: obj.etag,
+        'Accept-Ranges': 'bytes',
+      });
+      res.end();
+      return;
+    }
+
+    if (req.method === 'GET') {
+      stats.gets += 1;
+      const obj = s3Objects.get(key);
+      if (!obj) {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+      if (req.headers['if-none-match'] === obj.etag && !req.headers.range) {
+        res.writeHead(304, { ETag: obj.etag });
+        res.end();
+        return;
+      }
+      const rangeHeader = req.headers.range;
+      if (rangeHeader && /^bytes=\d+-\d*$/i.test(rangeHeader)) {
+        const [startStr, endStr] = rangeHeader.slice(6).split('-');
+        const start = Number(startStr);
+        const end = endStr ? Math.min(obj.buf.length - 1, Number(endStr)) : obj.buf.length - 1;
+        const slice = obj.buf.subarray(start, end + 1);
+        res.writeHead(206, {
+          'Content-Type': obj.contentType,
+          'Content-Length': String(slice.length),
+          'Content-Range': `bytes ${start}-${end}/${obj.buf.length}`,
+          'Accept-Ranges': 'bytes',
+          ETag: obj.etag,
+        });
+        res.end(slice);
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': obj.contentType,
+        'Content-Length': String(obj.buf.length),
+        'Accept-Ranges': 'bytes',
+        ETag: obj.etag,
+      });
+      res.end(obj.buf);
+      return;
+    }
+
+    if (req.method === 'DELETE') {
+      const uploadId = query.get('uploadId');
+      if (uploadId) {
+        multipartUploads.delete(uploadId);
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      stats.deletes += 1;
+      s3Objects.delete(key);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    res.writeHead(405);
+    res.end();
+  });
+
+  await new Promise((resolve) => mockMegaS4.listen(0, '127.0.0.1', resolve));
+  const s3Port = mockMegaS4.address().port;
+
+  const ctx = await startTestServer({
+    storageBackend: 'mega-s4', // verifies alias normalization -> 's3'
+    s3Endpoint: `http://127.0.0.1:${s3Port}`,
+    s3Bucket: 'photohub-mega-s4',
+    s3Prefix: 'vault',
+    s3AccessKeyId: 'mega-access',
+    s3SecretAccessKey: 'mega-secret',
+    s3ForcePathStyle: true,
+    s3StreamProxy: true,
+    s3MultipartThresholdMb: 5,
+    s3MultipartPartSizeMb: 5,
+    userKeys: 'alicekey:alice',
+    rateLimitEnabled: false,
+  });
+
+  t.after(async () => {
+    await ctx.cleanup();
+    await new Promise((resolve) => mockMegaS4.close(resolve));
+  });
+
+  const aliceHeaders = { 'X-API-Key': 'alicekey' };
+
+  async function listLocalStorageFiles(dir) {
+    const found = [];
+    async function walk(d) {
+      let entries = [];
+      try {
+        entries = await fsp.readdir(d, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) await walk(p);
+        else found.push(p);
+      }
+    }
+    await walk(dir);
+    return found;
+  }
+
+  // 1. Health, Auth Config & WhoAmI report storageBackend: 's3'
+  const healthBody = await (await ctx.request('/api/health')).json();
+  assert.equal(healthBody.storageBackend, 's3');
+  assert.equal(healthBody.s3Enabled, true);
+  const authCfgBody = await (await ctx.request('/api/auth/config')).json();
+  assert.equal(authCfgBody.storageBackend, 's3');
+  const whoamiBody = await (await ctx.request('/api/whoami', { headers: aliceHeaders })).json();
+  assert.equal(whoamiBody.storageBackend, 's3');
+  assert.equal(whoamiBody.s3Enabled, true);
+
+  // 2. Upload real JPEG via raw binary stream -> stored in S3 (NOT on local storageDir), background proxyQueue generates S3 proxy + dHash
+  const sharp = require('sharp');
+  const realJpegA = await sharp({
+    create: { width: 900, height: 600, channels: 3, background: { r: 220, g: 120, b: 60 } },
+  })
+    .jpeg({ quality: 88 })
+    .toBuffer();
+  const hashA = crypto.createHash('sha256').update(realJpegA).digest('hex');
+
+  const upA = await ctx.request('/api/upload', {
+    method: 'POST',
+    headers: {
+      ...aliceHeaders,
+      'Content-Type': 'image/jpeg',
+      'X-File-Name': 'SUNSET_S4.JPG',
+      'X-Created-At': '2026-11-28T10:00:00Z',
+      'X-File-Sha256': hashA,
+      'X-Verify-Checksum': 'strict',
+      'X-Upload-Source': 'web',
+    },
+    body: realJpegA,
+  });
+  assert.equal(upA.status, 200);
+  const upABody = await upA.json();
+  assert.equal(upABody.success, true);
+  assert.equal(upABody.storageType, 's3');
+  assert.equal(upABody.checksumVerified, true);
+  assert.ok(upABody.savedPath.startsWith('vault/alice/2026/2026-11-28/'));
+  assert.equal(upABody.proxyQueued, true);
+
+  // Wait for background proxyQueue to fetch from S3, transcode, upload proxy to S3, and analyze dHash/blurScore
+  await ctx.app.locals.proxyQueue.waitForIdle(10000);
+
+  const s3MasterKeyA = `/photohub-mega-s4/${upABody.savedPath}`;
+  const s3ProxyKeyA = `/photohub-mega-s4/vault/alice/.proxies/${hashA}.jpg`;
+  assert.ok(s3Objects.has(s3MasterKeyA), 'Master JPEG should be stored in MEGA S4');
+  assert.equal(Buffer.compare(s3Objects.get(s3MasterKeyA).buf, realJpegA), 0);
+  assert.ok(s3Objects.has(s3ProxyKeyA), 'Auto-generated image proxy should be stored in MEGA S4');
+  assert.deepEqual(await listLocalStorageFiles(ctx.storageDir), [], 'Local STORAGE_DIR must remain empty in S3 mode');
+
+  // 3. 360px grid thumbnail generated from S3 proxy & cached on local SSD DATA_DIR/thumb-cache
+  const getsBeforeThumb = stats.gets;
+  const thumb1 = await ctx.request(`/api/photo/${hashA}/preview?size=thumb`, {
+    headers: { ...aliceHeaders, Accept: 'image/webp,image/*,*/*' },
+  });
+  assert.equal(thumb1.status, 200);
+  assert.equal(thumb1.headers['x-thumb-cache'], 'generated');
+  assert.equal(thumb1.headers['x-photo-variant'], 'thumb-webp');
+  assert.equal(thumb1.headers['content-type'], 'image/webp');
+  assert.ok(thumb1.buffer.length > 50 && thumb1.buffer.length < realJpegA.length);
+  assert.equal(stats.gets, getsBeforeThumb + 1, 'First thumb fetch should read S3 proxy once');
+
+  const thumb2 = await ctx.request(`/api/photo/${hashA}/preview?size=thumb`, {
+    headers: { ...aliceHeaders, Accept: 'image/webp,image/*,*/*' },
+  });
+  assert.equal(thumb2.status, 200);
+  assert.equal(thumb2.headers['x-thumb-cache'], 'hit');
+  assert.equal(stats.gets, getsBeforeThumb + 1, 'Second thumb fetch must hit local SSD cache with 0 S3 calls');
+
+  // 4. Full preview streams S3 proxy (200, no 302 CORS redirect) & master download supports Range 206 + ETag 304
+  const fullPreview = await ctx.request(`/api/photo/${hashA}/preview`, { headers: aliceHeaders });
+  assert.equal(fullPreview.status, 200);
+  assert.equal(fullPreview.headers['x-photo-variant'], 'proxy');
+  assert.equal(Buffer.compare(fullPreview.buffer, s3Objects.get(s3ProxyKeyA).buf), 0);
+
+  const masterFull = await ctx.request(`/api/photo/${hashA}`, { headers: aliceHeaders });
+  assert.equal(masterFull.status, 200);
+  assert.equal(Buffer.compare(masterFull.buffer, realJpegA), 0);
+  assert.ok(masterFull.headers.etag);
+
+  const master304 = await ctx.request(`/api/photo/${hashA}`, {
+    headers: { ...aliceHeaders, 'If-None-Match': masterFull.headers.etag },
+  });
+  assert.equal(master304.status, 304);
+
+  const masterRange = await ctx.request(`/api/photo/${hashA}`, {
+    headers: { ...aliceHeaders, Range: 'bytes=0-63' },
+  });
+  assert.equal(masterRange.status, 206);
+  assert.equal(masterRange.buffer.length, 64);
+  assert.equal(Buffer.compare(masterRange.buffer, realJpegA.subarray(0, 64)), 0);
+
+  // 5. Multipart upload + mobile proxy registration + streaming video proxy -> ALL stored in S3
+  const realJpegB = await sharp({
+    create: { width: 800, height: 600, channels: 3, background: { r: 215, g: 122, b: 64 } },
+  })
+    .jpeg({ quality: 86 })
+    .toBuffer();
+  const hashB = crypto.createHash('sha256').update(realJpegB).digest('hex');
+  const boundary = '----PhotoHubS4Boundary';
+  const mpBody = Buffer.concat([
+    Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="photo"; filename="BEACH_S4.JPG"\r\nContent-Type: image/jpeg\r\n\r\n`
+    ),
+    realJpegB,
+    Buffer.from(`\r\n--${boundary}--\r\n`),
+  ]);
+  const upB = await ctx.request('/api/upload', {
+    method: 'POST',
+    headers: {
+      ...aliceHeaders,
+      'Content-Type': `multipart/form-data; boundary=${boundary}`,
+      'X-Skip-Auto-Proxy': '1',
+    },
+    body: mpBody,
+  });
+  assert.equal(upB.status, 200);
+  const upBBody = await upB.json();
+  assert.equal(upBBody.storageType, 's3');
+
+  const mobileImgProxy = Buffer.from('MOBILE_PROXY_JPEG_BYTES_S4');
+  const mobileVidProxy = Buffer.from('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_VIDEO_PROXY_S4');
+  const regRes = await ctx.request('/api/proxy/register', {
+    method: 'POST',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      masterHash: hashB,
+      proxyHash: crypto.createHash('sha256').update(mobileImgProxy).digest('hex'),
+      proxyBase64: mobileImgProxy.toString('base64'),
+    }),
+  });
+  assert.equal(regRes.status, 200);
+  const regBody = await regRes.json();
+  assert.equal(regBody.proxyStorageType, 's3');
+  assert.ok(s3Objects.has(`/photohub-mega-s4/vault/alice/.proxies/${hashB}.jpg`));
+
+  const vidStreamRes = await ctx.request(`/api/proxy/${hashB}/video`, {
+    method: 'POST',
+    headers: { ...aliceHeaders, 'Content-Type': 'video/mp4' },
+    body: mobileVidProxy,
+  });
+  assert.equal(vidStreamRes.status, 200);
+  const vidStreamBody = await vidStreamRes.json();
+  assert.equal(vidStreamBody.videoProxyStorageType, 's3');
+  assert.ok(s3Objects.has(`/photohub-mega-s4/vault/alice/.proxies/${hashB}.mp4`));
+
+  const vidRangeRes = await ctx.request(`/api/photo/${hashB}/video-proxy`, {
+    headers: { ...aliceHeaders, Range: 'bytes=0-15' },
+  });
+  assert.equal(vidRangeRes.status, 206);
+  assert.equal(vidRangeRes.headers['x-photo-variant'], 'video-proxy');
+  assert.equal(Buffer.compare(vidRangeRes.buffer, mobileVidProxy.subarray(0, 16)), 0);
+
+  // Explicit server-side POST /api/proxy/generate on S3 master works & writes proxy to S3
+  const genRes = await ctx.request('/api/proxy/generate', {
+    method: 'POST',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ masterHash: hashB }),
+  });
+  assert.equal(genRes.status, 200);
+  const genBody = await genRes.json();
+  assert.equal(genBody.success, true);
+  assert.equal(genBody.photo.hasPreview, true);
+
+  // 6. Chunked upload > 5 MiB threshold triggers real S3 Multipart Upload & reassembles exact SHA-256
+  const largeVideoBytes = Buffer.alloc(5 * 1024 * 1024 + 512 * 1024, 0x5a);
+  largeVideoBytes.write('PHOTOHUB_4K_S4_HEAD', 0);
+  largeVideoBytes.write('PHOTOHUB_4K_S4_TAIL', largeVideoBytes.length - 19);
+  const largeVideoHash = crypto.createHash('sha256').update(largeVideoBytes).digest('hex');
+
+  const initChunkRes = await ctx.request('/api/upload/chunked/init', {
+    method: 'POST',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      fileName: 'CLIP_4K_S4.MP4',
+      mimeType: 'video/mp4',
+      fileSize: largeVideoBytes.length,
+      chunkSize: 3 * 1024 * 1024,
+      expectedHash: largeVideoHash,
+      strictChecksum: true,
+    }),
+  });
+  assert.equal(initChunkRes.status, 201);
+  const { uploadId, totalChunks, chunkSize } = await initChunkRes.json();
+  assert.equal(totalChunks, 2);
+
+  for (let i = 0; i < totalChunks; i++) {
+    const slice = largeVideoBytes.subarray(i * chunkSize, Math.min(largeVideoBytes.length, (i + 1) * chunkSize));
+    const partRes = await ctx.request(`/api/upload/chunked/${uploadId}/part/${i}`, {
+      method: 'PUT',
+      headers: { ...aliceHeaders, 'Content-Type': 'application/octet-stream' },
+      body: slice,
+    });
+    assert.equal(partRes.status, 200);
+  }
+  const completeChunkRes = await ctx.request(`/api/upload/chunked/${uploadId}/complete`, {
+    method: 'POST',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json', 'X-Skip-Auto-Proxy': '1' },
+    body: JSON.stringify({ expectedHash: largeVideoHash, strictChecksum: true }),
+  });
+  assert.equal(completeChunkRes.status, 200);
+  const completeBody = await completeChunkRes.json();
+  assert.equal(completeBody.storageType, 's3');
+  assert.equal(completeBody.serverSha256, largeVideoHash);
+  assert.equal(stats.multipartInits, 1, 'Large file (>5 MiB threshold) must initiate S3 Multipart Upload');
+  assert.equal(stats.multipartParts, 2, '5.5 MiB file with 5 MiB part size must upload 2 S3 parts');
+  assert.equal(stats.multipartCompletes, 1, 'S3 Multipart Upload must complete cleanly');
+  const storedVideo = s3Objects.get(`/photohub-mega-s4/${completeBody.savedPath}`);
+  assert.ok(storedVideo);
+  assert.equal(
+    crypto.createHash('sha256').update(storedVideo.buf).digest('hex'),
+    largeVideoHash
+  );
+  assert.deepEqual(await listLocalStorageFiles(ctx.storageDir), [], 'Local STORAGE_DIR must have 0 media files after chunked S3 upload');
+
+  // 7. Smart Cleanup scans S3 photos cleanly
+  const cleanupRes = await ctx.request('/api/photos/cleanup-suggestions?scan=1', { headers: aliceHeaders });
+  assert.equal(cleanupRes.status, 200);
+  const cleanupBody = await cleanupRes.json();
+  assert.equal(cleanupBody.success, true);
+  assert.ok(cleanupBody.summary.analyzedCount >= 2, 'Smart Cleanup should analyze S3 photos');
+
+  // 8. Public Share streams S3 proxy preview, S3 download, and S3 ZIP without CORS redirects
+  const shareRes = await ctx.request('/api/shares', {
+    method: 'POST',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ hashes: [hashA, hashB], title: 'MEGA S4 Trip' }),
+  });
+  assert.equal(shareRes.status, 201);
+  const shareToken = (await shareRes.json()).share.token;
+
+  const pubPreview = await ctx.request(`/api/public/share/${shareToken}/preview/${hashA}`);
+  assert.equal(pubPreview.status, 200);
+  assert.equal(Buffer.compare(pubPreview.buffer, s3Objects.get(s3ProxyKeyA).buf), 0);
+
+  const pubDownload = await ctx.request(`/api/public/share/${shareToken}/download/${hashA}`);
+  assert.equal(pubDownload.status, 200);
+  assert.equal(Buffer.compare(pubDownload.buffer, realJpegA), 0);
+
+  const pubZip = await ctx.request(`/api/public/share/${shareToken}/download-zip`);
+  assert.equal(pubZip.status, 200);
+  assert.equal(pubZip.buffer.subarray(0, 2).toString('ascii'), 'PK');
+
+  // 9. DELETE /api/photo/:hash deletes master + image proxy + video proxy from S3 AND cleans local thumb-cache
+  const delB = await ctx.request(`/api/photo/${hashB}`, {
+    method: 'DELETE',
+    headers: aliceHeaders,
+  });
+  assert.equal(delB.status, 200);
+  assert.equal(s3Objects.has(`/photohub-mega-s4/${upBBody.savedPath}`), false, 'S3 master should be deleted');
+  assert.equal(s3Objects.has(`/photohub-mega-s4/vault/alice/.proxies/${hashB}.jpg`), false, 'S3 image proxy should be deleted');
+  assert.equal(s3Objects.has(`/photohub-mega-s4/vault/alice/.proxies/${hashB}.mp4`), false, 'S3 video proxy should be deleted');
+
+  const pathExists = (p) => fsp.access(p).then(() => true, () => false);
+  const cachedThumbPathA = path.join(ctx.dataDir, 'thumb-cache', 'alice', `${hashA}.webp`);
+  assert.equal(await pathExists(cachedThumbPathA), true);
+  const delA = await ctx.request(`/api/photo/${hashA}`, {
+    method: 'DELETE',
+    headers: aliceHeaders,
+  });
+  assert.equal(delA.status, 200);
+  assert.equal(s3Objects.has(s3MasterKeyA), false);
+  assert.equal(s3Objects.has(s3ProxyKeyA), false);
+  assert.equal(await pathExists(cachedThumbPathA), false, 'Local SSD thumb-cache should be removed on delete');
+});
+
+test('46. STORAGE_BACKEND=disk (default) preserves direct-to-server local storage even when S3 credentials are configured', async (t) => {
+  const pathExists = (p) => fsp.access(p).then(() => true, () => false);
+  const s3Objects = new Map();
+  const mockS3 = http.createServer((req, res) => {
+    const key = new URL(req.url, 'http://127.0.0.1').pathname;
+    if (req.method === 'PUT') {
+      const chunks = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        s3Objects.set(key, Buffer.concat(chunks));
+        res.writeHead(200);
+        res.end();
+      });
+    } else if (req.method === 'GET') {
+      const buf = s3Objects.get(key);
+      if (!buf) {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'Content-Length': String(buf.length) });
+      res.end(buf);
+    } else {
+      res.writeHead(405);
+      res.end();
+    }
+  });
+  await new Promise((resolve) => mockS3.listen(0, '127.0.0.1', resolve));
+  const s3Port = mockS3.address().port;
+
+  // Notice storageBackend is NOT set -> defaults to 'disk'
+  const ctx = await startTestServer({
+    s3Endpoint: `http://127.0.0.1:${s3Port}`,
+    s3Bucket: 'hybrid-bucket',
+    s3AccessKeyId: 'key',
+    s3SecretAccessKey: 'secret',
+    rateLimitEnabled: false,
+  });
+  t.after(async () => {
+    await ctx.cleanup();
+    await new Promise((resolve) => mockS3.close(resolve));
+  });
+
+  const health = await (await ctx.request('/api/health')).json();
+  assert.equal(health.storageBackend, 'disk');
+  assert.equal(health.s3Enabled, true);
+
+  // Direct upload goes to local STORAGE_DIR (NOT S3!)
+  const diskPhoto = Buffer.from('DIRECT_TO_SERVER_DISK_BYTES_2026');
+  const diskHash = crypto.createHash('sha256').update(diskPhoto).digest('hex');
+  const upRes = await ctx.request('/api/upload', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'image/jpeg',
+      'X-File-Name': 'LOCAL_DISK.JPG',
+      'X-File-Sha256': diskHash,
+      'X-Skip-Auto-Proxy': '1',
+    },
+    body: diskPhoto,
+  });
+  assert.equal(upRes.status, 200);
+  const upBody = await upRes.json();
+  assert.equal(upBody.success, true);
+  assert.equal(await pathExists(path.join(ctx.storageDir, upBody.savedPath)), true, 'Direct upload must stay on local disk');
+  assert.equal(s3Objects.size, 0, 'S3 bucket must remain untouched by direct uploads in disk mode');
+
+  // Proxy registration for a disk master also stays on local disk
+  const diskProxy = Buffer.from('LOCAL_DISK_PROXY_BYTES');
+  const regRes = await ctx.request('/api/proxy/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      masterHash: diskHash,
+      proxyHash: crypto.createHash('sha256').update(diskProxy).digest('hex'),
+      proxyBase64: diskProxy.toString('base64'),
+    }),
+  });
+  assert.equal(regRes.status, 200);
+  assert.equal((await regRes.json()).proxyStorageType, 'disk');
+  assert.equal(await pathExists(path.join(ctx.storageDir, '.proxies', `${diskHash}.jpg`)), true);
+  assert.equal(s3Objects.size, 0);
+
+  // Explicit presign + confirm S3 flow STILL works seamlessly alongside local disk photos
+  const hybridS3Bytes = Buffer.from('HYBRID_S3_PRESIGN_BYTES');
+  const hybridHash = crypto.createHash('sha256').update(hybridS3Bytes).digest('hex');
+  const presign = await (
+    await ctx.request('/api/upload/presign', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fileName: 'HYBRID.JPG', expectedHash: hybridHash }),
+    })
+  ).json();
+  assert.equal(presign.success, true);
+  assert.equal((await fetch(presign.uploadUrl, { method: 'PUT', body: hybridS3Bytes })).status, 200);
+  const confirm = await (
+    await ctx.request('/api/upload/confirm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ objectKey: presign.objectKey, expectedHash: hybridHash, fileName: 'HYBRID.JPG' }),
+    })
+  ).json();
+  assert.equal(confirm.success, true);
+  assert.equal(confirm.storageType, 's3');
+
+  // Both local disk photo and S3 photo coexist cleanly in GET /api/photos & GET /api/photo/:hash
+  const dlDisk = await ctx.request(`/api/photo/${diskHash}`);
+  assert.equal(dlDisk.status, 200);
+  assert.equal(Buffer.compare(dlDisk.buffer, diskPhoto), 0);
+
+  const dlS3 = await ctx.request(`/api/photo/${hybridHash}`);
+  assert.equal(dlS3.status, 200);
+  assert.equal(Buffer.compare(dlS3.buffer, hybridS3Bytes), 0);
 });

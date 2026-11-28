@@ -10,6 +10,7 @@
 const fs = require('fs');
 const path = require('path');
 const { isVideoFilename } = require('./proxyService');
+const { isS3Configured, fetchS3ObjectBuffer } = require('./s3Service');
 
 let sharpModule = null;
 try {
@@ -39,22 +40,16 @@ function hammingDistanceHex64(hexA, hexB) {
   return dist;
 }
 
-/**
- * Computes a 64-bit dHash, Laplacian variance blurScore, and dimensions for a local image file.
- * Returns null gracefully if `sharp` is unavailable or file is a video/unreadable.
- */
-async function analyzePhotoFile(filePath, originalName = '') {
-  if (!sharpModule || !filePath) return null;
-  if (isVideoFilename(originalName || filePath)) return null;
-  if (!fs.existsSync(filePath)) return null;
+async function analyzePhotoSource(input) {
+  if (!sharpModule || !input) return null;
 
   try {
-    const meta = await sharpModule(filePath).metadata();
+    const meta = await sharpModule(input).metadata();
     const width = meta.width || null;
     const height = meta.height || null;
 
     // 1. 9x8 grayscale for 64-bit horizontal difference hash (dHash)
-    const { data: dhashPixels } = await sharpModule(filePath)
+    const { data: dhashPixels } = await sharpModule(input)
       .rotate()
       .resize(9, 8, { fit: 'fill' })
       .grayscale()
@@ -75,7 +70,7 @@ async function analyzePhotoFile(filePath, originalName = '') {
     }
 
     // 2. 200x200 grayscale Laplacian variance for sharpness / blur detection
-    const { data: gray, info } = await sharpModule(filePath)
+    const { data: gray, info } = await sharpModule(input)
       .rotate()
       .resize(200, 200, { fit: 'inside', withoutEnlargement: true })
       .grayscale()
@@ -123,6 +118,23 @@ async function analyzePhotoFile(filePath, originalName = '') {
   }
 }
 
+/**
+ * Computes a 64-bit dHash, Laplacian variance blurScore, and dimensions for a local image file.
+ * Returns null gracefully if `sharp` is unavailable or file is a video/unreadable.
+ */
+async function analyzePhotoFile(filePath, originalName = '') {
+  if (!sharpModule || !filePath) return null;
+  if (isVideoFilename(originalName || filePath)) return null;
+  if (!fs.existsSync(filePath)) return null;
+  return analyzePhotoSource(filePath);
+}
+
+async function analyzePhotoBuffer(buffer, originalName = '') {
+  if (!sharpModule || !Buffer.isBuffer(buffer) || buffer.length === 0) return null;
+  if (originalName && isVideoFilename(originalName)) return null;
+  return analyzePhotoSource(buffer);
+}
+
 function parseTimestampMs(photo) {
   const raw = photo.takenAt || photo.photoDate || photo.uploadedAt;
   if (!raw) return null;
@@ -138,6 +150,7 @@ function parseTimestampMs(photo) {
 async function buildCleanupSuggestions({
   hashIndex,
   storageDir,
+  s3Config = null,
   scan = true,
   maxScan = 80,
   blurThreshold = 35,
@@ -146,6 +159,7 @@ async function buildCleanupSuggestions({
   burstWindowSec = 45,
 }) {
   const unique = hashIndex._getUniqueMasterRecords();
+  const s3Ready = Boolean(s3Config && isS3Configured(s3Config));
   let scannedThisCall = 0;
   let analyzedCount = 0;
   let pendingCount = 0;
@@ -158,7 +172,7 @@ async function buildCleanupSuggestions({
       analyzedCount += 1;
       continue;
     }
-    if (!scan || !sharpModule || entry.storageType === 's3') {
+    if (!scan || !sharpModule || (entry.storageType === 's3' && !s3Ready)) {
       pendingCount += 1;
       continue;
     }
@@ -167,20 +181,46 @@ async function buildCleanupSuggestions({
       continue;
     }
 
+    let metrics = null;
     // Prefer analyzing the smaller proxy JPEG if available (much faster!), falling back to original
-    const proxyPath = entry.proxyRelativePath
-      ? path.join(storageDir, entry.proxyRelativePath)
-      : null;
-    const masterPath = entry.relativePath
-      ? path.join(storageDir, entry.relativePath)
-      : null;
-    const targetPath = proxyPath && fs.existsSync(proxyPath) ? proxyPath : masterPath;
-    if (!targetPath || !fs.existsSync(targetPath)) {
-      pendingCount += 1;
-      continue;
+    if (entry.proxyRelativePath && entry.proxyStorageType === 's3' && s3Ready) {
+      const buf = await fetchS3ObjectBuffer({
+        s3Config,
+        objectKey: entry.proxyRelativePath,
+        maxBytes: 25 * 1024 * 1024,
+      }).catch(() => null);
+      if (buf) {
+        metrics = await analyzePhotoBuffer(buf, entry.originalName);
+      }
+    } else if (entry.proxyRelativePath) {
+      const proxyPath = path.join(storageDir, entry.proxyRelativePath);
+      if (fs.existsSync(proxyPath)) {
+        metrics = await analyzePhotoFile(proxyPath, entry.originalName);
+      }
     }
 
-    const metrics = await analyzePhotoFile(targetPath, entry.originalName);
+    if (!metrics) {
+      if (entry.storageType === 's3' && s3Ready && entry.relativePath) {
+        const buf = await fetchS3ObjectBuffer({
+          s3Config,
+          objectKey: entry.relativePath,
+          maxBytes: 25 * 1024 * 1024,
+        }).catch(() => null);
+        if (!buf) {
+          pendingCount += 1;
+          continue;
+        }
+        metrics = await analyzePhotoBuffer(buf, entry.originalName);
+      } else {
+        const masterPath = entry.relativePath ? path.join(storageDir, entry.relativePath) : null;
+        if (!masterPath || !fs.existsSync(masterPath)) {
+          pendingCount += 1;
+          continue;
+        }
+        metrics = await analyzePhotoFile(masterPath, entry.originalName);
+      }
+    }
+
     scannedThisCall += 1;
     if (metrics) {
       entry.dHash = metrics.dHash;
@@ -332,5 +372,6 @@ module.exports = {
   isAnalysisAvailable,
   hammingDistanceHex64,
   analyzePhotoFile,
+  analyzePhotoBuffer,
   buildCleanupSuggestions,
 };

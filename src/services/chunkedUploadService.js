@@ -10,8 +10,10 @@
 
 const fs = require('fs');
 const fsp = require('fs/promises');
+const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { isS3Configured } = require('./s3Service');
 const {
   assertWithinQuota,
   assertMinimumFreeDisk,
@@ -406,6 +408,7 @@ class ChunkedUploadService {
     minFreeDiskBytes = 0,
     expectedHash = '',
     strictChecksum = false,
+    s3Config = null,
   }) {
     const session = await this._getSession(uploadId, storageDir, folderName);
     if (!session) {
@@ -421,29 +424,36 @@ class ChunkedUploadService {
     }
     this.completingIds.add(session.uploadId);
 
-    const missingChunks = [];
-    for (let i = 0; i < session.totalChunks; i++) {
-      const pPath = this._partPath(storageDir, session.uploadId, i);
-      if (!fs.existsSync(pPath)) {
-        missingChunks.push(i);
-      }
-    }
-    if (missingChunks.length > 0) {
-      const err = new Error(`Cannot complete upload: missing ${missingChunks.length} chunk(s).`);
-      err.statusCode = 400;
-      err.missingChunks = missingChunks.slice(0, 50);
-      throw err;
-    }
-
-    const stagingPath = path.join(
-      storageDir,
-      `.chunked_assemble_${process.pid}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.tmp`
-    );
-
-    const hasher = crypto.createHash('sha256');
-    let assembledBytes = 0;
+    const useS3 = Boolean(s3Config && isS3Configured(s3Config));
+    let stagingPath = null;
 
     try {
+      const missingChunks = [];
+      for (let i = 0; i < session.totalChunks; i++) {
+        const pPath = this._partPath(storageDir, session.uploadId, i);
+        if (!fs.existsSync(pPath)) {
+          missingChunks.push(i);
+        }
+      }
+      if (missingChunks.length > 0) {
+        const err = new Error(`Cannot complete upload: missing ${missingChunks.length} chunk(s).`);
+        err.statusCode = 400;
+        err.missingChunks = missingChunks.slice(0, 50);
+        throw err;
+      }
+
+      const stagingBaseDir = useS3
+        ? path.join(os.tmpdir(), 'photohub-s3-staging')
+        : storageDir;
+      await fsp.mkdir(stagingBaseDir, { recursive: true });
+      stagingPath = path.join(
+        stagingBaseDir,
+        `.chunked_assemble_${process.pid}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.tmp`
+      );
+
+      const hasher = crypto.createHash('sha256');
+      let assembledBytes = 0;
+
       const ws = fs.createWriteStream(stagingPath, { highWaterMark: 512 * 1024 });
       for (let i = 0; i < session.totalChunks; i++) {
         const pPath = this._partPath(storageDir, session.uploadId, i);
@@ -486,12 +496,16 @@ class ChunkedUploadService {
         gpsLat: session.gpsLat,
         gpsLng: session.gpsLng,
         locationLabel: session.locationLabel,
+        s3Config,
+        folderName,
       });
 
       await this.abortSession({ uploadId: session.uploadId, storageDir, folderName, silent: true });
       return result;
     } catch (err) {
-      await fsp.unlink(stagingPath).catch(() => {});
+      if (stagingPath) {
+        await fsp.unlink(stagingPath).catch(() => {});
+      }
       throw err;
     } finally {
       this.completingIds.delete(session.uploadId);

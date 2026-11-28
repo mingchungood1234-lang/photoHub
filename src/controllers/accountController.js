@@ -7,7 +7,7 @@
  * Returns: The logged-in user's assigned folder, storage usage vs. quota, and indexed photo count.
  */
 
-const { isS3Configured } = require('../services/s3Service');
+const { isS3Configured, isPrimaryS3Backend } = require('../services/s3Service');
 
 function createAccountController({ config, contextService }) {
   return {
@@ -36,6 +36,7 @@ function createAccountController({ config, contextService }) {
           name: name || null,
           nodeId: nodeId || 'primary',
           indexedPhotos: hashIndex.size(),
+          storageBackend: isPrimaryS3Backend(config) ? 's3' : 'disk',
           s3Enabled: isS3Configured(config.s3),
           storage,
         });

@@ -267,7 +267,7 @@ class HashIndex {
         for (const [hash, entry] of Object.entries(parsed)) {
           if (entry && entry.relativePath) {
             const relSlash = String(entry.relativePath).replace(/\\/g, '/');
-            if (this.shouldExcludePath && this.shouldExcludePath(relSlash, false)) {
+            if (entry.storageType !== 's3' && this.shouldExcludePath && this.shouldExcludePath(relSlash, false)) {
               prunedExcluded = true;
               continue;
             }
@@ -321,7 +321,7 @@ class HashIndex {
 
       for (const [hash, entry] of this.records.entries()) {
         const relSlash = String((entry && entry.relativePath) || '').replace(/\\/g, '/');
-        if (this.shouldExcludePath && relSlash && this.shouldExcludePath(relSlash, false)) {
+        if (entry && entry.storageType !== 's3' && this.shouldExcludePath && relSlash && this.shouldExcludePath(relSlash, false)) {
           this._deleteIndexedRecord(hash, entry);
           changed = true;
           continue;
@@ -747,11 +747,17 @@ class HashIndex {
     if (proxyMeta.proxyRelativePath) {
       record.proxyRelativePath = proxyMeta.proxyRelativePath;
     }
+    if (proxyMeta.proxyStorageType) {
+      record.proxyStorageType = proxyMeta.proxyStorageType;
+    }
     if (proxyMeta.proxySize) {
       record.proxySize = Number(proxyMeta.proxySize);
     }
     if (proxyMeta.videoProxyRelativePath) {
       record.videoProxyRelativePath = proxyMeta.videoProxyRelativePath;
+    }
+    if (proxyMeta.videoProxyStorageType) {
+      record.videoProxyStorageType = proxyMeta.videoProxyStorageType;
     }
     if (proxyMeta.videoProxySize) {
       record.videoProxySize = Number(proxyMeta.videoProxySize);
@@ -1129,6 +1135,7 @@ class HashIndex {
       year: yearNum,
       uploadedAt: entry.uploadedAt || '',
       savedPath: entry.relativePath,
+      storageType: entry.storageType || 'disk',
       hasProxy: Boolean(entry.proxyHash || entry.proxyRelativePath),
       hasPreview: Boolean(entry.proxyRelativePath),
       proxyHash: entry.proxyHash || null,

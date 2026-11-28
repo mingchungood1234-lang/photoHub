@@ -9,7 +9,7 @@
 
 const os = require('os');
 const path = require('path');
-const { isS3Configured } = require('../services/s3Service');
+const { isS3Configured, isPrimaryS3Backend } = require('../services/s3Service');
 const { isVideoFilename, getCapabilities: getProxyCapabilities } = require('../services/proxyService');
 const { gbToBytes } = require('../config/env');
 
@@ -129,6 +129,7 @@ function createAdminController({
           success: true,
           server: {
             storageDir: config.storageDir,
+            storageBackend: isPrimaryS3Backend(config) ? 's3' : 'disk',
             s3Enabled: isS3Configured(config.s3),
             googleEnabled: Boolean(config.googleClientId && config.googleClientSecret),
             nodeCount: config.storageNodes.length || 1,

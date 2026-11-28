@@ -7,6 +7,8 @@
  */
 
 const fs = require('fs');
+const fsp = require('fs/promises');
+const os = require('os');
 const path = require('path');
 const {
   isVideoFilename,
@@ -14,12 +16,20 @@ const {
   generateServerSideProxy,
 } = require('./proxyService');
 const { analyzePhotoFile } = require('./mediaAnalysisService');
+const {
+  isS3Configured,
+  isPrimaryS3Backend,
+  buildS3ProxyKey,
+  uploadFileToS3,
+  downloadS3ObjectToFile,
+} = require('./s3Service');
 
 const MAX_RECENT_JOBS = 25;
 
 class ProxyQueueService {
-  constructor({ concurrency = 2 } = {}) {
+  constructor({ concurrency = 2, config = null } = {}) {
     this.concurrency = Math.max(1, Number(concurrency) || 2);
+    this.config = config;
     this.queue = [];
     this.pendingKeys = new Set();
     this.activeCount = 0;
@@ -63,6 +73,7 @@ class ProxyQueueService {
       jobKey,
       hashIndex,
       storageDir,
+      rawFolderName: folderName || null,
       folderName: folderName || '/',
       masterHash: normHash,
       originalName,
@@ -76,11 +87,12 @@ class ProxyQueueService {
 
   enqueueMissingForContext({ hashIndex, storageDir, folderName = null }, { limit = 500 } = {}) {
     if (!hashIndex || !storageDir) return 0;
+    const s3Ready = Boolean(this.config && isS3Configured(this.config.s3));
     let count = 0;
     const unique = hashIndex._getUniqueMasterRecords();
     for (const { canonicalHash, entry } of unique) {
       if (count >= limit) break;
-      if (entry.storageType === 's3') continue;
+      if (entry.storageType === 's3' && !s3Ready) continue;
       const isVid = isVideoFilename(entry.originalName || entry.relativePath || '');
       const needsProxy = isVid
         ? !entry.proxyRelativePath || !entry.videoProxyRelativePath
@@ -119,6 +131,7 @@ class ProxyQueueService {
 
   async _processJob(job) {
     const startedAt = Date.now();
+    let tmpWorkDir = null;
     try {
       const lookup = await job.hashIndex.lookup(job.masterHash, { allowStatFastPath: true });
       if (lookup.status === 'missing' || !lookup.record || lookup.record.deletedAt) {
@@ -127,39 +140,131 @@ class ProxyQueueService {
       }
 
       const record = lookup.record;
-      if (record.storageType === 's3' || !record.relativePath) {
+      if (!record.relativePath) {
         this.stats.skipped += 1;
         return;
       }
 
-      const fullPath = path.join(job.storageDir, record.relativePath);
-      if (!fs.existsSync(fullPath)) {
+      const isMasterS3 = record.storageType === 's3';
+      const s3Config = this.config && isS3Configured(this.config.s3) ? this.config.s3 : null;
+      if (isMasterS3 && !s3Config) {
         this.stats.skipped += 1;
         return;
       }
 
+      const storeInS3 = Boolean(s3Config && (isPrimaryS3Backend(this.config) || isMasterS3));
       const isVid = isVideoFilename(record.originalName || record.relativePath || '');
-      let didWork = false;
-
       const needsProxy = isVid
         ? !record.proxyRelativePath || !record.videoProxyRelativePath
         : !record.proxyRelativePath;
+      const needsMetrics =
+        !isVid && (typeof record.dHash !== 'string' || typeof record.blurScore !== 'number');
+
+      if (!needsProxy && !needsMetrics) {
+        this.stats.skipped += 1;
+        return;
+      }
+
+      let fullPath = null;
+      if (isMasterS3 || storeInS3 || record.proxyStorageType === 's3') {
+        tmpWorkDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'photohub-queue-'));
+      }
+
+      const ensureSourceFile = async () => {
+        if (fullPath) return fullPath;
+        if (isMasterS3) {
+          const safeSrcName = path
+            .basename(record.originalName || record.relativePath || 'source.bin')
+            .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_');
+          const dest = path.join(tmpWorkDir, safeSrcName);
+          await downloadS3ObjectToFile({
+            s3Config,
+            objectKey: record.relativePath,
+            destPath: dest,
+          });
+          fullPath = dest;
+          return fullPath;
+        }
+        const diskPath = path.join(job.storageDir, record.relativePath);
+        if (!fs.existsSync(diskPath)) return null;
+        fullPath = diskPath;
+        return fullPath;
+      };
+
+      let didWork = false;
+      let localProxyPathForAnalysis = null;
 
       if (needsProxy) {
-        const proxiesDir = path.join(job.storageDir, '.proxies');
+        const sourcePath = await ensureSourceFile();
+        if (!sourcePath) {
+          this.stats.skipped += 1;
+          return;
+        }
+        const proxiesDir = storeInS3
+          ? path.join(tmpWorkDir, '.proxies')
+          : path.join(job.storageDir, '.proxies');
         try {
           const generated = await generateServerSideProxy({
-            sourcePath: fullPath,
+            sourcePath,
             proxiesDir,
             masterHash: lookup.masterHash,
-            originalName: record.originalName || fullPath,
+            originalName: record.originalName || sourcePath,
             quality: 0.76,
           });
+
+          const proxyMeta = { ...generated };
+          if (storeInS3) {
+            if (generated.proxyRelativePath) {
+              const localImgProxy = path.join(proxiesDir, path.basename(generated.proxyRelativePath));
+              localProxyPathForAnalysis = localImgProxy;
+              const ext = path.extname(localImgProxy) || '.jpg';
+              const s3ImgKey = buildS3ProxyKey({
+                folderName: job.rawFolderName,
+                masterHash: lookup.masterHash,
+                ext,
+                prefix: s3Config.prefix,
+              });
+              await uploadFileToS3({
+                s3Config,
+                objectKey: s3ImgKey,
+                filePath: localImgProxy,
+                contentType: ext === '.heic' ? 'image/heic' : 'image/jpeg',
+              });
+              proxyMeta.proxyRelativePath = s3ImgKey;
+              proxyMeta.proxyStorageType = 's3';
+            }
+            if (generated.videoProxyRelativePath) {
+              const localVidProxy = path.join(proxiesDir, path.basename(generated.videoProxyRelativePath));
+              const s3VidKey = buildS3ProxyKey({
+                folderName: job.rawFolderName,
+                masterHash: lookup.masterHash,
+                ext: '.mp4',
+                prefix: s3Config.prefix,
+              });
+              await uploadFileToS3({
+                s3Config,
+                objectKey: s3VidKey,
+                filePath: localVidProxy,
+                contentType: 'video/mp4',
+              });
+              proxyMeta.videoProxyRelativePath = s3VidKey;
+              proxyMeta.videoProxyStorageType = 's3';
+            }
+          } else {
+            if (proxyMeta.proxyRelativePath) {
+              proxyMeta.proxyStorageType = 'disk';
+              localProxyPathForAnalysis = path.join(job.storageDir, proxyMeta.proxyRelativePath);
+            }
+            if (proxyMeta.videoProxyRelativePath) {
+              proxyMeta.videoProxyStorageType = 'disk';
+            }
+          }
+
           await job.hashIndex.registerProxy(
             lookup.masterHash,
-            generated.proxyHash,
+            proxyMeta.proxyHash,
             record.assetId || '',
-            generated
+            proxyMeta
           );
           didWork = true;
         } catch (proxyErr) {
@@ -171,15 +276,32 @@ class ProxyQueueService {
       }
 
       // Compute perceptual dHash + sharpness blurScore for photos so Smart Cleanup is instant
-      if (!isVid && (typeof record.dHash !== 'string' || typeof record.blurScore !== 'number')) {
-        const analysisPath =
-          record.proxyRelativePath && fs.existsSync(path.join(job.storageDir, record.proxyRelativePath))
-            ? path.join(job.storageDir, record.proxyRelativePath)
-            : fullPath;
-        const metrics = await analyzePhotoFile(analysisPath, record.originalName);
-        if (metrics) {
-          await job.hashIndex.updateVisualMetrics(lookup.masterHash, metrics);
-          didWork = true;
+      if (needsMetrics) {
+        let analysisPath = localProxyPathForAnalysis;
+        if (!analysisPath && record.proxyRelativePath) {
+          if (record.proxyStorageType === 's3' && s3Config) {
+            const proxyExt = path.extname(record.proxyRelativePath) || '.jpg';
+            const tmpProxy = path.join(tmpWorkDir, `proxy_analyze${proxyExt}`);
+            await downloadS3ObjectToFile({
+              s3Config,
+              objectKey: record.proxyRelativePath,
+              destPath: tmpProxy,
+            }).catch(() => {});
+            if (fs.existsSync(tmpProxy)) analysisPath = tmpProxy;
+          } else {
+            const candidate = path.join(job.storageDir, record.proxyRelativePath);
+            if (fs.existsSync(candidate)) analysisPath = candidate;
+          }
+        }
+        if (!analysisPath) {
+          analysisPath = await ensureSourceFile();
+        }
+        if (analysisPath) {
+          const metrics = await analyzePhotoFile(analysisPath, record.originalName);
+          if (metrics) {
+            await job.hashIndex.updateVisualMetrics(lookup.masterHash, metrics);
+            didWork = true;
+          }
         }
       }
 
@@ -188,7 +310,7 @@ class ProxyQueueService {
         this._recordJob({
           status: 'completed',
           masterHash: lookup.masterHash.slice(0, 12),
-          fileName: record.originalName || path.basename(fullPath),
+          fileName: record.originalName || path.basename(record.relativePath),
           folderName: job.folderName,
           source: job.source,
           durationMs: Date.now() - startedAt,
@@ -207,6 +329,10 @@ class ProxyQueueService {
         error: err && err.message ? err.message.slice(0, 180) : 'Unknown error',
         durationMs: Date.now() - startedAt,
       });
+    } finally {
+      if (tmpWorkDir) {
+        await fsp.rm(tmpWorkDir, { recursive: true, force: true }).catch(() => {});
+      }
     }
   }
 

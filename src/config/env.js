@@ -351,11 +351,24 @@ function getConfig(overrides = {}) {
           process.env.SCAN_STORAGE_ON_STARTUP ??
           'true'
       ).toLowerCase() !== 'false',
-    // Optional S3 / MinIO configuration for pre-signed URL uploads
+    // Storage mode: 'disk' (default: direct to server STORAGE_DIR) or 's3' (all originals & proxies in MEGA S4 / S3 / MinIO / R2)
+    storageBackend: (() => {
+      const raw = String(overrides.storageBackend ?? process.env.STORAGE_BACKEND ?? 'disk')
+        .trim()
+        .toLowerCase();
+      if (raw === 's3' || raw === 's4' || raw === 'mega-s4' || raw === 'megas4' || raw === 'object') {
+        return 's3';
+      }
+      return 'disk';
+    })(),
+    // Optional S3 / MEGA S4 / MinIO / R2 configuration (leave STORAGE_BACKEND=disk to store directly on server)
     s3: {
       endpoint: (overrides.s3Endpoint ?? process.env.S3_ENDPOINT ?? '').trim(),
       region: (overrides.s3Region ?? process.env.S3_REGION ?? 'us-east-1').trim(),
       bucket: (overrides.s3Bucket ?? process.env.S3_BUCKET ?? '').trim(),
+      prefix: String(overrides.s3Prefix ?? process.env.S3_PREFIX ?? '')
+        .trim()
+        .replace(/^\/+|\/+$/g, ''),
       accessKeyId: (overrides.s3AccessKeyId ?? process.env.S3_ACCESS_KEY_ID ?? '').trim(),
       secretAccessKey: (overrides.s3SecretAccessKey ?? process.env.S3_SECRET_ACCESS_KEY ?? '').trim(),
       forcePathStyle:
@@ -364,6 +377,27 @@ function getConfig(overrides = {}) {
             process.env.S3_FORCE_PATH_STYLE ??
             'true'
         ).toLowerCase() !== 'false',
+      // Stream S3 reads through the backend (supports full Range seeking & avoids browser CORS errors on MEGA S4)
+      streamProxy:
+        String(
+          overrides.s3StreamProxy ??
+            process.env.S3_STREAM_PROXY ??
+            'true'
+        ).toLowerCase() !== 'false',
+      multipartThresholdBytes:
+        Math.max(
+          5,
+          Number(overrides.s3MultipartThresholdMb ?? process.env.S3_MULTIPART_THRESHOLD_MB ?? 64) || 64
+        ) *
+        1024 *
+        1024,
+      multipartPartSizeBytes:
+        Math.max(
+          5,
+          Number(overrides.s3MultipartPartSizeMb ?? process.env.S3_MULTIPART_PART_SIZE_MB ?? 16) || 16
+        ) *
+        1024 *
+        1024,
     },
   };
 }

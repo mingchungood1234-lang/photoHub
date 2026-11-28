@@ -10,12 +10,21 @@
  */
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const {
   getCapabilities: getProxyCapabilities,
   generateServerSideProxy,
 } = require('../services/proxyService');
+const {
+  isS3Configured,
+  isPrimaryS3Backend,
+  buildS3ProxyKey,
+  putS3Buffer,
+  uploadFileToS3,
+  downloadS3ObjectToFile,
+} = require('../services/s3Service');
 
 const MAX_BASE64_IMAGE_PROXY_BYTES = 10 * 1024 * 1024; // 10 MB
 const MAX_BASE64_VIDEO_PROXY_BYTES = 20 * 1024 * 1024; // 20 MB
@@ -33,6 +42,13 @@ function resolveSafeChildPath(baseDir, fileName) {
 }
 
 function createProxyController({ config }) {
+  function shouldStoreProxyInS3(record) {
+    return Boolean(
+      isS3Configured(config.s3) &&
+        (isPrimaryS3Backend(config) || (record && record.storageType === 's3'))
+    );
+  }
+
   return {
     async registerProxy(req, res) {
       try {
@@ -59,8 +75,8 @@ function createProxyController({ config }) {
           });
         }
 
-        const { hashIndex, storageDir } = req.userContext;
-        // CRITICAL: Verify master exists in this user's HashIndex BEFORE writing any file to disk!
+        const { hashIndex, storageDir, folderName } = req.userContext;
+        // CRITICAL: Verify master exists in this user's HashIndex BEFORE writing any file to disk/S3!
         const lookupResult = await hashIndex.lookup(rawMaster, { allowStatFastPath: true });
         if (lookupResult.status === 'missing' || !lookupResult.record) {
           return res.status(404).json({
@@ -81,6 +97,7 @@ function createProxyController({ config }) {
         }
 
         const proxyMeta = {};
+        const storeInS3 = shouldStoreProxyInS3(lookupResult.record);
         const proxiesDir = path.join(storageDir, '.proxies');
 
         if (proxyBase64 && typeof proxyBase64 === 'string') {
@@ -102,12 +119,31 @@ function createProxyController({ config }) {
               String(proxyFormat || '').toLowerCase() === 'heic'
                 ? '.heic'
                 : '.jpg';
-            await fs.promises.mkdir(proxiesDir, { recursive: true });
-            const proxyFileName = `${normMaster}${ext}`;
-            const proxyFullPath = resolveSafeChildPath(proxiesDir, proxyFileName);
-            await fs.promises.writeFile(proxyFullPath, proxyBuf);
-            proxyMeta.proxyRelativePath = `.proxies/${proxyFileName}`;
-            proxyMeta.proxySize = proxyBuf.length;
+            if (storeInS3) {
+              const objectKey = buildS3ProxyKey({
+                folderName,
+                masterHash: normMaster,
+                ext,
+                prefix: config.s3.prefix,
+              });
+              await putS3Buffer({
+                s3Config: config.s3,
+                objectKey,
+                buffer: proxyBuf,
+                contentType: ext === '.heic' ? 'image/heic' : 'image/jpeg',
+              });
+              proxyMeta.proxyRelativePath = objectKey;
+              proxyMeta.proxyStorageType = 's3';
+              proxyMeta.proxySize = proxyBuf.length;
+            } else {
+              await fs.promises.mkdir(proxiesDir, { recursive: true });
+              const proxyFileName = `${normMaster}${ext}`;
+              const proxyFullPath = resolveSafeChildPath(proxiesDir, proxyFileName);
+              await fs.promises.writeFile(proxyFullPath, proxyBuf);
+              proxyMeta.proxyRelativePath = `.proxies/${proxyFileName}`;
+              proxyMeta.proxyStorageType = 'disk';
+              proxyMeta.proxySize = proxyBuf.length;
+            }
           }
         }
 
@@ -126,12 +162,31 @@ function createProxyController({ config }) {
             });
           }
           if (videoBuf.length > 0) {
-            await fs.promises.mkdir(proxiesDir, { recursive: true });
-            const videoFileName = `${normMaster}.mp4`;
-            const videoFullPath = resolveSafeChildPath(proxiesDir, videoFileName);
-            await fs.promises.writeFile(videoFullPath, videoBuf);
-            proxyMeta.videoProxyRelativePath = `.proxies/${videoFileName}`;
-            proxyMeta.videoProxySize = videoBuf.length;
+            if (storeInS3) {
+              const objectKey = buildS3ProxyKey({
+                folderName,
+                masterHash: normMaster,
+                ext: '.mp4',
+                prefix: config.s3.prefix,
+              });
+              await putS3Buffer({
+                s3Config: config.s3,
+                objectKey,
+                buffer: videoBuf,
+                contentType: 'video/mp4',
+              });
+              proxyMeta.videoProxyRelativePath = objectKey;
+              proxyMeta.videoProxyStorageType = 's3';
+              proxyMeta.videoProxySize = videoBuf.length;
+            } else {
+              await fs.promises.mkdir(proxiesDir, { recursive: true });
+              const videoFileName = `${normMaster}.mp4`;
+              const videoFullPath = resolveSafeChildPath(proxiesDir, videoFileName);
+              await fs.promises.writeFile(videoFullPath, videoBuf);
+              proxyMeta.videoProxyRelativePath = `.proxies/${videoFileName}`;
+              proxyMeta.videoProxyStorageType = 'disk';
+              proxyMeta.videoProxySize = videoBuf.length;
+            }
           }
         }
 
@@ -154,6 +209,8 @@ function createProxyController({ config }) {
           proxyHash: updated.proxyHash,
           proxySize: updated.proxySize || null,
           videoProxySize: updated.videoProxySize || null,
+          proxyStorageType: updated.proxyStorageType || 'disk',
+          videoProxyStorageType: updated.videoProxyStorageType || null,
           savedPath: updated.relativePath,
         });
       } catch (err) {
@@ -168,7 +225,7 @@ function createProxyController({ config }) {
       req.pause();
       let tmpPath = null;
       try {
-        const { hashIndex, storageDir } = req.userContext;
+        const { hashIndex, storageDir, folderName } = req.userContext;
         const lookupResult = await hashIndex.lookup(req.params.masterHash, { allowStatFastPath: true });
         if (lookupResult.status === 'missing' || !lookupResult.record) {
           return res.status(404).json({
@@ -178,11 +235,20 @@ function createProxyController({ config }) {
         }
 
         const normMaster = lookupResult.masterHash.replace(/[^a-f0-9]/gi, '');
-        const proxiesDir = path.join(storageDir, '.proxies');
-        await fs.promises.mkdir(proxiesDir, { recursive: true });
+        const storeInS3 = shouldStoreProxyInS3(lookupResult.record);
         const videoFileName = `${normMaster}.mp4`;
-        const videoFullPath = resolveSafeChildPath(proxiesDir, videoFileName);
-        tmpPath = `${videoFullPath}.${process.pid}.${Date.now()}.tmp`;
+        let videoFullPath = null;
+
+        if (storeInS3) {
+          const stagingDir = path.join(os.tmpdir(), 'photohub-s3-staging');
+          await fs.promises.mkdir(stagingDir, { recursive: true });
+          tmpPath = path.join(stagingDir, `vp_${normMaster}_${process.pid}_${Date.now()}.tmp`);
+        } else {
+          const proxiesDir = path.join(storageDir, '.proxies');
+          await fs.promises.mkdir(proxiesDir, { recursive: true });
+          videoFullPath = resolveSafeChildPath(proxiesDir, videoFileName);
+          tmpPath = `${videoFullPath}.${process.pid}.${Date.now()}.tmp`;
+        }
 
         const maxVideoProxyBytes = Math.min(
           Number(config.maxFileSizeBytes) || MAX_STREAM_VIDEO_PROXY_BYTES,
@@ -226,14 +292,37 @@ function createProxyController({ config }) {
 
         if (totalBytes === 0) {
           await fs.promises.unlink(tmpPath).catch(() => {});
+          tmpPath = null;
           return res.status(400).json({
             success: false,
             error: 'Empty video proxy stream',
           });
         }
 
-        await fs.promises.rename(tmpPath, videoFullPath);
-        tmpPath = null;
+        const proxyMeta = { videoProxySize: totalBytes };
+        if (storeInS3) {
+          const objectKey = buildS3ProxyKey({
+            folderName,
+            masterHash: normMaster,
+            ext: '.mp4',
+            prefix: config.s3.prefix,
+          });
+          await uploadFileToS3({
+            s3Config: config.s3,
+            objectKey,
+            filePath: tmpPath,
+            contentType: 'video/mp4',
+          });
+          await fs.promises.unlink(tmpPath).catch(() => {});
+          tmpPath = null;
+          proxyMeta.videoProxyRelativePath = objectKey;
+          proxyMeta.videoProxyStorageType = 's3';
+        } else {
+          await fs.promises.rename(tmpPath, videoFullPath);
+          tmpPath = null;
+          proxyMeta.videoProxyRelativePath = `.proxies/${videoFileName}`;
+          proxyMeta.videoProxyStorageType = 'disk';
+        }
 
         const resolvedProxyHash =
           providedProxyHash ||
@@ -244,10 +333,7 @@ function createProxyController({ config }) {
           lookupResult.masterHash,
           resolvedProxyHash,
           assetId,
-          {
-            videoProxyRelativePath: `.proxies/${videoFileName}`,
-            videoProxySize: totalBytes,
-          }
+          proxyMeta
         );
 
         return res.json({
@@ -255,6 +341,7 @@ function createProxyController({ config }) {
           masterHash: lookupResult.masterHash,
           proxyHash: updated?.proxyHash || resolvedProxyHash,
           videoProxySize: totalBytes,
+          videoProxyStorageType: proxyMeta.videoProxyStorageType,
         });
       } catch (err) {
         if (tmpPath) {
@@ -268,6 +355,7 @@ function createProxyController({ config }) {
     },
 
     async generateProxy(req, res) {
+      let tmpWorkDir = null;
       try {
         const { masterHash, maxPixelSize, quality } = req.body || {};
         if (!masterHash) {
@@ -277,7 +365,7 @@ function createProxyController({ config }) {
           });
         }
 
-        const { hashIndex, storageDir } = req.userContext;
+        const { hashIndex, storageDir, folderName } = req.userContext;
         const lookupResult = await hashIndex.lookup(masterHash, { allowStatFastPath: true });
         if (lookupResult.status === 'missing' || !lookupResult.record) {
           return res.status(404).json({
@@ -287,37 +375,102 @@ function createProxyController({ config }) {
         }
 
         const record = lookupResult.record;
-        if (record.storageType === 's3') {
+        const isMasterS3 = record.storageType === 's3';
+        if (isMasterS3 && !isS3Configured(config.s3)) {
           return res.status(501).json({
             success: false,
             fallbackToClient: true,
-            error: 'Server-side proxy generation requires local disk storage',
+            error: 'S3 storage is not configured to fetch master for proxy generation',
           });
         }
 
-        const fullPath = path.join(storageDir, record.relativePath);
-        if (!fs.existsSync(fullPath)) {
-          return res.status(404).json({
-            success: false,
-            error: 'Master photo file not found on disk',
-          });
+        const storeInS3 = shouldStoreProxyInS3(record);
+        let sourcePath = null;
+        let proxiesDir = path.join(storageDir, '.proxies');
+
+        if (isMasterS3 || storeInS3) {
+          tmpWorkDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'photohub-proxy-'));
         }
 
-        const proxiesDir = path.join(storageDir, '.proxies');
+        if (isMasterS3) {
+          const safeSrcName = path.basename(record.originalName || record.relativePath || 'source.bin')
+            .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_');
+          sourcePath = path.join(tmpWorkDir, safeSrcName);
+          await downloadS3ObjectToFile({
+            s3Config: config.s3,
+            objectKey: record.relativePath,
+            destPath: sourcePath,
+          });
+        } else {
+          sourcePath = path.join(storageDir, record.relativePath);
+          if (!fs.existsSync(sourcePath)) {
+            return res.status(404).json({
+              success: false,
+              error: 'Master photo file not found on disk',
+            });
+          }
+        }
+
+        if (storeInS3) {
+          proxiesDir = path.join(tmpWorkDir, '.proxies');
+        }
+
         const generated = await generateServerSideProxy({
-          sourcePath: fullPath,
+          sourcePath,
           proxiesDir,
           masterHash: lookupResult.masterHash,
-          originalName: record.originalName || fullPath,
+          originalName: record.originalName || sourcePath,
           maxPixelSize,
           quality,
         });
 
+        const proxyMeta = { ...generated };
+        if (storeInS3) {
+          if (generated.proxyRelativePath) {
+            const localImgProxy = path.join(proxiesDir, path.basename(generated.proxyRelativePath));
+            const ext = path.extname(localImgProxy) || '.jpg';
+            const s3ImgKey = buildS3ProxyKey({
+              folderName,
+              masterHash: lookupResult.masterHash,
+              ext,
+              prefix: config.s3.prefix,
+            });
+            await uploadFileToS3({
+              s3Config: config.s3,
+              objectKey: s3ImgKey,
+              filePath: localImgProxy,
+              contentType: ext === '.heic' ? 'image/heic' : 'image/jpeg',
+            });
+            proxyMeta.proxyRelativePath = s3ImgKey;
+            proxyMeta.proxyStorageType = 's3';
+          }
+          if (generated.videoProxyRelativePath) {
+            const localVidProxy = path.join(proxiesDir, path.basename(generated.videoProxyRelativePath));
+            const s3VidKey = buildS3ProxyKey({
+              folderName,
+              masterHash: lookupResult.masterHash,
+              ext: '.mp4',
+              prefix: config.s3.prefix,
+            });
+            await uploadFileToS3({
+              s3Config: config.s3,
+              objectKey: s3VidKey,
+              filePath: localVidProxy,
+              contentType: 'video/mp4',
+            });
+            proxyMeta.videoProxyRelativePath = s3VidKey;
+            proxyMeta.videoProxyStorageType = 's3';
+          }
+        } else {
+          if (proxyMeta.proxyRelativePath) proxyMeta.proxyStorageType = 'disk';
+          if (proxyMeta.videoProxyRelativePath) proxyMeta.videoProxyStorageType = 'disk';
+        }
+
         const updated = await hashIndex.registerProxy(
           lookupResult.masterHash,
-          generated.proxyHash,
+          proxyMeta.proxyHash,
           record.assetId || '',
-          generated
+          proxyMeta
         );
         if (!updated) {
           return res.status(404).json({
@@ -337,6 +490,10 @@ function createProxyController({ config }) {
           fallbackToClient: Boolean(err.fallbackToClient),
           error: err.message,
         });
+      } finally {
+        if (tmpWorkDir) {
+          await fs.promises.rm(tmpWorkDir, { recursive: true, force: true }).catch(() => {});
+        }
       }
     },
   };

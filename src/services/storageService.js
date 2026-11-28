@@ -11,9 +11,17 @@
 
 const fs = require('fs');
 const fsp = require('fs/promises');
+const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { computeBufferSha256, computeFileSha256 } = require('../models/hashIndexModel');
+const {
+  isS3Configured,
+  buildS3ObjectKey,
+  putS3Buffer,
+  uploadFileToS3,
+  headS3Object,
+} = require('./s3Service');
 const {
   EXIF_SCHEMA_VERSION,
   parseMediaExifFromBuffer,
@@ -328,6 +336,8 @@ async function storeAndVerifyPhoto({
   gpsLat = null,
   gpsLng = null,
   locationLabel = null,
+  s3Config = null,
+  folderName = null,
 }) {
   if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
     const err = new Error('Uploaded photo buffer is empty');
@@ -437,8 +447,12 @@ async function storeAndVerifyPhoto({
       };
     }
 
+    const useS3 = Boolean(s3Config && isS3Configured(s3Config));
+
     assertWithinQuota(hashIndex, quotaBytes, buffer.length);
-    await assertMinimumFreeDisk(storageDir, minFreeDiskBytes, buffer.length);
+    if (!useS3) {
+      await assertMinimumFreeDisk(storageDir, minFreeDiskBytes, buffer.length);
+    }
 
     // 2. Extract EXIF/GPS/date metadata (JPEG, HEIC/HEIF, MOV/MP4, PNG, WebP, TIFF) and determine date folder
     const exifMeta = parseMediaExifFromBuffer(buffer);
@@ -449,6 +463,77 @@ async function storeAndVerifyPhoto({
     const { year, dateFolder, dateObj, takenAt } = parseDateFolder(effectiveCreatedAt);
     const geo = resolveGeoFields({ exifMeta, gpsLat, gpsLng, locationLabel });
     const safeName = sanitizeFilename(originalName, mimeType, actualHash);
+
+    if (useS3) {
+      const objectKey = buildS3ObjectKey({
+        folderName,
+        year,
+        dateFolder,
+        hash: actualHash,
+        fileName: safeName,
+        prefix: s3Config.prefix,
+      });
+
+      await putS3Buffer({
+        s3Config,
+        objectKey,
+        buffer,
+        contentType: mimeType || 'application/octet-stream',
+      });
+
+      const head = await headS3Object({ s3Config, objectKey });
+      if (head.exists && head.size > 0 && head.size !== buffer.length) {
+        const err = new Error('S3 verification failed: stored object size mismatch');
+        err.statusCode = 502;
+        throw err;
+      }
+
+      const entryData = {
+        hash: actualHash,
+        diskHash: actualHash,
+        storageType: 's3',
+        relativePath: objectKey,
+        originalName: safeName,
+        size: buffer.length,
+        mtimeMs: Date.now(),
+        photoDate: dateFolder,
+        takenAt: takenAt || (exifMeta && exifMeta.takenAt) || null,
+        cameraModel: geo.cameraModel,
+        gpsLat: geo.gpsLat,
+        gpsLng: geo.gpsLng,
+        locationLabel: geo.locationLabel,
+        _exifScanned: true,
+        _exifVersion: EXIF_SCHEMA_VERSION,
+        uploadedAt: new Date().toISOString(),
+      };
+
+      const record = await hashIndex.set(actualHash, entryData);
+      if (cleanClientHash && cleanClientHash !== actualHash) {
+        await hashIndex.set(cleanClientHash, entryData);
+      }
+
+      return {
+        success: true,
+        backedUp: true,
+        canDelete: true,
+        canReplaceWithProxy: true,
+        checksumVerified: true,
+        isDuplicate: false,
+        storageType: 's3',
+        status: 'stored_verified',
+        message: 'Photo backed up and verified in S3 object storage.',
+        hash: actualHash,
+        serverSha256: actualHash,
+        savedPath: record.relativePath,
+        originalName: record.originalName,
+        size: record.size,
+        photoDate: record.photoDate,
+        locationLabel: record.locationLabel || null,
+        gpsLat: record.gpsLat,
+        gpsLng: record.gpsLng,
+      };
+    }
+
     const targetDir = await ensureTargetDateDir(storageDir, year, dateFolder);
     const { finalFileName, targetPath } = await resolveUniqueTargetPath(targetDir, safeName, actualHash);
 
@@ -548,6 +633,8 @@ async function finalizeStagedUpload({
   gpsLat = null,
   gpsLng = null,
   locationLabel = null,
+  s3Config = null,
+  folderName = null,
 }) {
   const cleanClientHash =
     expectedHash && typeof expectedHash === 'string'
@@ -645,8 +732,12 @@ async function finalizeStagedUpload({
       };
     }
 
+    const useS3 = Boolean(s3Config && isS3Configured(s3Config));
+
     assertWithinQuota(hashIndex, quotaBytes, totalBytes);
-    await assertMinimumFreeDisk(storageDir, minFreeDiskBytes, totalBytes);
+    if (!useS3) {
+      await assertMinimumFreeDisk(storageDir, minFreeDiskBytes, totalBytes);
+    }
 
     const exifMeta =
       (await readMediaExifMetadata(stagingPath)) ||
@@ -658,6 +749,81 @@ async function finalizeStagedUpload({
     const { year, dateFolder, dateObj, takenAt } = parseDateFolder(effectiveCreatedAt);
     const geo = resolveGeoFields({ exifMeta, gpsLat, gpsLng, locationLabel });
     const safeName = sanitizeFilename(originalName, mimeType, actualHash);
+
+    if (useS3) {
+      const objectKey = buildS3ObjectKey({
+        folderName,
+        year,
+        dateFolder,
+        hash: actualHash,
+        fileName: safeName,
+        prefix: s3Config.prefix,
+      });
+
+      try {
+        await uploadFileToS3({
+          s3Config,
+          objectKey,
+          filePath: stagingPath,
+          contentType: mimeType || 'application/octet-stream',
+        });
+      } finally {
+        await fsp.unlink(stagingPath).catch(() => {});
+      }
+
+      const headCheck = await headS3Object({ s3Config, objectKey });
+      if (headCheck.exists && headCheck.size > 0 && headCheck.size !== totalBytes) {
+        const err = new Error('S3 verification failed: stored object size mismatch');
+        err.statusCode = 502;
+        throw err;
+      }
+
+      const entryData = {
+        hash: actualHash,
+        diskHash: actualHash,
+        storageType: 's3',
+        relativePath: objectKey,
+        originalName: safeName,
+        size: totalBytes,
+        mtimeMs: Date.now(),
+        photoDate: dateFolder,
+        takenAt: takenAt || (exifMeta && exifMeta.takenAt) || null,
+        cameraModel: geo.cameraModel,
+        gpsLat: geo.gpsLat,
+        gpsLng: geo.gpsLng,
+        locationLabel: geo.locationLabel,
+        _exifScanned: true,
+        _exifVersion: EXIF_SCHEMA_VERSION,
+        uploadedAt: new Date().toISOString(),
+      };
+
+      const record = await hashIndex.set(actualHash, entryData);
+      if (cleanClientHash && cleanClientHash !== actualHash) {
+        await hashIndex.set(cleanClientHash, entryData);
+      }
+
+      return {
+        success: true,
+        backedUp: true,
+        canDelete: true,
+        canReplaceWithProxy: true,
+        checksumVerified: true,
+        isDuplicate: false,
+        storageType: 's3',
+        status: 'stored_verified',
+        message: 'Photo backed up and verified in S3 object storage.',
+        hash: actualHash,
+        serverSha256: actualHash,
+        savedPath: record.relativePath,
+        originalName: record.originalName,
+        size: record.size,
+        photoDate: record.photoDate,
+        locationLabel: record.locationLabel || null,
+        gpsLat: record.gpsLat,
+        gpsLng: record.gpsLng,
+      };
+    }
+
     const targetDir = await ensureTargetDateDir(storageDir, year, dateFolder);
     const { finalFileName, targetPath } = await resolveUniqueTargetPath(targetDir, safeName, actualHash);
 
@@ -752,11 +918,17 @@ async function storeAndVerifyStream({
   gpsLat = null,
   gpsLng = null,
   locationLabel = null,
+  s3Config = null,
+  folderName = null,
 }) {
   if (req && req.socket && typeof req.socket.setTimeout === 'function') {
     req.socket.setTimeout(0);
   }
-  await fsp.mkdir(storageDir, { recursive: true });
+  const useS3 = Boolean(s3Config && isS3Configured(s3Config));
+  const stagingBaseDir = useS3
+    ? path.join(os.tmpdir(), 'photohub-s3-staging')
+    : storageDir;
+  await fsp.mkdir(stagingBaseDir, { recursive: true });
 
   const declaredLen = Number(req.headers && req.headers['content-length']);
   if (maxFileSizeBytes > 0 && Number.isFinite(declaredLen) && declaredLen > maxFileSizeBytes) {
@@ -766,7 +938,7 @@ async function storeAndVerifyStream({
   }
 
   const stagingPath = path.join(
-    storageDir,
+    stagingBaseDir,
     `.upload_${process.pid}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.tmp`
   );
 
@@ -844,6 +1016,8 @@ async function storeAndVerifyStream({
       gpsLat,
       gpsLng,
       locationLabel,
+      s3Config,
+      folderName,
     });
   } catch (err) {
     await fsp.unlink(stagingPath).catch(() => {});
@@ -856,6 +1030,7 @@ module.exports = {
   storeAndVerifyStream,
   finalizeStagedUpload,
   assertWithinQuota,
+  assertMinimumFreeDisk,
   sanitizeFilename,
   parseDateFolder,
 };

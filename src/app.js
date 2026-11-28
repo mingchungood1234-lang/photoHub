@@ -81,7 +81,7 @@ async function createApp(configOverrides = {}) {
   const albumStore = new AlbumStore(config.dataDir);
   await albumStore.init();
 
-  const proxyQueue = new ProxyQueueService({ concurrency: 2 });
+  const proxyQueue = new ProxyQueueService({ concurrency: 2, config });
   const chunkedUploadService = new ChunkedUploadService();
 
   const nodeAllocationService = createNodeAllocationService({

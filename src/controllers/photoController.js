@@ -18,7 +18,13 @@ const fsp = require('fs/promises');
 const path = require('path');
 const zlib = require('zlib');
 const { promisify } = require('util');
-const { isS3Configured, createPresignedUrl, deleteS3Object } = require('../services/s3Service');
+const {
+  isS3Configured,
+  createPresignedUrl,
+  deleteS3Object,
+  fetchS3ObjectBuffer,
+  streamS3ObjectToResponse,
+} = require('../services/s3Service');
 const { isVideoFilename, generateGridThumbnail } = require('../services/proxyService');
 const { buildMemories } = require('../services/memoryService');
 const { buildCleanupSuggestions } = require('../services/mediaAnalysisService');
@@ -433,14 +439,31 @@ function createPhotoController({ config }) {
     return lookupResult;
   }
 
-  function redirectIfS3(res, record) {
-    if (record.storageType !== 's3' || !isS3Configured(config.s3)) {
+  async function serveS3Object(
+    req,
+    res,
+    { objectKey, variant = null, masterHash = null, contentType = null, contentDisposition = null }
+  ) {
+    if (!objectKey || !isS3Configured(config.s3)) {
       return false;
+    }
+    if (config.s3.streamProxy !== false) {
+      await streamS3ObjectToResponse({
+        req,
+        res,
+        s3Config: config.s3,
+        objectKey,
+        variant,
+        masterHash,
+        contentType,
+        contentDisposition,
+      });
+      return true;
     }
     const downloadUrl = createPresignedUrl({
       s3Config: config.s3,
       method: 'GET',
-      objectKey: record.relativePath,
+      objectKey,
       expiresIn: 300,
     });
     res.redirect(downloadUrl);
@@ -501,12 +524,30 @@ function createPhotoController({ config }) {
     }
 
     if (record.proxyRelativePath) {
-      const proxyFullPath = resolveInsideStorageDir(storageDir, record.proxyRelativePath);
-      await unlinkIfExists(proxyFullPath);
+      if (record.proxyStorageType === 's3') {
+        if (isS3Configured(config.s3)) {
+          await deleteS3Object({
+            s3Config: config.s3,
+            objectKey: record.proxyRelativePath,
+          });
+        }
+      } else {
+        const proxyFullPath = resolveInsideStorageDir(storageDir, record.proxyRelativePath);
+        await unlinkIfExists(proxyFullPath);
+      }
     }
     if (record.videoProxyRelativePath) {
-      const videoProxyFullPath = resolveInsideStorageDir(storageDir, record.videoProxyRelativePath);
-      await unlinkIfExists(videoProxyFullPath);
+      if (record.videoProxyStorageType === 's3') {
+        if (isS3Configured(config.s3)) {
+          await deleteS3Object({
+            s3Config: config.s3,
+            objectKey: record.videoProxyRelativePath,
+          });
+        }
+      } else {
+        const videoProxyFullPath = resolveInsideStorageDir(storageDir, record.videoProxyRelativePath);
+        await unlinkIfExists(videoProxyFullPath);
+      }
     }
 
     // Clean up any cached local SSD grid thumbnails for this photo
@@ -752,6 +793,7 @@ function createPhotoController({ config }) {
         const report = await buildCleanupSuggestions({
           hashIndex,
           storageDir,
+          s3Config: isS3Configured(config.s3) ? config.s3 : null,
           scan,
           maxScan,
           blurThreshold,
@@ -811,7 +853,8 @@ function createPhotoController({ config }) {
 
           // Pick fastest existing source (prefer existing JPEG proxy over huge 48MP master)
           let sourcePath = null;
-          if (record.proxyRelativePath) {
+          let sourceBuffer = null;
+          if (record.proxyRelativePath && record.proxyStorageType !== 's3') {
             const candidateProxy = path.join(storageDir, record.proxyRelativePath);
             if (await fileExistsAsync(candidateProxy)) {
               sourcePath = candidateProxy;
@@ -823,10 +866,26 @@ function createPhotoController({ config }) {
               sourcePath = candidateMaster;
             }
           }
+          if (!sourcePath && isS3Configured(config.s3)) {
+            const s3Key =
+              record.proxyRelativePath && record.proxyStorageType === 's3'
+                ? record.proxyRelativePath
+                : !isVideo && record.storageType === 's3' && record.relativePath
+                  ? record.relativePath
+                  : null;
+            if (s3Key) {
+              sourceBuffer = await fetchS3ObjectBuffer({
+                s3Config: config.s3,
+                objectKey: s3Key,
+                maxBytes: 25 * 1024 * 1024,
+              }).catch(() => null);
+            }
+          }
 
-          if (sourcePath) {
+          if (sourcePath || sourceBuffer) {
             const generated = await generateGridThumbnail({
               sourcePath,
+              sourceBuffer,
               thumbsDir,
               masterHash,
               width: targetPx,
@@ -848,18 +907,31 @@ function createPhotoController({ config }) {
 
         // Full preview (Lightbox) or fallback when micro-thumb couldn't be generated
         if (record.proxyRelativePath) {
-          const proxyPath = path.join(storageDir, record.proxyRelativePath);
-          try {
-            const proxyStat = await fsp.stat(proxyPath);
-            if (proxyStat.isFile()) {
-              return await streamImmutableFileFast(req, res, proxyPath, {
-                stat: proxyStat,
+          if (record.proxyStorageType === 's3') {
+            if (
+              await serveS3Object(req, res, {
+                objectKey: record.proxyRelativePath,
                 variant: 'proxy',
                 masterHash,
-              });
+                contentType: inferMediaContentType(record.proxyRelativePath),
+              })
+            ) {
+              return undefined;
             }
-          } catch {
-            // fall through to master check
+          } else {
+            const proxyPath = path.join(storageDir, record.proxyRelativePath);
+            try {
+              const proxyStat = await fsp.stat(proxyPath);
+              if (proxyStat.isFile()) {
+                return await streamImmutableFileFast(req, res, proxyPath, {
+                  stat: proxyStat,
+                  variant: 'proxy',
+                  masterHash,
+                });
+              }
+            } catch {
+              // fall through to master check
+            }
           }
         }
 
@@ -871,7 +943,18 @@ function createPhotoController({ config }) {
           });
         }
 
-        if (redirectIfS3(res, record)) return undefined;
+        if (record.storageType === 's3') {
+          if (
+            await serveS3Object(req, res, {
+              objectKey: record.relativePath,
+              variant: 'master',
+              masterHash,
+              contentType: inferMediaContentType(record.originalName || record.relativePath),
+            })
+          ) {
+            return undefined;
+          }
+        }
 
         const fullPath = path.join(storageDir, record.relativePath);
         try {
@@ -909,13 +992,26 @@ function createPhotoController({ config }) {
         const { storageDir } = req.userContext;
         const record = lookupResult.record;
         if (record.videoProxyRelativePath) {
-          const videoProxyPath = path.join(storageDir, record.videoProxyRelativePath);
-          if (await fileExistsAsync(videoProxyPath)) {
-            return sendImmutableMediaFile(res, videoProxyPath, {
-              variant: 'video-proxy',
-              masterHash: lookupResult.masterHash,
-              contentType: 'video/mp4',
-            });
+          if (record.videoProxyStorageType === 's3') {
+            if (
+              await serveS3Object(req, res, {
+                objectKey: record.videoProxyRelativePath,
+                variant: 'video-proxy',
+                masterHash: lookupResult.masterHash,
+                contentType: 'video/mp4',
+              })
+            ) {
+              return undefined;
+            }
+          } else {
+            const videoProxyPath = path.join(storageDir, record.videoProxyRelativePath);
+            if (await fileExistsAsync(videoProxyPath)) {
+              return sendImmutableMediaFile(res, videoProxyPath, {
+                variant: 'video-proxy',
+                masterHash: lookupResult.masterHash,
+                contentType: 'video/mp4',
+              });
+            }
           }
         }
 
@@ -1406,10 +1502,23 @@ function createPhotoController({ config }) {
 
         const { storageDir } = req.userContext;
         const record = lookupResult.record;
-        if (redirectIfS3(res, record)) return undefined;
+        const safeName = encodeURIComponent(
+          record.originalName || path.basename(record.relativePath || 'media.bin')
+        );
+        if (record.storageType === 's3') {
+          if (
+            await serveS3Object(req, res, {
+              objectKey: record.relativePath,
+              masterHash: lookupResult.masterHash,
+              contentType: inferMediaContentType(record.originalName || record.relativePath),
+              contentDisposition: `inline; filename="${safeName}"`,
+            })
+          ) {
+            return undefined;
+          }
+        }
 
         const fullPath = path.join(storageDir, record.relativePath);
-        const safeName = encodeURIComponent(record.originalName || path.basename(fullPath));
         return await streamImmutableFileFast(req, res, fullPath, {
           stat: lookupResult.stat || null,
           masterHash: lookupResult.masterHash,

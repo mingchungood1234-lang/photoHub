@@ -309,13 +309,16 @@ async function generateServerSideProxy({
  * and runs on a dedicated fast concurrency gate so heavy video/proxy jobs never block scrolling.
  */
 async function generateGridThumbnail({
-  sourcePath,
+  sourcePath = null,
+  sourceBuffer = null,
   thumbsDir,
   masterHash,
   width = 360,
   format = 'webp',
 }) {
-  if (!sharpModule || !sourcePath || !thumbsDir || !masterHash) return null;
+  const input =
+    Buffer.isBuffer(sourceBuffer) && sourceBuffer.length > 0 ? sourceBuffer : sourcePath;
+  if (!sharpModule || !input || !thumbsDir || !masterHash) return null;
 
   const normHash = String(masterHash).trim().toLowerCase().replace(/[^a-f0-9]/g, '');
   if (!normHash) return null;
@@ -333,7 +336,7 @@ async function generateGridThumbnail({
     try {
       await fsp.mkdir(thumbsDir, { recursive: true });
       const buf = await thumbGate(() => {
-        const pipeline = sharpModule(sourcePath)
+        const pipeline = sharpModule(input)
           .rotate()
           .resize({
             width: targetPx,

@@ -17,7 +17,11 @@ const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
 const { Readable } = require('stream');
-const { isS3Configured, createPresignedUrl } = require('../services/s3Service');
+const {
+  isS3Configured,
+  createPresignedUrl,
+  streamS3ObjectToResponse,
+} = require('../services/s3Service');
 const { isVideoFilename } = require('../services/proxyService');
 const {
   streamZipToResponse,
@@ -46,6 +50,34 @@ function resolveInsideStorageDir(storageDir, relativePath) {
 
 function createShareController({ config, shareStore, contextService, albumStore = null }) {
   const sharePagePath = path.join(__dirname, '..', 'views', 'share.html');
+
+  async function serveShareS3(
+    req,
+    res,
+    { objectKey, contentType = null, contentDisposition = null, cacheControl = 'public, max-age=3600' }
+  ) {
+    if (!objectKey || !isS3Configured(config.s3)) return false;
+    if (config.s3.streamProxy !== false) {
+      await streamS3ObjectToResponse({
+        req,
+        res,
+        s3Config: config.s3,
+        objectKey,
+        contentType,
+        contentDisposition,
+        cacheControl,
+      });
+      return true;
+    }
+    const url = createPresignedUrl({
+      s3Config: config.s3,
+      method: 'GET',
+      objectKey,
+      expiresIn: 300,
+    });
+    res.redirect(url);
+    return true;
+  }
 
   function findRemoteNodeForToken(token, req) {
     const raw = String(token || '');
@@ -389,23 +421,35 @@ function createShareController({ config, shareStore, contextService, albumStore 
 
         const record = found.record;
         if (record.proxyRelativePath) {
-          const proxyPath = resolveInsideStorageDir(ctx.storageDir, record.proxyRelativePath);
-          if (proxyPath && (await fileExistsAsync(proxyPath))) {
-            res.setHeader('Cache-Control', 'public, max-age=3600');
-            return res.sendFile(proxyPath, { dotfiles: 'allow' });
+          if (record.proxyStorageType === 's3') {
+            if (
+              await serveShareS3(req, res, {
+                objectKey: record.proxyRelativePath,
+                cacheControl: 'public, max-age=3600',
+              })
+            ) {
+              return undefined;
+            }
+          } else {
+            const proxyPath = resolveInsideStorageDir(ctx.storageDir, record.proxyRelativePath);
+            if (proxyPath && (await fileExistsAsync(proxyPath))) {
+              res.setHeader('Cache-Control', 'public, max-age=3600');
+              return res.sendFile(proxyPath, { dotfiles: 'allow' });
+            }
           }
         }
         if (isVideoFilename(record.originalName || record.relativePath || '')) {
           return res.status(404).json({ success: false, error: 'Video preview unavailable.' });
         }
-        if (record.storageType === 's3' && isS3Configured(config.s3)) {
-          const url = createPresignedUrl({
-            s3Config: config.s3,
-            method: 'GET',
-            objectKey: record.relativePath,
-            expiresIn: 300,
-          });
-          return res.redirect(url);
+        if (record.storageType === 's3') {
+          if (
+            await serveShareS3(req, res, {
+              objectKey: record.relativePath,
+              cacheControl: 'public, max-age=3600',
+            })
+          ) {
+            return undefined;
+          }
         }
         const fullPath = resolveInsideStorageDir(ctx.storageDir, record.relativePath);
         if (!fullPath || !(await fileExistsAsync(fullPath))) {
@@ -451,23 +495,27 @@ function createShareController({ config, shareStore, contextService, albumStore 
         }
 
         const record = found.record;
-        if (record.storageType === 's3' && isS3Configured(config.s3)) {
-          const url = createPresignedUrl({
-            s3Config: config.s3,
-            method: 'GET',
-            objectKey: record.relativePath,
-            expiresIn: 300,
-          });
-          return res.redirect(url);
+        const rawDispName = String(
+          record.originalName || path.basename(record.relativePath || 'media.bin')
+        )
+          .replace(/[\r\n"\\]/g, '_')
+          .slice(0, 180);
+        const safeName = encodeURIComponent(rawDispName);
+        if (record.storageType === 's3') {
+          if (
+            await serveShareS3(req, res, {
+              objectKey: record.relativePath,
+              contentDisposition: `attachment; filename="${safeName}"`,
+              cacheControl: 'private, max-age=300',
+            })
+          ) {
+            return undefined;
+          }
         }
         const fullPath = resolveInsideStorageDir(ctx.storageDir, record.relativePath);
         if (!fullPath || !(await fileExistsAsync(fullPath))) {
           return res.status(404).json({ success: false, error: 'File not found.' });
         }
-        const rawDispName = String(record.originalName || path.basename(fullPath))
-          .replace(/[\r\n"\\]/g, '_')
-          .slice(0, 180);
-        const safeName = encodeURIComponent(rawDispName);
         res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
         return res.sendFile(fullPath, { dotfiles: 'allow', acceptRanges: true });
       } catch (err) {
@@ -506,20 +554,33 @@ function createShareController({ config, shareStore, contextService, albumStore 
 
         const record = found.record;
         if (record.videoProxyRelativePath) {
-          const vpPath = resolveInsideStorageDir(ctx.storageDir, record.videoProxyRelativePath);
-          if (vpPath && (await fileExistsAsync(vpPath))) {
-            res.setHeader('Content-Type', 'video/mp4');
-            return res.sendFile(vpPath, { dotfiles: 'allow', acceptRanges: true });
+          if (record.videoProxyStorageType === 's3') {
+            if (
+              await serveShareS3(req, res, {
+                objectKey: record.videoProxyRelativePath,
+                contentType: 'video/mp4',
+                cacheControl: 'public, max-age=3600',
+              })
+            ) {
+              return undefined;
+            }
+          } else {
+            const vpPath = resolveInsideStorageDir(ctx.storageDir, record.videoProxyRelativePath);
+            if (vpPath && (await fileExistsAsync(vpPath))) {
+              res.setHeader('Content-Type', 'video/mp4');
+              return res.sendFile(vpPath, { dotfiles: 'allow', acceptRanges: true });
+            }
           }
         }
-        if (record.storageType === 's3' && isS3Configured(config.s3)) {
-          const url = createPresignedUrl({
-            s3Config: config.s3,
-            method: 'GET',
-            objectKey: record.relativePath,
-            expiresIn: 300,
-          });
-          return res.redirect(url);
+        if (record.storageType === 's3') {
+          if (
+            await serveShareS3(req, res, {
+              objectKey: record.relativePath,
+              cacheControl: 'public, max-age=3600',
+            })
+          ) {
+            return undefined;
+          }
         }
         const fullPath = resolveInsideStorageDir(ctx.storageDir, record.relativePath);
         if (!fullPath || !(await fileExistsAsync(fullPath))) {
