@@ -33,6 +33,14 @@ const { createNodeAllocationService } = require('./services/nodeAllocationServic
 const { createAuthMiddleware } = require('./middleware/authMiddleware');
 const { createAdminAuthMiddleware } = require('./middleware/adminAuthMiddleware');
 const { createUploadMiddleware } = require('./middleware/uploadMiddleware');
+const {
+  getClientIp,
+  securityHeadersMiddleware,
+  requestSanityMiddleware,
+  sanitizeJsonBodyMiddleware,
+  createRateLimiter,
+  createConcurrencyGuard,
+} = require('./middleware/securityMiddleware');
 const { errorMiddleware } = require('./middleware/errorMiddleware');
 const { createHealthController } = require('./controllers/healthController');
 const { createAuthController } = require('./controllers/authController');
@@ -85,6 +93,7 @@ async function createApp(configOverrides = {}) {
 
   // Build Express application and parse JSON/binary bodies before route handlers run
   const app = express();
+  app.disable('x-powered-by');
   app.set('trust proxy', 1); // Respect X-Forwarded-* headers when running behind Nginx/Cloudflare/Caddy
   app.locals.config = config;
   app.locals.hashIndex = contextService.defaultHashIndex;
@@ -92,6 +101,10 @@ async function createApp(configOverrides = {}) {
   app.locals.flushAllIndexes = contextService.flushAllIndexes;
   app.locals.proxyQueue = proxyQueue;
   app.locals.sessionSecret = sessionSecret;
+
+  // Global security headers & malformed URL/null-byte protection
+  app.use(securityHeadersMiddleware);
+  app.use(requestSanityMiddleware);
 
   // Middleware: parsers transform incoming bytes into `req.body` or `req.files`
   const uploadMiddleware = createUploadMiddleware(config);
@@ -105,7 +118,71 @@ async function createApp(configOverrides = {}) {
     sessionSecret,
   });
 
-  app.use(express.json({ limit: '50mb' })); // Parses `application/json` payloads into `req.body`
+  // Security rate limiters & per-user heavy-operation concurrency guards
+  const rlCfg = config.rateLimit || {};
+  const rlEnabled = rlCfg.enabled !== false;
+  const securityGuards = {
+    generalApiLimiter: createRateLimiter({
+      windowMs: 60_000,
+      max: rlCfg.apiMaxPerMin || 1500,
+      enabled: rlEnabled,
+      skip: (req) => req.path === '/health' || req.path === '/api/health',
+      message: 'Rate limit exceeded. Please slow down and try again shortly.',
+    }),
+    authBruteForceLimiter: createRateLimiter({
+      windowMs: 15 * 60_000,
+      max: rlCfg.authFailMaxPer15Min || 25,
+      enabled: rlEnabled,
+      countFailuresOnly: true,
+      message: 'Too many failed authentication attempts. Please try again later.',
+    }),
+    sharePasscodeLimiter: createRateLimiter({
+      windowMs: 15 * 60_000,
+      max: rlCfg.shareFailMaxPer15Min || 15,
+      enabled: rlEnabled,
+      countFailuresOnly: true,
+      keyGenerator: (req) => `${getClientIp(req)}:${String((req.params && req.params.token) || req.path).slice(0, 64)}`,
+      message: 'Too many incorrect passcode attempts. Please try again later.',
+    }),
+    heavyOpLimiter: createRateLimiter({
+      windowMs: 60_000,
+      max: rlCfg.heavyMaxPerMin || 30,
+      enabled: rlEnabled,
+      message: 'Too many heavy requests. Please wait a moment and try again.',
+    }),
+    mapRescanLimiter: createRateLimiter({
+      windowMs: 60_000,
+      max: rlCfg.heavyMaxPerMin || 30,
+      enabled: rlEnabled,
+      skip: (req) => req.query.rescan !== '1' && req.query.rescan !== 'true',
+      message: 'Too many GPS rescan requests. Please wait a moment.',
+    }),
+    zipConcurrencyGuard: createConcurrencyGuard({
+      maxConcurrent: 2,
+      message: 'Too many simultaneous ZIP downloads. Please wait for one to finish.',
+    }),
+    cleanupConcurrencyGuard: createConcurrencyGuard({
+      maxConcurrent: 1,
+      message: 'A Smart Cleanup scan is already running for your account.',
+    }),
+    mapRescanConcurrencyGuard: createConcurrencyGuard({
+      maxConcurrent: 1,
+      skip: (req) => req.query.rescan !== '1' && req.query.rescan !== 'true',
+      message: 'A GPS scan is already running for your account.',
+    }),
+    proxyGenConcurrencyGuard: createConcurrencyGuard({
+      maxConcurrent: 2,
+      message: 'Too many simultaneous proxy generation requests.',
+    }),
+  };
+
+  // Allow larger JSON payload ONLY on base64 proxy registration; tighten all other JSON endpoints to 2 MB to prevent OOM floods
+  app.use(['/api/proxy/register', '/api/web-node/proxy/register'], express.json({ limit: '25mb' }));
+  app.use(express.json({ limit: '2mb' }));
+  app.use(sanitizeJsonBodyMiddleware);
+  // General API flood guard across `/api/*` and brute-force guard on gateway `/api/web-node/*`
+  app.use('/api', securityGuards.generalApiLimiter);
+  app.use('/api/web-node', securityGuards.authBruteForceLimiter);
   // Raw binary `/api/upload` bodies stream directly to storage inside `uploadController.uploadDirect`
   // after `authMiddleware` resolves `req.userContext.storageDir` (avoids 100MB+ RAM buffering).
 
@@ -305,9 +382,12 @@ async function createApp(configOverrides = {}) {
         'accept-ranges',
         'content-disposition',
         'etag',
+        'last-modified',
         'cache-control',
+        'vary',
         'x-photo-variant',
         'x-master-sha256',
+        'x-thumb-cache',
       ];
       for (const h of passthroughHeaders) {
         const val = upstreamRes.headers.get(h);
@@ -381,7 +461,7 @@ async function createApp(configOverrides = {}) {
 
   // Mount all `/api/*` routes, `/admin` web page, and register errorMiddleware LAST (Express error-handler rule)
   app.get('/admin', controllers.adminController.getDashboardPage);
-  mountRoutes(app, { authMiddleware, adminAuthMiddleware, uploadMiddleware, controllers });
+  mountRoutes(app, { authMiddleware, adminAuthMiddleware, uploadMiddleware, controllers, securityGuards });
   app.use(errorMiddleware);
 
   return app;

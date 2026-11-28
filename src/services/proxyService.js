@@ -50,7 +50,9 @@ function createConcurrencyGate(maxConcurrent) {
 }
 
 const sharpGate = createConcurrencyGate(2);
+const thumbGate = createConcurrencyGate(4);
 const ffmpegGate = createConcurrencyGate(1);
+const thumbInFlight = new Map(); // cachePath -> Promise<Buffer|null>
 
 function isVideoFilename(name = '') {
   return VIDEO_EXTENSIONS.has(path.extname(String(name)).toLowerCase());
@@ -301,8 +303,72 @@ async function generateServerSideProxy({
   };
 }
 
+/**
+ * Generates and atomically caches a tiny 360px grid thumbnail (WebP or JPEG, ~10-25 KB)
+ * for blazing-fast webpage gallery browsing. Deduplicates concurrent requests per output path
+ * and runs on a dedicated fast concurrency gate so heavy video/proxy jobs never block scrolling.
+ */
+async function generateGridThumbnail({
+  sourcePath,
+  thumbsDir,
+  masterHash,
+  width = 360,
+  format = 'webp',
+}) {
+  if (!sharpModule || !sourcePath || !thumbsDir || !masterHash) return null;
+
+  const normHash = String(masterHash).trim().toLowerCase().replace(/[^a-f0-9]/g, '');
+  if (!normHash) return null;
+  const targetPx = Math.min(720, Math.max(120, Math.round(Number(width) || 360)));
+  const useWebp = format === 'webp';
+  const ext = useWebp ? 'webp' : 'jpg';
+  const suffix = targetPx === 360 ? '' : `_${targetPx}`;
+  const outPath = path.join(thumbsDir, `${normHash}${suffix}.${ext}`);
+
+  if (thumbInFlight.has(outPath)) {
+    return thumbInFlight.get(outPath);
+  }
+
+  const task = (async () => {
+    try {
+      await fsp.mkdir(thumbsDir, { recursive: true });
+      const buf = await thumbGate(() => {
+        const pipeline = sharpModule(sourcePath)
+          .rotate()
+          .resize({
+            width: targetPx,
+            height: targetPx,
+            fit: 'inside',
+            withoutEnlargement: true,
+          });
+        return useWebp
+          ? pipeline.webp({ quality: 74, effort: 3 }).toBuffer()
+          : pipeline.jpeg({ quality: 76, mozjpeg: true }).toBuffer();
+      });
+
+      if (!buf || buf.length === 0) return null;
+      const tmpPath = `${outPath}.${process.pid}.${Date.now()}.tmp`;
+      try {
+        await fsp.writeFile(tmpPath, buf);
+        await fsp.rename(tmpPath, outPath);
+      } catch {
+        await fsp.unlink(tmpPath).catch(() => {});
+      }
+      return { buffer: buf, outPath, contentType: useWebp ? 'image/webp' : 'image/jpeg' };
+    } catch {
+      return null;
+    } finally {
+      thumbInFlight.delete(outPath);
+    }
+  })();
+
+  thumbInFlight.set(outPath, task);
+  return task;
+}
+
 module.exports = {
   isVideoFilename,
   getCapabilities,
   generateServerSideProxy,
+  generateGridThumbnail,
 };

@@ -152,6 +152,12 @@ enum PhotoBackupPipeline {
         }
         defer { AssetUploadCoordinator.shared.releaseMasterHash(resolvedMasterHash) }
 
+        if checkResult.exists && checkResult.keepOriginalOnDevice != true && checkResult.isProtectedOriginal != true {
+            if !tracker.isPendingProtectionSync(masterHash: resolvedMasterHash) {
+                tracker.clearRestoredProtection(masterHash: resolvedMasterHash)
+            }
+        }
+
         let isProtectedOriginal = (checkResult.keepOriginalOnDevice == true)
             || (checkResult.isProtectedOriginal == true)
             || tracker.isRestoredMasterHash(master.sha256)

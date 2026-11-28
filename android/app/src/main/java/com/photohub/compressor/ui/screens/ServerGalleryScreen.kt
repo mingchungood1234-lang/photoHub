@@ -33,17 +33,20 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.photohub.compressor.ShareOriginalActivity
 import com.photohub.compressor.data.ServerPhoto
@@ -64,6 +67,7 @@ import com.photohub.compressor.ui.theme.PhotoHubMint
 import com.photohub.compressor.ui.theme.PhotoHubOrange
 import com.photohub.compressor.ui.theme.PhotoHubRed
 import com.photohub.compressor.viewmodel.*
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import java.io.File
 import java.util.Locale
@@ -117,6 +121,17 @@ fun ServerGalleryScreen(
 
     LaunchedEffect(Unit) {
         viewModel.onEnterScreen()
+    }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                viewModel.syncIfStale(minIntervalMs = 4_000L)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     LaunchedEffect(uiState.shareFileReady) {
@@ -244,6 +259,39 @@ fun ServerGalleryScreen(
             idx += sec.photos.size
         }
         map to sectionIndices
+    }
+
+    val visibleFlatPhotos = remember(uiState.timeline) { uiState.visiblePhotos }
+    val visibleIndexByHash = remember(visibleFlatPhotos) {
+        HashMap<String, Int>(visibleFlatPhotos.size * 2).apply {
+            visibleFlatPhotos.forEachIndexed { idx, item ->
+                put(item.hash.lowercase(Locale.ROOT), idx)
+            }
+        }
+    }
+
+    // Smooth lookahead prefetching: warms upcoming ~15 native Gallery thumbnails into RAM as user scrolls.
+    LaunchedEffect(gridState, visibleFlatPhotos) {
+        if (visibleFlatPhotos.isEmpty()) return@LaunchedEffect
+        snapshotFlow {
+            gridState.layoutInfo.visibleItemsInfo.lastOrNull()?.key as? String
+        }
+            .distinctUntilChanged()
+            .collect { lastKey ->
+                if (lastKey != null && lastKey.startsWith("tile-")) {
+                    val lastHash = lastKey.substringAfterLast('-').lowercase(Locale.ROOT)
+                    val idx = visibleIndexByHash[lastHash]
+                    if (idx != null) {
+                        val start = (idx + 1).coerceAtMost(visibleFlatPhotos.size)
+                        val end = (idx + 16).coerceAtMost(visibleFlatPhotos.size)
+                        if (start < end) {
+                            viewModel.prefetchLocalGridThumbnails(visibleFlatPhotos.subList(start, end))
+                        }
+                    }
+                } else if (lastKey == null) {
+                    viewModel.prefetchLocalGridThumbnails(visibleFlatPhotos.take(15))
+                }
+            }
     }
 
     Scaffold(
@@ -685,7 +733,11 @@ fun ServerGalleryScreen(
                             } else {
                                 for (sec in uiState.timeline.sections) {
                                     if (sec.startsNewYear && uiState.timelineGrouping != ServerTimelineGrouping.YEAR) {
-                                        item(key = "yr-${sec.anchorId}", span = { GridItemSpan(maxLineSpan) }) {
+                                        item(
+                                            key = "yr-${sec.anchorId}",
+                                            span = { GridItemSpan(maxLineSpan) },
+                                            contentType = "year-header"
+                                        ) {
                                             val yrInfo = uiState.timeline.years.firstOrNull { it.label == sec.yearLabel }
                                             Row(
                                                 modifier = Modifier
@@ -717,7 +769,11 @@ fun ServerGalleryScreen(
                                         }
                                     }
 
-                                    item(key = "hdr-${sec.id}", span = { GridItemSpan(maxLineSpan) }) {
+                                    item(
+                                        key = "hdr-${sec.id}",
+                                        span = { GridItemSpan(maxLineSpan) },
+                                        contentType = "section-header"
+                                    ) {
                                         Row(
                                             modifier = Modifier
                                                 .fillMaxWidth()
@@ -763,20 +819,19 @@ fun ServerGalleryScreen(
                                         }
                                     }
 
-                                    items(sec.photos, key = { "${sec.id}-${it.hash}" }) { photo ->
-                                        LaunchedEffect(photo.hash, photo.needsProxy) {
-                                            viewModel.loadCompressedPreviewIfNeeded(photo)
-                                        }
+                                    items(
+                                        items = sec.photos,
+                                        key = { "tile-${sec.id}-${it.hash}" },
+                                        contentType = { "photo-tile" }
+                                    ) { photo ->
                                         val normHash = photo.hash.lowercase(Locale.ROOT)
                                         val isSelected = normHash in uiState.selectedHashes
                                         val restoredOrProtected = uiState.isRestoredOrProtected(photo)
-                                        val thumbBitmap = remember(photo.hash, uiState.thumbnailCacheVersion) {
-                                            viewModel.getCachedThumbnail(photo.hash)
-                                        }
                                         ServerThumbnailCell(
                                             photo = photo,
-                                            bitmap = thumbBitmap,
-                                            showPlaceholder = (photo.hash in uiState.failedPreviewHashes) || (photo.isVideo && photo.needsProxy),
+                                            cacheInvalidationVersion = uiState.thumbnailCacheVersion,
+                                            getCachedImage = viewModel::getCachedImageBitmap,
+                                            loadImage = viewModel::loadGridThumbnail,
                                             isSelectionMode = uiState.isSelectionMode,
                                             isSelected = isSelected,
                                             isRestoredOrProtected = restoredOrProtected,
@@ -1864,8 +1919,9 @@ private fun SelectionRestoreBottomBar(
 @Composable
 private fun ServerThumbnailCell(
     photo: ServerPhoto,
-    bitmap: android.graphics.Bitmap?,
-    showPlaceholder: Boolean,
+    cacheInvalidationVersion: Long,
+    getCachedImage: (String) -> ImageBitmap?,
+    loadImage: suspend (ServerPhoto) -> ImageBitmap?,
     isSelectionMode: Boolean,
     isSelected: Boolean,
     isRestoredOrProtected: Boolean,
@@ -1873,16 +1929,40 @@ private fun ServerThumbnailCell(
     onLongClick: () -> Unit
 ) {
     val tileShape = RoundedCornerShape(12.dp)
-    val tileScale by animateFloatAsState(
-        targetValue = if (isSelected) 0.95f else 1f,
-        animationSpec = spring(dampingRatio = 0.72f, stiffness = 450f),
-        label = "tileScale"
-    )
+    var imageBitmap by remember(photo.hash) { mutableStateOf(getCachedImage(photo.hash)) }
+    var loadFailed by remember(photo.hash, photo.needsProxy, cacheInvalidationVersion) { mutableStateOf(false) }
+
+    LaunchedEffect(photo.hash, photo.needsProxy, cacheInvalidationVersion) {
+        val cached = getCachedImage(photo.hash)
+        if (cached != null) {
+            imageBitmap = cached
+            loadFailed = false
+            return@LaunchedEffect
+        }
+        val loaded = loadImage(photo)
+        if (loaded != null) {
+            imageBitmap = loaded
+            loadFailed = false
+        } else {
+            loadFailed = true
+        }
+    }
+
+    val tileScale = if (isSelectionMode) {
+        animateFloatAsState(
+            targetValue = if (isSelected) 0.95f else 1f,
+            animationSpec = spring(dampingRatio = 0.72f, stiffness = 450f),
+            label = "tileScale"
+        ).value
+    } else {
+        1f
+    }
+    val showPlaceholder = loadFailed || (photo.isVideo && photo.needsProxy && imageBitmap == null)
 
     Box(
         modifier = Modifier
             .aspectRatio(1f)
-            .scale(tileScale)
+            .let { if (tileScale != 1f) it.scale(tileScale) else it }
             .clip(tileShape)
             .background(MaterialTheme.colorScheme.surfaceVariant)
             .border(
@@ -1896,9 +1976,10 @@ private fun ServerThumbnailCell(
             ),
         contentAlignment = Alignment.Center
     ) {
-        if (bitmap != null) {
+        val readyImage = imageBitmap
+        if (readyImage != null) {
             Image(
-                bitmap = bitmap.asImageBitmap(),
+                bitmap = readyImage,
                 contentDescription = photo.originalName,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize()

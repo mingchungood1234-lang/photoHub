@@ -271,6 +271,9 @@ object PhotoBackupPipeline {
             }
 
             try {
+                if (check.exists && !check.keepOriginalOnDevice && !check.isProtectedOriginal && !tracker.isPendingProtectionSync(resolvedMasterHash)) {
+                    tracker.clearRestoredProtection(resolvedMasterHash)
+                }
                 val isProtected = check.keepOriginalOnDevice ||
                     check.isProtectedOriginal ||
                     tracker.isRestoredMasterHash(master.sha256) ||

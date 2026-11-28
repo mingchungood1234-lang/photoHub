@@ -15,18 +15,24 @@
 
 const express = require('express');
 
-function createPhotoRoutes({ photoController, shareController, albumController }) {
+function createPhotoRoutes({ photoController, shareController, albumController, securityGuards = {} }) {
   const router = express.Router();
+  const noop = (_req, _res, next) => next();
+  const heavyLimit = securityGuards.heavyOpLimiter || noop;
+  const mapRescanLimit = securityGuards.mapRescanLimiter || noop;
+  const mapRescanGuard = securityGuards.mapRescanConcurrencyGuard || noop;
+  const cleanupGuard = securityGuards.cleanupConcurrencyGuard || noop;
+  const zipGuard = securityGuards.zipConcurrencyGuard || noop;
 
   router.get('/photos', photoController.listPhotos);
   router.get('/photos/memories', photoController.getMemories);
-  router.get('/photos/map', photoController.getPhotoMap);
-  router.get('/photos/cleanup-suggestions', photoController.getCleanupSuggestions);
+  router.get('/photos/map', mapRescanLimit, mapRescanGuard, photoController.getPhotoMap);
+  router.get('/photos/cleanup-suggestions', heavyLimit, cleanupGuard, photoController.getCleanupSuggestions);
   router.get('/photos/trash', photoController.listTrash);
   router.post('/photos/trash', photoController.moveToTrash);
   router.post('/photos/trash/restore', photoController.restoreFromTrash);
   router.post('/photos/trash/empty', photoController.emptyTrash);
-  router.post('/photos/download-zip', photoController.downloadZip);
+  router.post('/photos/download-zip', heavyLimit, zipGuard, photoController.downloadZip);
   router.post('/photos/protect-original', photoController.setProtectOriginalsBatch);
   router.post('/photos/delete', photoController.deletePhotosBatch);
   router.delete('/photos', photoController.deletePhotosBatch);

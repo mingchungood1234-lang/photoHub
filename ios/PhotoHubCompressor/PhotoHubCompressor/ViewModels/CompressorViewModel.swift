@@ -94,11 +94,20 @@ final class CompressorViewModel: ObservableObject {
                 let mode = self.sortMode
                 let backupOnly = self.settings.isBackupOnlyMode
                 let isSignedIn = self.settings.isSignedIn
+                let apiClient = PhotoHubAPIClient(settings: self.settings)
                 let cachedServerPhotos = LocalProxyStore.shared.cachedPhotos(
                     baseURL: self.settings.normalizedBaseURL,
                     apiKey: self.settings.apiKey
                 )
                 Task.detached(priority: .userInitiated) { [weak self] in
+                    // Sync protected/allow-reproxy changes from webpage BEFORE scanning Apple Photos
+                    // so items unlocked on webpage immediately appear ready for re-proxying!
+                    if isSignedIn {
+                        await apiClient.flushPendingProtectionUploads()
+                        if let serverProtected = try? await apiClient.fetchProtectedMasterHashes() {
+                            tracker.syncProtectedMasterHashesFromServer(serverProtected)
+                        }
+                    }
                     let raw = service.scanCandidates(
                         tracker: tracker,
                         knownServerPhotos: cachedServerPhotos,
@@ -161,6 +170,12 @@ final class CompressorViewModel: ObservableObject {
                     apiKey: self.settings.apiKey
                 )
                 Task.detached(priority: .userInitiated) { [weak self] in
+                    if isSignedIn {
+                        await apiClient.flushPendingProtectionUploads()
+                        if let serverProtected = try? await apiClient.fetchProtectedMasterHashes() {
+                            tracker.syncProtectedMasterHashesFromServer(serverProtected)
+                        }
+                    }
                     let raw = service.scanCandidates(
                         tracker: tracker,
                         knownServerPhotos: cachedServerPhotos,

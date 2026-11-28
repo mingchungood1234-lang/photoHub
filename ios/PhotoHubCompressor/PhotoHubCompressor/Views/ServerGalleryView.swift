@@ -54,7 +54,46 @@ private struct DeleteConfirmPrompt {
     let isPermanent: Bool
 }
 
+private struct CloudGalleryStats {
+    var unproxiedPhotos: [ServerPhoto] = []
+    var favoriteCount: Int = 0
+    var protectedCount: Int = 0
+    var videoCount: Int = 0
+    var photoCount: Int = 0
+    var totalServerBytes: Int64 = 0
+
+    static func compute(photos: [ServerPhoto], locallyProtectedHashes: Set<String>) -> CloudGalleryStats {
+        var unproxied: [ServerPhoto] = []
+        var favs = 0
+        var prot = 0
+        var vids = 0
+        var totalBytes: Int64 = 0
+        for p in photos {
+            if p.needsProxy { unproxied.append(p) }
+            if p.isFavorited { favs += 1 }
+            if p.isProtectedOriginal || locallyProtectedHashes.contains(p.hash.lowercased()) { prot += 1 }
+            if p.isVideo { vids += 1 }
+            totalBytes += max(0, p.size)
+        }
+        return CloudGalleryStats(
+            unproxiedPhotos: unproxied,
+            favoriteCount: favs,
+            protectedCount: prot,
+            videoCount: vids,
+            photoCount: max(0, photos.count - vids),
+            totalServerBytes: totalBytes
+        )
+    }
+}
+
+/// Bounded network concurrency limiter for cloud-only thumbnail downloads so fast scrolling
+/// never floods URLSession or starves visible cells.
+private enum CloudThumbnailNetworkLimiter {
+    static let semaphore = AsyncSemaphore(value: 4)
+}
+
 struct ServerGalleryView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var settings: AppSettings
     @ObservedObject private var syncManager: LocalProxySyncManager
 
@@ -71,8 +110,12 @@ struct ServerGalleryView: View {
     @State private var isLoading: Bool = false
     @State private var errorMessage: String?
     @State private var selectedPhoto: ServerPhoto?
-    @State private var thumbCacheRevision: Int = 0
-    @State private var failedPreviewHashes: Set<String> = []
+    @State private var nativeAssetGeneration: Int = 0
+    @State private var stats: CloudGalleryStats = CloudGalleryStats()
+    @State private var visibleFlatPhotos: [ServerPhoto] = []
+    @State private var visibleIndexByHash: [String: Int] = [:]
+    @State private var reconcileTask: Task<Void, Never>?
+    @State private var lastServerSyncDate: Date = .distantPast
     @State private var filterMode: ServerGalleryFilter = .all
     @State private var mediaTypeFilter: ServerMediaTypeFilter = .all
     @State private var timelineGrouping: ServerTimelineGrouping = .day
@@ -119,35 +162,12 @@ struct ServerGalleryView: View {
         isViewingTrash ? trashPhotos : photos
     }
 
-    private var unproxiedPhotos: [ServerPhoto] {
-        photos.filter { $0.needsProxy }
-    }
-
-    private var favoriteCount: Int {
-        photos.reduce(into: 0) { count, p in
-            if p.isFavorited { count += 1 }
-        }
-    }
-
-    private var protectedCount: Int {
-        photos.reduce(into: 0) { count, p in
-            if isRestoredOrProtected(p) { count += 1 }
-        }
-    }
-
-    private var videoCount: Int {
-        photos.reduce(into: 0) { count, p in
-            if p.isVideo { count += 1 }
-        }
-    }
-
-    private var photoCount: Int {
-        max(0, photos.count - videoCount)
-    }
-
-    private var totalServerBytes: Int64 {
-        photos.reduce(into: Int64(0)) { $0 += max(0, $1.size) }
-    }
+    private var unproxiedPhotos: [ServerPhoto] { stats.unproxiedPhotos }
+    private var favoriteCount: Int { stats.favoriteCount }
+    private var protectedCount: Int { stats.protectedCount }
+    private var videoCount: Int { stats.videoCount }
+    private var photoCount: Int { stats.photoCount }
+    private var totalServerBytes: Int64 { stats.totalServerBytes }
 
     private var activeHeroMood: MascotMood {
         if isBatchProxying || isBatchRestoring || syncManager.isSyncing || isLoading {
@@ -176,7 +196,7 @@ struct ServerGalleryView: View {
     }
 
     private var visiblePhotos: [ServerPhoto] {
-        timelineData.sections.flatMap(\.photos)
+        visibleFlatPhotos
     }
 
     private var selectedPhotos: [ServerPhoto] {
@@ -384,14 +404,16 @@ struct ServerGalleryView: View {
                                                         let norm = photo.hash.lowercased()
                                                         let isSelected = selectedPhotoHashes.contains(norm)
                                                         let protectedOrRestored = isRestoredOrProtected(photo)
-                                                        let _ = thumbCacheRevision
                                                         ServerThumbnailCell(
                                                             photo: photo,
-                                                            image: ThumbnailMemoryCache.shared.image(forHash: photo.hash),
-                                                            showPlaceholder: failedPreviewHashes.contains(photo.hash) || (photo.isVideo && photo.needsProxy),
+                                                            settings: settings,
+                                                            nativeAssetGeneration: nativeAssetGeneration,
                                                             isSelectionMode: isSelectionMode,
                                                             isSelected: isSelected,
-                                                            isRestoredOrProtected: protectedOrRestored
+                                                            isRestoredOrProtected: protectedOrRestored,
+                                                            onCellAppear: {
+                                                                preheatUpcomingThumbnails(aroundHash: norm)
+                                                            }
                                                         )
                                                         .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                                                         .onTapGesture {
@@ -402,12 +424,9 @@ struct ServerGalleryView: View {
                                                             }
                                                         }
                                                         .onLongPressGesture {
-                                                            if !isSelectionMode && !isBatchRestoring && !isBatchProxying && !isBatchDeleting {
+                                                            if !isSelectionMode && !isBatchRestoring && !isBatchProxying && !isBatchDeleting && !isBatchUpdatingProtection {
                                                                 enterSelectionMode(initialPhoto: photo)
                                                             }
-                                                        }
-                                                        .task(id: "\(photo.hash)-\(photo.needsProxy ? 0 : 1)") {
-                                                            await loadCompressedPreviewIfNeeded(for: photo)
                                                         }
                                                     }
                                                 }
@@ -523,6 +542,11 @@ struct ServerGalleryView: View {
                 loadFromLocalStore()
                 Task { await loadPhotos() }
             }
+            .onChange(of: scenePhase) { newPhase in
+                if newPhase == .active {
+                    Task { await syncFromServerIfStale(minInterval: 4.0) }
+                }
+            }
             .onChange(of: filterMode) { _ in
                 rebuildTimeline()
             }
@@ -531,6 +555,8 @@ struct ServerGalleryView: View {
                 rebuildTimeline()
                 if newFilter == .trash {
                     Task { await loadTrashPhotos() }
+                } else if newFilter == .protectedOnly || newFilter == .favorites {
+                    Task { await syncFromServerIfStale(minInterval: 6.0) }
                 }
             }
             .onChange(of: timelineGrouping) { _ in
@@ -542,6 +568,8 @@ struct ServerGalleryView: View {
             .onDisappear {
                 batchTask?.cancel()
                 restoreTask?.cancel()
+                reconcileTask?.cancel()
+                PhotoLibraryService.stopPreheatingNativeGalleryThumbnails()
             }
             .onReceive(NotificationCenter.default.publisher(for: .localProxyStoreDidChange)) { _ in
                 loadFromLocalStore()
@@ -1256,8 +1284,6 @@ struct ServerGalleryView: View {
 
         photos.removeAll { removedSet.contains($0.hash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) }
         ThumbnailMemoryCache.shared.remove(hashes: removedSet)
-        thumbCacheRevision &+= 1
-        failedPreviewHashes = failedPreviewHashes.filter { !removedSet.contains($0.lowercased()) }
         selectedPhotoHashes = selectedPhotoHashes.filter { !removedSet.contains($0.lowercased()) }
         refreshLocallyProtectedHashes()
         rebuildTimeline()
@@ -1856,6 +1882,7 @@ struct ServerGalleryView: View {
     }
 
     private func rebuildTimeline() {
+        stats = CloudGalleryStats.compute(photos: photos, locallyProtectedHashes: locallyProtectedHashes)
         let built = ServerTimelineBuilder.build(
             photos: activeSourcePhotos,
             filterMode: filterMode,
@@ -1865,11 +1892,59 @@ struct ServerGalleryView: View {
             locallyProtectedHashes: locallyProtectedHashes
         )
         timelineData = built
+        let flat = built.sections.flatMap(\.photos)
+        visibleFlatPhotos = flat
+        var idxMap: [String: Int] = [:]
+        idxMap.reserveCapacity(flat.count)
+        for (i, p) in flat.enumerated() {
+            idxMap[p.hash.lowercased()] = i
+        }
+        visibleIndexByHash = idxMap
         if let selectedYearAnchor,
            built.years.contains(where: { $0.anchorId == selectedYearAnchor }) {
             return
         }
         selectedYearAnchor = built.years.first?.anchorId
+    }
+
+    private func preheatUpcomingThumbnails(aroundHash normHash: String) {
+        guard !visibleFlatPhotos.isEmpty, let idx = visibleIndexByHash[normHash] else { return }
+        let start = max(0, idx - 3)
+        let end = min(visibleFlatPhotos.count, idx + 18)
+        guard start < end else { return }
+        var hashesToPreheat: [String] = []
+        hashesToPreheat.reserveCapacity(end - start)
+        for i in start..<end {
+            let h = visibleFlatPhotos[i].hash
+            if ThumbnailMemoryCache.shared.image(forHash: h) == nil {
+                hashesToPreheat.append(h)
+            }
+        }
+        if !hashesToPreheat.isEmpty {
+            PhotoLibraryService.preheatNativeGalleryThumbnails(forMasterHashes: hashesToPreheat, maxPixelSize: 280)
+        }
+    }
+
+    private func primeAndReconcileNativeGalleryAsync(for targetPhotos: [ServerPhoto], forceReconcile: Bool) {
+        guard !targetPhotos.isEmpty else { return }
+        reconcileTask?.cancel()
+        let initialPreheatHashes = Array(visibleFlatPhotos.prefix(36).map(\.hash))
+        reconcileTask = Task {
+            let linked = await Task.detached(priority: .utility) { () -> Int in
+                let allHashes = targetPhotos.map(\.hash)
+                // 1. Instant ONE-call batched PHAsset resolution (~5ms) + preheat first screenful
+                PhotoLibraryService.primeNativeGalleryAssetCache(forMasterHashes: allHashes)
+                if !Task.isCancelled && !initialPreheatHashes.isEmpty {
+                    PhotoLibraryService.preheatNativeGalleryThumbnails(forMasterHashes: initialPreheatHashes, maxPixelSize: 280)
+                }
+                if Task.isCancelled { return 0 }
+                // 2. Single-pass background reconcile (throttled to 30s unless forced) for newly discovered assets
+                return PhotoLibraryService.reconcileExistingNativeGalleryAssets(for: targetPhotos, force: forceReconcile)
+            }.value
+            if linked > 0 && !Task.isCancelled {
+                nativeAssetGeneration &+= 1
+            }
+        }
     }
 
     private func applyUpdatedPhoto(_ updated: ServerPhoto) {
@@ -1878,15 +1953,18 @@ struct ServerGalleryView: View {
             rebuildTimeline()
         }
         refreshLocallyProtectedHashes()
-        failedPreviewHashes.remove(updated.hash)
         let targetHash = updated.hash
-        Task.detached(priority: .utility) {
-            if let data = LocalProxyStore.shared.previewData(forHash: targetHash),
-               let thumb = ThumbnailMemoryCache.decodeGridThumbnail(from: data, maxPixelSize: 360) {
-                ThumbnailMemoryCache.shared.setImage(thumb, forHash: targetHash)
-                await MainActor.run {
-                    thumbCacheRevision &+= 1
+        Task {
+            let didDecode = await Task.detached(priority: .utility) { () -> Bool in
+                guard let data = LocalProxyStore.shared.previewData(forHash: targetHash),
+                      let thumb = ThumbnailMemoryCache.decodeGridThumbnail(from: data, maxPixelSize: 280) else {
+                    return false
                 }
+                ThumbnailMemoryCache.shared.setImage(thumb, forHash: targetHash)
+                return true
+            }.value
+            if didDecode {
+                nativeAssetGeneration &+= 1
             }
         }
     }
@@ -1897,21 +1975,36 @@ struct ServerGalleryView: View {
             apiKey: settings.apiKey
         )
         if !cached.isEmpty || photos.isEmpty {
+            let changed = cached.count != photos.count || cached.first?.hash != photos.first?.hash
             photos = cached
             refreshLocallyProtectedHashes()
             rebuildTimeline()
+            if changed && !cached.isEmpty {
+                primeAndReconcileNativeGalleryAsync(for: cached, forceReconcile: false)
+            }
         }
-        // Grid cells decode 360px thumbnails lazily off the main thread via ThumbnailMemoryCache
-        // so opening huge libraries stays instant and memory-bounded (~64 MB cap).
-        thumbCacheRevision &+= 1
+    }
+
+    private func syncFromServerIfStale(minInterval: TimeInterval) async {
+        guard !isLoading,
+              !isBatchRestoring,
+              !isBatchDeleting,
+              !isBatchUpdatingProtection,
+              Date().timeIntervalSince(lastServerSyncDate) >= minInterval else {
+            return
+        }
+        await loadPhotos()
     }
 
     private func loadPhotos() async {
+        guard !isLoading else { return }
         isLoading = true
         defer { isLoading = false }
         let client = PhotoHubAPIClient(settings: settings)
         async let whoamiTask: WhoAmIResponse? = try? await client.whoami()
         do {
+            // 1. Push any offline restore protections up to the server first
+            await client.flushPendingProtectionUploads()
             let fetched = try await client.fetchAllServerPhotos(sync: true) { partial, tc in
                 Task { @MainActor in
                     trashCount = tc
@@ -1921,24 +2014,25 @@ struct ServerGalleryView: View {
                     }
                 }
             }
+            // 2. Sync local protection locks with authoritative server state (clears items unlocked on webpage!)
+            LocalProxyTracker.shared.syncProtectionStateFromServer(photos: fetched)
             LocalProxyStore.shared.savePhotos(
                 fetched,
                 baseURL: settings.normalizedBaseURL,
                 apiKey: settings.apiKey
             )
-            // Link any already-present Apple Photos assets by local metadata (zero iCloud download)
-            // so grid thumbnails & videos load directly from native Photos without server downloads.
-            await Task.detached(priority: .utility) {
-                PhotoLibraryService.reconcileExistingNativeGalleryAssets(for: fetched)
-            }.value
+            // Display immediately without blocking on native Photos scan; prime PHAsset cache & reconcile asynchronously.
             photos = fetched
+            lastServerSyncDate = Date()
             refreshLocallyProtectedHashes()
             rebuildTimeline()
-            thumbCacheRevision &+= 1
-            for photo in fetched where !photo.needsProxy {
-                failedPreviewHashes.remove(photo.hash)
-            }
             errorMessage = nil
+            primeAndReconcileNativeGalleryAsync(for: fetched, forceReconcile: false)
+
+            if isViewingTrash {
+                await loadTrashPhotos()
+            }
+
             if let who = await whoamiTask {
                 settings.applyServerCapabilities(storage: who.storage, s3Enabled: who.s3Enabled)
                 settings.updateResolvedNode(
@@ -1956,59 +2050,6 @@ struct ServerGalleryView: View {
         } catch {
             errorMessage = error.localizedDescription
         }
-    }
-
-    private func loadCompressedPreviewIfNeeded(for photo: ServerPhoto) async {
-        guard ThumbnailMemoryCache.shared.image(forHash: photo.hash) == nil else { return }
-
-        let targetHash = photo.hash
-
-        // 1. Check Native Apple Photos FIRST (zero network download, zero duplicate app cache!)
-        if let nativeThumb = await PhotoLibraryService.loadNativeGalleryThumbnail(forMasterHash: targetHash, maxPixelSize: 360) {
-            ThumbnailMemoryCache.shared.setImage(nativeThumb, forHash: targetHash)
-            failedPreviewHashes.remove(targetHash)
-            thumbCacheRevision &+= 1
-            return
-        }
-
-        // 2. Check local app preview cache (for items not currently in this phone's Photos library)
-        let decodedLocal: UIImage? = await Task.detached(priority: .utility) {
-            guard let cachedData = LocalProxyStore.shared.previewData(forHash: targetHash) else {
-                return nil
-            }
-            return ThumbnailMemoryCache.decodeGridThumbnail(from: cachedData, maxPixelSize: 360)
-        }.value
-
-        if let decodedLocal {
-            ThumbnailMemoryCache.shared.setImage(decodedLocal, forHash: targetHash)
-            failedPreviewHashes.remove(targetHash)
-            thumbCacheRevision &+= 1
-            return
-        }
-
-        // Un-proxied videos do not have a server preview image yet; avoid pulling gigabytes of video via /preview.
-        if photo.isVideo && photo.needsProxy {
-            failedPreviewHashes.insert(targetHash)
-            return
-        }
-
-        // 3. On-demand fallback to server preview (only for cloud-only items not on this phone)
-        let client = PhotoHubAPIClient(settings: settings)
-        if let rawData = try? await client.downloadPhotoPreviewData(hash: targetHash) {
-            let thumb: UIImage? = await Task.detached(priority: .utility) {
-                guard let (_, smallData) = LocalProxyStore.shared.cacheDownloadedPreview(rawData, forHash: targetHash) else {
-                    return nil
-                }
-                return ThumbnailMemoryCache.decodeGridThumbnail(from: smallData, maxPixelSize: 360)
-            }.value
-            if let thumb {
-                ThumbnailMemoryCache.shared.setImage(thumb, forHash: targetHash)
-                failedPreviewHashes.remove(targetHash)
-                thumbCacheRevision &+= 1
-                return
-            }
-        }
-        failedPreviewHashes.insert(targetHash)
     }
 }
 
@@ -2285,44 +2326,71 @@ private enum ServerTimelineBuilder {
 
 private struct ServerThumbnailCell: View {
     let photo: ServerPhoto
-    let image: UIImage?
-    let showPlaceholder: Bool
+    let settings: AppSettings
+    let nativeAssetGeneration: Int
     let isSelectionMode: Bool
     let isSelected: Bool
     let isRestoredOrProtected: Bool
+    let onCellAppear: () -> Void
+
+    @State private var loadedImage: UIImage?
+    @State private var loadFailed: Bool = false
 
     private let tileShape = RoundedRectangle(cornerRadius: 12, style: .continuous)
 
+    init(
+        photo: ServerPhoto,
+        settings: AppSettings,
+        nativeAssetGeneration: Int,
+        isSelectionMode: Bool,
+        isSelected: Bool,
+        isRestoredOrProtected: Bool,
+        onCellAppear: @escaping () -> Void
+    ) {
+        self.photo = photo
+        self.settings = settings
+        self.nativeAssetGeneration = nativeAssetGeneration
+        self.isSelectionMode = isSelectionMode
+        self.isSelected = isSelected
+        self.isRestoredOrProtected = isRestoredOrProtected
+        self.onCellAppear = onCellAppear
+        // Seed synchronously from RAM cache so scrolled-back tiles render on Frame 0 with zero shimmer.
+        self._loadedImage = State(initialValue: ThumbnailMemoryCache.shared.image(forHash: photo.hash))
+    }
+
     var body: some View {
-        GeometryReader { geo in
-            ZStack {
-                if let image {
-                    Image(uiImage: image)
+        let displayImage = loadedImage ?? ThumbnailMemoryCache.shared.image(forHash: photo.hash)
+        let showPlaceholder = loadFailed || (photo.isVideo && photo.needsProxy && displayImage == nil)
+
+        Color.clear
+            .aspectRatio(1, contentMode: .fit)
+            .overlay {
+                if let displayImage {
+                    Image(uiImage: displayImage)
                         .resizable()
                         .scaledToFill()
-                        .frame(width: geo.size.width, height: geo.size.height)
-                        .clipped()
-                        .transition(.opacity.animation(.easeOut(duration: 0.22)))
                 } else if showPlaceholder {
-                    tileShape
-                        .fill(PhotoHubPalette.softPeach)
-                    VStack(spacing: 4) {
-                        Image(systemName: photo.isVideo ? "video.fill" : "photo")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundColor(PhotoHubPalette.muted)
-                        Text(photo.isVideo ? "Video" : "Photo")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundColor(PhotoHubPalette.muted)
+                    ZStack {
+                        PhotoHubPalette.softPeach
+                        VStack(spacing: 4) {
+                            Image(systemName: photo.isVideo ? "video.fill" : "photo")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundColor(PhotoHubPalette.muted)
+                            Text(photo.isVideo ? "Video" : "Photo")
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundColor(PhotoHubPalette.muted)
+                        }
                     }
                 } else {
                     WarmShimmerView(cornerRadius: 12)
                 }
-
+            }
+            .overlay {
                 if isSelected {
-                    tileShape
-                        .fill(PhotoHubPalette.orange.opacity(0.24))
+                    PhotoHubPalette.orange.opacity(0.24)
                 }
             }
+            .clipped()
             .clipShape(tileShape)
             .overlay {
                 if isSelected {
@@ -2410,11 +2478,98 @@ private struct ServerThumbnailCell: View {
                 }
                 .padding(6)
             }
-            .frame(width: geo.size.width, height: geo.size.height)
             .scaleEffect(isSelected ? 0.95 : 1.0)
             .animation(.spring(response: 0.22, dampingFraction: 0.72), value: isSelected)
+            .onAppear {
+                onCellAppear()
+            }
+            .task(id: "\(photo.hash)-\(photo.needsProxy ? 0 : 1)-\(nativeAssetGeneration)") {
+                await loadCellThumbnail()
+            }
+    }
+
+    @MainActor
+    private func loadCellThumbnail() async {
+        let targetHash = photo.hash
+        if let cached = ThumbnailMemoryCache.shared.image(forHash: targetHash) {
+            if loadedImage !== cached {
+                loadedImage = cached
+            }
+            loadFailed = false
+            return
         }
-        .aspectRatio(1, contentMode: .fit)
+
+        // 1. Native Apple Photos FIRST via PHCachingImageManager (zero network, instant ~1ms progressive decode,
+        // automatically cancels PHImageRequestID if the cell scrolls off screen!)
+        let nativeThumb = await PhotoLibraryService.loadNativeGalleryThumbnailProgressive(
+            forMasterHash: targetHash,
+            maxPixelSize: 280
+        ) { degraded in
+            Task { @MainActor in
+                if loadedImage == nil {
+                    loadedImage = degraded
+                }
+            }
+        }
+        guard !Task.isCancelled else { return }
+        if let nativeThumb {
+            ThumbnailMemoryCache.shared.setImage(nativeThumb, forHash: targetHash)
+            loadedImage = nativeThumb
+            loadFailed = false
+            return
+        }
+
+        // 2. Local app disk preview cache (lock-free read + ImageIO downsample off main thread)
+        let decodedLocal: UIImage? = await Task.detached(priority: .utility) {
+            guard !Task.isCancelled,
+                  let cachedData = LocalProxyStore.shared.previewData(forHash: targetHash) else {
+                return nil
+            }
+            return ThumbnailMemoryCache.decodeGridThumbnail(from: cachedData, maxPixelSize: 280)
+        }.value
+        guard !Task.isCancelled else { return }
+        if let decodedLocal {
+            ThumbnailMemoryCache.shared.setImage(decodedLocal, forHash: targetHash)
+            loadedImage = decodedLocal
+            loadFailed = false
+            return
+        }
+
+        // Un-proxied videos have no server image preview yet.
+        if photo.isVideo && photo.needsProxy {
+            loadFailed = true
+            return
+        }
+
+        // 3. On-demand server preview fallback (bounded network concurrency for cloud-only items)
+        await CloudThumbnailNetworkLimiter.semaphore.acquire()
+        if Task.isCancelled {
+            await CloudThumbnailNetworkLimiter.semaphore.release()
+            return
+        }
+        let rawData: Data? = try? await PhotoHubAPIClient(settings: settings).downloadPhotoPreviewData(hash: targetHash)
+        await CloudThumbnailNetworkLimiter.semaphore.release()
+        guard !Task.isCancelled else { return }
+
+        if let rawData {
+            let thumb: UIImage? = await Task.detached(priority: .utility) {
+                guard !Task.isCancelled,
+                      let (_, smallData) = LocalProxyStore.shared.cacheDownloadedPreview(rawData, forHash: targetHash) else {
+                    return nil
+                }
+                return ThumbnailMemoryCache.decodeGridThumbnail(from: smallData, maxPixelSize: 280)
+            }.value
+            guard !Task.isCancelled else { return }
+            if let thumb {
+                ThumbnailMemoryCache.shared.setImage(thumb, forHash: targetHash)
+                loadedImage = thumb
+                loadFailed = false
+                return
+            }
+        }
+        if !Task.isCancelled {
+            loadFailed = true
+        }
     }
 }
 

@@ -14,7 +14,9 @@ import android.media.MediaMetadataRetriever
 import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
+import android.os.CancellationSignal
 import android.os.Environment
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Size
 import androidx.core.content.ContextCompat
@@ -22,6 +24,7 @@ import com.photohub.compressor.data.PhotoCandidate
 import com.photohub.compressor.data.PhotoCompressionState
 import com.photohub.compressor.data.ServerPhoto
 import com.photohub.compressor.sync.LocalProxyTracker
+import com.photohub.compressor.sync.ReconciledProxyLink
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -34,6 +37,13 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
+
+data class NativeGalleryScanSnapshot(
+    val liveUris: Set<String>,
+    val proxyPrefixes: Map<String, String>,
+    val originalsMap: Map<String, String>
+)
 
 data class ExportedMaster(
     val file: File,
@@ -452,51 +462,171 @@ class MediaLibraryService(private val context: Context) {
     }
 
     /**
-     * Reconciles server photos against native Android Gallery metadata (zero network I/O)
-     * so already-present originals & proxies immediately link to LocalProxyTracker.
+     * Single-pass MediaStore scan collecting:
+     * 1. All live non-trashed image/video content URIs (`liveUris`) for O(1) liveness checks (zero N+1 Binder queries)
+     * 2. Compressed proxy prefixes (`proxyPrefixes`)
+     * 3. Non-proxy original match keys (`originalsMap`)
      */
-    fun reconcileExistingNativeGalleryAssets(photos: List<ServerPhoto>) {
-        if (currentAccessLevel() == MediaAccessLevel.DENIED || photos.isEmpty()) return
+    fun scanGallerySnapshotSinglePass(): NativeGalleryScanSnapshot {
+        if (currentAccessLevel() == MediaAccessLevel.DENIED) {
+            return NativeGalleryScanSnapshot(emptySet(), emptyMap(), emptyMap())
+        }
+        val resolver = context.contentResolver
+        val collection = MediaStore.Files.getContentUri("external")
+        val projection = arrayOf(
+            MediaStore.Files.FileColumns._ID,
+            MediaStore.Files.FileColumns.MEDIA_TYPE,
+            MediaStore.MediaColumns.DISPLAY_NAME,
+            MediaStore.MediaColumns.SIZE,
+            MediaStore.MediaColumns.DATE_TAKEN,
+            MediaStore.MediaColumns.DATE_ADDED
+        )
+        val trashClause = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            " AND COALESCE(${MediaStore.MediaColumns.IS_TRASHED}, 0) = 0 AND COALESCE(${MediaStore.MediaColumns.IS_PENDING}, 0) = 0"
+        } else {
+            ""
+        }
+        val selection = "${MediaStore.Files.FileColumns.MEDIA_TYPE} IN (?, ?)$trashClause"
+        val args = arrayOf(
+            MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE.toString(),
+            MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString()
+        )
+        val proxyPrefixLower = ProxyGenerator.PROXY_FILENAME_PREFIX.lowercase(Locale.ROOT)
         val tracker = LocalProxyTracker.getInstance(context)
-        val unresolved = photos.filter { !tracker.hasAnyLiveGalleryAsset(it.hash) }
-        if (unresolved.isEmpty()) return
+        val liveUris = HashSet<String>(512)
+        val proxyPrefixes = HashMap<String, String>(128)
+        val originalsMap = HashMap<String, String>(512)
 
-        val proxyPrefixes = scanExistingProxyPrefixesInGallery()
-        val originalsMap = scanExistingOriginalMapInGallery()
+        runCatching {
+            resolver.query(collection, projection, selection, args, null)?.use { cursor ->
+                val idCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID)
+                val typeCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.MEDIA_TYPE)
+                val nameCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
+                val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
+                val takenCol = cursor.getColumnIndex(MediaStore.MediaColumns.DATE_TAKEN)
+                val addedCol = cursor.getColumnIndex(MediaStore.MediaColumns.DATE_ADDED)
+                while (cursor.moveToNext()) {
+                    val id = cursor.getLong(idCol)
+                    val mediaType = cursor.getInt(typeCol)
+                    val isVideo = (mediaType == MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO)
+                    val uriStr = ContentUris.withAppendedId(
+                        if (isVideo) {
+                            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                        } else {
+                            MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                        },
+                        id
+                    ).toString()
+                    liveUris.add(uriStr)
 
-        for (photo in unresolved) {
+                    val displayName = cursor.getString(nameCol)?.trim() ?: continue
+                    val base = File(displayName).name.lowercase(Locale.ROOT)
+                    if (base.isEmpty()) continue
+
+                    if (base.startsWith(proxyPrefixLower)) {
+                        val prefix = ProxyGenerator.extractMasterHashPrefix(displayName)
+                        if (prefix != null) {
+                            proxyPrefixes.putIfAbsent(prefix, uriStr)
+                        }
+                        continue
+                    }
+                    if (tracker.isKnownProxy(uriStr)) continue
+
+                    val size = cursor.getLong(sizeCol)
+                    val takenMs = if (takenCol >= 0) cursor.getLong(takenCol) else 0L
+                    val addedSec = if (addedCol >= 0) cursor.getLong(addedCol) else 0L
+                    val effectiveMs = when {
+                        takenMs > 0L -> takenMs
+                        addedSec > 0L -> addedSec * 1000L
+                        else -> 0L
+                    }
+                    val stem = normalizeFilenameStem(base)
+                    val kind = if (isVideo) "v" else "i"
+                    if (size > 0L) {
+                        originalsMap.putIfAbsent("sz:$base|$size", uriStr)
+                        if (stem.isNotEmpty()) originalsMap.putIfAbsent("szs:$stem|$size", uriStr)
+                    }
+                    if (effectiveMs > 0L) {
+                        val day = formatUtcDay(effectiveMs)
+                        if (size > 0L) originalsMap.putIfAbsent("szd:$kind|$size|$day", uriStr)
+                        originalsMap.putIfAbsent("dt:$base|$day", uriStr)
+                        if (stem.isNotEmpty()) originalsMap.putIfAbsent("dts:$stem|$day", uriStr)
+                    }
+                    originalsMap.putIfAbsent("nm:$base", uriStr)
+                    if (stem.isNotEmpty()) originalsMap.putIfAbsent("nms:$stem", uriStr)
+                }
+            }
+        }
+        return NativeGalleryScanSnapshot(liveUris, proxyPrefixes, originalsMap)
+    }
+
+    /**
+     * Reconciles server photos against native Android Gallery metadata in ONE single MediaStore scan
+     * + ONE batched SharedPreferences flush, priming the lock-free live URI cache for instant scrolling.
+     * Returns the number of newly linked native gallery items.
+     */
+    fun reconcileExistingNativeGalleryAssets(photos: List<ServerPhoto>, force: Boolean = false): Int {
+        if (currentAccessLevel() == MediaAccessLevel.DENIED || photos.isEmpty()) return 0
+        val now = SystemClock.elapsedRealtime()
+        if (!force && now - LAST_RECONCILE_ELAPSED_MS.get() < 25_000L) {
+            return 0
+        }
+
+        val tracker = LocalProxyTracker.getInstance(context)
+        val snapshot = scanGallerySnapshotSinglePass()
+        val confirmedLiveHashes = tracker.primeLiveUriCacheFromLiveSet(
+            photos.map { it.hash },
+            snapshot.liveUris
+        )
+
+        val newProxies = mutableListOf<ReconciledProxyLink>()
+        val newOriginals = mutableListOf<Pair<String, String>>()
+
+        for (photo in photos) {
+            val normHash = photo.hash.trim().lowercase(Locale.ROOT)
+            if (normHash in confirmedLiveHashes) continue
+
             val prefix = ProxyGenerator.proxyPrefixTag(photo.hash)
-            val proxyUri = if (prefix.isNotEmpty()) proxyPrefixes[prefix] else null
+            val proxyUri = if (prefix.isNotEmpty()) snapshot.proxyPrefixes[prefix] else null
             if (proxyUri != null) {
-                tracker.markAsProxy(
-                    assetId = proxyUri,
-                    proxySha256 = photo.proxyHash.orEmpty(),
-                    masterHash = photo.hash,
-                    originalName = photo.originalName
+                newProxies.add(
+                    ReconciledProxyLink(
+                        assetId = proxyUri,
+                        proxySha256 = photo.proxyHash.orEmpty(),
+                        masterHash = photo.hash,
+                        originalName = photo.originalName
+                    )
                 )
                 continue
             }
-            val keys = originalMatchKeys(photo.originalName, photo.parsedCreationDateMs, photo.size)
+            val keys = originalMatchKeys(photo.originalName, photo.parsedCreationDateMs, photo.size, photo.isVideo)
             for (key in keys) {
-                val origUri = originalsMap[key]
+                val origUri = snapshot.originalsMap[key]
                 if (origUri != null) {
-                    tracker.markUploadedOriginal(origUri, photo.hash)
+                    newOriginals.add(origUri to photo.hash)
                     break
                 }
             }
         }
+
+        val linkedCount = newProxies.size + newOriginals.size
+        if (linkedCount > 0) {
+            tracker.batchRecordReconciledLinks(newProxies, newOriginals)
+        }
+        LAST_RECONCILE_ELAPSED_MS.set(SystemClock.elapsedRealtime())
+        return linkedCount
     }
 
-    /**
-     * Loads a fast local thumbnail directly from native Android Gallery (zero network, zero app cache duplication)
-     * when a live copy (restored original, uploaded original, or saved proxy) already exists on this phone.
-     */
-    fun loadNativeGalleryThumbnail(masterHash: String, isVideo: Boolean, maxPixelSize: Int = 320): Bitmap? {
-        if (currentAccessLevel() == MediaAccessLevel.DENIED) return null
-        val uri = LocalProxyTracker.getInstance(context).liveGalleryAssetUri(masterHash) ?: return null
+    private fun loadThumbnailFromUri(
+        uri: Uri,
+        isVideo: Boolean,
+        maxPixelSize: Int,
+        cancellationSignal: CancellationSignal?
+    ): Bitmap? {
+        if (cancellationSignal?.isCanceled == true) return null
         return runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                context.contentResolver.loadThumbnail(uri, Size(maxPixelSize, maxPixelSize), null)
+                context.contentResolver.loadThumbnail(uri, Size(maxPixelSize, maxPixelSize), cancellationSignal)
             } else if (isVideo) {
                 val retriever = MediaMetadataRetriever()
                 try {
@@ -512,11 +642,56 @@ class MediaLibraryService(private val context: Context) {
     }
 
     /**
+     * Loads a fast local thumbnail directly from native Android Gallery (1 Binder IPC, no pre-query round-trip!)
+     * with hardware-level [CancellationSignal] support so scrolling past off-screen tiles aborts immediately.
+     */
+    fun loadNativeGalleryThumbnail(
+        masterHash: String,
+        isVideo: Boolean,
+        maxPixelSize: Int = 256,
+        cancellationSignal: CancellationSignal? = null
+    ): Bitmap? {
+        if (currentAccessLevel() == MediaAccessLevel.DENIED) return null
+        if (cancellationSignal?.isCanceled == true) return null
+        val tracker = LocalProxyTracker.getInstance(context)
+        if (tracker.isKnownMissingLiveGalleryUri(masterHash)) return null
+
+        // Fast path: 1 direct MediaStore.loadThumbnail IPC using cached live URI (zero existence query!)
+        val cachedUri = tracker.cachedLiveGalleryUri(masterHash)
+        if (cachedUri != null) {
+            val bmp = loadThumbnailFromUri(cachedUri, isVideo, maxPixelSize, cancellationSignal)
+            if (bmp != null) return bmp
+            if (cancellationSignal?.isCanceled == true) return null
+            tracker.invalidateLiveUri(masterHash, cachedUri)
+        }
+
+        // Fallback: try tracked candidate URIs directly without extra ContentResolver.query IPC
+        val candidates = tracker.candidateGalleryAssetUris(masterHash)
+        if (candidates.isEmpty()) return null
+        for (uri in candidates) {
+            if (cancellationSignal?.isCanceled == true) return null
+            if (uri == cachedUri) continue
+            val bmp = loadThumbnailFromUri(uri, isVideo, maxPixelSize, cancellationSignal)
+            if (bmp != null) {
+                tracker.markLiveUriConfirmed(masterHash, uri)
+                return bmp
+            }
+            if (cancellationSignal?.isCanceled == true) return null
+        }
+
+        if (cancellationSignal?.isCanceled != true) {
+            tracker.markLiveUriMissing(masterHash)
+        }
+        return null
+    }
+
+    /**
      * Loads a crisp preview directly from native Android Gallery for the Cloud Lightbox with zero server download.
      */
     fun loadNativeGalleryPreviewBitmap(masterHash: String, isVideo: Boolean, maxPixelSize: Int = 1600): Bitmap? {
         if (currentAccessLevel() == MediaAccessLevel.DENIED) return null
-        val uri = LocalProxyTracker.getInstance(context).liveGalleryAssetUri(masterHash) ?: return null
+        val tracker = LocalProxyTracker.getInstance(context)
+        val uri = tracker.cachedLiveGalleryUri(masterHash) ?: tracker.liveGalleryAssetUri(masterHash) ?: return null
         return runCatching {
             if (isVideo) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -542,7 +717,8 @@ class MediaLibraryService(private val context: Context) {
      */
     fun findLiveNativeVideoUri(masterHash: String): Uri? {
         if (currentAccessLevel() == MediaAccessLevel.DENIED) return null
-        return LocalProxyTracker.getInstance(context).liveGalleryAssetUri(masterHash)
+        val tracker = LocalProxyTracker.getInstance(context)
+        return tracker.cachedLiveGalleryUri(masterHash) ?: tracker.liveGalleryAssetUri(masterHash)
     }
 
     private fun decodeSampledBitmapFromUri(uri: Uri, maxPixelSize: Int, preferRgb565: Boolean): Bitmap? {
@@ -1260,6 +1436,7 @@ class MediaLibraryService(private val context: Context) {
 
     companion object {
         val galleryWriteMutex = Mutex()
+        private val LAST_RECONCILE_ELAPSED_MS = AtomicLong(0L)
         private val UTC_DAY_FORMAT: ThreadLocal<SimpleDateFormat> = object : ThreadLocal<SimpleDateFormat>() {
             override fun initialValue(): SimpleDateFormat =
                 SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {

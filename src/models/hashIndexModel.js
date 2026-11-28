@@ -17,7 +17,7 @@ const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
-const { readJpegExifMetadata } = require('../services/exifGeoService');
+const { readMediaExifMetadata, EXIF_SCHEMA_VERSION, reverseGeocodeOffline } = require('../services/exifGeoService');
 
 function computeBufferSha256(buffer) {
   return crypto.createHash('sha256').update(buffer).digest('hex');
@@ -72,11 +72,11 @@ function parseExifDateString(str) {
 }
 
 /**
- * Lightweight dependency-free reader for JPEG APP1 EXIF DateTimeOriginal/Camera/GPS
- * delegated to `exifGeoService.js` (at most a 64 KB header read).
+ * Lightweight dependency-free reader for EXIF/GPS DateTimeOriginal/Camera/GPS across
+ * JPEG, HEIC/HEIF/AVIF, MOV/MP4, PNG, WebP, and TIFF/DNG delegated to `exifGeoService.js`.
  */
 async function readJpegExifDateTime(fullPath) {
-  return readJpegExifMetadata(fullPath);
+  return readMediaExifMetadata(fullPath);
 }
 
 function extractDateFromFilename(fileName) {
@@ -205,6 +205,7 @@ class HashIndex {
       typeof shouldExcludePath === 'function' ? shouldExcludePath : null;
     this.records = new Map(); // sha256 -> { hash, relativePath, originalName, size, photoDate, uploadedAt, proxyHash? }
     this.proxyToMaster = new Map(); // proxySha256 -> masterSha256
+    this.instanceNonce = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     this.version = 1;
     this._cachedMasters = null;
     this._cachedStorageUsage = null;
@@ -342,7 +343,8 @@ class HashIndex {
             const needsMetaBackfill =
               entry.storageType !== 's3' &&
               ((!entry.diskHash && (!entry.photoDate || !entry.takenAt)) ||
-                (entry.gpsLat === undefined && !entry._exifScanned));
+                (typeof entry.gpsLat !== 'number' &&
+                  (!entry._exifScanned || (entry._exifVersion || 0) < EXIF_SCHEMA_VERSION)));
             if (needsMetaBackfill) {
               const inferred = await inferDiskMediaDates(
                 entry.relativePath,
@@ -370,8 +372,9 @@ class HashIndex {
                 entry.locationLabel = inferred.locationLabel || entry.locationLabel || null;
                 changed = true;
               }
-              if (!entry._exifScanned) {
+              if (!entry._exifScanned || entry._exifVersion !== EXIF_SCHEMA_VERSION) {
                 entry._exifScanned = true;
+                entry._exifVersion = EXIF_SCHEMA_VERSION;
                 changed = true;
               }
             }
@@ -428,6 +431,7 @@ class HashIndex {
                   gpsLng: inferred.gpsLng,
                   locationLabel: inferred.locationLabel || null,
                   _exifScanned: true,
+                  _exifVersion: EXIF_SCHEMA_VERSION,
                   uploadedAt: (stat.birthtime || stat.mtime).toISOString(),
                 });
                 indexedPaths.add(relPath);
@@ -452,6 +456,112 @@ class HashIndex {
     } finally {
       this.syncPromise = null;
     }
+  }
+
+  /**
+   * Backfills GPS/camera/date EXIF metadata for active disk files that have not yet been
+   * scanned by the multi-format parser (HEIC/HEIF, MOV/MP4, JPEG, WebP, PNG, TIFF/DNG).
+   * Safe to call on demand from `GET /api/photos/map` without blocking large libraries.
+   */
+  async backfillExifGeo({ maxFiles = 350, force = false } = {}) {
+    const candidates = [];
+    const seenCanonical = new Set();
+    let changed = false;
+
+    for (const [key, entry] of this.records.entries()) {
+      if (!entry || entry.deletedAt || entry.storageType === 's3' || !entry.relativePath) {
+        continue;
+      }
+      const canonical = String(entry.diskHash || entry.hash || key).toLowerCase();
+      if (seenCanonical.has(canonical)) continue;
+      seenCanonical.add(canonical);
+
+      // Refresh missing locationLabel if GPS coords already exist
+      if (typeof entry.gpsLat === 'number' && typeof entry.gpsLng === 'number') {
+        if (!entry.locationLabel) {
+          const label = reverseGeocodeOffline(entry.gpsLat, entry.gpsLng);
+          if (label) {
+            const found = this.findMasterRecordKeys(canonical);
+            const aliasKeys = found && Array.isArray(found.keys) ? found.keys : [canonical];
+            for (const aliasKey of aliasKeys) {
+              const rec = this.records.get(aliasKey);
+              if (rec) rec.locationLabel = label;
+            }
+            changed = true;
+          }
+        }
+        continue;
+      }
+
+      const needsScan = force || !entry._exifScanned || (entry._exifVersion || 0) < EXIF_SCHEMA_VERSION;
+      if (needsScan) {
+        candidates.push({ canonical, entry });
+      }
+    }
+
+    if (candidates.length === 0) {
+      if (changed) {
+        this._markDirty();
+        await this.persist();
+      }
+      return { scanned: 0, foundGps: 0, remaining: 0 };
+    }
+
+    const limit = Math.max(1, Number(maxFiles) || 350);
+    const batch = candidates.slice(0, limit);
+    const remaining = Math.max(0, candidates.length - batch.length);
+    let scanned = 0;
+    let foundGps = 0;
+
+    const concurrency = 8;
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < batch.length) {
+        const idx = cursor++;
+        const { canonical, entry } = batch[idx];
+        const fullPath = path.join(this.storageDir, entry.relativePath);
+        try {
+          const exif = await readMediaExifMetadata(fullPath);
+          scanned += 1;
+          const found = this.findMasterRecordKeys(canonical);
+          const keys = found && Array.isArray(found.keys) ? found.keys : [canonical];
+          const hasGps = exif && typeof exif.gpsLat === 'number' && typeof exif.gpsLng === 'number';
+          if (hasGps) foundGps += 1;
+          for (const k of keys) {
+            const rec = this.records.get(k);
+            if (!rec) continue;
+            if (hasGps) {
+              rec.gpsLat = exif.gpsLat;
+              rec.gpsLng = exif.gpsLng;
+              rec.locationLabel = exif.locationLabel || rec.locationLabel || reverseGeocodeOffline(exif.gpsLat, exif.gpsLng);
+            }
+            if (exif && exif.cameraModel && !rec.cameraModel) {
+              rec.cameraModel = exif.cameraModel;
+            }
+            if (exif && exif.takenAt && !rec.takenAt) {
+              rec.takenAt = exif.takenAt;
+            }
+            rec._exifScanned = true;
+            rec._exifVersion = EXIF_SCHEMA_VERSION;
+          }
+          changed = true;
+        } catch {
+          // Non-fatal: mark scanned on unreadable file only if missing
+        }
+      }
+    };
+
+    const workers = [];
+    for (let i = 0; i < Math.min(concurrency, batch.length); i++) {
+      workers.push(worker());
+    }
+    await Promise.all(workers);
+
+    if (changed) {
+      this._markDirty();
+      await this.persist();
+    }
+    return { scanned, foundGps, remaining };
   }
 
   /**
@@ -660,6 +770,7 @@ class HashIndex {
   /**
    * Marks or clears whether a master photo was intentionally restored on device and should
    * not be re-proxied or auto-deleted by background/batch compression.
+   * Updates canonical + all alias keys atomically so cross-device views never diverge.
    */
   async setOriginalProtected(masterHash, keepOriginal = true) {
     const lookupResult = await this.lookup(masterHash, { allowStatFastPath: true });
@@ -667,9 +778,24 @@ class HashIndex {
       return null;
     }
     const normMaster = (lookupResult.masterHash || String(masterHash || '')).trim().toLowerCase();
+    const flag = Boolean(keepOriginal);
+    const nowIso = flag ? new Date().toISOString() : null;
+    const found = this.findMasterRecordKeys(normMaster);
+    if (found && found.keys.length > 0) {
+      for (const k of found.keys) {
+        const entry = this.records.get(k);
+        if (entry) {
+          entry.keepOriginalOnDevice = flag;
+          entry.originalProtectedAt = nowIso;
+        }
+      }
+      this._markDirty();
+      await this.persist();
+      return found.record;
+    }
     const record = this.records.get(normMaster) || lookupResult.record;
-    record.keepOriginalOnDevice = Boolean(keepOriginal);
-    record.originalProtectedAt = keepOriginal ? new Date().toISOString() : null;
+    record.keepOriginalOnDevice = flag;
+    record.originalProtectedAt = nowIso;
     this.records.set(normMaster, record);
     this._markDirty();
     await this.persist();
@@ -787,13 +913,46 @@ class HashIndex {
       return null;
     }
     const normMaster = (lookupResult.masterHash || String(masterHash || '')).trim().toLowerCase();
+    const flag = Boolean(isFavorite);
+    const nowIso = flag ? new Date().toISOString() : null;
+    const found = this.findMasterRecordKeys(normMaster);
+    if (found && found.keys.length > 0) {
+      for (const k of found.keys) {
+        const entry = this.records.get(k);
+        if (entry) {
+          entry.isFavorite = flag;
+          entry.favoritedAt = nowIso;
+        }
+      }
+      this._markDirty();
+      await this.persist();
+      return found.record;
+    }
     const record = this.records.get(normMaster) || lookupResult.record;
-    record.isFavorite = Boolean(isFavorite);
-    record.favoritedAt = isFavorite ? new Date().toISOString() : null;
+    record.isFavorite = flag;
+    record.favoritedAt = nowIso;
     this.records.set(normMaster, record);
     this._markDirty();
     await this.persist();
     return record;
+  }
+
+  getCategoryCounts() {
+    const unique = this._getUniqueMasterRecords({ includeTrashed: true });
+    let totalActive = 0;
+    let protectedCount = 0;
+    let favoriteCount = 0;
+    let trashCount = 0;
+    for (const { entry } of unique) {
+      if (entry.deletedAt) {
+        trashCount += 1;
+        continue;
+      }
+      totalActive += 1;
+      if (entry.keepOriginalOnDevice) protectedCount += 1;
+      if (entry.isFavorite) favoriteCount += 1;
+    }
+    return { totalActive, protectedCount, favoriteCount, trashCount };
   }
 
   async updateVisualMetrics(masterHash, { dHash = null, blurScore = null, width = null, height = null } = {}) {

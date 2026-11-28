@@ -10,6 +10,20 @@
  */
 
 const { verifyToken, resolveConfiguredUserFolder } = require('../models/userModel');
+const { timingSafeEqualStr } = require('./securityMiddleware');
+
+const MAX_AUTH_TOKEN_LENGTH = 4096;
+
+function findUserFolderTimingSafe(userKeyMap, providedKey) {
+  if (!providedKey || !userKeyMap || userKeyMap.size === 0) return null;
+  let matchedFolder = null;
+  for (const [configuredKey, folderName] of userKeyMap.entries()) {
+    if (timingSafeEqualStr(providedKey, configuredKey)) {
+      matchedFolder = folderName;
+    }
+  }
+  return matchedFolder;
+}
 
 /**
  * Authenticates `/api/*` requests via:
@@ -28,6 +42,13 @@ function createAuthMiddleware({ config, sessionSecret, contextService }) {
       const providedKey = String(
         req.headers['x-api-key'] || req.query.apiKey || bearerToken || ''
       ).trim();
+      if (providedKey.length > MAX_AUTH_TOKEN_LENGTH) {
+        return res.status(401).json({
+          success: false,
+          canDelete: false,
+          error: 'Unauthorized: Credentials exceed maximum allowed length.',
+        });
+      }
 
       // 1. Signed Google session Bearer/JWT token
       const sessionPayload = providedKey
@@ -75,10 +96,10 @@ function createAuthMiddleware({ config, sessionSecret, contextService }) {
         return next();
       }
 
-      // 2. Multi-user key map (USER_KEYS)
-      if (config.userKeyMap.size > 0 && config.userKeyMap.has(providedKey)) {
-        const folderName = config.userKeyMap.get(providedKey);
-        const folderCtx = await contextService.getOrCreateFolderContext(folderName);
+      // 2. Multi-user key map (USER_KEYS) with timing-safe comparison
+      const matchedUserFolder = findUserFolderTimingSafe(config.userKeyMap, providedKey);
+      if (matchedUserFolder !== null) {
+        const folderCtx = await contextService.getOrCreateFolderContext(matchedUserFolder);
         req.userContext = {
           ...folderCtx,
           apiKey: providedKey,
@@ -88,8 +109,8 @@ function createAuthMiddleware({ config, sessionSecret, contextService }) {
         return next();
       }
 
-      // 3. Single shared API_KEY
-      if (config.apiKey && providedKey === config.apiKey) {
+      // 3. Single shared API_KEY with timing-safe comparison
+      if (config.apiKey && timingSafeEqualStr(providedKey, config.apiKey)) {
         req.userContext = {
           folderName: null,
           apiKey: providedKey,

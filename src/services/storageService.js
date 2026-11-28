@@ -15,8 +15,9 @@ const path = require('path');
 const crypto = require('crypto');
 const { computeBufferSha256, computeFileSha256 } = require('../models/hashIndexModel');
 const {
-  parseJpegExifFromBuffer,
-  readJpegExifMetadata,
+  EXIF_SCHEMA_VERSION,
+  parseMediaExifFromBuffer,
+  readMediaExifMetadata,
   normalizeGpsCoords,
   reverseGeocodeOffline,
 } = require('./exifGeoService');
@@ -439,8 +440,8 @@ async function storeAndVerifyPhoto({
     assertWithinQuota(hashIndex, quotaBytes, buffer.length);
     await assertMinimumFreeDisk(storageDir, minFreeDiskBytes, buffer.length);
 
-    // 2. Extract EXIF camera/GPS/date metadata (fast header-only scan) and determine date folder
-    const exifMeta = parseJpegExifFromBuffer(buffer.subarray(0, Math.min(buffer.length, 65536)));
+    // 2. Extract EXIF/GPS/date metadata (JPEG, HEIC/HEIF, MOV/MP4, PNG, WebP, TIFF) and determine date folder
+    const exifMeta = parseMediaExifFromBuffer(buffer);
     const effectiveCreatedAt =
       createdAt !== undefined && createdAt !== null && String(createdAt).trim() !== ''
         ? createdAt
@@ -491,6 +492,7 @@ async function storeAndVerifyPhoto({
       gpsLng: geo.gpsLng,
       locationLabel: geo.locationLabel,
       _exifScanned: true,
+      _exifVersion: EXIF_SCHEMA_VERSION,
       uploadedAt: new Date().toISOString(),
     };
 
@@ -517,6 +519,9 @@ async function storeAndVerifyPhoto({
       originalName: record.originalName,
       size: record.size,
       photoDate: record.photoDate,
+      locationLabel: record.locationLabel || null,
+      gpsLat: record.gpsLat,
+      gpsLng: record.gpsLng,
     };
   });
 }
@@ -644,8 +649,8 @@ async function finalizeStagedUpload({
     await assertMinimumFreeDisk(storageDir, minFreeDiskBytes, totalBytes);
 
     const exifMeta =
-      parseJpegExifFromBuffer(head.subarray(0, Math.min(head.length, 65536))) ||
-      (await readJpegExifMetadata(stagingPath));
+      (await readMediaExifMetadata(stagingPath)) ||
+      parseMediaExifFromBuffer(head);
     const effectiveCreatedAt =
       createdAt !== undefined && createdAt !== null && String(createdAt).trim() !== ''
         ? createdAt
@@ -697,6 +702,7 @@ async function finalizeStagedUpload({
       gpsLng: geo.gpsLng,
       locationLabel: geo.locationLabel,
       _exifScanned: true,
+      _exifVersion: EXIF_SCHEMA_VERSION,
       uploadedAt: new Date().toISOString(),
     };
 

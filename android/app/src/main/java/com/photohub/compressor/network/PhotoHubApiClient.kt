@@ -109,6 +109,10 @@ private object SharedHttpClientPool {
         photosEtagByScope[scopeKey] = etag to totalCount
     }
 
+    fun clearPhotosEtag(scopeKey: String) {
+        photosEtagByScope.remove(scopeKey)
+    }
+
     fun clientFor(hosts: List<String>, pins: List<String>): OkHttpClient {
         if (pins.isEmpty() || hosts.isEmpty()) return baseClient
         val key = "${hosts.sorted().joinToString(",")}|${pins.sorted().joinToString(",")}"
@@ -1172,6 +1176,73 @@ class PhotoHubApiClient(
         private const val PROGRESS_STEP_BYTES = 128L * 1024L
     }
 
+    fun invalidatePhotosEtagCache() {
+        val cur = settings.current
+        val scopeKey = "${cur.normalizedBaseUrl.orEmpty()}|${cur.apiKeyCacheScope}"
+        SharedHttpClientPool.clearPhotosEtag(scopeKey)
+    }
+
+    /**
+     * Lightweight sync endpoint returning the authoritative set of protected master hashes on the server
+     * (`GET /api/photos?protected=1`), returning null safely on older servers without `?protected=1`.
+     */
+    suspend fun fetchProtectedMasterHashes(): Set<String>? = withContext(Dispatchers.IO) {
+        val collected = HashSet<String>()
+        var offset = 0
+        val pageSize = 1000
+        while (true) {
+            val req = Request.Builder()
+                .url(makeUrl("/api/photos?protected=1&limit=$pageSize&offset=$offset"))
+                .get()
+                .applyAuth()
+                .build()
+            var pageCount = 0
+            var total = 0
+            var hasMore: Boolean? = null
+            var unsupportedOlderServer = false
+            client.newCall(req).execute().use { resp ->
+                val text = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) throw ApiHttpException(resp.code, parseErrorMessage(resp.code, text))
+                val json = JSONObject(text)
+                if (!json.has("protectedCount")) {
+                    unsupportedOlderServer = true
+                    return@use
+                }
+                total = json.optInt("total", 0)
+                hasMore = if (json.has("hasMore") && !json.isNull("hasMore")) json.optBoolean("hasMore") else null
+                val photos = ServerPhoto.listFromJsonArray(json.optJSONArray("photos"))
+                pageCount = photos.size
+                for (item in photos) {
+                    if (item.isProtectedOriginal) {
+                        collected.add(item.hash.trim().lowercase(Locale.ROOT))
+                    }
+                }
+            }
+            if (unsupportedOlderServer) return@withContext null
+            if (pageCount == 0) break
+            offset += pageCount
+            val serverHasMore = hasMore ?: (offset < total)
+            if (!serverHasMore || offset >= total) break
+        }
+        collected
+    }
+
+    /**
+     * Pushes any locally restored original protections that previously failed to reach the server (offline restore).
+     */
+    suspend fun flushPendingProtectionUploads() {
+        val tracker = LocalProxyTracker.getInstance(context)
+        val pending = tracker.pendingProtectionSyncHashes()
+        if (pending.isEmpty()) return
+        val ok = runCatching {
+            setOriginalsProtectedBatch(masterHashes = pending, protected = true, notifyStore = false)
+            true
+        }.getOrDefault(false)
+        if (ok) {
+            tracker.clearPendingProtectionSync(pending)
+        }
+    }
+
     suspend fun setOriginalProtected(masterHash: String, protected: Boolean): ServerPhoto = withContext(Dispatchers.IO) {
         val body = JSONObject().apply { put("keepOriginalOnDevice", protected) }.toString()
         val req = Request.Builder()
@@ -1196,6 +1267,7 @@ class PhotoHubApiClient(
                 cur.apiKeyCacheScope,
                 notify = true
             )
+            invalidatePhotosEtagCache()
             updated
         }
     }
@@ -1255,6 +1327,7 @@ class PhotoHubApiClient(
                 cur.apiKeyCacheScope,
                 notify = notifyStore
             )
+            invalidatePhotosEtagCache()
         }
         allUpdated
     }
@@ -1283,6 +1356,7 @@ class PhotoHubApiClient(
                 cur.apiKeyCacheScope,
                 notify = true
             )
+            invalidatePhotosEtagCache()
             updated
         }
     }
@@ -1341,6 +1415,7 @@ class PhotoHubApiClient(
                 scopeKey = cur.apiKeyCacheScope,
                 notify = true
             )
+            invalidatePhotosEtagCache()
         }
         DeletePhotosResult(success = true, deleted = trashed, missing = missing, freedBytes = 0L)
     }
@@ -1362,6 +1437,9 @@ class PhotoHubApiClient(
             json.optJSONArray("restored")?.let { arr ->
                 for (i in 0 until arr.length()) arr.optString(i).takeIf { it.isNotBlank() }?.let(restored::add)
             }
+        }
+        if (restored.isNotEmpty()) {
+            invalidatePhotosEtagCache()
         }
         restored
     }

@@ -12,9 +12,22 @@
 const multer = require('multer');
 
 function createUploadMiddleware(config) {
+  // Cap RAM-buffered multipart uploads so abusive/oversized multipart requests cannot OOM-kill Node.js.
+  // Large 4K videos bypass multer and stream directly to disk via raw binary or chunked upload endpoints.
+  const maxMultipartBytes =
+    Number(config.maxMultipartFileBytes) > 0
+      ? Number(config.maxMultipartFileBytes)
+      : Math.min(Number(config.maxFileSizeBytes) || 150 * 1024 * 1024, 150 * 1024 * 1024);
+
   const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: config.maxFileSizeBytes },
+    limits: {
+      fileSize: maxMultipartBytes,
+      files: 25,
+      fields: 50,
+      fieldSize: 1 * 1024 * 1024,
+      parts: 80,
+    },
   });
 
   const conditionalMultipart = (req, res, next) => {

@@ -22,9 +22,18 @@
     protectedCount: 0,
     isLoadingProtected: false,
     protectedLoadedOnce: false,
+    protectedLoadSeq: 0,
+    favoritePhotos: [],
+    favoriteCount: 0,
+    isLoadingFavorites: false,
+    favoriteLoadedOnce: false,
+    favoriteLoadSeq: 0,
     trashPhotos: [],
     trashCount: 0,
     isLoadingTrash: false,
+    trashLoadSeq: 0,
+    isMutatingProtection: false,
+    lastAutoSyncMs: 0,
     years: [],
     totalPhotos: 0,
     hasMore: false,
@@ -47,11 +56,6 @@
     shareTargetHashes: [],
     shareAlbumId: null,
     activeShares: [],
-    memories: [],
-    activeMemory: null,
-    memorySlideIndex: 0,
-    memoryTimer: null,
-    memoryPaused: false,
     albums: [],
     albumCategoryFilter: 'all',
     activeAlbum: null,
@@ -60,9 +64,11 @@
     albumPickerHashes: [],
     mapData: null,
     selectedMapClusterId: null,
-    mapZoom: 1,
-    mapPanX: 0,
-    mapPanY: 0,
+    selectedMapFilter: null,
+    mapProvider: 'leaflet', // 'leaflet' | 'google'
+    mapProviderUserChosen: false,
+    mapStyle: 'street', // 'street' | 'satellite' | 'osm'
+    mapHasFittedOnce: false,
     cleanupReport: null,
     cleanupTab: 'similar',
     cleanupSelectedHashes: new Set(),
@@ -70,7 +76,7 @@
   };
 
   // Bounded LRU cache for preloaded lightbox full previews (eliminates spinner flash on swipe/next)
-  const MAX_LB_CACHE = 12;
+  const MAX_LB_CACHE = 24;
   const lbPreviewCache = new Map(); // hash -> objectURL
   const lbPreviewInFlight = new Map(); // hash -> Promise<string|null>
 
@@ -89,12 +95,20 @@
     ['december', 'dec'],
   ];
 
-  // Bounded LRU ObjectURL cache for grid thumbnails (prevents memory leaks on huge libraries)
-  const MAX_THUMB_CACHE = 300;
+  // Two-tier grid thumbnail cache:
+  //   L1: Bounded RAM LRU ObjectURL cache (instant synchronous hits on re-renders)
+  //   L2: Persistent Browser Cache Storage API (instant 1-3ms hits across reloads, zero server traffic)
+  const MAX_THUMB_CACHE = 800;
+  const THUMB_DISK_CACHE_NAME = 'photohub-thumbs-v1';
+  const MAX_THUMB_DISK_ENTRIES = 2500;
   const thumbUrlCache = new Map(); // hash -> objectURL
-  const inFlightThumbs = new Set();
+  const thumbInFlight = new Map(); // hash -> Promise<string|null>
+  const thumbAbortControllers = new Map(); // hash -> AbortController
+  const visibleThumbTiles = new Set(); // currently-intersecting tile elements
+  let thumbDiskCachePromise = null;
+  let thumbDiskWriteCount = 0;
   let activeThumbFetches = 0;
-  const MAX_CONCURRENT_THUMBS = 6;
+  const MAX_CONCURRENT_THUMBS = 10;
   const thumbFetchQueue = [];
 
   // ==================== SUNNY MASCOT SVG GENERATOR ====================
@@ -336,6 +350,7 @@
     const next = cur === 'dark' ? 'light' : 'dark';
     document.documentElement.setAttribute('data-theme', next);
     localStorage.setItem(THEME_KEY, next);
+    if (typeof syncMapTheme === 'function') syncMapTheme();
   }
 
   // ==================== SESSION & API ====================
@@ -666,7 +681,7 @@
   }
 
   function preloadAdjacentLightboxItems(index) {
-    for (const delta of [1, -1]) {
+    for (const delta of [1, -1, 2, -2]) {
       const neighbor = state.visibleFlatPhotos[index + delta];
       if (neighbor && !isVideoPhoto(neighbor)) {
         fetchLightboxPreviewCached(neighbor.hash);
@@ -684,19 +699,30 @@
     state.trashPhotos = [];
     state.trashCount = 0;
     state.years = [];
-    state.memories = [];
     state.albums = [];
     state.activeAlbum = null;
     state.activeAlbumPhotos = [];
     state.mapData = null;
     state.selectedMapClusterId = null;
+    state.selectedMapFilter = null;
+    state.mapHasFittedOnce = false;
+    clearActiveMapMarkers();
     state.activeShares = [];
     state.cleanupReport = null;
     state.photosEtag = null;
+    state.protectedPhotos = [];
+    state.protectedCount = 0;
+    state.protectedLoadedOnce = false;
+    state.favoritePhotos = [];
+    state.favoriteCount = 0;
+    state.favoriteLoadedOnce = false;
+    state.trashPhotos = [];
+    state.trashCount = 0;
+    state.isMutatingProtection = false;
     state.selectedHashes.clear();
     state.lastSelectedIndex = -1;
     state.isSelectionMode = false;
-    clearThumbCache();
+    clearThumbCache({ clearDisk: true });
     clearLbPreviewCache();
     updateSelectionBar();
     updateAuthUI();
@@ -730,10 +756,11 @@
   }
 
   // ==================== GALLERY DATA & TIMELINE ====================
-  async function loadGallery(forceSync = false) {
-    if (!state.session || state.isLoadingPhotos) return;
+  async function loadGallery(forceSync = false, { silent = false } = {}) {
+    if (!state.session || state.isLoadingPhotos) return false;
     state.isLoadingPhotos = true;
-    $('refreshGalleryBtn').querySelector('.refresh-svg').classList.add('is-spinning');
+    const refreshSvg = $('refreshGalleryBtn')?.querySelector('.refresh-svg');
+    if (!silent && refreshSvg) refreshSvg.classList.add('is-spinning');
     if (state.photos.length === 0) {
       $('gallerySkeleton').classList.remove('hidden');
       $('galleryEmptyState').classList.add('hidden');
@@ -749,10 +776,10 @@
       if (state.selectedYear) query.set('year', String(state.selectedYear));
 
       const res = await apiFetch(`/api/photos?${query.toString()}`, { headers });
+      state.lastAutoSyncMs = Date.now();
       if (res.status === 304) {
-        // Gallery unchanged!
-        renderGallery();
-        return;
+        if (!silent) renderGallery();
+        return false;
       }
       if (!res.ok) throw new Error(`Server returned HTTP ${res.status}`);
       const etag = res.headers.get('ETag');
@@ -766,17 +793,44 @@
         typeof data.protectedCount === 'number'
           ? data.protectedCount
           : state.photos.filter((p) => Boolean(p.keepOriginalOnDevice)).length;
+      state.favoriteCount =
+        typeof data.favoriteCount === 'number'
+          ? data.favoriteCount
+          : state.photos.filter((p) => Boolean(p.isFavorite)).length;
       state.hasMore = Boolean(data.hasMore);
       updateTrashBadge();
       updateProtectedBadge();
+      updateFavoriteBadge();
       if (Array.isArray(data.years)) {
         state.years = data.years;
         renderYearPills();
       }
+
+      // Server index changed (e.g. from phone client): refresh whichever category view is open!
+      if (state.filterMedia === 'protected' && !state.isMutatingProtection) {
+        loadProtectedPhotos({ silent: true });
+      } else if (state.filterMedia === 'favorite') {
+        loadFavoritePhotos({ silent: true });
+      } else if (state.filterMedia === 'trash') {
+        loadTrash({ silent: true });
+      } else if (state.filterMedia === 'albums') {
+        loadAlbums();
+        if (state.activeAlbum) openAlbumDetail(state.activeAlbum.id);
+      } else if (state.filterMedia === 'map') {
+        loadPhotoMap();
+      } else {
+        // Mark category caches dirty so switching to them fetches fresh server data
+        state.protectedLoadedOnce = false;
+        state.favoriteLoadedOnce = false;
+      }
+
       renderGallery();
-      loadMemories();
-      verifySession();
+      if (!silent) {
+        verifySession();
+      }
+      return true;
     } catch (err) {
+      if (silent) return false;
       if (state.photos.length === 0) {
         $('galleryEmptyState').classList.remove('hidden');
         setMascotMood($('emptyStateMascot'), 'alert');
@@ -785,11 +839,20 @@
       } else {
         showToast(err.message || 'Refresh failed', 'rose');
       }
+      return false;
     } finally {
       state.isLoadingPhotos = false;
       $('gallerySkeleton').classList.add('hidden');
-      $('refreshGalleryBtn').querySelector('.refresh-svg').classList.remove('is-spinning');
+      if (refreshSvg) refreshSvg.classList.remove('is-spinning');
     }
+  }
+
+  async function syncGalleryFromServerIfChanged({ force = false } = {}) {
+    if (!state.session || state.activeView !== 'gallery') return;
+    if (state.isLoadingPhotos || state.isMutatingProtection || uploadState.isRunning) return;
+    const now = Date.now();
+    if (!force && now - state.lastAutoSyncMs < 5000) return;
+    await loadGallery(false, { silent: true });
   }
 
   async function loadMorePhotos() {
@@ -879,29 +942,65 @@
     }
   }
 
-  function updateProtectedBannerUI() {
+  function updateFavoriteBadge() {
+    const badge = $('favoriteCountBadge');
+    if (!badge) return;
+    if (state.favoriteCount > 0) {
+      badge.textContent = String(state.favoriteCount);
+      badge.classList.remove('hidden');
+    } else {
+      badge.classList.add('hidden');
+    }
+  }
+
+  function applyServerCategoryCounts(data) {
+    if (!data || typeof data !== 'object') return;
+    if (typeof data.protectedCount === 'number') {
+      state.protectedCount = Math.max(0, data.protectedCount);
+      updateProtectedBadge();
+    }
+    if (typeof data.favoriteCount === 'number') {
+      state.favoriteCount = Math.max(0, data.favoriteCount);
+      updateFavoriteBadge();
+    }
+    if (typeof data.trashCount === 'number') {
+      state.trashCount = Math.max(0, data.trashCount);
+      updateTrashBadge();
+    }
+  }
+
+  function updateProtectedBannerUI(progressMessage = null) {
     const list = state.protectedLoadedOnce
       ? state.protectedPhotos
       : state.photos.filter((p) => Boolean(p.keepOriginalOnDevice));
     const totalBytes = list.reduce((sum, p) => sum + (Number(p.size) || 0), 0);
     const sub = $('protectedBannerSub');
     if (sub) {
-      sub.textContent =
-        list.length > 0
-          ? `${list.length} protected original(s) (${formatBytes(totalBytes)}) · Won't be auto-compressed into proxies on your phone.`
-          : 'No protected originals yet. Restored or protected photos appear here so they stay full-resolution on your phone.';
+      if (progressMessage) {
+        sub.textContent = progressMessage;
+      } else {
+        sub.textContent =
+          list.length > 0
+            ? `${list.length} protected original(s) (${formatBytes(totalBytes)}) · Won't be auto-compressed into proxies on your phone.`
+            : 'No protected originals yet. Restored or protected photos appear here so they stay full-resolution on your phone.';
+      }
     }
+    const busy = Boolean(state.isMutatingProtection);
     const selAllBtn = $('selectAllProtectedBtn');
     const unlockAllBtn = $('allowReproxyAllProtectedBtn');
-    if (selAllBtn) selAllBtn.disabled = list.length === 0;
-    if (unlockAllBtn) unlockAllBtn.disabled = list.length === 0;
+    if (selAllBtn) selAllBtn.disabled = busy || list.length === 0;
+    if (unlockAllBtn) {
+      unlockAllBtn.disabled = busy || list.length === 0;
+      if (!busy) unlockAllBtn.textContent = 'Allow Re-Proxy All';
+    }
   }
 
-  async function loadProtectedPhotos() {
-    if (!state.session || state.isLoadingProtected) return;
+  async function loadProtectedPhotos({ silent = false } = {}) {
+    if (!state.session) return;
+    const mySeq = ++state.protectedLoadSeq;
     state.isLoadingProtected = true;
     const sub = $('protectedBannerSub');
-    if (sub && !state.protectedLoadedOnce) {
+    if (!silent && sub && !state.protectedLoadedOnce) {
       sub.textContent = 'Loading all protected originals from server…';
     }
     try {
@@ -909,14 +1008,13 @@
       const seen = new Set();
       let offset = 0;
       const limit = 1000;
-      let serverProtectedCount = null;
+      let serverMeta = null;
       while (true) {
         const res = await apiFetch(`/api/photos?protected=1&limit=${limit}&offset=${offset}`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        if (typeof data.protectedCount === 'number') {
-          serverProtectedCount = data.protectedCount;
-        }
+        if (mySeq !== state.protectedLoadSeq) return;
+        serverMeta = data;
         const page = Array.isArray(data.photos) ? data.photos : [];
         for (const p of page) {
           if (!p || !p.keepOriginalOnDevice) continue;
@@ -929,26 +1027,102 @@
         offset += page.length;
         if (!data.hasMore || page.length === 0) break;
       }
+      if (mySeq !== state.protectedLoadSeq) return;
       state.protectedPhotos = collected;
       state.protectedLoadedOnce = true;
-      state.protectedCount = serverProtectedCount !== null ? serverProtectedCount : collected.length;
+      // Reconcile keepOriginalOnDevice across already-loaded main/favorite/album arrays too
+      const protectedSet = seen;
+      for (const list of [state.photos, state.favoritePhotos, state.activeAlbumPhotos]) {
+        for (const p of list) {
+          const k = String(p.hash || '').toLowerCase();
+          p.keepOriginalOnDevice = protectedSet.has(k);
+        }
+      }
+      state.protectedCount =
+        serverMeta && typeof serverMeta.protectedCount === 'number'
+          ? serverMeta.protectedCount
+          : collected.length;
+      if (serverMeta) applyServerCategoryCounts(serverMeta);
       updateProtectedBadge();
       updateProtectedBannerUI();
       renderGallery();
     } catch (err) {
-      showToast(err.message || 'Could not load Protected photos', 'rose');
+      if (!silent && mySeq === state.protectedLoadSeq) {
+        showToast(err.message || 'Could not load Protected photos', 'rose');
+      }
     } finally {
-      state.isLoadingProtected = false;
+      if (mySeq === state.protectedLoadSeq) {
+        state.isLoadingProtected = false;
+        if (state.filterMedia === 'protected') renderGallery();
+      }
     }
   }
 
-  async function loadTrash() {
-    if (!state.session || state.isLoadingTrash) return;
+  async function loadFavoritePhotos({ silent = false } = {}) {
+    if (!state.session) return;
+    const mySeq = ++state.favoriteLoadSeq;
+    state.isLoadingFavorites = true;
+    try {
+      const collected = [];
+      const seen = new Set();
+      let offset = 0;
+      const limit = 1000;
+      let serverMeta = null;
+      while (true) {
+        const res = await apiFetch(`/api/photos?favorite=1&limit=${limit}&offset=${offset}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (mySeq !== state.favoriteLoadSeq) return;
+        serverMeta = data;
+        const page = Array.isArray(data.photos) ? data.photos : [];
+        for (const p of page) {
+          if (!p || !p.isFavorite) continue;
+          const k = String(p.hash || '').toLowerCase();
+          if (k && !seen.has(k)) {
+            seen.add(k);
+            collected.push(p);
+          }
+        }
+        offset += page.length;
+        if (!data.hasMore || page.length === 0) break;
+      }
+      if (mySeq !== state.favoriteLoadSeq) return;
+      state.favoritePhotos = collected;
+      state.favoriteLoadedOnce = true;
+      for (const list of [state.photos, state.protectedPhotos, state.activeAlbumPhotos]) {
+        for (const p of list) {
+          const k = String(p.hash || '').toLowerCase();
+          p.isFavorite = seen.has(k);
+        }
+      }
+      state.favoriteCount =
+        serverMeta && typeof serverMeta.favoriteCount === 'number'
+          ? serverMeta.favoriteCount
+          : collected.length;
+      if (serverMeta) applyServerCategoryCounts(serverMeta);
+      updateFavoriteBadge();
+      renderGallery();
+    } catch (err) {
+      if (!silent && mySeq === state.favoriteLoadSeq) {
+        showToast(err.message || 'Could not load Favorites', 'rose');
+      }
+    } finally {
+      if (mySeq === state.favoriteLoadSeq) {
+        state.isLoadingFavorites = false;
+        if (state.filterMedia === 'favorite') renderGallery();
+      }
+    }
+  }
+
+  async function loadTrash({ silent = false } = {}) {
+    if (!state.session) return;
+    const mySeq = ++state.trashLoadSeq;
     state.isLoadingTrash = true;
     try {
       const res = await apiFetch('/api/photos/trash');
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
+      if (mySeq !== state.trashLoadSeq) return;
       state.trashPhotos = Array.isArray(data.photos) ? data.photos : [];
       state.trashCount = Number(data.total) || state.trashPhotos.length;
       updateTrashBadge();
@@ -959,9 +1133,13 @@
       $('emptyTrashBtn').disabled = state.trashPhotos.length === 0;
       renderGallery();
     } catch (err) {
-      showToast(err.message || 'Could not load Trash', 'rose');
+      if (!silent && mySeq === state.trashLoadSeq) {
+        showToast(err.message || 'Could not load Trash', 'rose');
+      }
     } finally {
-      state.isLoadingTrash = false;
+      if (mySeq === state.trashLoadSeq) {
+        state.isLoadingTrash = false;
+      }
     }
   }
 
@@ -1003,7 +1181,10 @@
     }
     if (state.filterMedia === 'map') {
       let list = (state.mapData && Array.isArray(state.mapData.photos) ? state.mapData.photos : []).slice();
-      if (state.selectedMapClusterId && state.mapData && Array.isArray(state.mapData.clusters)) {
+      if (state.selectedMapFilter && state.selectedMapFilter.hashes && state.selectedMapFilter.hashes.size > 0) {
+        const allowed = state.selectedMapFilter.hashes;
+        list = list.filter((p) => allowed.has(String(p.hash).toLowerCase()));
+      } else if (state.selectedMapClusterId && state.mapData && Array.isArray(state.mapData.clusters)) {
         const cl = state.mapData.clusters.find((c) => c.id === state.selectedMapClusterId);
         if (cl) {
           const allowed = new Set(cl.hashes.map((h) => String(h).toLowerCase()));
@@ -1028,13 +1209,28 @@
         return true;
       });
     }
+    if (state.filterMedia === 'favorite') {
+      const base = state.favoriteLoadedOnce
+        ? state.favoritePhotos
+        : state.photos.filter((p) => Boolean(p.isFavorite));
+      return base.filter((p) => {
+        if (!p.isFavorite) return false;
+        if (state.selectedYear) {
+          const rawDate = String(p.photoDate || p.takenAt || p.uploadedAt || '');
+          const match = /^(\d{4})/.exec(rawDate);
+          const itemYear = match ? Number(match[1]) : null;
+          if (itemYear !== Number(state.selectedYear)) return false;
+        }
+        if (state.searchQuery && !matchesSmartSearch(p, state.searchQuery)) return false;
+        return true;
+      });
+    }
     const isTrash = state.filterMedia === 'trash';
     const source = isTrash ? state.trashPhotos : state.photos;
     return source.filter((p) => {
       const isVid = isVideoPhoto(p);
       if (state.filterMedia === 'photo' && isVid) return false;
       if (state.filterMedia === 'video' && !isVid) return false;
-      if (state.filterMedia === 'favorite' && !p.isFavorite) return false;
       if (state.searchQuery && !matchesSmartSearch(p, state.searchQuery)) return false;
       return true;
     });
@@ -1075,36 +1271,145 @@
     return Array.from(map.values());
   }
 
-  // Lazy Thumbnail IntersectionObserver
+  // ==================== TWO-TIER THUMBNAIL CACHE & VIEWPORT-FIRST QUEUE ====================
+  function getThumbSessionScope() {
+    const email = (state.whoami && state.whoami.email) || (state.session && state.session.user && state.session.user.email) || '';
+    const node = (state.session && state.session.nodeId) || 'primary';
+    const raw = `${email || 'user'}_${node}`.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+    return raw || 'default';
+  }
+
+  function getThumbDiskCacheRequest(hash) {
+    return `${window.location.origin}/__photohub_thumb__/${getThumbSessionScope()}/${encodeURIComponent(hash)}?size=thumb`;
+  }
+
+  function openThumbDiskCache() {
+    if (typeof window === 'undefined' || !('caches' in window)) {
+      return Promise.resolve(null);
+    }
+    if (!thumbDiskCachePromise) {
+      thumbDiskCachePromise = window.caches
+        .open(THUMB_DISK_CACHE_NAME)
+        .catch(() => null);
+    }
+    return thumbDiskCachePromise;
+  }
+
+  async function readThumbFromDiskCache(hash) {
+    try {
+      const cache = await openThumbDiskCache();
+      if (!cache) return null;
+      const res = await cache.match(getThumbDiskCacheRequest(hash));
+      if (!res || !res.ok) return null;
+      const blob = await res.blob();
+      if (!blob || blob.size === 0) return null;
+      const objUrl = URL.createObjectURL(blob);
+      rememberThumbUrl(hash, objUrl);
+      return objUrl;
+    } catch {
+      return null;
+    }
+  }
+
+  function writeThumbToDiskCache(hash, responseClone) {
+    if (!responseClone) return;
+    openThumbDiskCache()
+      .then(async (cache) => {
+        if (!cache) return;
+        await cache.put(getThumbDiskCacheRequest(hash), responseClone);
+        thumbDiskWriteCount += 1;
+        if (thumbDiskWriteCount % 120 === 0) {
+          const keys = await cache.keys();
+          if (keys.length > MAX_THUMB_DISK_ENTRIES) {
+            const toDelete = keys.slice(0, keys.length - MAX_THUMB_DISK_ENTRIES);
+            await Promise.all(toDelete.map((k) => cache.delete(k).catch(() => {})));
+          }
+        }
+      })
+      .catch(() => {});
+  }
+
+  // Lazy Thumbnail IntersectionObserver (tracks viewport visibility for LIFO visible-first priority)
   const thumbObserver = new IntersectionObserver(
     (entries) => {
       for (const entry of entries) {
-        if (!entry.isIntersecting) continue;
         const tile = entry.target;
-        thumbObserver.unobserve(tile);
-        const hash = tile.dataset.hash;
-        const isVid = tile.dataset.video === '1';
-        const needsProxy = tile.dataset.needsProxy === '1';
-        if (hash) {
-          queueThumbnailLoad(tile, hash, isVid, needsProxy);
+        if (entry.isIntersecting) {
+          visibleThumbTiles.add(tile);
+          if (tile.dataset.thumbLoaded === '1') {
+            thumbObserver.unobserve(tile);
+            visibleThumbTiles.delete(tile);
+            continue;
+          }
+          const hash = tile.dataset.hash;
+          const isVid = tile.dataset.video === '1';
+          const needsProxy = tile.dataset.needsProxy === '1';
+          if (hash) {
+            queueThumbnailLoad(tile, hash, isVid, needsProxy);
+          }
+        } else {
+          visibleThumbTiles.delete(tile);
         }
       }
     },
-    { rootMargin: '260px 0px' }
+    { rootMargin: '420px 0px' }
   );
 
-  function clearThumbCache() {
+  function cancelStaleThumbFetches() {
+    // Drop queued tiles that were detached from DOM during view/filter switches
+    for (let i = thumbFetchQueue.length - 1; i >= 0; i--) {
+      if (!thumbFetchQueue[i] || !thumbFetchQueue[i].tile || !thumbFetchQueue[i].tile.isConnected) {
+        thumbFetchQueue.splice(i, 1);
+      }
+    }
+    for (const tile of Array.from(visibleThumbTiles)) {
+      if (!tile.isConnected) visibleThumbTiles.delete(tile);
+    }
+    // Abort in-flight grid fetches whose hashes are no longer mounted in the current view
+    for (const [hash, ctrl] of Array.from(thumbAbortControllers.entries())) {
+      const stillMounted = Boolean(
+        document.querySelector(`.photo-tile[data-hash="${CSS.escape(hash)}"]`)
+      );
+      if (!stillMounted) {
+        try {
+          ctrl.abort();
+        } catch {
+          // ignore
+        }
+        thumbAbortControllers.delete(hash);
+      }
+    }
+  }
+
+  function clearThumbCache({ clearDisk = false } = {}) {
+    for (const ctrl of thumbAbortControllers.values()) {
+      try {
+        ctrl.abort();
+      } catch {
+        // ignore
+      }
+    }
+    thumbAbortControllers.clear();
     for (const url of thumbUrlCache.values()) {
       URL.revokeObjectURL(url);
     }
     thumbUrlCache.clear();
-    inFlightThumbs.clear();
+    thumbInFlight.clear();
+    visibleThumbTiles.clear();
     thumbFetchQueue.length = 0;
+    if (clearDisk && typeof window !== 'undefined' && 'caches' in window) {
+      thumbDiskCachePromise = null;
+      window.caches.delete(THUMB_DISK_CACHE_NAME).catch(() => {});
+    }
   }
 
   function rememberThumbUrl(hash, objectUrl) {
     if (thumbUrlCache.has(hash)) {
+      const prev = thumbUrlCache.get(hash);
       thumbUrlCache.delete(hash);
+      if (prev && prev !== objectUrl) {
+        URL.revokeObjectURL(prev);
+      }
     }
     thumbUrlCache.set(hash, objectUrl);
     if (thumbUrlCache.size > MAX_THUMB_CACHE) {
@@ -1116,26 +1421,91 @@
   }
 
   function applyThumbToTile(tile, url) {
+    if (!tile || !url) return;
+    tile.dataset.thumbLoaded = '1';
+    visibleThumbTiles.delete(tile);
+    thumbObserver.unobserve(tile);
     const img = tile.querySelector('img');
     const shimmer = tile.querySelector('.photo-tile-shimmer');
     if (img) {
-      img.src = url;
-      img.onload = () => {
+      if (img.src !== url) img.src = url;
+      if (img.complete && img.naturalWidth > 0) {
         img.classList.add('is-loaded');
         if (shimmer) shimmer.remove();
-      };
+      } else {
+        img.onload = () => {
+          img.classList.add('is-loaded');
+          if (shimmer) shimmer.remove();
+        };
+      }
     }
   }
 
   function showTileFallback(tile, isVid) {
+    if (!tile) return;
+    tile.dataset.thumbLoaded = '1';
+    visibleThumbTiles.delete(tile);
+    thumbObserver.unobserve(tile);
     const shimmer = tile.querySelector('.photo-tile-shimmer');
     if (shimmer) shimmer.remove();
+    if (tile.querySelector('.tile-placeholder')) return;
     const ph = document.createElement('div');
     ph.className = 'tile-placeholder';
     ph.innerHTML = isVid
       ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24"><polygon points="5 3 19 12 5 21 5 3"/></svg><span>Video</span>`
       : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg><span>Photo</span>`;
     tile.appendChild(ph);
+  }
+
+  /**
+   * Shared deduplicated micro-thumbnail loader (L1 RAM -> L2 Browser Cache Storage -> Server `?size=thumb` WebP/JPEG).
+   */
+  function fetchThumbUrl(hash, { abortable = false } = {}) {
+    if (!hash) return Promise.resolve(null);
+    if (thumbUrlCache.has(hash)) {
+      // Refresh LRU recency
+      const hit = thumbUrlCache.get(hash);
+      thumbUrlCache.delete(hash);
+      thumbUrlCache.set(hash, hit);
+      return Promise.resolve(hit);
+    }
+    if (thumbInFlight.has(hash)) {
+      return thumbInFlight.get(hash);
+    }
+
+    const p = (async () => {
+      // Check L2 persistent browser Cache Storage first (0 network latency on reload!)
+      const diskHit = await readThumbFromDiskCache(hash);
+      if (diskHit) return diskHit;
+
+      const controller = abortable && typeof AbortController !== 'undefined' ? new AbortController() : null;
+      if (controller) thumbAbortControllers.set(hash, controller);
+      try {
+        const res = await apiFetch(`/api/photo/${encodeURIComponent(hash)}/preview?size=thumb`, {
+          headers: { Accept: 'image/webp,image/*,*/*;q=0.8' },
+          ...(controller ? { signal: controller.signal } : {}),
+        });
+        if (!res.ok) return null;
+        const cloneForDisk = res.clone();
+        const blob = await res.blob();
+        if (!blob || blob.size === 0) return null;
+        writeThumbToDiskCache(hash, cloneForDisk);
+        const objUrl = URL.createObjectURL(blob);
+        rememberThumbUrl(hash, objUrl);
+        return objUrl;
+      } catch {
+        return null;
+      } finally {
+        if (controller && thumbAbortControllers.get(hash) === controller) {
+          thumbAbortControllers.delete(hash);
+        }
+      }
+    })().finally(() => {
+      thumbInFlight.delete(hash);
+    });
+
+    thumbInFlight.set(hash, p);
+    return p;
   }
 
   function queueThumbnailLoad(tile, hash, isVid, needsProxy) {
@@ -1147,40 +1517,87 @@
       showTileFallback(tile, true);
       return;
     }
+    if (thumbInFlight.has(hash)) {
+      thumbInFlight.get(hash).then((url) => {
+        if (!tile.isConnected) return;
+        if (url) applyThumbToTile(tile, url);
+        else showTileFallback(tile, isVid);
+      });
+      return;
+    }
+    // Check L2 persistent Cache Storage without consuming a network concurrency slot
+    if (typeof window !== 'undefined' && 'caches' in window) {
+      readThumbFromDiskCache(hash).then((diskHit) => {
+        if (!tile.isConnected) return;
+        if (diskHit) {
+          applyThumbToTile(tile, diskHit);
+          return;
+        }
+        if (tile.dataset.thumbLoaded === '1') return;
+        thumbFetchQueue.push({ tile, hash, isVid });
+        drainThumbQueue();
+      });
+      return;
+    }
     thumbFetchQueue.push({ tile, hash, isVid });
     drainThumbQueue();
   }
 
+  function pickNextPriorityThumbJob() {
+    // Prefer the most recently entered currently-visible tile (LIFO visible-first),
+    // discarding detached tiles so fast scrolling loads what's on-screen NOW!
+    for (let i = thumbFetchQueue.length - 1; i >= 0; i--) {
+      const job = thumbFetchQueue[i];
+      if (!job || !job.tile || !job.tile.isConnected || job.tile.dataset.thumbLoaded === '1') {
+        thumbFetchQueue.splice(i, 1);
+        continue;
+      }
+      if (visibleThumbTiles.has(job.tile)) {
+        thumbFetchQueue.splice(i, 1);
+        return job;
+      }
+    }
+    while (thumbFetchQueue.length > 0) {
+      const job = thumbFetchQueue.pop();
+      if (job && job.tile && job.tile.isConnected && job.tile.dataset.thumbLoaded !== '1') {
+        return job;
+      }
+    }
+    return null;
+  }
+
   function drainThumbQueue() {
     while (activeThumbFetches < MAX_CONCURRENT_THUMBS && thumbFetchQueue.length > 0) {
-      const job = thumbFetchQueue.shift();
-      if (!job || !job.tile.isConnected) continue;
+      const job = pickNextPriorityThumbJob();
+      if (!job) break;
       if (thumbUrlCache.has(job.hash)) {
         applyThumbToTile(job.tile, thumbUrlCache.get(job.hash));
         continue;
       }
-      if (inFlightThumbs.has(job.hash)) continue;
-      inFlightThumbs.add(job.hash);
-      activeThumbFetches++;
+      if (thumbInFlight.has(job.hash)) {
+        thumbInFlight.get(job.hash).then((url) => {
+          if (!job.tile.isConnected) return;
+          if (url) applyThumbToTile(job.tile, url);
+          else showTileFallback(job.tile, job.isVid);
+        });
+        continue;
+      }
 
-      apiFetch(`/api/photo/${encodeURIComponent(job.hash)}/preview`)
-        .then((res) => (res.ok ? res.blob() : null))
-        .then((blob) => {
-          if (blob && blob.size > 0) {
-            const objUrl = URL.createObjectURL(blob);
-            rememberThumbUrl(job.hash, objUrl);
+      activeThumbFetches++;
+      fetchThumbUrl(job.hash, { abortable: true })
+        .then((objUrl) => {
+          if (objUrl) {
             document
               .querySelectorAll(`.photo-tile[data-hash="${CSS.escape(job.hash)}"]`)
               .forEach((t) => applyThumbToTile(t, objUrl));
-          } else {
+          } else if (job.tile.isConnected) {
             showTileFallback(job.tile, job.isVid);
           }
         })
         .catch(() => {
-          showTileFallback(job.tile, job.isVid);
+          if (job.tile.isConnected) showTileFallback(job.tile, job.isVid);
         })
         .finally(() => {
-          inFlightThumbs.delete(job.hash);
           activeThumbFetches--;
           drainThumbQueue();
         });
@@ -1190,6 +1607,7 @@
   function renderGallery() {
     const isTrashView = state.filterMedia === 'trash';
     const isProtectedView = state.filterMedia === 'protected';
+    const isFavoriteView = state.filterMedia === 'favorite';
     const isAlbumsView = state.filterMedia === 'albums';
     const isMapView = state.filterMedia === 'map';
 
@@ -1197,12 +1615,9 @@
     $('protectedBanner').classList.toggle('hidden', !isProtectedView);
     $('albumsViewSection').classList.toggle('hidden', !isAlbumsView);
     $('mapViewSection').classList.toggle('hidden', !isMapView);
-    if (isProtectedView) {
+    if (isProtectedView && !state.isMutatingProtection) {
       updateProtectedBannerUI();
     }
-
-    const showMemories = state.filterMedia === 'all' && !state.searchQuery && state.memories.length > 0;
-    $('memoriesStrip').classList.toggle('hidden', !showMemories);
 
     if (isAlbumsView) {
       $('albumsOverviewPane').classList.toggle('hidden', Boolean(state.activeAlbum));
@@ -1225,11 +1640,13 @@
       ? `${state.trashPhotos.length} item(s) in Trash`
       : isProtectedView
         ? `${items.length} protected original(s)`
-        : isAlbumsView && state.activeAlbum
-          ? `${state.activeAlbum.name} · ${items.length} item(s)`
-          : isMapView
-            ? `${items.length} mapped photo(s)`
-            : `${state.totalPhotos} total · ${photoCount} photos · ${vidCount} videos${state.protectedCount > 0 ? ` · ${state.protectedCount} protected` : ''}`;
+        : isFavoriteView
+          ? `${items.length} favorite(s)`
+          : isAlbumsView && state.activeAlbum
+            ? `${state.activeAlbum.name} · ${items.length} item(s)`
+            : isMapView
+              ? `${items.length} mapped photo(s)`
+              : `${state.totalPhotos} total · ${photoCount} photos · ${vidCount} videos${state.protectedCount > 0 ? ` · ${state.protectedCount} protected` : ''}`;
 
     const container = $('galleryTimeline');
     container.innerHTML = '';
@@ -1245,6 +1662,11 @@
         $('emptyStateText').textContent = state.isLoadingProtected
           ? 'Fetching all protected items across your cloud library…'
           : 'Restored or protected originals appear here so they stay full-resolution on your phone.';
+      } else if (isFavoriteView) {
+        $('emptyStateTitle').textContent = state.isLoadingFavorites ? 'Loading Favorites…' : 'No Favorites Yet';
+        $('emptyStateText').textContent = state.isLoadingFavorites
+          ? 'Fetching your favorited photos across your cloud library…'
+          : 'Tap the ♥ heart on any photo in the webpage or phone app to add it here.';
       } else if (isAlbumsView && state.activeAlbum) {
         $('emptyStateTitle').textContent = 'Empty Album';
         $('emptyStateText').textContent = 'Select photos from All Photos and tap "+ Album" to add them here.';
@@ -1297,8 +1719,17 @@
         tile.setAttribute('role', 'button');
         tile.setAttribute('aria-label', photo.originalName || 'Photo');
 
-        tile.innerHTML = `<div class="photo-tile-shimmer"></div><img alt="" loading="lazy" />`;
-        tile.querySelector('img').alt = photo.originalName || '';
+        const cachedThumbUrl = thumbUrlCache.get(photo.hash) || null;
+        if (cachedThumbUrl) {
+          tile.dataset.thumbLoaded = '1';
+          tile.innerHTML = `<img alt="" decoding="async" class="is-loaded" />`;
+          const imgEl = tile.querySelector('img');
+          imgEl.alt = photo.originalName || '';
+          imgEl.src = cachedThumbUrl;
+        } else {
+          tile.innerHTML = `<div class="photo-tile-shimmer"></div><img alt="" loading="lazy" decoding="async" />`;
+          tile.querySelector('img').alt = photo.originalName || '';
+        }
 
         if (state.isSelectionMode) {
           const chk = document.createElement('div');
@@ -1365,7 +1796,9 @@
         });
 
         grid.appendChild(tile);
-        thumbObserver.observe(tile);
+        if (!cachedThumbUrl) {
+          thumbObserver.observe(tile);
+        }
       }
 
       secEl.appendChild(grid);
@@ -1373,7 +1806,8 @@
     }
 
     container.appendChild(frag);
-    const canPaginateMain = !isTrashView && !isProtectedView && !isAlbumsView && !isMapView && state.hasMore;
+    cancelStaleThumbFetches();
+    const canPaginateMain = !isTrashView && !isProtectedView && !isFavoriteView && !isAlbumsView && !isMapView && state.hasMore;
     $('loadMoreWrap').classList.toggle('hidden', !canPaginateMain);
     if (canPaginateMain) {
       $('loadMoreLabel').textContent = `Showing ${state.photos.length} of ${state.totalPhotos} — scroll for more`;
@@ -1425,6 +1859,11 @@
         ? state.protectedPhotos
         : state.photos.filter((p) => Boolean(p.keepOriginalOnDevice));
     }
+    if (state.filterMedia === 'favorite') {
+      return state.favoriteLoadedOnce
+        ? state.favoritePhotos
+        : state.photos.filter((p) => Boolean(p.isFavorite));
+    }
     if (state.filterMedia === 'albums' && state.activeAlbum) return state.activeAlbumPhotos;
     if (state.filterMedia === 'map' && state.mapData && Array.isArray(state.mapData.photos)) {
       return state.mapData.photos;
@@ -1464,15 +1903,20 @@
 
     if (allowReproxyBtn) {
       allowReproxyBtn.classList.toggle('hidden', !showAllowReproxy);
-      allowReproxyBtn.disabled = protectedSelectedCount === 0;
-      allowReproxyBtn.textContent =
-        protectedSelectedCount > 0 && protectedSelectedCount < count
-          ? `Allow Re-Proxy (${protectedSelectedCount})`
-          : 'Allow Re-Proxy';
+      allowReproxyBtn.disabled = state.isMutatingProtection || protectedSelectedCount === 0;
+      if (!state.isMutatingProtection) {
+        allowReproxyBtn.textContent =
+          protectedSelectedCount > 0 && protectedSelectedCount < count
+            ? `Allow Re-Proxy (${protectedSelectedCount})`
+            : 'Allow Re-Proxy';
+      }
     }
     if (protectBtn) {
       protectBtn.classList.toggle('hidden', !showProtect);
-      protectBtn.disabled = unprotectedSelectedCount === 0;
+      protectBtn.disabled = state.isMutatingProtection || unprotectedSelectedCount === 0;
+      if (!state.isMutatingProtection) {
+        protectBtn.textContent = 'Protect';
+      }
     }
 
     $('deleteSelectedBtn').disabled = count === 0;
@@ -1489,99 +1933,185 @@
     $('restoreSelectedBtn').disabled = count === 0;
   }
 
+  function applyProtectedDeltaLocally(appliedHashes, updatedPhotosList, keepOriginal, serverCounts = null) {
+    const flag = Boolean(keepOriginal);
+    const targetSet = new Set(appliedHashes);
+    const updatedMap = new Map(
+      (updatedPhotosList || []).map((p) => [String(p.hash || '').toLowerCase(), p])
+    );
+
+    let delta = 0;
+    for (const list of [state.photos, state.favoritePhotos, state.activeAlbumPhotos]) {
+      for (const p of list) {
+        const k = String(p.hash || '').toLowerCase();
+        if (!targetSet.has(k)) continue;
+        const prev = Boolean(p.keepOriginalOnDevice);
+        const srv = updatedMap.get(k);
+        p.keepOriginalOnDevice = srv ? Boolean(srv.keepOriginalOnDevice) : flag;
+        if (list === state.photos && prev !== p.keepOriginalOnDevice) {
+          delta += p.keepOriginalOnDevice ? 1 : -1;
+        }
+      }
+    }
+
+    if (flag) {
+      const existingProtected = new Set(state.protectedPhotos.map((p) => String(p.hash || '').toLowerCase()));
+      for (const h of appliedHashes) {
+        if (existingProtected.has(h)) continue;
+        const item =
+          updatedMap.get(h) ||
+          state.photos.find((p) => String(p.hash || '').toLowerCase() === h) ||
+          state.favoritePhotos.find((p) => String(p.hash || '').toLowerCase() === h);
+        if (item) {
+          state.protectedPhotos.unshift({ ...item, keepOriginalOnDevice: true });
+          existingProtected.add(h);
+        }
+      }
+    } else {
+      const beforeLen = state.protectedPhotos.length;
+      state.protectedPhotos = state.protectedPhotos.filter(
+        (p) => !targetSet.has(String(p.hash || '').toLowerCase())
+      );
+      if (state.protectedLoadedOnce) {
+        delta = state.protectedPhotos.length - beforeLen;
+      }
+      for (const h of appliedHashes) {
+        state.selectedHashes.delete(h);
+      }
+    }
+
+    if (serverCounts && typeof serverCounts.protectedCount === 'number') {
+      applyServerCategoryCounts(serverCounts);
+    } else if (state.protectedLoadedOnce) {
+      state.protectedCount = state.protectedPhotos.length;
+    } else {
+      state.protectedCount = Math.max(
+        0,
+        state.protectedCount + (delta !== 0 ? delta : flag ? appliedHashes.length : -appliedHashes.length)
+      );
+    }
+    state.photosEtag = null;
+    updateProtectedBadge();
+  }
+
   async function batchSetProtectOriginals(rawHashes, keepOriginal) {
+    if (state.isMutatingProtection) return;
     const cleaned = Array.from(
       new Set((rawHashes || []).map((h) => String(h || '').trim().toLowerCase()).filter(Boolean))
     );
     if (cleaned.length === 0) return;
 
     const flag = Boolean(keepOriginal);
-    const updatedPhotos = [];
+    const total = cleaned.length;
+    const verb = flag ? 'Protecting' : 'Allowing re-proxy';
+    const allowBtn = $('allowReproxySelectedBtn');
+    const protectBtn = $('protectSelectedBtn');
+    const unlockAllBtn = $('allowReproxyAllProtectedBtn');
+
+    state.isMutatingProtection = true;
+    // Invalidate any stale in-flight loadProtectedPhotos so it cannot overwrite our live progress
+    state.protectedLoadSeq += 1;
+
+    const setLiveProgressUI = (done) => {
+      const msg = `${verb} (${done}/${total})…`;
+      updateProtectedBannerUI(msg);
+      if (allowBtn) {
+        allowBtn.disabled = true;
+        if (!flag) allowBtn.textContent = `Unlocking ${done}/${total}…`;
+      }
+      if (protectBtn) {
+        protectBtn.disabled = true;
+        if (flag) protectBtn.textContent = `Protecting ${done}/${total}…`;
+      }
+      if (unlockAllBtn) {
+        unlockAllBtn.disabled = true;
+        if (!flag) unlockAllBtn.textContent = `Unlocking ${done}/${total}…`;
+      }
+    };
+
+    setLiveProgressUI(0);
+    let completedCount = 0;
+    let lastServerCounts = null;
+    let failureError = null;
+
     try {
-      for (let i = 0; i < cleaned.length; i += 200) {
-        const chunk = cleaned.slice(i, i + 200);
+      const chunkSize = total > 60 ? 50 : 200;
+      for (let i = 0; i < total; i += chunkSize) {
+        const chunk = cleaned.slice(i, i + chunkSize);
         const res = await apiFetch('/api/photos/protect-original', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ hashes: chunk, keepOriginalOnDevice: flag }),
         });
+
         if (res.status === 404) {
+          // Graceful fallback for older servers: update item-by-item and stream live UI progress!
           for (const h of chunk) {
             const singleRes = await apiFetch(`/api/photo/${encodeURIComponent(h)}/protect-original`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ keepOriginalOnDevice: flag }),
             });
-            if (singleRes.ok) {
-              const singleData = await singleRes.json().catch(() => ({}));
-              if (singleData.photo) updatedPhotos.push(singleData.photo);
+            const singleData = await singleRes.json().catch(() => ({}));
+            if (!singleRes.ok) {
+              throw new Error(singleData.error || `Could not update protection (HTTP ${singleRes.status})`);
+            }
+            if (typeof singleData.protectedCount === 'number') {
+              lastServerCounts = singleData;
+            }
+            completedCount += 1;
+            applyProtectedDeltaLocally(
+              [h],
+              singleData.photo ? [singleData.photo] : [],
+              flag,
+              lastServerCounts
+            );
+            setLiveProgressUI(completedCount);
+            if (completedCount % 3 === 0 || completedCount === total) {
+              renderGallery();
             }
           }
           continue;
         }
+
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.error || 'Could not update protection');
-        if (Array.isArray(data.photos)) {
-          updatedPhotos.push(...data.photos);
+        if (typeof data.protectedCount === 'number') {
+          lastServerCounts = data;
         }
+        const chunkPhotos = Array.isArray(data.photos) ? data.photos : [];
+        completedCount += chunk.length;
+        applyProtectedDeltaLocally(chunk, chunkPhotos, flag, lastServerCounts);
+        setLiveProgressUI(completedCount);
+        renderGallery();
       }
-
-      const targetSet = new Set(cleaned);
-      const updatedMap = new Map(updatedPhotos.map((p) => [String(p.hash || '').toLowerCase(), p]));
-      let delta = 0;
-
-      for (const list of [state.photos, state.activeAlbumPhotos]) {
-        for (const p of list) {
-          const k = String(p.hash || '').toLowerCase();
-          if (!targetSet.has(k)) continue;
-          const prev = Boolean(p.keepOriginalOnDevice);
-          const srv = updatedMap.get(k);
-          p.keepOriginalOnDevice = srv ? Boolean(srv.keepOriginalOnDevice) : flag;
-          if (list === state.photos && prev !== p.keepOriginalOnDevice) {
-            delta += p.keepOriginalOnDevice ? 1 : -1;
-          }
-        }
-      }
-
-      if (flag) {
-        const existingProtected = new Set(state.protectedPhotos.map((p) => String(p.hash || '').toLowerCase()));
-        for (const h of cleaned) {
-          if (existingProtected.has(h)) continue;
-          const item =
-            updatedMap.get(h) ||
-            state.photos.find((p) => String(p.hash || '').toLowerCase() === h);
-          if (item) {
-            state.protectedPhotos.unshift({ ...item, keepOriginalOnDevice: true });
-            existingProtected.add(h);
-          }
-        }
-      } else {
-        const beforeLen = state.protectedPhotos.length;
-        state.protectedPhotos = state.protectedPhotos.filter(
-          (p) => !targetSet.has(String(p.hash || '').toLowerCase())
-        );
-        if (state.protectedLoadedOnce) {
-          delta = state.protectedPhotos.length - beforeLen;
-        }
-      }
-
-      if (state.protectedLoadedOnce) {
-        state.protectedCount = state.protectedPhotos.length;
-      } else {
-        state.protectedCount = Math.max(0, state.protectedCount + (delta !== 0 ? delta : flag ? cleaned.length : -cleaned.length));
-      }
-      state.photosEtag = null;
-      updateProtectedBadge();
+    } catch (err) {
+      failureError = err;
+    } finally {
+      state.isMutatingProtection = false;
       updateProtectedBannerUI();
       toggleSelectionMode(false);
+    }
+
+    // Re-sync authoritative server state for Protected view so the page matches phone clients 100%
+    if (state.filterMedia === 'protected') {
+      loadProtectedPhotos({ silent: true });
+    }
+
+    if (failureError) {
+      showToast(
+        completedCount > 0
+          ? `Updated ${completedCount}/${total}, then failed: ${failureError.message}`
+          : failureError.message || 'Could not update protection',
+        'rose'
+      );
+    } else {
       showToast(
         flag
-          ? `Protected ${cleaned.length} original(s) from auto re-compression.`
-          : `Unlocked ${cleaned.length} photo(s) — allowed to re-proxy on your phone.`,
+          ? `Protected ${completedCount} original(s) from auto re-compression.`
+          : `Unlocked ${completedCount} photo(s) — synced with phone to allow re-proxy.`,
         'mint'
       );
-    } catch (err) {
-      showToast(err.message || 'Could not update protection', 'rose');
     }
   }
 
@@ -1610,24 +2140,42 @@
       if (!res.ok) throw new Error(data.error || 'Move to Trash failed');
       const moved = new Set((data.trashed || []).map((h) => String(h).toLowerCase()));
       let removedProtected = 0;
+      let removedFavorites = 0;
       for (const p of state.photos) {
-        if (moved.has(p.hash.toLowerCase()) && p.keepOriginalOnDevice) removedProtected += 1;
+        if (moved.has(p.hash.toLowerCase())) {
+          if (p.keepOriginalOnDevice) removedProtected += 1;
+          if (p.isFavorite) removedFavorites += 1;
+        }
       }
       state.photos = state.photos.filter((p) => !moved.has(p.hash.toLowerCase()));
       const prevProtectedLen = state.protectedPhotos.length;
       state.protectedPhotos = state.protectedPhotos.filter((p) => !moved.has(p.hash.toLowerCase()));
-      if (state.protectedLoadedOnce) {
-        state.protectedCount = state.protectedPhotos.length;
+      const prevFavLen = state.favoritePhotos.length;
+      state.favoritePhotos = state.favoritePhotos.filter((p) => !moved.has(p.hash.toLowerCase()));
+      state.activeAlbumPhotos = state.activeAlbumPhotos.filter((p) => !moved.has(p.hash.toLowerCase()));
+      if (typeof data.protectedCount === 'number') {
+        applyServerCategoryCounts(data);
       } else {
-        const protDelta = Math.max(removedProtected, prevProtectedLen - state.protectedPhotos.length);
-        state.protectedCount = Math.max(0, state.protectedCount - protDelta);
+        if (state.protectedLoadedOnce) {
+          state.protectedCount = state.protectedPhotos.length;
+        } else {
+          const protDelta = Math.max(removedProtected, prevProtectedLen - state.protectedPhotos.length);
+          state.protectedCount = Math.max(0, state.protectedCount - protDelta);
+        }
+        if (state.favoriteLoadedOnce) {
+          state.favoriteCount = state.favoritePhotos.length;
+        } else {
+          const favDelta = Math.max(removedFavorites, prevFavLen - state.favoritePhotos.length);
+          state.favoriteCount = Math.max(0, state.favoriteCount - favDelta);
+        }
+        state.trashCount += moved.size;
       }
       state.totalPhotos = Math.max(0, state.totalPhotos - moved.size);
-      state.trashCount += moved.size;
       state.photosEtag = null;
       for (const h of moved) state.selectedHashes.delete(h);
       updateTrashBadge();
       updateProtectedBadge();
+      updateFavoriteBadge();
       updateProtectedBannerUI();
       showToast(`Moved ${moved.size} item(s) to Trash (kept 30 days)`, 'amber');
       toggleSelectionMode(false);
@@ -1649,10 +2197,14 @@
       const restored = new Set((data.restored || []).map((h) => String(h).toLowerCase()));
       state.trashPhotos = state.trashPhotos.filter((p) => !restored.has(p.hash.toLowerCase()));
       state.trashCount = state.trashPhotos.length;
+      applyServerCategoryCounts(data);
       state.photosEtag = null;
       state.protectedLoadedOnce = false;
+      state.favoriteLoadedOnce = false;
       for (const h of restored) state.selectedHashes.delete(h);
       updateTrashBadge();
+      updateProtectedBadge();
+      updateFavoriteBadge();
       showToast(`Restored ${restored.size} item(s) to library`, 'mint');
       toggleSelectionMode(false);
       loadGallery(false);
@@ -1886,175 +2438,93 @@
     }
   }
 
-  // ==================== MEMORIES & ANIMATED STORY VIEWER ====================
+  // ==================== PREVIEW IMAGE HELPER ====================
   function attachPreviewToImg(imgEl, hash) {
     if (!imgEl || !hash) return;
+    imgEl.decoding = 'async';
     if (thumbUrlCache.has(hash)) {
       imgEl.src = thumbUrlCache.get(hash);
       return;
     }
-    apiFetch(`/api/photo/${encodeURIComponent(hash)}/preview`)
-      .then((r) => (r.ok ? r.blob() : null))
-      .then((blob) => {
-        if (!blob || !blob.size) return;
-        const url = URL.createObjectURL(blob);
-        rememberThumbUrl(hash, url);
-        if (imgEl.isConnected) imgEl.src = url;
+    fetchThumbUrl(hash, { abortable: false })
+      .then((url) => {
+        if (url && imgEl.isConnected) imgEl.src = url;
       })
       .catch(() => {});
   }
 
-  async function loadMemories() {
-    if (!state.session) return;
-    try {
-      const now = new Date();
-      const ymd = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-      const res = await apiFetch(`/api/photos/memories?date=${encodeURIComponent(ymd)}`);
-      if (!res.ok) return;
-      const data = await res.json().catch(() => ({}));
-      state.memories = Array.isArray(data.memories) ? data.memories : [];
-      renderMemoriesStrip();
-    } catch {
-      // non-fatal
-    }
-  }
-
-  function renderMemoriesStrip() {
-    const strip = $('memoriesStrip');
-    const carousel = $('memoriesCarousel');
-    if (!strip || !carousel) return;
-    const show = state.filterMedia === 'all' && !state.searchQuery && state.memories.length > 0;
-    strip.classList.toggle('hidden', !show);
-    if (!show) return;
-
-    carousel.innerHTML = '';
-    for (const mem of state.memories) {
-      const card = document.createElement('div');
-      card.className = 'memory-card';
-      card.tabIndex = 0;
-      card.setAttribute('role', 'button');
-
-      const img = document.createElement('img');
-      img.alt = mem.title;
-      card.appendChild(img);
-      if (mem.coverHash) attachPreviewToImg(img, mem.coverHash);
-
-      const ov = document.createElement('div');
-      ov.className = 'memory-card-overlay';
-      const badge = document.createElement('span');
-      badge.className = 'memory-card-badge';
-      badge.textContent = mem.badge || 'Memory';
-      const bottom = document.createElement('div');
-      const title = document.createElement('div');
-      title.className = 'memory-card-title';
-      title.textContent = mem.title;
-      const sub = document.createElement('div');
-      sub.className = 'memory-card-sub';
-      sub.textContent = mem.subtitle || `${mem.itemCount} items`;
-      bottom.append(title, sub);
-      ov.append(badge, bottom);
-      card.appendChild(ov);
-
-      card.addEventListener('click', () => openMemoryViewer(mem));
-      carousel.appendChild(card);
-    }
-  }
-
-  function clearMemoryTimer() {
-    if (state.memoryTimer) {
-      clearTimeout(state.memoryTimer);
-      state.memoryTimer = null;
-    }
-  }
-
-  function openMemoryViewer(mem) {
-    if (!mem || !Array.isArray(mem.photos) || mem.photos.length === 0) return;
-    state.activeMemory = mem;
-    state.memorySlideIndex = 0;
-    state.memoryPaused = false;
-    $('memoryBadge').textContent = mem.badge || 'Memory';
-    $('memoryTitle').textContent = mem.title || 'Memory';
-    $('memorySubtitle').textContent = mem.subtitle || '';
-    $('memoryPlayPauseBtn').textContent = '⏸';
-    $('memoryViewer').classList.remove('hidden');
-    document.body.style.overflow = 'hidden';
-    renderMemorySlide();
-  }
-
-  function closeMemoryViewer() {
-    clearMemoryTimer();
-    state.activeMemory = null;
-    $('memoryViewer').classList.add('hidden');
-    document.body.style.overflow = '';
-  }
-
-  async function renderMemorySlide() {
-    clearMemoryTimer();
-    const mem = state.activeMemory;
-    if (!mem) return;
-    const slides = mem.photos;
-    const idx = Math.max(0, Math.min(slides.length - 1, state.memorySlideIndex));
-    state.memorySlideIndex = idx;
-    const photo = slides[idx];
-
-    const bars = $('memoryProgressBars');
-    bars.innerHTML = '';
-    for (let i = 0; i < slides.length; i++) {
-      const b = document.createElement('div');
-      b.className = `memory-bar${i < idx ? ' is-done' : ''}`;
-      b.innerHTML = '<div class="memory-bar-fill"></div>';
-      bars.appendChild(b);
-    }
-    requestAnimationFrame(() => {
-      const activeBar = bars.children[idx];
-      if (activeBar && !state.memoryPaused) activeBar.classList.add('is-active');
-    });
-
-    $('memoryPrevBtn').disabled = idx <= 0;
-    $('memoryNextBtn').disabled = idx >= slides.length - 1;
-    const loc = photo.locationLabel ? ` · 📍 ${photo.locationLabel}` : '';
-    $('memoryCaption').textContent = `${photo.photoDate || ''} · ${photo.originalName || ''}${loc} (${idx + 1}/${slides.length})`;
-
-    const img = $('memoryImg');
-    img.style.animation = 'none';
-    const url = await fetchLightboxPreviewCached(photo.hash);
-    if (state.activeMemory !== mem || state.memorySlideIndex !== idx) return;
-    if (url) {
-      img.src = url;
-      void img.offsetWidth;
-      img.style.animation = '';
-    }
-
-    if (!state.memoryPaused) {
-      state.memoryTimer = setTimeout(() => {
-        if (!state.activeMemory || state.memoryPaused) return;
-        if (state.memorySlideIndex < slides.length - 1) {
-          state.memorySlideIndex++;
-          renderMemorySlide();
-        } else {
-          closeMemoryViewer();
-        }
-      }, 4100);
-    }
-  }
-
-  function toggleMemoryPause() {
-    state.memoryPaused = !state.memoryPaused;
-    $('memoryPlayPauseBtn').textContent = state.memoryPaused ? '▶' : '⏸';
-    if (state.memoryPaused) {
-      clearMemoryTimer();
-    } else {
-      renderMemorySlide();
-    }
-  }
-
-  // ==================== CUSTOM ALBUMS (TRIPS, EVENTS, FAMILY) ====================
+  // ==================== CUSTOM ALBUMS (TRIPS, EVENTS, FAMILY & CUSTOM CATEGORIES) ====================
+  const ALBUM_PRESET_CATEGORIES = new Set(['trip', 'event', 'family']);
   const ALBUM_CAT_LABELS = {
     trip: '✈️ Trip',
     event: '🎉 Event',
     family: '👨‍👩‍👧 Family',
     custom: '📁 Album',
   };
+
+  function formatAlbumCategory(rawCategory) {
+    const clean = String(rawCategory || '').trim();
+    if (!clean) return ALBUM_CAT_LABELS.custom;
+    const lower = clean.toLowerCase();
+    if (ALBUM_CAT_LABELS[lower]) return ALBUM_CAT_LABELS[lower];
+    return `🏷️ ${clean}`;
+  }
+
+  function renderAlbumCategoryPills() {
+    const container = $('albumCategoryPills');
+    if (!container) return;
+
+    const pills = [
+      { key: 'all', label: 'All Albums' },
+      { key: 'trip', label: '✈️ Trips' },
+      { key: 'event', label: '🎉 Events' },
+      { key: 'family', label: '👨‍👩‍👧 Family' },
+    ];
+
+    // Dynamically include any user-defined custom categories present on albums (never showing literal "Custom")
+    const seenCustom = new Set();
+    for (const alb of state.albums || []) {
+      const cat = String(alb.category || '').trim();
+      const lower = cat.toLowerCase();
+      if (!cat || lower === 'custom' || ALBUM_PRESET_CATEGORIES.has(lower) || seenCustom.has(lower)) {
+        continue;
+      }
+      seenCustom.add(lower);
+      pills.push({ key: lower, label: `🏷️ ${cat}` });
+    }
+
+    const activeKey = String(state.albumCategoryFilter || 'all').toLowerCase();
+    if (!pills.some((p) => p.key === activeKey)) {
+      state.albumCategoryFilter = 'all';
+    }
+
+    container.innerHTML = '';
+    for (const p of pills) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = `f-pill${state.albumCategoryFilter === p.key ? ' is-active' : ''}`;
+      btn.dataset.albCat = p.key;
+      btn.textContent = p.label;
+      btn.addEventListener('click', () => {
+        state.albumCategoryFilter = p.key;
+        renderAlbumsGrid();
+      });
+      container.appendChild(btn);
+    }
+  }
+
+  function syncAlbumCustomCategoryField({ focus = false } = {}) {
+    const sel = $('albumCategorySelect');
+    const field = $('albumCustomCategoryField');
+    const input = $('albumCustomCategoryInput');
+    if (!sel || !field || !input) return;
+    const isCustom = sel.value === 'custom';
+    field.classList.toggle('hidden', !isCustom);
+    input.required = isCustom;
+    if (isCustom && focus) {
+      requestAnimationFrame(() => input.focus());
+    }
+  }
 
   async function loadAlbums() {
     if (!state.session) return;
@@ -2070,15 +2540,17 @@
   }
 
   function renderAlbumsGrid() {
+    renderAlbumCategoryPills();
     const grid = $('albumsGrid');
     if (!grid) return;
     grid.innerHTML = '';
+    const activeFilter = String(state.albumCategoryFilter || 'all').toLowerCase();
     const list = state.albums.filter(
-      (a) => state.albumCategoryFilter === 'all' || a.category === state.albumCategoryFilter
+      (a) => activeFilter === 'all' || String(a.category || '').trim().toLowerCase() === activeFilter
     );
     if (list.length === 0) {
       grid.innerHTML =
-        '<div class="empty-state" style="grid-column:1/-1;padding:36px 12px;"><h3>No Albums Yet</h3><p>Create Trips, Events, or Family albums to organize and share collections.</p></div>';
+        '<div class="empty-state" style="grid-column:1/-1;padding:36px 12px;"><h3>No Albums Yet</h3><p>Create Trips, Events, Family, or your own custom category albums to organize and share collections.</p></div>';
       return;
     }
 
@@ -2098,7 +2570,7 @@
       }
       const badge = document.createElement('span');
       badge.className = 'album-cat-badge';
-      badge.textContent = ALBUM_CAT_LABELS[alb.category] || '📁 Album';
+      badge.textContent = formatAlbumCategory(alb.category);
       cov.appendChild(badge);
 
       const body = document.createElement('div');
@@ -2122,7 +2594,7 @@
       if (!res.ok || !data.album) throw new Error(data.error || 'Album not found');
       state.activeAlbum = data.album;
       state.activeAlbumPhotos = Array.isArray(data.photos) ? data.photos : [];
-      $('activeAlbumTitle').textContent = `${ALBUM_CAT_LABELS[data.album.category] || '📁'} · ${data.album.name}`;
+      $('activeAlbumTitle').textContent = `${formatAlbumCategory(data.album.category)} · ${data.album.name}`;
       $('activeAlbumMeta').textContent = [
         `${state.activeAlbumPhotos.length} item(s)`,
         data.album.dateRange || null,
@@ -2146,7 +2618,18 @@
     state.albumPickerHashes = Array.isArray(initialHashes) ? initialHashes : [];
     $('albumModalTitle').textContent = editAlbum ? 'Edit Album' : 'New Album';
     $('albumNameInput').value = editAlbum ? editAlbum.name : '';
-    $('albumCategorySelect').value = editAlbum ? editAlbum.category || 'custom' : 'trip';
+
+    const rawCat = editAlbum ? String(editAlbum.category || '').trim() : 'trip';
+    const lowerCat = rawCat.toLowerCase();
+    if (ALBUM_PRESET_CATEGORIES.has(lowerCat)) {
+      $('albumCategorySelect').value = lowerCat;
+      $('albumCustomCategoryInput').value = '';
+    } else {
+      $('albumCategorySelect').value = 'custom';
+      $('albumCustomCategoryInput').value = lowerCat && lowerCat !== 'custom' ? rawCat : '';
+    }
+    syncAlbumCustomCategoryField({ focus: false });
+
     $('albumDescInput').value = editAlbum ? editAlbum.description || '' : '';
     $('albumModal').classList.remove('hidden');
   }
@@ -2160,7 +2643,17 @@
     e.preventDefault();
     const name = $('albumNameInput').value.trim();
     if (!name) return;
-    const category = $('albumCategorySelect').value;
+    const selectedCategory = $('albumCategorySelect').value;
+    let category = selectedCategory;
+    if (selectedCategory === 'custom') {
+      const customCategory = $('albumCustomCategoryInput').value.trim();
+      if (!customCategory) {
+        showToast('Please enter a custom category name.', 'amber');
+        $('albumCustomCategoryInput').focus();
+        return;
+      }
+      category = customCategory;
+    }
     const description = $('albumDescInput').value.trim();
     try {
       if (state.editingAlbumId) {
@@ -2220,7 +2713,7 @@
       const info = document.createElement('div');
       info.className = 'manage-row-info';
       const title = document.createElement('strong');
-      title.textContent = `${ALBUM_CAT_LABELS[alb.category] || '📁'} · ${alb.name}`;
+      title.textContent = `${formatAlbumCategory(alb.category)} · ${alb.name}`;
       const sub = document.createElement('span');
       sub.textContent = `${alb.itemCount || 0} item(s)`;
       info.append(title, sub);
@@ -2273,79 +2766,694 @@
     }
   }
 
-  // ==================== PHOTO MAP & LOCATION SEARCH ====================
-  function applyMapTransform() {
-    const canvas = $('photoMapCanvas');
-    if (!canvas) return;
-    canvas.style.transform = `translate3d(${state.mapPanX}px, ${state.mapPanY}px, 0) scale(${state.mapZoom})`;
+  // ==================== PHOTO MAP & LOCATION SEARCH (LEAFLET + OPTIONAL GOOGLE MAPS) ====================
+  const mapRuntime = {
+    leafletLoadPromise: null,
+    leafletMap: null,
+    leafletBaseLayer: null,
+    leafletMarkersLayer: null,
+    googleLoadPromise: null,
+    googleLoadedKey: null,
+    googleMap: null,
+    googleOverlays: [],
+  };
+
+  function getGoogleMapsLink(lat, lng) {
+    return `https://www.google.com/maps?q=${encodeURIComponent(`${Number(lat).toFixed(6)},${Number(lng).toFixed(6)}`)}`;
   }
 
-  async function loadPhotoMap() {
-    if (!state.session) return;
-    try {
-      const res = await apiFetch('/api/photos/map');
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      state.mapData = await res.json();
-      renderPhotoMap();
-      renderGallery();
-    } catch (err) {
-      showToast(err.message || 'Could not load photo map', 'rose');
+  function setMapLoading(visible, message = 'Loading interactive map…') {
+    const overlay = $('mapLoadingOverlay');
+    if (!overlay) return;
+    overlay.classList.toggle('hidden', !visible);
+    const label = $('mapLoadingText');
+    if (label && message) label.textContent = message;
+  }
+
+  function injectCssOnce(id, href) {
+    return new Promise((resolve, reject) => {
+      const existing = document.getElementById(id);
+      if (existing) return resolve();
+      const link = document.createElement('link');
+      link.id = id;
+      link.rel = 'stylesheet';
+      link.href = href;
+      link.onload = () => resolve();
+      link.onerror = () => {
+        link.remove();
+        reject(new Error(`Failed to load CSS ${href}`));
+      };
+      document.head.appendChild(link);
+    });
+  }
+
+  function injectScriptOnce(id, src, timeoutMs = 12000) {
+    return new Promise((resolve, reject) => {
+      const existing = document.getElementById(id);
+      if (existing && existing.dataset.loaded === '1') return resolve();
+      if (existing) existing.remove();
+      const script = document.createElement('script');
+      script.id = id;
+      script.src = src;
+      script.async = true;
+      const timer = setTimeout(() => {
+        script.remove();
+        reject(new Error(`Timed out loading ${src}`));
+      }, timeoutMs);
+      script.onload = () => {
+        clearTimeout(timer);
+        script.dataset.loaded = '1';
+        resolve();
+      };
+      script.onerror = () => {
+        clearTimeout(timer);
+        script.remove();
+        reject(new Error(`Failed to load ${src}`));
+      };
+      document.head.appendChild(script);
+    });
+  }
+
+  async function ensureLeafletLoaded() {
+    if (window.L && typeof window.L.map === 'function') return window.L;
+    if (mapRuntime.leafletLoadPromise) return mapRuntime.leafletLoadPromise;
+
+    mapRuntime.leafletLoadPromise = (async () => {
+      const cdns = [
+        {
+          css: 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css',
+          js: 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js',
+        },
+        {
+          css: 'https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css',
+          js: 'https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js',
+        },
+      ];
+      let lastErr = null;
+      for (const cdn of cdns) {
+        try {
+          await injectCssOnce('photohub-leaflet-css', cdn.css);
+          await injectScriptOnce('photohub-leaflet-js', cdn.js);
+          if (window.L && typeof window.L.map === 'function') {
+            return window.L;
+          }
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      mapRuntime.leafletLoadPromise = null;
+      throw lastErr || new Error('Could not load map library');
+    })();
+    return mapRuntime.leafletLoadPromise;
+  }
+
+  async function ensureGoogleMapsLoaded(apiKey) {
+    if (window.google && window.google.maps && typeof window.google.maps.Map === 'function') {
+      return window.google.maps;
+    }
+    if (!apiKey) throw new Error('Google Maps API key not configured');
+    if (mapRuntime.googleLoadPromise && mapRuntime.googleLoadedKey === apiKey) {
+      return mapRuntime.googleLoadPromise;
+    }
+    mapRuntime.googleLoadedKey = apiKey;
+    mapRuntime.googleLoadPromise = (async () => {
+      try {
+        await injectScriptOnce(
+          'photohub-google-maps-js',
+          `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(apiKey)}&v=weekly`,
+          12000
+        );
+        if (window.google && window.google.maps && typeof window.google.maps.Map === 'function') {
+          return window.google.maps;
+        }
+        throw new Error('Google Maps SDK unavailable');
+      } catch (err) {
+        mapRuntime.googleLoadPromise = null;
+        throw err;
+      }
+    })();
+    return mapRuntime.googleLoadPromise;
+  }
+
+  function clearActiveMapMarkers() {
+    if (mapRuntime.leafletMarkersLayer) {
+      mapRuntime.leafletMarkersLayer.clearLayers();
+    }
+    if (Array.isArray(mapRuntime.googleOverlays)) {
+      for (const ov of mapRuntime.googleOverlays) {
+        try {
+          ov.setMap(null);
+        } catch {
+          // ignore
+        }
+      }
+      mapRuntime.googleOverlays = [];
     }
   }
 
-  function renderPhotoMap() {
-    const data = state.mapData;
-    const pinsLayer = $('photoMapPins');
+  function applyLeafletBaseLayer() {
+    const L = window.L;
+    const map = mapRuntime.leafletMap;
+    if (!L || !map) return;
+    if (mapRuntime.leafletBaseLayer) {
+      map.removeLayer(mapRuntime.leafletBaseLayer);
+      mapRuntime.leafletBaseLayer = null;
+    }
+
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+    let nextLayer;
+    if (state.mapStyle === 'satellite') {
+      const imagery = L.tileLayer(
+        'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        { maxZoom: 19, attribution: 'Imagery © Esri' }
+      );
+      const labels = L.tileLayer(
+        'https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
+        { maxZoom: 19, opacity: 0.9 }
+      );
+      nextLayer = L.layerGroup([imagery, labels]);
+    } else if (state.mapStyle === 'osm') {
+      nextLayer = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '© OpenStreetMap contributors',
+      });
+    } else {
+      const tileUrl = isDark
+        ? 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png'
+        : 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png';
+      nextLayer = L.tileLayer(tileUrl, {
+        subdomains: 'abcd',
+        maxZoom: 19,
+        attribution: '© OpenStreetMap · © CARTO',
+      });
+    }
+    nextLayer.addTo(map);
+    mapRuntime.leafletBaseLayer = nextLayer;
+  }
+
+  function applyGoogleMapStyle() {
+    const gmap = mapRuntime.googleMap;
+    if (!gmap) return;
+    const typeId =
+      state.mapStyle === 'satellite'
+        ? 'hybrid'
+        : state.mapStyle === 'osm'
+          ? 'terrain'
+          : 'roadmap';
+    gmap.setMapTypeId(typeId);
+  }
+
+  function syncMapTheme() {
+    if (mapRuntime.leafletMap && state.mapStyle === 'street') {
+      applyLeafletBaseLayer();
+    }
+  }
+
+  function getActiveMapPhotos() {
+    const all = state.mapData && Array.isArray(state.mapData.photos) ? state.mapData.photos : [];
+    if (!state.searchQuery) return all;
+    return all.filter((p) => matchesSmartSearch(p, state.searchQuery));
+  }
+
+  function buildZoomClusters(photos, zoom) {
+    if (!Array.isArray(photos) || photos.length === 0) return [];
+    const safeZoom = Math.max(1, Math.min(19, Math.round(Number(zoom) || 2)));
+    const worldSize = 256 * Math.pow(2, safeZoom);
+    const cellPx = safeZoom >= 16 ? 42 : safeZoom >= 12 ? 54 : 62;
+    const buckets = new Map();
+
+    for (const p of photos) {
+      if (typeof p.gpsLat !== 'number' || typeof p.gpsLng !== 'number') continue;
+      const clampedLat = Math.max(-85.0511, Math.min(85.0511, p.gpsLat));
+      const latRad = (clampedLat * Math.PI) / 180;
+      const x = ((p.gpsLng + 180) / 360) * worldSize;
+      const y = ((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * worldSize;
+      const bx = Math.floor(x / cellPx);
+      const by = Math.floor(y / cellPx);
+      const key = `${safeZoom}:${bx}:${by}`;
+      if (!buckets.has(key)) {
+        buckets.set(key, {
+          id: key,
+          latSum: 0,
+          lngSum: 0,
+          minLat: p.gpsLat,
+          maxLat: p.gpsLat,
+          minLng: p.gpsLng,
+          maxLng: p.gpsLng,
+          coverHash: p.hash,
+          label: p.locationLabel || `${p.gpsLat.toFixed(3)}, ${p.gpsLng.toFixed(3)}`,
+          photos: [],
+        });
+      }
+      const b = buckets.get(key);
+      b.latSum += p.gpsLat;
+      b.lngSum += p.gpsLng;
+      if (p.gpsLat < b.minLat) b.minLat = p.gpsLat;
+      if (p.gpsLat > b.maxLat) b.maxLat = p.gpsLat;
+      if (p.gpsLng < b.minLng) b.minLng = p.gpsLng;
+      if (p.gpsLng > b.maxLng) b.maxLng = p.gpsLng;
+      b.photos.push(p);
+    }
+
+    return Array.from(buckets.values()).map((b) => ({
+      id: b.id,
+      lat: b.latSum / b.photos.length,
+      lng: b.lngSum / b.photos.length,
+      minLat: b.minLat,
+      maxLat: b.maxLat,
+      minLng: b.minLng,
+      maxLng: b.maxLng,
+      count: b.photos.length,
+      coverHash: b.coverHash,
+      label: b.label,
+      hashes: b.photos.map((p) => p.hash),
+      photos: b.photos,
+    }));
+  }
+
+  function createPinDomNode(cluster, isActive) {
+    const wrap = document.createElement('button');
+    wrap.type = 'button';
+    wrap.className = `photo-map-pin${isActive ? ' is-active' : ''}`;
+    wrap.title = `${cluster.label} (${cluster.count} ${cluster.count === 1 ? 'item' : 'items'})`;
+    wrap.setAttribute('aria-label', wrap.title);
+
+    const img = document.createElement('img');
+    img.className = 'photo-map-pin-thumb';
+    img.alt = '';
+    img.loading = 'lazy';
+    wrap.appendChild(img);
+    if (cluster.coverHash) attachPreviewToImg(img, cluster.coverHash);
+
+    if (cluster.count > 1) {
+      const badge = document.createElement('span');
+      badge.className = 'photo-map-pin-badge';
+      badge.textContent = cluster.count > 999 ? '999+' : String(cluster.count);
+      wrap.appendChild(badge);
+    }
+
+    const tip = document.createElement('span');
+    tip.className = 'photo-map-pin-tip';
+    wrap.appendChild(tip);
+    return wrap;
+  }
+
+  function handleVisualPinClick(cluster, currentZoom) {
+    const spread = Math.max(
+      Math.abs(cluster.maxLat - cluster.minLat),
+      Math.abs(cluster.maxLng - cluster.minLng)
+    );
+    const sameAlreadySelected =
+      state.selectedMapFilter && state.selectedMapFilter.id === cluster.id;
+
+    // Clicking an already-selected single photo pin opens it directly in Lightbox
+    if (sameAlreadySelected && cluster.count === 1) {
+      const targetHash = String(cluster.coverHash || '').toLowerCase();
+      const idx = state.visibleFlatPhotos.findIndex(
+        (p) => String(p.hash || '').toLowerCase() === targetHash
+      );
+      if (idx >= 0) {
+        openLightbox(idx);
+        return;
+      }
+    }
+
+    // Select the cluster's photos in the timeline grid below
+    state.selectedMapClusterId = null;
+    state.selectedMapFilter = {
+      id: cluster.id,
+      label: cluster.label,
+      lat: cluster.lat,
+      lng: cluster.lng,
+      count: cluster.count,
+      hashes: new Set(cluster.hashes.map((h) => String(h).toLowerCase())),
+    };
+
+    // If zoomed out on a multi-photo cluster with real geographic spread, zoom in to split pins
+    if (cluster.count > 1 && currentZoom < 14 && spread > 0.002) {
+      fitMapToCoords(cluster.photos);
+    } else if (currentZoom < 12) {
+      focusMapOnLatLng(cluster.lat, cluster.lng, Math.max(currentZoom + 3, 12));
+    }
+
+    updateMapSelectedHeader();
+    renderMapPlacePills();
+    renderGallery();
+    renderMapMarkers();
+  }
+
+  function focusMapOnLatLng(lat, lng, zoom = 12) {
+    if (state.mapProvider === 'google' && mapRuntime.googleMap) {
+      mapRuntime.googleMap.panTo({ lat, lng });
+      mapRuntime.googleMap.setZoom(zoom);
+    } else if (mapRuntime.leafletMap) {
+      mapRuntime.leafletMap.flyTo([lat, lng], zoom, { duration: 0.45 });
+    }
+  }
+
+  function fitMapToCoords(photos) {
+    const valid = (photos || []).filter(
+      (p) => typeof p.gpsLat === 'number' && typeof p.gpsLng === 'number'
+    );
+    if (valid.length === 0) {
+      if (state.mapProvider === 'google' && mapRuntime.googleMap) {
+        mapRuntime.googleMap.setCenter({ lat: 20, lng: 0 });
+        mapRuntime.googleMap.setZoom(2);
+      } else if (mapRuntime.leafletMap) {
+        mapRuntime.leafletMap.setView([20, 0], 2);
+      }
+      return;
+    }
+    if (valid.length === 1) {
+      focusMapOnLatLng(valid[0].gpsLat, valid[0].gpsLng, 13);
+      return;
+    }
+
+    if (state.mapProvider === 'google' && mapRuntime.googleMap && window.google?.maps) {
+      const bounds = new window.google.maps.LatLngBounds();
+      for (const p of valid) bounds.extend({ lat: p.gpsLat, lng: p.gpsLng });
+      mapRuntime.googleMap.fitBounds(bounds, 56);
+    } else if (mapRuntime.leafletMap && window.L) {
+      const bounds = window.L.latLngBounds(valid.map((p) => [p.gpsLat, p.gpsLng]));
+      mapRuntime.leafletMap.fitBounds(bounds, { padding: [52, 52], maxZoom: 15 });
+    }
+  }
+
+  function renderMapMarkers() {
+    clearActiveMapMarkers();
+    const photos = getActiveMapPhotos();
+    if (photos.length === 0) return;
+
+    if (state.mapProvider === 'google' && mapRuntime.googleMap && window.google?.maps) {
+      const gmaps = window.google.maps;
+      const zoom = mapRuntime.googleMap.getZoom() || 2;
+      const clusters = buildZoomClusters(photos, zoom);
+
+      class PhotoPinOverlay extends gmaps.OverlayView {
+        constructor(cluster) {
+          super();
+          this.cluster = cluster;
+          this.el = null;
+        }
+        onAdd() {
+          const isActive = Boolean(
+            state.selectedMapFilter && state.selectedMapFilter.id === this.cluster.id
+          );
+          const wrap = createPinDomNode(this.cluster, isActive);
+          wrap.style.position = 'absolute';
+          wrap.addEventListener('click', (e) => {
+            e.stopPropagation();
+            handleVisualPinClick(this.cluster, mapRuntime.googleMap.getZoom() || 2);
+          });
+          this.el = wrap;
+          const panes = this.getPanes();
+          if (panes && panes.overlayMouseTarget) {
+            panes.overlayMouseTarget.appendChild(wrap);
+          }
+        }
+        draw() {
+          if (!this.el) return;
+          const proj = this.getProjection();
+          if (!proj) return;
+          const pt = proj.fromLatLngToDivPixel(new gmaps.LatLng(this.cluster.lat, this.cluster.lng));
+          if (!pt) return;
+          this.el.style.left = `${Math.round(pt.x - 25)}px`;
+          this.el.style.top = `${Math.round(pt.y - 54)}px`;
+        }
+        onRemove() {
+          if (this.el && this.el.parentNode) {
+            this.el.parentNode.removeChild(this.el);
+          }
+          this.el = null;
+        }
+      }
+
+      for (const c of clusters) {
+        const ov = new PhotoPinOverlay(c);
+        ov.setMap(mapRuntime.googleMap);
+        mapRuntime.googleOverlays.push(ov);
+      }
+      return;
+    }
+
+    if (mapRuntime.leafletMap && mapRuntime.leafletMarkersLayer && window.L) {
+      const L = window.L;
+      const zoom = mapRuntime.leafletMap.getZoom() || 2;
+      const clusters = buildZoomClusters(photos, zoom);
+      for (const c of clusters) {
+        const isActive = Boolean(
+          state.selectedMapFilter && state.selectedMapFilter.id === c.id
+        );
+        const icon = L.divIcon({
+          className: 'photo-map-div-icon',
+          html: '',
+          iconSize: [50, 56],
+          iconAnchor: [25, 56],
+        });
+        const marker = L.marker([c.lat, c.lng], { icon });
+        marker.addTo(mapRuntime.leafletMarkersLayer);
+        const rootEl = marker.getElement();
+        if (rootEl) {
+          const pinNode = createPinDomNode(c, isActive);
+          pinNode.addEventListener('click', (e) => {
+            e.stopPropagation();
+            handleVisualPinClick(c, mapRuntime.leafletMap.getZoom() || 2);
+          });
+          rootEl.appendChild(pinNode);
+        }
+      }
+    }
+  }
+
+  function updateMapSelectedHeader() {
+    const header = $('mapSelectedHeader');
+    if (!header) return;
+    const sel = state.selectedMapFilter;
+    header.classList.toggle('hidden', !sel);
+    if (!sel) return;
+    $('mapSelectedTitle').textContent = `📍 ${sel.label} · ${sel.count} photo(s)`;
+    const gLink = $('mapOpenGoogleLink');
+    if (gLink && typeof sel.lat === 'number' && typeof sel.lng === 'number') {
+      gLink.href = getGoogleMapsLink(sel.lat, sel.lng);
+      gLink.classList.remove('hidden');
+    } else if (gLink) {
+      gLink.classList.add('hidden');
+    }
+  }
+
+  function updateMapControlLabels() {
+    const googleKey = state.mapData?.mapConfig?.googleMapsApiKey;
+    const toggleBtn = $('mapProviderToggleBtn');
+    if (toggleBtn) {
+      toggleBtn.classList.toggle('hidden', !googleKey);
+      toggleBtn.textContent =
+        state.mapProvider === 'google' ? 'Use Open Map' : 'Use Google Maps';
+    }
+    const osmBtn = document.querySelector('#mapStyleControl [data-map-style="osm"]');
+    if (osmBtn) {
+      osmBtn.textContent = state.mapProvider === 'google' ? 'Terrain' : 'OSM';
+    }
+    document.querySelectorAll('#mapStyleControl .seg-btn').forEach((b) => {
+      b.classList.toggle('is-active', b.dataset.mapStyle === state.mapStyle);
+    });
+  }
+
+  function renderMapPlacePills() {
     const pillsLayer = $('mapPlacePills');
-    if (!data || !pinsLayer || !pillsLayer) return;
-
-    const clusters = Array.isArray(data.clusters) ? data.clusters : [];
-    $('mapSummaryText').textContent =
-      data.geoTaggedCount > 0
-        ? `${data.geoTaggedCount} geo-tagged item(s) across ${clusters.length} location(s) · Click a pin or search any city`
-        : 'No GPS tags detected yet. Photos taken with Location Services enabled appear here.';
-
-    pinsLayer.innerHTML = '';
+    if (!pillsLayer || !state.mapData) return;
+    const clusters = Array.isArray(state.mapData.clusters) ? state.mapData.clusters : [];
     pillsLayer.innerHTML = '';
 
     for (const c of clusters) {
-      const xPct = Math.max(3, Math.min(97, ((c.lng + 180) / 360) * 100));
-      const yPct = Math.max(6, Math.min(94, ((90 - c.lat) / 180) * 100));
       const isSelected = state.selectedMapClusterId === c.id;
-
-      const pin = document.createElement('button');
-      pin.type = 'button';
-      pin.className = `map-pin${isSelected ? ' is-active' : ''}`;
-      pin.style.left = `${xPct}%`;
-      pin.style.top = `${yPct}%`;
-      pin.innerHTML = `<span class="map-pin-count">${c.count}</span><span></span>`;
-      pin.querySelector('span:last-child').textContent = c.label.split(',')[0];
-      pin.addEventListener('click', (e) => {
-        e.stopPropagation();
-        state.selectedMapClusterId = isSelected ? null : c.id;
-        renderPhotoMap();
-        renderGallery();
-      });
-      pinsLayer.appendChild(pin);
-
       const pill = document.createElement('button');
       pill.type = 'button';
       pill.className = `year-pill${isSelected ? ' is-active' : ''}`;
       pill.textContent = `📍 ${c.label} (${c.count})`;
       pill.addEventListener('click', () => {
-        state.selectedMapClusterId = isSelected ? null : c.id;
-        renderPhotoMap();
+        if (isSelected) {
+          state.selectedMapClusterId = null;
+          state.selectedMapFilter = null;
+          fitMapToCoords(getActiveMapPhotos());
+        } else {
+          state.selectedMapClusterId = c.id;
+          const allowed = new Set(c.hashes.map((h) => String(h).toLowerCase()));
+          state.selectedMapFilter = {
+            id: c.id,
+            label: c.label,
+            lat: c.lat,
+            lng: c.lng,
+            count: c.count,
+            hashes: allowed,
+          };
+          const matching = getActiveMapPhotos().filter((p) =>
+            allowed.has(String(p.hash).toLowerCase())
+          );
+          if (matching.length > 1) {
+            fitMapToCoords(matching);
+          } else {
+            focusMapOnLatLng(c.lat, c.lng, 12);
+          }
+        }
+        updateMapSelectedHeader();
+        renderMapPlacePills();
+        renderMapMarkers();
         renderGallery();
       });
       pillsLayer.appendChild(pill);
     }
+  }
 
-    const selCluster = clusters.find((c) => c.id === state.selectedMapClusterId) || null;
-    $('mapSelectedHeader').classList.toggle('hidden', !selCluster);
-    if (selCluster) {
-      $('mapSelectedTitle').textContent = `📍 ${selCluster.label} · ${selCluster.count} photo(s)`;
+  async function initAndRenderInteractiveMap({ fitBounds = false } = {}) {
+    if (state.filterMedia !== 'map') return;
+    const leafletEl = $('leafletMapCanvas');
+    const googleEl = $('googleMapCanvas');
+    if (!leafletEl || !googleEl) return;
+
+    const googleKey = state.mapData?.mapConfig?.googleMapsApiKey || null;
+    if (!state.mapProviderUserChosen) {
+      state.mapProvider = googleKey ? 'google' : 'leaflet';
     }
-    applyMapTransform();
+    if (state.mapProvider === 'google' && !googleKey) {
+      state.mapProvider = 'leaflet';
+    }
+    updateMapControlLabels();
+
+    setMapLoading(
+      true,
+      state.mapProvider === 'google' ? 'Loading Google Maps…' : 'Loading interactive map…'
+    );
+
+    if (state.mapProvider === 'google' && googleKey) {
+      leafletEl.classList.add('hidden');
+      googleEl.classList.remove('hidden');
+      try {
+        const gmaps = await ensureGoogleMapsLoaded(googleKey);
+        if (!mapRuntime.googleMap) {
+          mapRuntime.googleMap = new gmaps.Map(googleEl, {
+            center: { lat: 20, lng: 0 },
+            zoom: 2,
+            mapTypeId: 'roadmap',
+            mapTypeControl: false,
+            streetViewControl: true,
+            fullscreenControl: true,
+            gestureHandling: 'greedy',
+          });
+          mapRuntime.googleMap.addListener('zoom_changed', () => {
+            renderMapMarkers();
+          });
+        }
+        applyGoogleMapStyle();
+        setMapLoading(false);
+        if (fitBounds || !state.mapHasFittedOnce) {
+          state.mapHasFittedOnce = true;
+          fitMapToCoords(getActiveMapPhotos());
+        }
+        renderMapMarkers();
+        return;
+      } catch (err) {
+        console.warn('[PhotoMap] Google Maps failed, falling back to Leaflet:', err);
+        state.mapProvider = 'leaflet';
+        updateMapControlLabels();
+        showToast('Google Maps unavailable — switched to built-in Open Map.', 'amber');
+      }
+    }
+
+    // Default / Fallback: Leaflet with Carto Voyager / Dark Matter / Esri Satellite / OpenStreetMap
+    googleEl.classList.add('hidden');
+    leafletEl.classList.remove('hidden');
+    try {
+      const L = await ensureLeafletLoaded();
+      if (!mapRuntime.leafletMap) {
+        mapRuntime.leafletMap = L.map(leafletEl, {
+          center: [20, 0],
+          zoom: 2,
+          minZoom: 2,
+          maxZoom: 19,
+          zoomControl: true,
+          worldCopyJump: true,
+        });
+        mapRuntime.leafletMarkersLayer = L.layerGroup().addTo(mapRuntime.leafletMap);
+        mapRuntime.leafletMap.on('zoomend', () => {
+          renderMapMarkers();
+        });
+      }
+      applyLeafletBaseLayer();
+      setMapLoading(false);
+
+      const refreshView = () => {
+        if (!mapRuntime.leafletMap) return;
+        mapRuntime.leafletMap.invalidateSize(false);
+        if (fitBounds || !state.mapHasFittedOnce) {
+          state.mapHasFittedOnce = true;
+          fitMapToCoords(getActiveMapPhotos());
+        }
+        renderMapMarkers();
+      };
+      requestAnimationFrame(refreshView);
+      setTimeout(() => {
+        if (mapRuntime.leafletMap && state.filterMedia === 'map') {
+          mapRuntime.leafletMap.invalidateSize(false);
+        }
+      }, 180);
+    } catch (err) {
+      setMapLoading(
+        true,
+        'Map tiles unavailable offline. You can still browse places below.'
+      );
+      console.warn('[PhotoMap] Leaflet load error:', err);
+    }
+  }
+
+  async function loadPhotoMap({ rescan = false } = {}) {
+    if (!state.session) return;
+    const rescanBtn = $('mapRescanBtn');
+    if (rescan && rescanBtn) {
+      rescanBtn.disabled = true;
+      rescanBtn.textContent = 'Scanning…';
+    }
+    try {
+      const url = rescan ? '/api/photos/map?rescan=1' : '/api/photos/map';
+      const res = await apiFetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      state.mapData = await res.json();
+      if (rescan) {
+        const found = Number(state.mapData.newlyFoundGps) || 0;
+        const scanned = Number(state.mapData.scannedNow) || 0;
+        showToast(
+          found > 0
+            ? `Found GPS on ${found} more item(s) (${scanned} scanned)`
+            : `GPS scan complete (${scanned} checked · ${state.mapData.geoTaggedCount || 0} total mapped)`,
+          'mint'
+        );
+      }
+      renderPhotoMap({ fitBounds: rescan || !state.mapHasFittedOnce });
+      renderGallery();
+    } catch (err) {
+      showToast(err.message || 'Could not load photo map', 'rose');
+    } finally {
+      if (rescan && rescanBtn) {
+        rescanBtn.disabled = false;
+        rescanBtn.textContent = '↻ Scan GPS';
+      }
+    }
+  }
+
+  function renderPhotoMap({ fitBounds = false } = {}) {
+    const data = state.mapData;
+    if (!data) return;
+
+    const clusters = Array.isArray(data.clusters) ? data.clusters : [];
+    const remainingNote =
+      data.remainingToScan > 0 ? ` · ${data.remainingToScan} more file(s) ready to Scan GPS` : '';
+    $('mapSummaryText').textContent =
+      data.geoTaggedCount > 0
+        ? `${data.geoTaggedCount} geo-tagged item(s) across ${clusters.length} location(s) · Zoom in to explore streets or click any photo pin${remainingNote}`
+        : `No GPS tags detected yet (${data.totalPhotos || 0} total). Click "Scan GPS" to index existing HEIC, JPEG & video locations.`;
+
+    renderMapPlacePills();
+    updateMapSelectedHeader();
+    initAndRenderInteractiveMap({ fitBounds });
   }
 
   // ==================== SMART CLEANUP STUDIO (SIMILAR / BURST / BLURRY) ====================
@@ -2544,6 +3652,20 @@
       dt.textContent = label;
       const dd = document.createElement('dd');
       dd.textContent = value;
+      if (
+        label === 'Location' &&
+        typeof photo.gpsLat === 'number' &&
+        typeof photo.gpsLng === 'number'
+      ) {
+        dd.appendChild(document.createElement('br'));
+        const mapLink = document.createElement('a');
+        mapLink.className = 'lb-maps-link';
+        mapLink.href = getGoogleMapsLink(photo.gpsLat, photo.gpsLng);
+        mapLink.target = '_blank';
+        mapLink.rel = 'noopener noreferrer';
+        mapLink.textContent = `Open in Google Maps (${photo.gpsLat.toFixed(4)}, ${photo.gpsLng.toFixed(4)}) ↗`;
+        dd.appendChild(mapLink);
+      }
       list.appendChild(dt);
       list.appendChild(dd);
     }
@@ -2654,11 +3776,21 @@
       return;
     }
 
+    // Progressive Lightbox: immediately display the cached grid thumbnail (0ms, zero spinner flash!)
+    // while fetching the full 1440px-1920px proxy in the background and swapping seamlessly.
+    const img = $('lbImage');
+    const cachedFullUrl = lbPreviewCache.get(photo.hash) || null;
+    const cachedGridThumb = !cachedFullUrl ? thumbUrlCache.get(photo.hash) || null : null;
+    if (cachedGridThumb) {
+      img.src = cachedGridThumb;
+      img.classList.remove('hidden');
+      spinner.classList.add('hidden');
+    }
+
     try {
       const objUrl = await fetchLightboxPreviewCached(photo.hash);
       if (!objUrl) throw new Error('Preview unavailable');
       if (state.visibleFlatPhotos[state.lightboxIndex]?.hash !== photo.hash) return;
-      const img = $('lbImage');
       img.src = objUrl;
       if (img.complete && img.naturalWidth > 0) {
         spinner.classList.add('hidden');
@@ -2672,7 +3804,9 @@
       preloadAdjacentLightboxItems(state.lightboxIndex);
     } catch {
       spinner.classList.add('hidden');
-      showToast('Preview not available — tap Original to download.', 'amber');
+      if (!cachedGridThumb) {
+        showToast('Preview not available — tap Original to download.', 'amber');
+      }
     }
   }
 
@@ -2689,10 +3823,42 @@
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || 'Could not update favorite');
       photo.isFavorite = nextFav;
+      const norm = String(photo.hash || '').toLowerCase();
+      for (const list of [state.photos, state.protectedPhotos, state.activeAlbumPhotos]) {
+        for (const p of list) {
+          if (String(p.hash || '').toLowerCase() === norm) p.isFavorite = nextFav;
+        }
+      }
+      if (nextFav) {
+        if (!state.favoritePhotos.some((p) => String(p.hash || '').toLowerCase() === norm)) {
+          state.favoritePhotos.unshift({ ...(data.photo || photo), isFavorite: true });
+        }
+        state.favoriteCount =
+          typeof data.favoriteCount === 'number'
+            ? data.favoriteCount
+            : state.favoriteLoadedOnce
+              ? state.favoritePhotos.length
+              : state.favoriteCount + 1;
+      } else {
+        state.favoritePhotos = state.favoritePhotos.filter(
+          (p) => String(p.hash || '').toLowerCase() !== norm
+        );
+        state.favoriteCount =
+          typeof data.favoriteCount === 'number'
+            ? data.favoriteCount
+            : state.favoriteLoadedOnce
+              ? state.favoritePhotos.length
+              : Math.max(0, state.favoriteCount - 1);
+      }
+      applyServerCategoryCounts(data);
       state.photosEtag = null;
+      updateFavoriteBadge();
       const favBtn = $('lbFavBtn');
       favBtn.classList.toggle('is-fav', nextFav);
       favBtn.textContent = nextFav ? '♥' : '♡';
+      if (state.filterMedia === 'favorite' && !nextFav) {
+        closeLightbox();
+      }
       renderGallery();
       showToast(nextFav ? 'Added to Favorites ♥' : 'Removed from Favorites', 'mint');
     } catch (err) {
@@ -2771,26 +3937,8 @@
       if (!res.ok) throw new Error(data.error || 'Update failed');
       photo.keepOriginalOnDevice = nextProtected;
       const norm = String(photo.hash || '').toLowerCase();
-      for (const p of state.photos) {
-        if (String(p.hash || '').toLowerCase() === norm) p.keepOriginalOnDevice = nextProtected;
-      }
-      if (nextProtected) {
-        if (!state.protectedPhotos.some((p) => String(p.hash || '').toLowerCase() === norm)) {
-          state.protectedPhotos.unshift({ ...photo, keepOriginalOnDevice: true });
-        }
-        state.protectedCount = state.protectedLoadedOnce
-          ? state.protectedPhotos.length
-          : state.protectedCount + 1;
-      } else {
-        state.protectedPhotos = state.protectedPhotos.filter(
-          (p) => String(p.hash || '').toLowerCase() !== norm
-        );
-        state.protectedCount = state.protectedLoadedOnce
-          ? state.protectedPhotos.length
-          : Math.max(0, state.protectedCount - 1);
-      }
-      state.photosEtag = null;
-      updateProtectedBadge();
+      state.protectedLoadSeq += 1;
+      applyProtectedDeltaLocally([norm], data.photo ? [data.photo] : [photo], nextProtected, data);
       updateProtectedBannerUI();
       if (state.filterMedia === 'protected' && !nextProtected) {
         closeLightbox();
@@ -2801,7 +3949,7 @@
       showToast(
         nextProtected
           ? 'Protected from auto re-compression'
-          : 'Unlocked — allowed to re-proxy on your phone.',
+          : 'Unlocked — synced with phone to allow re-proxy.',
         'mint'
       );
     } catch (err) {
@@ -3598,13 +4746,18 @@
         } else if (state.filterMedia === 'protected') {
           renderGallery();
           loadProtectedPhotos();
+        } else if (state.filterMedia === 'favorite') {
+          renderGallery();
+          loadFavoritePhotos();
         } else if (state.filterMedia === 'albums') {
           loadAlbums();
           renderGallery();
         } else if (state.filterMedia === 'map') {
+          renderGallery();
           loadPhotoMap();
         } else {
           renderGallery();
+          syncGalleryFromServerIfChanged();
         }
       });
     });
@@ -3684,6 +4837,11 @@
       searchTimer = setTimeout(() => {
         state.searchQuery = e.target.value || '';
         renderGallery();
+        if (state.filterMedia === 'map') {
+          renderMapMarkers();
+          const matched = getActiveMapPhotos();
+          if (matched.length > 0) fitMapToCoords(matched);
+        }
       }, 140);
     });
 
@@ -3733,16 +4891,45 @@
         );
       }
     });
-    $('refreshGalleryBtn').addEventListener('click', () => {
-      if (state.filterMedia === 'trash') loadTrash();
-      else if (state.filterMedia === 'protected') loadProtectedPhotos();
-      else loadGallery(true);
+    const refreshCurrentGalleryView = () => {
+      if (state.filterMedia === 'trash') {
+        loadTrash();
+        loadGallery(false, { silent: true });
+      } else if (state.filterMedia === 'protected') {
+        loadProtectedPhotos();
+        loadGallery(false, { silent: true });
+      } else if (state.filterMedia === 'favorite') {
+        loadFavoritePhotos();
+        loadGallery(false, { silent: true });
+      } else if (state.filterMedia === 'albums') {
+        loadAlbums();
+        if (state.activeAlbum) openAlbumDetail(state.activeAlbum.id);
+        loadGallery(false, { silent: true });
+      } else if (state.filterMedia === 'map') {
+        loadPhotoMap();
+        loadGallery(false, { silent: true });
+      } else {
+        loadGallery(true);
+      }
+    };
+    $('refreshGalleryBtn').addEventListener('click', refreshCurrentGalleryView);
+    $('emptyRetryBtn').addEventListener('click', refreshCurrentGalleryView);
+
+    // Cross-device auto-sync: whenever you switch back to this browser tab from your phone
+    // (or periodically while browsing), lightweight ETag check pulls any Protected/Favorite/Trash/Upload changes.
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        syncGalleryFromServerIfChanged();
+      }
     });
-    $('emptyRetryBtn').addEventListener('click', () => {
-      if (state.filterMedia === 'trash') loadTrash();
-      else if (state.filterMedia === 'protected') loadProtectedPhotos();
-      else loadGallery(true);
+    window.addEventListener('focus', () => {
+      syncGalleryFromServerIfChanged();
     });
+    setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        syncGalleryFromServerIfChanged();
+      }
+    }, 20000);
 
     // Share modal + Manage Share Links + Cleanup + Albums + Map + Memory Viewer
     $('closeShareModalBtn').addEventListener('click', closeShareModal);
@@ -3761,13 +4948,9 @@
     });
 
     // Albums controls
-    document.querySelectorAll('#albumCategoryPills .f-pill').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        document.querySelectorAll('#albumCategoryPills .f-pill').forEach((b) => b.classList.remove('is-active'));
-        btn.classList.add('is-active');
-        state.albumCategoryFilter = btn.dataset.albCat || 'all';
-        renderAlbumsGrid();
-      });
+    renderAlbumCategoryPills();
+    $('albumCategorySelect').addEventListener('change', () => {
+      syncAlbumCustomCategoryField({ focus: true });
     });
     $('newAlbumBtn').addEventListener('click', () => openAlbumModal(null, []));
     $('closeAlbumModalBtn').addEventListener('click', closeAlbumModal);
@@ -3819,45 +5002,42 @@
     });
 
     // Map controls
-    $('mapZoomInBtn').addEventListener('click', () => {
-      state.mapZoom = Math.min(4, state.mapZoom * 1.35);
-      applyMapTransform();
+    document.querySelectorAll('#mapStyleControl .seg-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        state.mapStyle = btn.dataset.mapStyle || 'street';
+        updateMapControlLabels();
+        if (state.mapProvider === 'google') {
+          applyGoogleMapStyle();
+        } else {
+          applyLeafletBaseLayer();
+        }
+      });
     });
-    $('mapZoomOutBtn').addEventListener('click', () => {
-      state.mapZoom = Math.max(1, state.mapZoom / 1.35);
-      if (state.mapZoom <= 1.02) {
-        state.mapZoom = 1;
-        state.mapPanX = 0;
-        state.mapPanY = 0;
-      }
-      applyMapTransform();
+    $('mapProviderToggleBtn').addEventListener('click', () => {
+      state.mapProviderUserChosen = true;
+      state.mapProvider = state.mapProvider === 'google' ? 'leaflet' : 'google';
+      initAndRenderInteractiveMap({ fitBounds: true });
     });
-    $('mapResetBtn').addEventListener('click', () => {
-      state.mapZoom = 1;
-      state.mapPanX = 0;
-      state.mapPanY = 0;
+    $('mapRescanBtn').addEventListener('click', () => {
+      loadPhotoMap({ rescan: true });
+    });
+    $('mapFitBoundsBtn').addEventListener('click', () => {
       state.selectedMapClusterId = null;
-      renderPhotoMap();
+      state.selectedMapFilter = null;
+      updateMapSelectedHeader();
+      renderMapPlacePills();
+      fitMapToCoords(getActiveMapPhotos());
+      renderMapMarkers();
       renderGallery();
     });
     $('mapClearPlaceBtn').addEventListener('click', () => {
       state.selectedMapClusterId = null;
-      renderPhotoMap();
+      state.selectedMapFilter = null;
+      updateMapSelectedHeader();
+      renderMapPlacePills();
+      fitMapToCoords(getActiveMapPhotos());
+      renderMapMarkers();
       renderGallery();
-    });
-    let mapDrag = null;
-    $('photoMapStage').addEventListener('mousedown', (e) => {
-      if (state.mapZoom <= 1.01) return;
-      mapDrag = { x: e.clientX - state.mapPanX, y: e.clientY - state.mapPanY };
-    });
-    window.addEventListener('mousemove', (e) => {
-      if (!mapDrag) return;
-      state.mapPanX = e.clientX - mapDrag.x;
-      state.mapPanY = e.clientY - mapDrag.y;
-      applyMapTransform();
-    });
-    window.addEventListener('mouseup', () => {
-      mapDrag = null;
     });
 
     // Cleanup studio controls
@@ -3890,25 +5070,6 @@
       );
     });
 
-    // Memory viewer controls
-    $('memoryCloseBtn').addEventListener('click', closeMemoryViewer);
-    $('memoryPlayPauseBtn').addEventListener('click', toggleMemoryPause);
-    $('memoryPrevBtn').addEventListener('click', () => {
-      if (state.memorySlideIndex > 0) {
-        state.memorySlideIndex--;
-        renderMemorySlide();
-      }
-    });
-    $('memoryNextBtn').addEventListener('click', () => {
-      if (state.activeMemory && state.memorySlideIndex < state.activeMemory.photos.length - 1) {
-        state.memorySlideIndex++;
-        renderMemorySlide();
-      }
-    });
-    $('memoryShareBtn').addEventListener('click', () => {
-      if (!state.activeMemory) return;
-      openShareModal(state.activeMemory.hashes, state.activeMemory.title);
-    });
     $('shareCopyBtn').addEventListener('click', async () => {
       const val = $('shareUrlOutput').value;
       if (!val) return;
@@ -4072,20 +5233,6 @@
       }
       if (!$('loginModal').classList.contains('hidden')) {
         if (e.key === 'Escape') closeLoginModal();
-        return;
-      }
-      if (!$('memoryViewer').classList.contains('hidden')) {
-        if (e.key === 'Escape') closeMemoryViewer();
-        else if (e.key === 'ArrowLeft' && state.memorySlideIndex > 0) {
-          state.memorySlideIndex--;
-          renderMemorySlide();
-        } else if (e.key === 'ArrowRight' && state.activeMemory && state.memorySlideIndex < state.activeMemory.photos.length - 1) {
-          state.memorySlideIndex++;
-          renderMemorySlide();
-        } else if (e.key === ' ') {
-          e.preventDefault();
-          toggleMemoryPause();
-        }
         return;
       }
       if ($('lightbox').classList.contains('hidden')) return;

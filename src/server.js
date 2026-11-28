@@ -40,12 +40,21 @@ if (require.main === module) {
           srv = http.createServer(app);
         }
         // Keep TCP/TLS sockets warm longer (65s vs Node's 5s default), disable Nagle's algorithm
-        // for snappy Range/keep-alive transfers, and allow slow large-video uploads over Tailscale/WAN.
+        // for snappy Range/keep-alive transfers, cap header counts against header-flood Slowloris,
+        // and allow slow large-video uploads over Tailscale/WAN.
         srv.keepAliveTimeout = 65_000;
         srv.headersTimeout = 66_000;
         srv.requestTimeout = 0;
+        srv.maxHeadersCount = 100;
+        srv.maxRequestsPerSocket = 1000;
         srv.on('connection', (socket) => {
           socket.setNoDelay(true);
+        });
+        srv.on('clientError', (err, socket) => {
+          if (err && err.code === 'ECONNRESET') return;
+          if (socket && socket.writable && !socket.destroyed) {
+            socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+          }
         });
         return srv;
       };
@@ -77,6 +86,23 @@ if (require.main === module) {
       };
       process.once('SIGINT', shutdown);
       process.once('SIGTERM', shutdown);
+      process.on('unhandledRejection', (reason) => {
+        console.error(
+          `[${new Date().toISOString()}] UNHANDLED PROMISE REJECTION (kept alive):`,
+          reason instanceof Error ? reason.stack || reason.message : reason
+        );
+      });
+      process.on('uncaughtException', (err) => {
+        console.error(
+          `[${new Date().toISOString()}] UNCAUGHT EXCEPTION (flushing indexes before exit):`,
+          err && (err.stack || err.message || err)
+        );
+        const flushFn = app.locals && app.locals.flushAllIndexes;
+        Promise.resolve(typeof flushFn === 'function' ? flushFn() : null)
+          .catch(() => {})
+          .finally(() => process.exit(1));
+        setTimeout(() => process.exit(1), 3000).unref();
+      });
 
       apiServer.listen(port, '0.0.0.0', () => {
         console.log(`PhotoHub backend listening on ${scheme}://0.0.0.0:${port}`);

@@ -4,8 +4,11 @@ import android.app.Application
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.CancellationSignal
 import android.provider.MediaStore
 import android.util.LruCache
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.photohub.compressor.background.BackgroundBackupManager
@@ -680,12 +683,16 @@ object BatchRestoreExecutor {
             if (pendingProtectHashes.size < threshold) return
             val chunk = pendingProtectHashes.toList()
             pendingProtectHashes.clear()
-            runCatching {
+            val ok = runCatching {
                 client.setOriginalsProtectedBatch(
                     masterHashes = chunk,
                     protected = true,
                     notifyStore = false
                 )
+                true
+            }.getOrDefault(false)
+            if (!ok) {
+                tracker.markPendingProtectionSync(chunk)
             }
         }
 
@@ -1044,26 +1051,44 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
     private val _detailState = MutableStateFlow<PhotoDetailUiState?>(null)
     val detailState: StateFlow<PhotoDetailUiState?> = _detailState.asStateFlow()
 
-    // Bounded LRU thumbnail cache (max 1/8 JVM heap, capped at 48 MB) to prevent OOM on large libraries.
-    private val thumbnailLruCache: LruCache<String, Bitmap> = run {
+    private data class CachedGridThumb(
+        val bitmap: Bitmap,
+        val imageBitmap: ImageBitmap
+    )
+
+    // Bounded LRU thumbnail cache (max 1/8 JVM heap, capped at 48 MB) holding pre-wrapped ImageBitmaps
+    // so Compose grid cells render directly without re-wrapping bitmaps or triggering root recompositions.
+    private val thumbnailLruCache: LruCache<String, CachedGridThumb> = run {
         val maxKb = (Runtime.getRuntime().maxMemory() / 1024L).toInt()
         val cacheKb = minOf(maxKb / 8, 48 * 1024).coerceAtLeast(8 * 1024)
-        object : LruCache<String, Bitmap>(cacheKb) {
-            override fun sizeOf(key: String, value: Bitmap): Int =
-                (value.allocationByteCount / 1024).coerceAtLeast(1)
+        object : LruCache<String, CachedGridThumb>(cacheKb) {
+            override fun sizeOf(key: String, value: CachedGridThumb): Int =
+                (value.bitmap.allocationByteCount / 1024).coerceAtLeast(1)
         }
     }
 
-    fun getCachedThumbnail(hash: String): Bitmap? = thumbnailLruCache.get(hash.lowercase(Locale.ROOT))
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val localThumbDispatcher = Dispatchers.IO.limitedParallelism(4)
 
-    private fun putCachedThumbnail(hash: String, bmp: Bitmap) {
-        thumbnailLruCache.put(hash.lowercase(Locale.ROOT), bmp)
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val networkThumbDispatcher = Dispatchers.IO.limitedParallelism(3)
+
+    fun getCachedThumbnail(hash: String): Bitmap? = thumbnailLruCache.get(hash.lowercase(Locale.ROOT))?.bitmap
+
+    fun getCachedImageBitmap(hash: String): ImageBitmap? = thumbnailLruCache.get(hash.lowercase(Locale.ROOT))?.imageBitmap
+
+    private fun putCachedThumbnail(hash: String, bmp: Bitmap): ImageBitmap {
+        val img = bmp.asImageBitmap()
+        thumbnailLruCache.put(hash.lowercase(Locale.ROOT), CachedGridThumb(bmp, img))
+        return img
     }
 
-    private val inFlightPreviews = Collections.synchronizedSet(mutableSetOf<String>())
     private var batchJob: Job? = null
     private var restoreJob: Job? = null
     private var speculativePrefetchJob: Job? = null
+    private var reconcileJob: Job? = null
+    private var gridPrefetchJob: Job? = null
+    private var lastServerSyncElapsedMs: Long = 0L
 
     init {
         viewModelScope.launch {
@@ -1107,34 +1132,60 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
 
     fun loadFromLocalStore() {
         val cur = settings.current
-        val cached = store.cachedPhotos(cur.normalizedBaseUrl, cur.apiKeyCacheScope)
         viewModelScope.launch(Dispatchers.IO) {
-            // Grid thumbnails are decoded lazily per visible tile into thumbnailLruCache (48 MB cap),
-            // avoiding decoding all library bitmaps into RAM at startup.
-            val protectedSet = computeLocallyProtectedHashes(cached)
+            val cached = store.cachedPhotos(cur.normalizedBaseUrl, cur.apiKeyCacheScope)
+            val prevSnapshot = _uiState.value
+            val nextPhotos = if (cached.isNotEmpty() || prevSnapshot.photos.isEmpty()) cached else prevSnapshot.photos
+            val nextProtected = computeLocallyProtectedHashes(nextPhotos)
+            val rebuilt = rebuildTimelineData(
+                nextPhotos,
+                prevSnapshot.filterMode,
+                prevSnapshot.mediaTypeFilter,
+                prevSnapshot.timelineGrouping,
+                prevSnapshot.selectedYearAnchor,
+                prevSnapshot.searchQuery,
+                nextProtected
+            )
             withContext(Dispatchers.Main) {
                 _uiState.update { prev ->
-                    val nextPhotos = if (cached.isNotEmpty() || prev.photos.isEmpty()) cached else prev.photos
-                    val nextProtected = if (nextPhotos === cached) protectedSet else computeLocallyProtectedHashes(nextPhotos)
-                    val rebuilt = rebuildTimelineData(
-                        nextPhotos,
-                        prev.filterMode,
-                        prev.mediaTypeFilter,
-                        prev.timelineGrouping,
-                        prev.selectedYearAnchor,
-                        prev.searchQuery,
-                        nextProtected
-                    )
+                    val shouldBump = prev.photos.size != nextPhotos.size || prev.photos.firstOrNull()?.hash != nextPhotos.firstOrNull()?.hash
                     prev.copy(
                         photos = nextPhotos,
-                        thumbnailCacheVersion = prev.thumbnailCacheVersion + 1L,
+                        thumbnailCacheVersion = if (shouldBump) prev.thumbnailCacheVersion + 1L else prev.thumbnailCacheVersion,
                         locallyProtectedHashes = nextProtected,
                         timeline = rebuilt.first,
                         selectedYearAnchor = rebuilt.second
                     )
                 }
             }
+            if (nextPhotos.isNotEmpty()) {
+                reconcileNativeGalleryAsync(nextPhotos, force = false)
+            }
         }
+    }
+
+    private fun reconcileNativeGalleryAsync(photos: List<ServerPhoto>, force: Boolean) {
+        if (photos.isEmpty()) return
+        reconcileJob?.cancel()
+        reconcileJob = viewModelScope.launch(Dispatchers.IO) {
+            val linkedCount = mediaService.reconcileExistingNativeGalleryAssets(photos, force = force)
+            if (!isActive) return@launch
+            if (linkedCount > 0) {
+                withContext(Dispatchers.Main) {
+                    _uiState.update { prev ->
+                        prev.copy(thumbnailCacheVersion = prev.thumbnailCacheVersion + 1L)
+                    }
+                }
+            }
+        }
+    }
+
+    fun syncIfStale(minIntervalMs: Long = 4_000L) {
+        val state = _uiState.value
+        if (state.isLoading || state.isBatchRestoring || state.isBatchDeleting || state.isBatchUpdatingProtection) return
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (lastServerSyncElapsedMs > 0L && now - lastServerSyncElapsedMs < minIntervalMs) return
+        loadPhotos()
     }
 
     fun loadPhotos() {
@@ -1145,21 +1196,24 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
             val client = PhotoHubApiClient(context, settings)
             val whoamiDeferred = async { runCatching { client.whoami() }.getOrNull() }
             try {
+                // 1. Push any offline restore protections up to the server first
+                client.flushPendingProtectionUploads()
                 var latestTrashCount = _uiState.value.trashCount
                 val fetched = client.fetchAllServerPhotos(sync = true) { partial, trashCount ->
                     latestTrashCount = trashCount
                     if (partial.size >= 300) {
+                        val snap = _uiState.value
+                        val source = if (snap.isViewingTrash) snap.trashPhotos else partial
+                        val rebuilt = rebuildTimelineData(
+                            source,
+                            snap.filterMode,
+                            snap.mediaTypeFilter,
+                            snap.timelineGrouping,
+                            snap.selectedYearAnchor,
+                            snap.searchQuery,
+                            snap.locallyProtectedHashes
+                        )
                         _uiState.update { prev ->
-                            val source = if (prev.isViewingTrash) prev.trashPhotos else partial
-                            val rebuilt = rebuildTimelineData(
-                                source,
-                                prev.filterMode,
-                                prev.mediaTypeFilter,
-                                prev.timelineGrouping,
-                                prev.selectedYearAnchor,
-                                prev.searchQuery,
-                                prev.locallyProtectedHashes
-                            )
                             prev.copy(
                                 photos = partial,
                                 trashCount = trashCount,
@@ -1170,10 +1224,24 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                     }
                 }
                 val cur = settings.current
-                store.savePhotos(fetched, cur.normalizedBaseUrl, cur.apiKeyCacheScope)
+                // 2. Sync local protection locks with authoritative server state (clears items unlocked on webpage!)
                 val protectedSet = withContext(Dispatchers.IO) {
-                    mediaService.reconcileExistingNativeGalleryAssets(fetched)
+                    tracker.syncProtectionStateFromServer(fetched)
+                    store.savePhotos(fetched, cur.normalizedBaseUrl, cur.apiKeyCacheScope)
                     computeLocallyProtectedHashes(fetched)
+                }
+                val snap = _uiState.value
+                val source = if (snap.isViewingTrash) snap.trashPhotos else fetched
+                val rebuilt = withContext(Dispatchers.Default) {
+                    rebuildTimelineData(
+                        source,
+                        snap.filterMode,
+                        snap.mediaTypeFilter,
+                        snap.timelineGrouping,
+                        snap.selectedYearAnchor,
+                        snap.searchQuery,
+                        protectedSet
+                    )
                 }
                 whoamiDeferred.await()?.let { who ->
                     settings.updateServerCapabilities(who.storage, who.s3Enabled)
@@ -1185,20 +1253,8 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                         name = who.name
                     )
                 }
+                lastServerSyncElapsedMs = android.os.SystemClock.elapsedRealtime()
                 _uiState.update { prev ->
-                    val source = if (prev.isViewingTrash) prev.trashPhotos else fetched
-                    val rebuilt = rebuildTimelineData(
-                        source,
-                        prev.filterMode,
-                        prev.mediaTypeFilter,
-                        prev.timelineGrouping,
-                        prev.selectedYearAnchor,
-                        prev.searchQuery,
-                        protectedSet
-                    )
-                    val clearedFailed = prev.failedPreviewHashes.filterNot { h ->
-                        fetched.any { it.hash == h && !it.needsProxy } || tracker.hasAnyLiveGalleryAsset(h)
-                    }.toSet()
                     prev.copy(
                         photos = fetched,
                         trashCount = latestTrashCount,
@@ -1206,11 +1262,16 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
                         locallyProtectedHashes = protectedSet,
                         timeline = rebuilt.first,
                         selectedYearAnchor = rebuilt.second,
-                        failedPreviewHashes = clearedFailed,
+                        failedPreviewHashes = emptySet(),
                         errorMessage = null,
                         isLoading = false
                     )
                 }
+                if (_uiState.value.isViewingTrash) {
+                    loadTrashPhotos()
+                }
+                // Run single-pass native Gallery reconcile & live-URI cache priming in background (non-blocking!).
+                reconcileNativeGalleryAsync(fetched, force = false)
                 syncManager.startPrefetchIfNeeded(fetched)
             } catch (err: ApiHttpException) {
                 if (err.statusCode == 401) {
@@ -1260,6 +1321,8 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
         }
         if (media == ServerMediaTypeFilter.TRASH) {
             loadTrashPhotos()
+        } else if (media == ServerMediaTypeFilter.PROTECTED || media == ServerMediaTypeFilter.FAVORITES) {
+            syncIfStale(minIntervalMs = 6_000L)
         }
     }
 
@@ -1383,78 +1446,97 @@ class ServerGalleryViewModel(application: Application) : AndroidViewModel(applic
         return data to nextAnchor
     }
 
-    fun loadCompressedPreviewIfNeeded(photo: ServerPhoto) {
-        if (getCachedThumbnail(photo.hash) != null || !inFlightPreviews.add(photo.hash)) {
-            return
-        }
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                // 1. Check Native Android Gallery FIRST (zero network download, zero duplicate app cache!)
-                val nativeBmp = mediaService.loadNativeGalleryThumbnail(photo.hash, photo.isVideo, maxPixelSize = 320)
-                if (nativeBmp != null) {
-                    putCachedThumbnail(photo.hash, nativeBmp)
-                    withContext(Dispatchers.Main) {
-                        _uiState.update { prev ->
-                            prev.copy(
-                                thumbnailCacheVersion = prev.thumbnailCacheVersion + 1L,
-                                failedPreviewHashes = prev.failedPreviewHashes - photo.hash
-                            )
-                        }
-                    }
-                    return@launch
-                }
+    /**
+     * Loads a grid thumbnail directly for a single Compose cell with:
+     * - O(1) RAM cache hit returning pre-wrapped [ImageBitmap]
+     * - Hardware-cancellable MediaStore `loadThumbnail` via [CancellationSignal] (aborts immediately on fast fling!)
+     * - Bounded concurrency (`localThumbDispatcher` / `networkThumbDispatcher`)
+     * - ZERO root `_uiState` invalidations (only the calling cell updates!)
+     */
+    suspend fun loadGridThumbnail(photo: ServerPhoto): ImageBitmap? {
+        getCachedImageBitmap(photo.hash)?.let { return it }
 
-                // 2. Check app disk preview cache
-                val cachedBmp = store.decodeGridThumbnailBitmap(photo.hash, maxPixelSize = 320)
-                if (cachedBmp != null) {
-                    putCachedThumbnail(photo.hash, cachedBmp)
-                    withContext(Dispatchers.Main) {
-                        _uiState.update { prev ->
-                            prev.copy(
-                                thumbnailCacheVersion = prev.thumbnailCacheVersion + 1L,
-                                failedPreviewHashes = prev.failedPreviewHashes - photo.hash
-                            )
-                        }
-                    }
-                    return@launch
-                }
+        // 1 & 2. Fast local path (Native Android Gallery -> App Disk Preview Cache) on bounded local dispatcher
+        val localImg = withContext(localThumbDispatcher) {
+            ensureActive()
+            getCachedImageBitmap(photo.hash)?.let { return@withContext it }
 
-                if (photo.isVideo && photo.needsProxy) {
-                    withContext(Dispatchers.Main) {
-                        _uiState.update { prev ->
-                            prev.copy(failedPreviewHashes = prev.failedPreviewHashes + photo.hash)
-                        }
-                    }
-                    return@launch
-                }
-
-                // 3. On-demand fallback to server preview (only for cloud-only items not in phone Gallery)
-                val client = PhotoHubApiClient(context, settings)
-                val raw = runCatching { client.downloadPhotoPreviewData(photo.hash) }.getOrNull()
-                val compressed = raw?.let { store.cacheDownloadedPreview(it, photo.hash) }
-                val gridBmp = compressed?.let { (_, bytes) ->
-                    store.decodeGridThumbnailFromBytes(bytes, maxPixelSize = 320) ?: compressed.first
-                }
-                if (compressed != null && gridBmp !== compressed.first) {
-                    compressed.first.recycle()
-                }
-                withContext(Dispatchers.Main) {
-                    if (gridBmp != null) {
-                        putCachedThumbnail(photo.hash, gridBmp)
-                        _uiState.update { prev ->
-                            prev.copy(
-                                thumbnailCacheVersion = prev.thumbnailCacheVersion + 1L,
-                                failedPreviewHashes = prev.failedPreviewHashes - photo.hash
-                            )
-                        }
-                    } else {
-                        _uiState.update { prev ->
-                            prev.copy(failedPreviewHashes = prev.failedPreviewHashes + photo.hash)
-                        }
-                    }
-                }
+            val cancelSignal = CancellationSignal()
+            val cancelHandle = coroutineContext[Job]?.invokeOnCompletion { cause ->
+                if (cause != null) cancelSignal.cancel()
+            }
+            val nativeBmp = try {
+                mediaService.loadNativeGalleryThumbnail(
+                    masterHash = photo.hash,
+                    isVideo = photo.isVideo,
+                    maxPixelSize = 256,
+                    cancellationSignal = cancelSignal
+                )
             } finally {
-                inFlightPreviews.remove(photo.hash)
+                cancelHandle?.dispose()
+            }
+            if (nativeBmp != null) {
+                return@withContext putCachedThumbnail(photo.hash, nativeBmp)
+            }
+
+            ensureActive()
+            val cachedBmp = store.decodeGridThumbnailBitmap(photo.hash, maxPixelSize = 256)
+            if (cachedBmp != null) {
+                return@withContext putCachedThumbnail(photo.hash, cachedBmp)
+            }
+            null
+        }
+        if (localImg != null) return localImg
+
+        if (photo.isVideo && photo.needsProxy) {
+            return null
+        }
+
+        // 3. On-demand fallback to server preview (only for cloud-only items not on this phone)
+        return withContext(networkThumbDispatcher) {
+            ensureActive()
+            getCachedImageBitmap(photo.hash)?.let { return@withContext it }
+            val client = PhotoHubApiClient(context, settings)
+            val raw = runCatching { client.downloadPhotoPreviewData(photo.hash) }.getOrNull() ?: return@withContext null
+            ensureActive()
+            val compressed = store.cacheDownloadedPreview(raw, photo.hash) ?: return@withContext null
+            val gridBmp = store.decodeGridThumbnailFromBytes(compressed.second, maxPixelSize = 256) ?: compressed.first
+            if (gridBmp !== compressed.first) {
+                compressed.first.recycle()
+            }
+            putCachedThumbnail(photo.hash, gridBmp)
+        }
+    }
+
+    /**
+     * Lightweight lookahead prefetch for upcoming visible grid tiles from native Gallery / local disk cache only
+     * (never triggers network downloads off-screen). Automatically cancels when scroll moves on.
+     */
+    fun prefetchLocalGridThumbnails(upcomingPhotos: List<ServerPhoto>) {
+        val candidates = upcomingPhotos.filter { getCachedImageBitmap(it.hash) == null }.take(15)
+        if (candidates.isEmpty()) return
+        gridPrefetchJob?.cancel()
+        gridPrefetchJob = viewModelScope.launch(localThumbDispatcher) {
+            for (photo in candidates) {
+                if (!isActive) break
+                if (getCachedImageBitmap(photo.hash) != null) continue
+                val signal = CancellationSignal()
+                val handle = coroutineContext[Job]?.invokeOnCompletion { cause ->
+                    if (cause != null) signal.cancel()
+                }
+                val bmp = try {
+                    mediaService.loadNativeGalleryThumbnail(
+                        masterHash = photo.hash,
+                        isVideo = photo.isVideo,
+                        maxPixelSize = 256,
+                        cancellationSignal = signal
+                    ) ?: store.decodeGridThumbnailBitmap(photo.hash, maxPixelSize = 256)
+                } finally {
+                    handle?.dispose()
+                }
+                if (bmp != null) {
+                    putCachedThumbnail(photo.hash, bmp)
+                }
             }
         }
     }

@@ -8,18 +8,35 @@
 const crypto = require('crypto');
 const fsp = require('fs/promises');
 const path = require('path');
+const { promisify } = require('util');
+
+const scryptAsync = promisify(crypto.scrypt);
 
 const DEFAULT_EXPIRY_HOURS = 168; // 7 days
 const MAX_EXPIRY_HOURS = 720; // 30 days
 const MAX_SHARES_PER_LINK = 200;
+const MAX_ACTIVE_SHARES_PER_USER = 200;
 
 function hashPasscode(passcode, salt) {
   return crypto.scryptSync(String(passcode), salt, 32).toString('hex');
 }
 
+async function verifyPasscodeHashAsync(passcode, salt, expectedHex) {
+  if (!expectedHex || !salt) return true;
+  if (typeof passcode !== 'string' || !passcode || passcode.length > 128) return false;
+  try {
+    const derived = await scryptAsync(passcode, salt, 32);
+    const expected = Buffer.from(expectedHex, 'hex');
+    if (derived.length !== expected.length) return false;
+    return crypto.timingSafeEqual(derived, expected);
+  } catch {
+    return false;
+  }
+}
+
 function verifyPasscodeHash(passcode, salt, expectedHex) {
   if (!expectedHex || !salt) return true;
-  if (typeof passcode !== 'string' || !passcode) return false;
+  if (typeof passcode !== 'string' || !passcode || passcode.length > 128) return false;
   try {
     const actual = Buffer.from(hashPasscode(passcode, salt), 'hex');
     const expected = Buffer.from(expectedHex, 'hex');
@@ -101,6 +118,12 @@ class ShareStore {
     nodeId = null,
   }) {
     this._pruneExpired();
+    const existingCount = this.listForFolder(folderName).length;
+    if (existingCount >= MAX_ACTIVE_SHARES_PER_USER) {
+      const err = new Error(`Maximum of ${MAX_ACTIVE_SHARES_PER_USER} active share links reached. Revoke unused links first.`);
+      err.statusCode = 400;
+      throw err;
+    }
     const cleanHashes = [];
     const seen = new Set();
     for (const h of hashes) {
@@ -234,6 +257,15 @@ class ShareStore {
   verifyPasscode(shareRecord, providedPasscode) {
     if (!shareRecord || !shareRecord.passcodeHash) return true;
     return verifyPasscodeHash(
+      String(providedPasscode || '').trim(),
+      shareRecord.passcodeSalt,
+      shareRecord.passcodeHash
+    );
+  }
+
+  async verifyPasscodeAsync(shareRecord, providedPasscode) {
+    if (!shareRecord || !shareRecord.passcodeHash) return true;
+    return verifyPasscodeHashAsync(
       String(providedPasscode || '').trim(),
       shareRecord.passcodeSalt,
       shareRecord.passcodeHash

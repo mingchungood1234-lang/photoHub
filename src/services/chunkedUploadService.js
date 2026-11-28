@@ -14,6 +14,7 @@ const path = require('path');
 const crypto = require('crypto');
 const {
   assertWithinQuota,
+  assertMinimumFreeDisk,
   sanitizeFilename,
   parseDateFolder,
   finalizeStagedUpload,
@@ -23,11 +24,14 @@ const DEFAULT_CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB
 const MIN_CHUNK_SIZE = 256 * 1024; // 256 KB
 const MAX_CHUNK_SIZE = 32 * 1024 * 1024; // 32 MB
 const MAX_CHUNKS_PER_SESSION = 5000;
+const MAX_ACTIVE_SESSIONS_PER_USER = 10;
+const MAX_TOTAL_ACTIVE_SESSIONS = 100;
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 class ChunkedUploadService {
   constructor() {
     this.sessions = new Map(); // uploadId -> sessionRecord
+    this.completingIds = new Set(); // guards concurrent double-complete races
   }
 
   _sessionDir(storageDir, uploadId) {
@@ -192,6 +196,9 @@ class ChunkedUploadService {
     }
 
     assertWithinQuota(hashIndex, quotaBytes, sizeNum);
+    if (minFreeDiskBytes > 0) {
+      await assertMinimumFreeDisk(storageDir, minFreeDiskBytes, sizeNum);
+    }
 
     // Resume explicitly requested uploadId OR match an existing in-progress session for the same file
     if (resumeUploadId) {
@@ -206,7 +213,11 @@ class ChunkedUploadService {
     }
 
     const safeName = sanitizeFilename(fileName, mimeType, cleanHash || crypto.randomBytes(8).toString('hex'));
+    let activeForFolder = 0;
     for (const existing of this.sessions.values()) {
+      if ((existing.folderName || null) === (folderName || null)) {
+        activeForFolder += 1;
+      }
       if (
         (existing.folderName || null) === (folderName || null) &&
         existing.fileSize === sizeNum &&
@@ -219,6 +230,17 @@ class ChunkedUploadService {
           ...this.formatSessionStatus(existing),
         };
       }
+    }
+
+    if (activeForFolder >= MAX_ACTIVE_SESSIONS_PER_USER) {
+      const err = new Error(`Too many active chunked upload sessions (max ${MAX_ACTIVE_SESSIONS_PER_USER}). Finish or abort existing uploads first.`);
+      err.statusCode = 429;
+      throw err;
+    }
+    if (this.sessions.size >= MAX_TOTAL_ACTIVE_SESSIONS) {
+      const err = new Error('Server chunked upload queue is temporarily full. Please try again shortly.');
+      err.statusCode = 503;
+      throw err;
     }
 
     const safeChunkSize = Math.min(
@@ -283,6 +305,12 @@ class ChunkedUploadService {
     if (!session) {
       const err = new Error('Chunked upload session not found or expired.');
       err.statusCode = 404;
+      throw err;
+    }
+
+    if (this.completingIds.has(session.uploadId)) {
+      const err = new Error('Upload session is already finalizing.');
+      err.statusCode = 409;
       throw err;
     }
 
@@ -386,6 +414,13 @@ class ChunkedUploadService {
       throw err;
     }
 
+    if (this.completingIds.has(session.uploadId)) {
+      const err = new Error('Upload session is already finalizing.');
+      err.statusCode = 409;
+      throw err;
+    }
+    this.completingIds.add(session.uploadId);
+
     const missingChunks = [];
     for (let i = 0; i < session.totalChunks; i++) {
       const pPath = this._partPath(storageDir, session.uploadId, i);
@@ -458,6 +493,8 @@ class ChunkedUploadService {
     } catch (err) {
       await fsp.unlink(stagingPath).catch(() => {});
       throw err;
+    } finally {
+      this.completingIds.delete(session.uploadId);
     }
   }
 

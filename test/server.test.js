@@ -2741,6 +2741,29 @@ test('Auto-proxy queue, EXIF GPS map & search, Memories, Custom Albums, Share up
   });
   assert.equal((await remAlbRes.json()).album.itemCount, 2);
 
+  // User-defined custom category album (e.g. "Pets" -> updated to "Food & Cafes")
+  const customCatRes = await ctx.request('/api/albums', {
+    method: 'POST',
+    headers: { 'X-API-Key': 'alice_key', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'Mochi the Cat', category: '  Pets  ', hashes: [h1] }),
+  });
+  assert.equal(customCatRes.status, 201);
+  const customAlb = (await customCatRes.json()).album;
+  assert.equal(customAlb.category, 'Pets');
+
+  const updateCatRes = await ctx.request(`/api/albums/${customAlb.id}`, {
+    method: 'PUT',
+    headers: { 'X-API-Key': 'alice_key', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ category: 'Food & Cafes' }),
+  });
+  assert.equal(updateCatRes.status, 200);
+  assert.equal((await updateCatRes.json()).album.category, 'Food & Cafes');
+
+  await ctx.request(`/api/albums/${customAlb.id}`, {
+    method: 'DELETE',
+    headers: { 'X-API-Key': 'alice_key' },
+  });
+
   // 5. Public Share Link Upgrades (Album Share, View-Only, ZIP download, View Count & Max Views)
   const shareRes = await ctx.request('/api/shares', {
     method: 'POST',
@@ -3024,12 +3047,16 @@ test('High-throughput GET /api/photo/:hash Range streaming and POST /api/photos/
   assert.equal(protectBody.success, true);
   assert.equal(protectBody.keepOriginalOnDevice, true);
   assert.equal(protectBody.updatedCount, 3);
+  assert.equal(protectBody.protectedCount, 3);
   assert.equal(protectBody.photos.length, 3);
   assert.ok(protectBody.photos.every((p) => p.keepOriginalOnDevice === true));
   assert.deepEqual(protectBody.missing, [missingHash]);
 
-  // Verify persisted state via /api/photos + protected=1 filter + protectedCount
-  const listAfter = await (await ctx.request('/api/photos', { headers })).json();
+  // Verify persisted state via /api/photos + protected=1 filter + protectedCount + ETag
+  const listAfterRes = await ctx.request('/api/photos', { headers });
+  const etagBeforeUnlock = listAfterRes.headers.etag;
+  assert.ok(etagBeforeUnlock, 'Expected ETag on /api/photos');
+  const listAfter = await listAfterRes.json();
   assert.equal(listAfter.photos.length, 3);
   assert.equal(listAfter.protectedCount, 3);
   assert.ok(listAfter.photos.every((p) => p.keepOriginalOnDevice === true));
@@ -3039,6 +3066,7 @@ test('High-throughput GET /api/photo/:hash Range streaming and POST /api/photos/
   assert.equal(protectedOnly.protectedCount, 3);
 
   // 6. Batch Allow Re-Proxy (keepOriginalOnDevice: false) unlocks multiple selected photos at once
+  // and returns authoritative category counts + invalidates /api/photos ETag for instant cross-client sync
   const batchUnlock = await ctx.request('/api/photos/protect-original', {
     method: 'POST',
     headers: { ...headers, 'Content-Type': 'application/json' },
@@ -3052,16 +3080,687 @@ test('High-throughput GET /api/photo/:hash Range streaming and POST /api/photos/
   assert.equal(unlockBody.success, true);
   assert.equal(unlockBody.keepOriginalOnDevice, false);
   assert.equal(unlockBody.updatedCount, 2);
+  assert.equal(unlockBody.protectedCount, 1);
   assert.ok(unlockBody.photos.every((p) => p.keepOriginalOnDevice === false));
+
+  // ETag MUST change after Allow Re-Proxy so phone & webpage tabs sync immediately instead of hitting 304
+  const afterUnlockRes = await ctx.request('/api/photos', {
+    headers: { ...headers, 'If-None-Match': etagBeforeUnlock },
+  });
+  assert.equal(afterUnlockRes.status, 200);
+  assert.notEqual(afterUnlockRes.headers.etag, etagBeforeUnlock);
 
   const protectedAfterUnlock = await (await ctx.request('/api/photos?protected=1', { headers })).json();
   assert.equal(protectedAfterUnlock.total, 1);
   assert.equal(protectedAfterUnlock.protectedCount, 1);
   assert.equal(protectedAfterUnlock.photos[0].hash, bigSha);
 
-  // 7. Webpage exposes Protected banner & multi-select Allow Re-Proxy controls
+  // 6b. Favorite & Trash mutations return authoritative cross-category counts and ?favorite=1 works
+  const favRes = await ctx.request(`/api/photo/${up1.hash}/favorite`, {
+    method: 'POST',
+    headers: { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ isFavorite: true }),
+  });
+  assert.equal(favRes.status, 200);
+  const favBody = await favRes.json();
+  assert.equal(favBody.favoriteCount, 1);
+  assert.equal(favBody.protectedCount, 1);
+
+  const favOnly = await (await ctx.request('/api/photos?favorite=1', { headers })).json();
+  assert.equal(favOnly.total, 1);
+  assert.equal(favOnly.favoriteCount, 1);
+  assert.equal(favOnly.photos[0].hash, up1.hash);
+
+  const trashRes = await ctx.request('/api/photos/trash', {
+    method: 'POST',
+    headers: { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ hashes: [bigSha] }),
+  });
+  assert.equal(trashRes.status, 200);
+  const trashBody = await trashRes.json();
+  assert.equal(trashBody.trashCount, 1);
+  assert.equal(trashBody.protectedCount, 0);
+  assert.equal(trashBody.favoriteCount, 1);
+
+  const restoreTrashRes = await ctx.request('/api/photos/trash/restore', {
+    method: 'POST',
+    headers: { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ hashes: [bigSha] }),
+  });
+  assert.equal(restoreTrashRes.status, 200);
+  const restoreTrashBody = await restoreTrashRes.json();
+  assert.equal(restoreTrashBody.trashCount, 0);
+  assert.equal(restoreTrashBody.protectedCount, 1);
+  assert.equal(restoreTrashBody.favoriteCount, 1);
+
+  // 7. Webpage exposes Protected banner, Favorites badge & multi-select Allow Re-Proxy controls
   const webHtml = (await ctx.request('/')).buffer.toString('utf8');
   assert.ok(webHtml.includes('id="protectedBanner"'));
   assert.ok(webHtml.includes('id="allowReproxySelectedBtn"'));
   assert.ok(webHtml.includes('id="protectedCountBadge"'));
+  assert.ok(webHtml.includes('id="favoriteCountBadge"'));
+});
+
+test('Multi-format GPS extraction (HEIC, MOV, MP4, PNG, WebP), automatic GPS backfill, and Map provider config work end-to-end', async (t) => {
+  const { parseMediaExifFromBuffer } = require('../src/services/exifGeoService');
+
+  // Helper: build a valid little-endian TIFF EXIF block with GPS + camera + DateTimeOriginal
+  const buildTiffExif = (lat, lng, modelStr = 'iPhone 16 Pro', dateStr = '2026:05:12 14:30:00') => {
+    const buf = Buffer.alloc(512, 0);
+    buf.write('II', 0, 'ascii');
+    buf.writeUInt16LE(0x002a, 2);
+    buf.writeUInt32LE(8, 4); // IFD0 at offset 8
+
+    // IFD0: 3 entries (0x0110 Model, 0x8769 ExifIFD, 0x8825 GPSIFD)
+    const ifd0 = 8;
+    buf.writeUInt16LE(3, ifd0);
+    const modelOff = 120;
+    const modelBytes = Buffer.from(`${modelStr}\0`, 'ascii');
+    modelBytes.copy(buf, modelOff);
+
+    const exifIfd = 180;
+    const gpsIfd = 240;
+
+    // Entry 0: Model (0x0110)
+    buf.writeUInt16LE(0x0110, ifd0 + 2);
+    buf.writeUInt16LE(2, ifd0 + 4);
+    buf.writeUInt32LE(modelBytes.length, ifd0 + 6);
+    buf.writeUInt32LE(modelOff, ifd0 + 10);
+
+    // Entry 1: ExifIFD pointer (0x8769)
+    buf.writeUInt16LE(0x8769, ifd0 + 14);
+    buf.writeUInt16LE(4, ifd0 + 16);
+    buf.writeUInt32LE(1, ifd0 + 18);
+    buf.writeUInt32LE(exifIfd, ifd0 + 22);
+
+    // Entry 2: GPSIFD pointer (0x8825)
+    buf.writeUInt16LE(0x8825, ifd0 + 26);
+    buf.writeUInt16LE(4, ifd0 + 28);
+    buf.writeUInt32LE(1, ifd0 + 30);
+    buf.writeUInt32LE(gpsIfd, ifd0 + 34);
+
+    // ExifIFD: 1 entry (0x9003 DateTimeOriginal)
+    const dateOff = 210;
+    const dateBytes = Buffer.from(`${dateStr}\0`, 'ascii');
+    dateBytes.copy(buf, dateOff);
+    buf.writeUInt16LE(1, exifIfd);
+    buf.writeUInt16LE(0x9003, exifIfd + 2);
+    buf.writeUInt16LE(2, exifIfd + 4);
+    buf.writeUInt32LE(dateBytes.length, exifIfd + 6);
+    buf.writeUInt32LE(dateOff, exifIfd + 10);
+
+    // GPS IFD: 4 entries (LatRef, Lat, LngRef, Lng)
+    const absLat = Math.abs(lat);
+    const absLng = Math.abs(lng);
+    const latDeg = Math.floor(absLat);
+    const latMin = Math.floor((absLat - latDeg) * 60);
+    const latSecNum = Math.round(((absLat - latDeg) * 60 - latMin) * 60 * 1000);
+    const lngDeg = Math.floor(absLng);
+    const lngMin = Math.floor((absLng - lngDeg) * 60);
+    const lngSecNum = Math.round(((absLng - lngDeg) * 60 - lngMin) * 60 * 1000);
+
+    const latDataOff = 320;
+    const lngDataOff = 352;
+    buf.writeUInt32LE(latDeg, latDataOff);
+    buf.writeUInt32LE(1, latDataOff + 4);
+    buf.writeUInt32LE(latMin, latDataOff + 8);
+    buf.writeUInt32LE(1, latDataOff + 12);
+    buf.writeUInt32LE(latSecNum, latDataOff + 16);
+    buf.writeUInt32LE(1000, latDataOff + 20);
+
+    buf.writeUInt32LE(lngDeg, lngDataOff);
+    buf.writeUInt32LE(1, lngDataOff + 4);
+    buf.writeUInt32LE(lngMin, lngDataOff + 8);
+    buf.writeUInt32LE(1, lngDataOff + 12);
+    buf.writeUInt32LE(lngSecNum, lngDataOff + 16);
+    buf.writeUInt32LE(1000, lngDataOff + 20);
+
+    buf.writeUInt16LE(4, gpsIfd);
+    // LatRef
+    buf.writeUInt16LE(0x0001, gpsIfd + 2);
+    buf.writeUInt16LE(2, gpsIfd + 4);
+    buf.writeUInt32LE(2, gpsIfd + 6);
+    buf.write(lat >= 0 ? 'N\0' : 'S\0', gpsIfd + 10, 'ascii');
+    // Lat
+    buf.writeUInt16LE(0x0002, gpsIfd + 14);
+    buf.writeUInt16LE(5, gpsIfd + 16);
+    buf.writeUInt32LE(3, gpsIfd + 18);
+    buf.writeUInt32LE(latDataOff, gpsIfd + 22);
+    // LngRef
+    buf.writeUInt16LE(0x0003, gpsIfd + 26);
+    buf.writeUInt16LE(2, gpsIfd + 28);
+    buf.writeUInt32LE(2, gpsIfd + 30);
+    buf.write(lng >= 0 ? 'E\0' : 'W\0', gpsIfd + 34, 'ascii');
+    // Lng
+    buf.writeUInt16LE(0x0004, gpsIfd + 38);
+    buf.writeUInt16LE(5, gpsIfd + 40);
+    buf.writeUInt32LE(3, gpsIfd + 42);
+    buf.writeUInt32LE(lngDataOff, gpsIfd + 46);
+
+    return buf;
+  };
+
+  const makeBox = (type, payload) => {
+    const hdr = Buffer.alloc(8);
+    hdr.writeUInt32BE(8 + payload.length, 0);
+    if (Buffer.isBuffer(type)) type.copy(hdr, 4, 0, 4);
+    else hdr.write(type, 4, 4, 'ascii');
+    return Buffer.concat([hdr, payload]);
+  };
+
+  // Build synthetic ISO BMFF HEIC with meta -> iinf/infe('Exif') + iloc pointing into mdat
+  const buildHeicWithGps = (lat, lng, modelStr) => {
+    const ftyp = makeBox('ftyp', Buffer.from('heic\0\0\0\0mif1heic', 'ascii'));
+    const tiff = buildTiffExif(lat, lng, modelStr);
+    const exifItemPayload = Buffer.concat([Buffer.from([0, 0, 0, 6]), Buffer.from('Exif\0\0', 'ascii'), tiff]);
+
+    // infe v2: version=2(1)+flags(3)+item_ID=2(2)+prot=0(2)+item_type='Exif'(4)
+    const infePayload = Buffer.alloc(12);
+    infePayload[0] = 2;
+    infePayload.writeUInt16BE(2, 4);
+    infePayload.write('Exif', 8, 'ascii');
+    const infe = makeBox('infe', infePayload);
+    // iinf v0: version/flags(4) + entry_count(2) + infe
+    const iinfHdr = Buffer.alloc(6);
+    iinfHdr.writeUInt16BE(1, 4);
+    const iinf = makeBox('iinf', Buffer.concat([iinfHdr, infe]));
+
+    // Build iloc with placeholder offset, then compute exact file offset into mdat
+    const buildIloc = (exifOffset) => {
+      const p = Buffer.alloc(22);
+      p[0] = 0; // version 0
+      p[4] = 0x44; // offset_size=4, length_size=4
+      p[5] = 0x00; // base_offset_size=0
+      p.writeUInt16BE(1, 6); // item_count=1
+      p.writeUInt16BE(2, 8); // item_ID=2
+      p.writeUInt16BE(0, 10); // data_reference_index=0
+      p.writeUInt16BE(1, 12); // extent_count=1
+      p.writeUInt32BE(exifOffset, 14);
+      p.writeUInt32BE(exifItemPayload.length, 18);
+      return makeBox('iloc', p);
+    };
+    const metaDraft = makeBox('meta', Buffer.concat([Buffer.alloc(4), iinf, buildIloc(0)]));
+    const mdatHeaderLen = 8;
+    const exactExifFileOffset = ftyp.length + metaDraft.length + mdatHeaderLen;
+    const meta = makeBox('meta', Buffer.concat([Buffer.alloc(4), iinf, buildIloc(exactExifFileOffset)]));
+    const mdat = makeBox('mdat', Buffer.concat([exifItemPayload, Buffer.alloc(128, 0xaa)]));
+    return Buffer.concat([ftyp, meta, mdat]);
+  };
+
+  // Build synthetic QuickTime MOV with trailing moov -> meta(keys/ilst ISO6709)
+  const buildMovWithGps = (iso6709, modelStr = 'iPhone 16 Pro') => {
+    const ftyp = makeBox('ftyp', Buffer.from('qt  \0\0\0\0qt  ', 'ascii'));
+    const mdat = makeBox('mdat', Buffer.alloc(1024, 0x11));
+
+    const makeKeyEntry = (name) => {
+      const nb = Buffer.from(name, 'utf8');
+      const b = Buffer.alloc(8 + nb.length);
+      b.writeUInt32BE(8 + nb.length, 0);
+      b.write('mdta', 4, 'ascii');
+      nb.copy(b, 8);
+      return b;
+    };
+    const k1 = makeKeyEntry('com.apple.quicktime.location.ISO6709');
+    const k2 = makeKeyEntry('com.apple.quicktime.model');
+    const keysHdr = Buffer.alloc(8);
+    keysHdr.writeUInt32BE(2, 4);
+    const keys = makeBox('keys', Buffer.concat([keysHdr, k1, k2]));
+
+    const makeIlstItem = (index1Based, value) => {
+      const vb = Buffer.from(value, 'utf8');
+      const dataBox = makeBox('data', Buffer.concat([Buffer.from([0, 0, 0, 1, 0, 0, 0, 0]), vb]));
+      const idxBuf = Buffer.alloc(4);
+      idxBuf.writeUInt32BE(index1Based, 0);
+      return makeBox(idxBuf, dataBox);
+    };
+    const ilst = makeBox('ilst', Buffer.concat([makeIlstItem(1, iso6709), makeIlstItem(2, modelStr)]));
+    const meta = makeBox('meta', Buffer.concat([Buffer.alloc(4), keys, ilst]));
+    const moov = makeBox('moov', meta);
+    return Buffer.concat([ftyp, mdat, moov]);
+  };
+
+  // Build synthetic Android MP4 with trailing moov -> udta -> ©xyz
+  const buildMp4WithXyz = (iso6709) => {
+    const ftyp = makeBox('ftyp', Buffer.from('isom\0\0\0\0isommp42', 'ascii'));
+    const mdat = makeBox('mdat', Buffer.alloc(512, 0x22));
+    const strBuf = Buffer.from(iso6709, 'utf8');
+    const xyzPayload = Buffer.alloc(4 + strBuf.length);
+    xyzPayload.writeUInt16BE(strBuf.length, 0);
+    xyzPayload.writeUInt16BE(0x15c7, 2);
+    strBuf.copy(xyzPayload, 4);
+    const xyzBox = makeBox(Buffer.from([0xa9, 0x78, 0x79, 0x7a]), xyzPayload);
+    const udta = makeBox('udta', xyzBox);
+    const moov = makeBox('moov', udta);
+    return Buffer.concat([ftyp, mdat, moov]);
+  };
+
+  // Build PNG with eXIf chunk and WebP with EXIF chunk
+  const pngTiff = buildTiffExif(1.3521, 103.8198, 'Pixel 9 Pro');
+  const pngSig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const pngExifHdr = Buffer.alloc(8);
+  pngExifHdr.writeUInt32BE(pngTiff.length, 0);
+  pngExifHdr.write('eXIf', 4, 'ascii');
+  const pngBuf = Buffer.concat([pngSig, pngExifHdr, pngTiff, Buffer.alloc(4)]);
+
+  const webpExifPayload = Buffer.concat([Buffer.from('Exif\0\0', 'ascii'), buildTiffExif(48.8566, 2.3522, 'Galaxy S25')]);
+  const webpChunkHdr = Buffer.alloc(8);
+  webpChunkHdr.write('EXIF', 0, 'ascii');
+  webpChunkHdr.writeUInt32LE(webpExifPayload.length, 4);
+  const riffHdr = Buffer.alloc(12);
+  riffHdr.write('RIFF', 0, 'ascii');
+  riffHdr.writeUInt32LE(4 + webpChunkHdr.length + webpExifPayload.length, 4);
+  riffHdr.write('WEBP', 8, 'ascii');
+  const webpBuf = Buffer.concat([riffHdr, webpChunkHdr, webpExifPayload]);
+
+  // 1. Direct parser assertions across PNG and WebP
+  const pngMeta = parseMediaExifFromBuffer(pngBuf);
+  assert.ok(pngMeta && Math.abs(pngMeta.gpsLat - 1.3521) < 0.01);
+  assert.equal(pngMeta.locationLabel, 'Singapore');
+
+  const webpMeta = parseMediaExifFromBuffer(webpBuf);
+  assert.ok(webpMeta && Math.abs(webpMeta.gpsLat - 48.8566) < 0.01);
+  assert.equal(webpMeta.locationLabel, 'Paris, France');
+
+  // 2. End-to-end streaming uploads (HEIC, MOV, MP4) + automatic backfill + optional Google Maps config
+  const ctx = await startTestServer({
+    userKeys: 'map_key:map_user',
+    googleMapsApiKey: 'AIzaTestMapKey123',
+  });
+  t.after(() => ctx.cleanup());
+  const headers = { 'X-API-Key': 'map_key' };
+
+  const heicBuf = buildHeicWithGps(35.6762, 139.6503, 'iPhone 16 Pro');
+  const heicSha = crypto.createHash('sha256').update(heicBuf).digest('hex');
+  const upHeic = await ctx.request('/api/upload', {
+    method: 'POST',
+    headers: {
+      ...headers,
+      'Content-Type': 'image/heic',
+      'X-File-Name': 'IMG_TOKYO.HEIC',
+      'X-File-Sha256': heicSha,
+      'X-Verify-Checksum': 'true',
+      'X-Skip-Auto-Proxy': '1',
+    },
+    body: heicBuf,
+  });
+  assert.equal(upHeic.status, 200);
+  const heicJson = await upHeic.json();
+  assert.equal(heicJson.locationLabel, 'Tokyo, Japan');
+  assert.ok(Math.abs(heicJson.gpsLat - 35.6762) < 0.01);
+
+  const movBuf = buildMovWithGps('+03.1390+101.6869+050.0/', 'iPhone 16 Pro');
+  const movSha = crypto.createHash('sha256').update(movBuf).digest('hex');
+  const upMov = await ctx.request('/api/upload', {
+    method: 'POST',
+    headers: {
+      ...headers,
+      'Content-Type': 'video/quicktime',
+      'X-File-Name': 'VID_KL.MOV',
+      'X-File-Sha256': movSha,
+      'X-Verify-Checksum': 'true',
+      'X-Skip-Auto-Proxy': '1',
+    },
+    body: movBuf,
+  });
+  assert.equal(upMov.status, 200);
+  const movJson = await upMov.json();
+  assert.equal(movJson.locationLabel, 'Kuala Lumpur, Malaysia');
+
+  const mp4Buf = buildMp4WithXyz('+05.4141+100.3288/');
+  const mp4Sha = crypto.createHash('sha256').update(mp4Buf).digest('hex');
+  const upMp4 = await ctx.request('/api/upload', {
+    method: 'POST',
+    headers: {
+      ...headers,
+      'Content-Type': 'video/mp4',
+      'X-File-Name': 'VID_PENANG.MP4',
+      'X-File-Sha256': mp4Sha,
+      'X-Verify-Checksum': 'true',
+      'X-Skip-Auto-Proxy': '1',
+    },
+    body: mp4Buf,
+  });
+  assert.equal(upMp4.status, 200);
+  const mp4Json = await upMp4.json();
+  assert.equal(mp4Json.locationLabel, 'Penang, Malaysia');
+
+  // 3. Test real legacy-index upgrade: persist a v1 hash-index with gpsLat=null & _exifScanned=true (no _exifVersion),
+  // boot a fresh server with scanStorageOnStartup: false (no googleMapsApiKey), and verify GET /api/photos/map auto-backfills HEIC GPS!
+  const legacyStorageDir = path.join(ctx.storageDir, 'map_user');
+  const legacyDataDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'photohub-legacy-map-'));
+  t.after(() => fsp.rm(legacyDataDir, { recursive: true, force: true }));
+  const heicDiskRel = String(heicJson.savedPath || '').replace(/^map_user\//, '');
+  await fsp.writeFile(
+    path.join(legacyDataDir, 'hash-index.json'),
+    JSON.stringify({
+      [heicSha]: {
+        hash: heicSha,
+        diskHash: heicSha,
+        relativePath: heicDiskRel,
+        originalName: 'IMG_TOKYO.HEIC',
+        size: heicBuf.length,
+        photoDate: '2026-05-12',
+        gpsLat: null,
+        gpsLng: null,
+        locationLabel: null,
+        _exifScanned: true,
+      },
+    })
+  );
+  const legacyCtx = await startTestServer({
+    storageDir: legacyStorageDir,
+    dataDir: legacyDataDir,
+    scanStorageOnStartup: false,
+  });
+  t.after(() => legacyCtx.cleanup());
+
+  const legacyMapRes = await legacyCtx.request('/api/photos/map');
+  assert.equal(legacyMapRes.status, 200);
+  const legacyMapBody = await legacyMapRes.json();
+  assert.equal(legacyMapBody.geoTaggedCount, 1);
+  assert.equal(legacyMapBody.scannedNow, 1);
+  assert.equal(legacyMapBody.newlyFoundGps, 1);
+  assert.equal(legacyMapBody.mapConfig.googleMapsApiKey, null);
+  assert.equal(legacyMapBody.mapConfig.defaultProvider, 'leaflet');
+  assert.equal(legacyMapBody.clusters[0].label, 'Tokyo, Japan');
+
+  // 4. Verify primary server with Google Maps key returns all 3 multi-format locations + Google config
+  const mapRes = await ctx.request('/api/photos/map', { headers });
+  assert.equal(mapRes.status, 200);
+  const mapBody = await mapRes.json();
+  assert.equal(mapBody.geoTaggedCount, 3);
+  assert.equal(mapBody.mapConfig.googleMapsApiKey, 'AIzaTestMapKey123');
+  assert.equal(mapBody.mapConfig.defaultProvider, 'google');
+  assert.ok(mapBody.clusters.some((c) => c.label === 'Tokyo, Japan'));
+  assert.ok(mapBody.clusters.some((c) => c.label === 'Kuala Lumpur, Malaysia'));
+  assert.ok(mapBody.clusters.some((c) => c.label === 'Penang, Malaysia'));
+
+  // 5. Verify webpage uses the real interactive map (no fake SVG / no Memories section) & custom album category input
+  const webHtml = (await ctx.request('/')).buffer.toString('utf8');
+  assert.ok(webHtml.includes('id="leafletMapCanvas"'));
+  assert.ok(webHtml.includes('id="googleMapCanvas"'));
+  assert.ok(webHtml.includes('id="mapRescanBtn"'));
+  assert.ok(webHtml.includes('id="mapOpenGoogleLink"'));
+  assert.equal(webHtml.includes('world-map-svg'), false);
+  assert.equal(webHtml.includes('id="memoriesStrip"'), false);
+  assert.ok(webHtml.includes('id="albumCustomCategoryInput"'));
+  assert.equal(webHtml.includes('data-alb-cat="custom"'), false);
+});
+
+test('GET /api/photo/:hash/preview?size=thumb serves fast cached WebP/JPEG micro-thumbnails with ETag 304 and cleans up on delete', async (t) => {
+  let sharp = null;
+  try {
+    sharp = require('sharp');
+  } catch {
+    sharp = null;
+  }
+
+  const ctx = await startTestServer({ userKeys: 'thumb_key:thumb_user' });
+  t.after(() => ctx.cleanup());
+  const headers = { 'X-API-Key': 'thumb_key' };
+
+  // Build a real 1200x900 photo if sharp is available so WebP/JPEG downscaling & size reduction are verified end-to-end
+  let imgBuf;
+  if (sharp) {
+    imgBuf = await sharp({
+      create: { width: 1200, height: 900, channels: 3, background: { r: 249, g: 115, b: 22 } },
+    })
+      .jpeg({ quality: 95 })
+      .toBuffer();
+  } else {
+    imgBuf = Buffer.from('synthetic-photo-bytes-when-sharp-unavailable');
+  }
+  const sha = crypto.createHash('sha256').update(imgBuf).digest('hex');
+
+  const upRes = await ctx.request('/api/upload', {
+    method: 'POST',
+    headers: {
+      ...headers,
+      'Content-Type': 'image/jpeg',
+      'X-File-Name': 'SUNSET_1200.JPG',
+      'X-File-Sha256': sha,
+      'X-Verify-Checksum': 'true',
+      'X-Skip-Auto-Proxy': '1',
+    },
+    body: imgBuf,
+  });
+  assert.equal(upRes.status, 200);
+
+  // 1. Request micro-thumbnail with Accept: image/webp
+  const thumb1 = await ctx.request(`/api/photo/${sha}/preview?size=thumb`, {
+    headers: { ...headers, Accept: 'image/webp,image/*,*/*;q=0.8' },
+  });
+  assert.equal(thumb1.status, 200);
+  assert.ok(String(thumb1.headers['cache-control'] || '').includes('immutable'));
+  assert.ok(thumb1.headers.etag);
+
+  if (sharp) {
+    assert.equal(thumb1.headers['content-type'], 'image/webp');
+    assert.equal(thumb1.headers['x-photo-variant'], 'thumb-webp');
+    assert.equal(thumb1.headers['x-thumb-cache'], 'generated');
+    assert.equal(String(thumb1.headers.vary || '').toLowerCase(), 'accept');
+    assert.ok(thumb1.buffer.length > 0 && thumb1.buffer.length < imgBuf.length);
+
+    // Verify thumbnail cached on local dataDir SSD
+    const cachedWebpPath = path.join(ctx.dataDir, 'thumb-cache', 'thumb_user', `${sha}.webp`);
+    const cachedStat = await fsp.stat(cachedWebpPath);
+    assert.ok(cachedStat.size > 0);
+
+    // 2. Second request hits local SSD cache immediately
+    const thumb2 = await ctx.request(`/api/photo/${sha}/preview?size=thumb`, {
+      headers: { ...headers, Accept: 'image/webp' },
+    });
+    assert.equal(thumb2.status, 200);
+    assert.equal(thumb2.headers['x-thumb-cache'], 'hit');
+    assert.equal(thumb2.headers.etag, thumb1.headers.etag);
+
+    // 3. Conditional ETag returns 304 Not Modified with zero body
+    const thumb304 = await ctx.request(`/api/photo/${sha}/preview?size=thumb`, {
+      headers: { ...headers, Accept: 'image/webp', 'If-None-Match': thumb2.headers.etag },
+    });
+    assert.equal(thumb304.status, 304);
+    assert.equal(thumb304.buffer.length, 0);
+
+    // 4. Non-WebP clients get cached JPEG micro-thumbnail
+    const thumbJpg = await ctx.request(`/api/photo/${sha}/preview?size=thumb`, {
+      headers: { ...headers, Accept: 'image/jpeg' },
+    });
+    assert.equal(thumbJpg.status, 200);
+    assert.equal(thumbJpg.headers['content-type'], 'image/jpeg');
+    assert.equal(thumbJpg.headers['x-photo-variant'], 'thumb-jpeg');
+
+    // 5. Full preview (Lightbox, no ?size=thumb) still returns full master/proxy
+    const fullPreview = await ctx.request(`/api/photo/${sha}/preview`, { headers });
+    assert.equal(fullPreview.status, 200);
+    assert.equal(fullPreview.headers['x-photo-variant'], 'master');
+    assert.equal(fullPreview.buffer.length, imgBuf.length);
+
+    // 6. Permanently deleting the photo removes cached local SSD thumbnails too
+    const delRes = await ctx.request(`/api/photo/${sha}`, {
+      method: 'DELETE',
+      headers,
+    });
+    assert.equal(delRes.status, 200);
+    let thumbExists = true;
+    try {
+      await fsp.access(cachedWebpPath);
+    } catch {
+      thumbExists = false;
+    }
+    assert.equal(thumbExists, false);
+  }
+});
+
+test('Backend security hardening blocks path traversal, S3 tenant spoofing, JSON/URL attacks, brute-force, and session floods', async (t) => {
+  const ctx = await startTestServer({
+    userKeys: 'alice_sec:alice,bob_sec:bob',
+    adminKey: 'super-secret-admin-key',
+    s3Endpoint: 'http://127.0.0.1:9',
+    s3Bucket: 'test-bucket',
+    s3AccessKeyId: 'test-ak',
+    s3SecretAccessKey: 'test-sk',
+    rateLimitAuthFailMax: 3,
+    rateLimitShareFailMax: 3,
+    rateLimitApiMaxPerMin: 120,
+    rateLimitHeavyMaxPerMin: 25,
+  });
+  t.after(() => ctx.cleanup());
+
+  const aliceHeaders = { 'X-API-Key': 'alice_sec' };
+
+  // 1. Security headers present and X-Powered-By disabled
+  const healthRes = await ctx.request('/api/health');
+  assert.equal(healthRes.status, 200);
+  assert.equal(healthRes.headers['x-powered-by'], undefined);
+  assert.equal(healthRes.headers['x-content-type-options'], 'nosniff');
+  assert.equal(healthRes.headers['x-frame-options'], 'SAMEORIGIN');
+  assert.equal(healthRes.headers['referrer-policy'], 'strict-origin-when-cross-origin');
+  assert.ok(healthRes.headers['permissions-policy']);
+
+  // 2. Malformed URL encoding & null-byte URL injection cleanly rejected (400)
+  const badUrlRes = await ctx.request('/api/photos/%E0%A4%A', { headers: aliceHeaders });
+  assert.equal(badUrlRes.status, 400);
+  const nullByteRes = await ctx.request('/api/photos/abc%00def', { headers: aliceHeaders });
+  assert.equal(nullByteRes.status, 400);
+
+  // 3. Path traversal in POST /api/proxy/register blocked BEFORE writing anything to disk
+  const evilPayload = Buffer.from('pwned-file-contents').toString('base64');
+  const traversalRes = await ctx.request('/api/proxy/register', {
+    method: 'POST',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      masterHash: '../../../escaped_pwn',
+      proxyHash: 'a'.repeat(64),
+      proxyBase64: evilPayload,
+    }),
+  });
+  assert.equal(traversalRes.status, 400);
+  const escapedPath = path.resolve(ctx.storageDir, 'alice', '.proxies', '../../../escaped_pwn.jpg');
+  let escapedExists = true;
+  try {
+    await fsp.access(escapedPath);
+  } catch {
+    escapedExists = false;
+  }
+  assert.equal(escapedExists, false);
+
+  // 4. S3 cross-tenant objectKey spoofing & traversal blocked on POST /api/upload/confirm
+  const crossTenantS3 = await ctx.request('/api/upload/confirm', {
+    method: 'POST',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      objectKey: 'bob/2026/2026-11-28/secret.jpg',
+      expectedHash: 'b'.repeat(64),
+    }),
+  });
+  assert.equal(crossTenantS3.status, 403);
+
+  const traversalS3 = await ctx.request('/api/upload/confirm', {
+    method: 'POST',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      objectKey: 'alice/../bob/secret.jpg',
+      expectedHash: 'b'.repeat(64),
+    }),
+  });
+  assert.equal(traversalS3.status, 400);
+
+  // 5. Prototype pollution stripped, deep JSON nesting rejected (400), oversized >2MB JSON rejected (413), bad JSON -> 400
+  const protoRes = await ctx.request('/api/albums', {
+    method: 'POST',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: '{"name":"Safe Album","__proto__":{"pollutedKey":"yes"}}',
+  });
+  assert.equal(protoRes.status, 201);
+  assert.equal(({}).pollutedKey, undefined);
+
+  let deepObj = { leaf: 1 };
+  for (let i = 0; i < 25; i++) deepObj = { nested: deepObj };
+  const deepRes = await ctx.request('/api/albums', {
+    method: 'POST',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify(deepObj),
+  });
+  assert.equal(deepRes.status, 400);
+
+  const hugeJsonRes = await ctx.request('/api/albums', {
+    method: 'POST',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'Big', pad: 'x'.repeat(2.4 * 1024 * 1024) }),
+  });
+  assert.equal(hugeJsonRes.status, 413);
+
+  const badJsonRes = await ctx.request('/api/albums', {
+    method: 'POST',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: '{broken-json',
+  });
+  assert.equal(badJsonRes.status, 400);
+
+  // 6. Malformed percent-encoded X-File-Name header handled safely without URIError crash
+  const safeBytes = Buffer.from('photo-with-percent-filename-100%-safe');
+  const safeSha = crypto.createHash('sha256').update(safeBytes).digest('hex');
+  const pctUploadRes = await ctx.request('/api/upload', {
+    method: 'POST',
+    headers: {
+      ...aliceHeaders,
+      'Content-Type': 'image/jpeg',
+      'X-File-Name': 'SALE_100%_IMG.JPG',
+      'X-Location-Label': '100%Sunny',
+      'X-File-Sha256': safeSha,
+      'X-Skip-Auto-Proxy': '1',
+    },
+    body: safeBytes,
+  });
+  assert.equal(pctUploadRes.status, 200);
+
+  // 7. Share passcode brute-force lockout (async scrypt + 429 after 3 wrong guesses)
+  const shareCreate = await ctx.request('/api/shares', {
+    method: 'POST',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ hashes: [safeSha], passcode: 'CorrectPass99' }),
+  });
+  assert.equal(shareCreate.status, 201);
+  const shareToken = (await shareCreate.json()).share.token;
+
+  for (let i = 0; i < 3; i++) {
+    const wrong = await ctx.request(`/api/public/share/${shareToken}`, {
+      headers: { 'X-Share-Passcode': `wrong-${i}` },
+    });
+    assert.equal(wrong.status, 401);
+  }
+  const lockedShare = await ctx.request(`/api/public/share/${shareToken}`, {
+    headers: { 'X-Share-Passcode': 'CorrectPass99' },
+  });
+  assert.equal(lockedShare.status, 429);
+  assert.ok(lockedShare.headers['retry-after']);
+
+  // 8. Chunked upload per-user active session cap blocks spam with 429
+  for (let i = 0; i < 10; i++) {
+    const initOk = await ctx.request('/api/upload/chunked/init', {
+      method: 'POST',
+      headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fileName: `clip_${i}.mp4`, fileSize: 1024 * 1024 }),
+    });
+    assert.equal(initOk.status, 201);
+  }
+  const initCap = await ctx.request('/api/upload/chunked/init', {
+    method: 'POST',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fileName: 'clip_overflow.mp4', fileSize: 1024 * 1024 }),
+  });
+  assert.equal(initCap.status, 429);
+
+  // 9. Admin brute-force lockout after 3 failed ADMIN_KEY guesses (returns 429 + Retry-After)
+  for (let i = 0; i < 3; i++) {
+    const badAdmin = await ctx.request('/api/admin/overview', {
+      headers: { 'X-Admin-Key': `wrong-admin-${i}` },
+    });
+    assert.equal(badAdmin.status, 401);
+  }
+  const lockedAdmin = await ctx.request('/api/admin/overview', {
+    headers: { 'X-Admin-Key': 'super-secret-admin-key' },
+  });
+  assert.equal(lockedAdmin.status, 429);
+  assert.ok(lockedAdmin.headers['retry-after']);
 });

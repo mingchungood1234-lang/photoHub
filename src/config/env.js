@@ -260,6 +260,9 @@ function getConfig(overrides = {}) {
     googleClientSecret: String(
       overrides.googleClientSecret ?? process.env.GOOGLE_CLIENT_SECRET ?? ''
     ).trim(),
+    googleMapsApiKey: String(
+      overrides.googleMapsApiKey ?? process.env.GOOGLE_MAPS_API_KEY ?? ''
+    ).trim(),
     allowedGoogleDomains:
       overrides.allowedGoogleDomains instanceof Set
         ? overrides.allowedGoogleDomains
@@ -308,6 +311,39 @@ function getConfig(overrides = {}) {
         ? overrides.adminEmails
         : parseListCsv(overrides.adminEmails ?? process.env.ADMIN_EMAILS ?? ''),
     maxFileSizeBytes: effectiveMaxMb * 1024 * 1024,
+    // Cap RAM-buffered multipart uploads (large videos stream via raw binary or chunked upload)
+    maxMultipartFileBytes: Math.min(
+      effectiveMaxMb * 1024 * 1024,
+      Math.max(
+        10,
+        Number(overrides.maxMultipartMb ?? process.env.MAX_MULTIPART_MB ?? 150) || 150
+      ) *
+        1024 *
+        1024
+    ),
+    // Backend abuse / DoS & brute-force rate-limiting guardrails
+    rateLimit: {
+      enabled:
+        String(overrides.rateLimitEnabled ?? process.env.RATE_LIMIT_ENABLED ?? 'true')
+          .trim()
+          .toLowerCase() !== 'false',
+      apiMaxPerMin: Math.max(
+        30,
+        Number(overrides.rateLimitApiMaxPerMin ?? process.env.RATE_LIMIT_MAX_PER_MIN ?? 1500) || 1500
+      ),
+      authFailMaxPer15Min: Math.max(
+        3,
+        Number(overrides.rateLimitAuthFailMax ?? process.env.AUTH_FAIL_MAX_PER_15M ?? 25) || 25
+      ),
+      shareFailMaxPer15Min: Math.max(
+        3,
+        Number(overrides.rateLimitShareFailMax ?? process.env.SHARE_FAIL_MAX_PER_15M ?? 15) || 15
+      ),
+      heavyMaxPerMin: Math.max(
+        5,
+        Number(overrides.rateLimitHeavyMaxPerMin ?? process.env.HEAVY_OP_MAX_PER_MIN ?? 30) || 30
+      ),
+    },
     // Set SCAN_STORAGE_ON_STARTUP=false if using a large remote rclone/gdrive mount to avoid slow startup scans
     scanStorageOnStartup:
       String(

@@ -68,8 +68,10 @@ class LocalProxySyncManager private constructor(context: Context) {
         activeJob = scope.launch {
             try {
                 val client = PhotoHubApiClient(appContext, settings)
+                client.flushPendingProtectionUploads()
                 val fetched = client.fetchAllServerPhotos(sync = false)
                 if (!isActive) return@launch
+                tracker.syncProtectionStateFromServer(fetched)
                 store.savePhotos(fetched, cur.normalizedBaseUrl, cur.apiKeyCacheScope)
                 store.notifyChanged()
                 _serverSyncCompleted.tryEmit(Unit)
@@ -159,21 +161,27 @@ class LocalProxySyncManager private constructor(context: Context) {
         forceAllMissingInPhotos: Boolean
     ) {
         val mediaService = MediaLibraryService(appContext)
+        tracker.syncProtectionStateFromServer(photos)
         val canReadGallery = mediaService.currentAccessLevel() != com.photohub.compressor.media.MediaAccessLevel.DENIED
         val canWriteGallery = saveToPhotosApp && mediaService.canWriteGallery()
-        val existingProxyPrefixes = if (canReadGallery) {
-            mediaService.scanExistingProxyPrefixesInGallery()
+        val snapshot = if (canReadGallery) {
+            mediaService.scanGallerySnapshotSinglePass()
         } else {
-            emptyMap()
+            com.photohub.compressor.media.NativeGalleryScanSnapshot(emptySet(), emptyMap(), emptyMap())
         }
-        val existingOriginalsMap = if (canReadGallery) {
-            mediaService.scanExistingOriginalMapInGallery()
+        val confirmedLiveHashes = if (canReadGallery) {
+            tracker.primeLiveUriCacheFromLiveSet(photos.map { it.hash }, snapshot.liveUris)
         } else {
-            emptyMap()
+            emptySet()
         }
+        val existingProxyPrefixes = snapshot.proxyPrefixes
+        val existingOriginalsMap = snapshot.originalsMap
 
+        val reconciledProxies = mutableListOf<ReconciledProxyLink>()
+        val reconciledOriginals = mutableListOf<Pair<String, String>>()
         val workItems = mutableListOf<PrefetchWorkItem>()
         for (photo in photos) {
+            val normHash = photo.hash.trim().lowercase()
             val hasServerPreview = (photo.hasPreview == true) ||
                 (photo.hasPreview == null && photo.hasProxy == true && !photo.isVideo)
             val hasServerVideoProxy = photo.isVideo && photo.hasVideoProxy == true
@@ -181,11 +189,13 @@ class LocalProxySyncManager private constructor(context: Context) {
             val prefixTag = ProxyGenerator.proxyPrefixTag(photo.hash)
             val syncedAssetId = existingProxyPrefixes[prefixTag]
             if (syncedAssetId != null) {
-                tracker.markAsProxy(
-                    assetId = syncedAssetId,
-                    proxySha256 = photo.proxyHash.orEmpty(),
-                    masterHash = photo.hash,
-                    originalName = photo.originalName
+                reconciledProxies.add(
+                    ReconciledProxyLink(
+                        assetId = syncedAssetId,
+                        proxySha256 = photo.proxyHash.orEmpty(),
+                        masterHash = photo.hash,
+                        originalName = photo.originalName
+                    )
                 )
             }
 
@@ -197,14 +207,14 @@ class LocalProxySyncManager private constructor(context: Context) {
                     val found = existingOriginalsMap[key]
                     if (found != null) {
                         matchedOriginalAssetId = found
-                        tracker.markUploadedOriginal(found, photo.hash)
+                        reconciledOriginals.add(found to photo.hash)
                         break
                     }
                 }
             }
 
             val isActiveUpload = com.photohub.compressor.background.AssetUploadCoordinator.isMasterHashActive(photo.hash)
-            val hasLiveNativeGalleryAsset = tracker.hasAnyLiveGalleryAsset(photo.hash) ||
+            val hasLiveNativeGalleryAsset = (normHash in confirmedLiveHashes) ||
                 syncedAssetId != null ||
                 matchedOriginalAssetId != null ||
                 isActiveUpload
@@ -244,6 +254,10 @@ class LocalProxySyncManager private constructor(context: Context) {
                     )
                 )
             }
+        }
+
+        if (reconciledProxies.isNotEmpty() || reconciledOriginals.isNotEmpty()) {
+            tracker.batchRecordReconciledLinks(reconciledProxies, reconciledOriginals)
         }
 
         if (workItems.isEmpty()) {

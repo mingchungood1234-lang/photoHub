@@ -17,7 +17,7 @@ final class ThumbnailMemoryCache {
     private var memoryWarningObserver: NSObjectProtocol?
 
     private init() {
-        cache.countLimit = 260
+        cache.countLimit = 450
         cache.totalCostLimit = 64 * 1024 * 1024 // 64 MB
         memoryWarningObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.didReceiveMemoryWarningNotification,
@@ -276,9 +276,9 @@ final class LocalProxyStore {
     // MARK: - Image / Poster Previews
 
     func previewData(forHash hash: String) -> Data? {
-        lock.lock()
-        defer { lock.unlock() }
-        return try? Data(contentsOf: previewFileURL(forHash: hash))
+        // Preview files are immutable content-addressed blobs written atomically;
+        // read without acquiring `lock` so parallel grid tile decodes never serialize.
+        try? Data(contentsOf: previewFileURL(forHash: hash))
     }
 
     func previewImage(forHash hash: String) -> UIImage? {

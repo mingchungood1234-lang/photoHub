@@ -22,6 +22,7 @@ const {
   createPresignedUrl,
   verifyS3ObjectChecksum,
 } = require('../services/s3Service');
+const { safeDecodeURIComponent } = require('../middleware/securityMiddleware');
 
 function createUploadController({ config, contextService, proxyQueue = null, chunkedUploadService = null }) {
   function maybeEnqueueAutoProxy({ req, result, hashIndex, storageDir, folderName, source = 'upload' }) {
@@ -64,7 +65,7 @@ function createUploadController({ config, contextService, proxyQueue = null, chu
         // Raw binary uploads stream straight to disk (no 100MB+ RAM Buffer bottleneck).
         if (!isMultipart && (!Array.isArray(req.files) || req.files.length === 0)) {
           const originalName = req.headers['x-file-name']
-            ? decodeURIComponent(String(req.headers['x-file-name']))
+            ? safeDecodeURIComponent(req.headers['x-file-name'])
             : '';
           const mimeType = String(req.headers['content-type'] || 'application/octet-stream');
           const createdAt =
@@ -83,7 +84,7 @@ function createUploadController({ config, contextService, proxyQueue = null, chu
           const gpsLat = req.headers['x-gps-lat'] !== undefined ? Number(req.headers['x-gps-lat']) : null;
           const gpsLng = req.headers['x-gps-lng'] !== undefined ? Number(req.headers['x-gps-lng']) : null;
           const locationLabel = req.headers['x-location-label']
-            ? decodeURIComponent(String(req.headers['x-location-label']))
+            ? safeDecodeURIComponent(req.headers['x-location-label'])
             : null;
 
           const { storageDir, hashIndex, folderName } = req.userContext;
@@ -137,9 +138,7 @@ function createUploadController({ config, contextService, proxyQueue = null, chu
           mimeType = file.mimetype;
         } else if (Buffer.isBuffer(req.body) && req.body.length > 0) {
           buffer = req.body;
-          originalName = decodeURIComponent(
-            String(req.headers['x-file-name'] || '')
-          );
+          originalName = safeDecodeURIComponent(req.headers['x-file-name'] || '');
           mimeType = String(
             req.headers['content-type'] || 'application/octet-stream'
           );
@@ -173,7 +172,7 @@ function createUploadController({ config, contextService, proxyQueue = null, chu
           bodyFields.fileName ||
           bodyFields.filename ||
           (req.headers['x-file-name']
-            ? decodeURIComponent(String(req.headers['x-file-name']))
+            ? safeDecodeURIComponent(req.headers['x-file-name'])
             : '') ||
           originalName;
         const strictChecksum =
@@ -372,13 +371,38 @@ function createUploadController({ config, contextService, proxyQueue = null, chu
           });
         }
 
+        const cleanObjectKey = String(objectKey).trim();
+        const { hashIndex, folderName } = req.userContext;
+        // CRITICAL: Enforce strict S3 tenant prefix & block path traversal so users cannot claim another tenant's objects
+        if (
+          !cleanObjectKey ||
+          cleanObjectKey.startsWith('/') ||
+          cleanObjectKey.includes('\\') ||
+          cleanObjectKey.includes('\0') ||
+          cleanObjectKey.split('/').some((seg) => seg === '..' || seg === '.')
+        ) {
+          return res.status(400).json({
+            success: false,
+            checksumVerified: false,
+            canReplaceWithProxy: false,
+            error: 'Invalid S3 objectKey.',
+          });
+        }
+        if (folderName && !cleanObjectKey.startsWith(`${folderName}/`)) {
+          return res.status(403).json({
+            success: false,
+            checksumVerified: false,
+            canReplaceWithProxy: false,
+            error: 'Forbidden: objectKey is outside your assigned storage prefix.',
+          });
+        }
+
         const { actualSha256, size } = await verifyS3ObjectChecksum({
           s3Config: config.s3,
-          objectKey,
+          objectKey: cleanObjectKey,
           expectedSha256: expectedHash,
         });
 
-        const { hashIndex, folderName } = req.userContext;
         const quotaBytes = contextService.getQuotaBytesForContext(req.userContext);
         assertWithinQuota(hashIndex, quotaBytes, size);
 
@@ -387,8 +411,8 @@ function createUploadController({ config, contextService, proxyQueue = null, chu
           hash: actualSha256,
           diskHash: actualSha256,
           storageType: 's3',
-          relativePath: objectKey,
-          originalName: fileName || path.basename(objectKey),
+          relativePath: cleanObjectKey,
+          originalName: sanitizeFilename(fileName || path.basename(cleanObjectKey), '', actualSha256),
           size,
           photoDate: dateFolder,
           takenAt: takenAt || null,

@@ -34,6 +34,16 @@ async function fileExistsAsync(filePath) {
   }
 }
 
+function resolveInsideStorageDir(storageDir, relativePath) {
+  if (!relativePath || typeof relativePath !== 'string') return null;
+  const root = path.resolve(storageDir);
+  const resolved = path.resolve(root, relativePath);
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+    return null;
+  }
+  return resolved;
+}
+
 function createShareController({ config, shareStore, contextService, albumStore = null }) {
   const sharePagePath = path.join(__dirname, '..', 'views', 'share.html');
 
@@ -64,16 +74,37 @@ function createShareController({ config, shareStore, contextService, albumStore 
     if (req.headers.range) {
       headers.Range = String(req.headers.range);
     }
+    const abortController = new AbortController();
+    const timeoutId = setTimeout(() => abortController.abort(), 30_000);
+    const onClose = () => {
+      if (!res.writableEnded) abortController.abort();
+    };
+    res.on('close', onClose);
     try {
-      const upstreamRes = await fetch(upstreamUrl, { method: 'GET', headers });
+      const upstreamRes = await fetch(upstreamUrl, {
+        method: 'GET',
+        headers,
+        signal: abortController.signal,
+      });
+      clearTimeout(timeoutId);
       res.status(upstreamRes.status);
       for (const h of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'content-disposition', 'cache-control']) {
         const val = upstreamRes.headers.get(h);
         if (val !== null) res.setHeader(h, val);
       }
-      if (!upstreamRes.body) return res.end();
-      return Readable.fromWeb(upstreamRes.body).pipe(res);
+      if (!upstreamRes.body) {
+        res.off('close', onClose);
+        return res.end();
+      }
+      const stream = Readable.fromWeb(upstreamRes.body);
+      stream.on('error', () => {
+        if (!res.writableEnded) res.end();
+      });
+      res.on('finish', () => res.off('close', onClose));
+      return stream.pipe(res);
     } catch {
+      clearTimeout(timeoutId);
+      res.off('close', onClose);
       if (!res.headersSent) {
         return res.status(502).json({ success: false, error: 'Shared album server is currently unreachable.' });
       }
@@ -265,7 +296,7 @@ function createShareController({ config, shareStore, contextService, albumStore 
         }
 
         const passcode = extractPasscode(req);
-        if (share.passcodeHash && !shareStore.verifyPasscode(share, passcode)) {
+        if (share.passcodeHash && !(await shareStore.verifyPasscodeAsync(share, passcode))) {
           return res.status(401).json({
             success: false,
             requiresPasscode: true,
@@ -342,7 +373,7 @@ function createShareController({ config, shareStore, contextService, albumStore 
 
         const share = shareStore.getShare(token);
         if (!share) return res.status(404).json({ success: false, error: 'Share expired or not found.' });
-        if (share.passcodeHash && !shareStore.verifyPasscode(share, extractPasscode(req))) {
+        if (share.passcodeHash && !(await shareStore.verifyPasscodeAsync(share, extractPasscode(req)))) {
           return res.status(401).json({ success: false, requiresPasscode: true, error: 'Passcode required.' });
         }
         const normHash = String(hash || '').trim().toLowerCase();
@@ -358,10 +389,10 @@ function createShareController({ config, shareStore, contextService, albumStore 
 
         const record = found.record;
         if (record.proxyRelativePath) {
-          const proxyPath = path.join(ctx.storageDir, record.proxyRelativePath);
-          if (await fileExistsAsync(proxyPath)) {
+          const proxyPath = resolveInsideStorageDir(ctx.storageDir, record.proxyRelativePath);
+          if (proxyPath && (await fileExistsAsync(proxyPath))) {
             res.setHeader('Cache-Control', 'public, max-age=3600');
-            return res.sendFile(path.resolve(proxyPath), { dotfiles: 'allow' });
+            return res.sendFile(proxyPath, { dotfiles: 'allow' });
           }
         }
         if (isVideoFilename(record.originalName || record.relativePath || '')) {
@@ -376,12 +407,12 @@ function createShareController({ config, shareStore, contextService, albumStore 
           });
           return res.redirect(url);
         }
-        const fullPath = path.join(ctx.storageDir, record.relativePath);
-        if (!(await fileExistsAsync(fullPath))) {
+        const fullPath = resolveInsideStorageDir(ctx.storageDir, record.relativePath);
+        if (!fullPath || !(await fileExistsAsync(fullPath))) {
           return res.status(404).json({ success: false, error: 'File not found.' });
         }
         res.setHeader('Cache-Control', 'public, max-age=3600');
-        return res.sendFile(path.resolve(fullPath), { dotfiles: 'allow' });
+        return res.sendFile(fullPath, { dotfiles: 'allow' });
       } catch (err) {
         return res.status(500).json({ success: false, error: err.message });
       }
@@ -405,7 +436,7 @@ function createShareController({ config, shareStore, contextService, albumStore 
         if (share.allowDownload === false) {
           return res.status(403).json({ success: false, error: 'Downloads are disabled for this view-only share link.' });
         }
-        if (share.passcodeHash && !shareStore.verifyPasscode(share, extractPasscode(req))) {
+        if (share.passcodeHash && !(await shareStore.verifyPasscodeAsync(share, extractPasscode(req)))) {
           return res.status(401).json({ success: false, requiresPasscode: true, error: 'Passcode required.' });
         }
         const normHash = String(hash || '').trim().toLowerCase();
@@ -429,13 +460,16 @@ function createShareController({ config, shareStore, contextService, albumStore 
           });
           return res.redirect(url);
         }
-        const fullPath = path.join(ctx.storageDir, record.relativePath);
-        if (!(await fileExistsAsync(fullPath))) {
+        const fullPath = resolveInsideStorageDir(ctx.storageDir, record.relativePath);
+        if (!fullPath || !(await fileExistsAsync(fullPath))) {
           return res.status(404).json({ success: false, error: 'File not found.' });
         }
-        const safeName = encodeURIComponent(record.originalName || path.basename(fullPath));
+        const rawDispName = String(record.originalName || path.basename(fullPath))
+          .replace(/[\r\n"\\]/g, '_')
+          .slice(0, 180);
+        const safeName = encodeURIComponent(rawDispName);
         res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
-        return res.sendFile(path.resolve(fullPath), { dotfiles: 'allow', acceptRanges: true });
+        return res.sendFile(fullPath, { dotfiles: 'allow', acceptRanges: true });
       } catch (err) {
         return res.status(500).json({ success: false, error: err.message });
       }
@@ -456,7 +490,7 @@ function createShareController({ config, shareStore, contextService, albumStore 
 
         const share = shareStore.getShare(token);
         if (!share) return res.status(404).json({ success: false, error: 'Share expired or not found.' });
-        if (share.passcodeHash && !shareStore.verifyPasscode(share, extractPasscode(req))) {
+        if (share.passcodeHash && !(await shareStore.verifyPasscodeAsync(share, extractPasscode(req)))) {
           return res.status(401).json({ success: false, requiresPasscode: true, error: 'Passcode required.' });
         }
         const normHash = String(hash || '').trim().toLowerCase();
@@ -472,10 +506,10 @@ function createShareController({ config, shareStore, contextService, albumStore 
 
         const record = found.record;
         if (record.videoProxyRelativePath) {
-          const vpPath = path.join(ctx.storageDir, record.videoProxyRelativePath);
-          if (await fileExistsAsync(vpPath)) {
+          const vpPath = resolveInsideStorageDir(ctx.storageDir, record.videoProxyRelativePath);
+          if (vpPath && (await fileExistsAsync(vpPath))) {
             res.setHeader('Content-Type', 'video/mp4');
-            return res.sendFile(path.resolve(vpPath), { dotfiles: 'allow', acceptRanges: true });
+            return res.sendFile(vpPath, { dotfiles: 'allow', acceptRanges: true });
           }
         }
         if (record.storageType === 's3' && isS3Configured(config.s3)) {
@@ -487,11 +521,11 @@ function createShareController({ config, shareStore, contextService, albumStore 
           });
           return res.redirect(url);
         }
-        const fullPath = path.join(ctx.storageDir, record.relativePath);
-        if (!(await fileExistsAsync(fullPath))) {
+        const fullPath = resolveInsideStorageDir(ctx.storageDir, record.relativePath);
+        if (!fullPath || !(await fileExistsAsync(fullPath))) {
           return res.status(404).json({ success: false, error: 'File not found.' });
         }
-        return res.sendFile(path.resolve(fullPath), { dotfiles: 'allow', acceptRanges: true });
+        return res.sendFile(fullPath, { dotfiles: 'allow', acceptRanges: true });
       } catch (err) {
         return res.status(500).json({ success: false, error: err.message });
       }
@@ -515,7 +549,7 @@ function createShareController({ config, shareStore, contextService, albumStore 
         if (share.allowDownload === false) {
           return res.status(403).json({ success: false, error: 'Downloads are disabled for this view-only share link.' });
         }
-        if (share.passcodeHash && !shareStore.verifyPasscode(share, extractPasscode(req))) {
+        if (share.passcodeHash && !(await shareStore.verifyPasscodeAsync(share, extractPasscode(req)))) {
           return res.status(401).json({ success: false, requiresPasscode: true, error: 'Passcode required.' });
         }
 
@@ -547,8 +581,8 @@ function createShareController({ config, shareStore, contextService, albumStore 
               },
             });
           } else if (record.relativePath) {
-            const fullPath = path.join(ctx.storageDir, record.relativePath);
-            if (await fileExistsAsync(fullPath)) {
+            const fullPath = resolveInsideStorageDir(ctx.storageDir, record.relativePath);
+            if (fullPath && (await fileExistsAsync(fullPath))) {
               entries.push({
                 name,
                 date: entryDate,

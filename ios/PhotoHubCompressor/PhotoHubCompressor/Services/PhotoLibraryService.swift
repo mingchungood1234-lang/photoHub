@@ -48,17 +48,24 @@ final class PhotoLibraryService {
         }
     }
 
-    /// Reads the original filename stored in Photos SQLite/CoreData without downloading iCloud media bytes.
-    static func inspectAssetResources(
+    /// Reads the original filename and byte size stored in Photos SQLite/CoreData without downloading iCloud media bytes.
+    static func inspectAssetResourcesWithSize(
         for asset: PHAsset
-    ) -> (proxyMatch: (prefix: String, filename: String)?, originalFilename: String?) {
+    ) -> (proxyMatch: (prefix: String, filename: String)?, originalFilename: String?, fileSizeBytes: Int64?) {
         let resources = PHAssetResource.assetResources(for: asset)
         var primaryFilename: String?
         var fallbackFilename: String?
+        var fileSizeBytes: Int64?
         for resource in resources {
             let name = resource.originalFilename.trimmingCharacters(in: .whitespacesAndNewlines)
             if let prefix = ProxyGenerator.extractMasterHashPrefix(fromProxyFilename: name) {
-                return ((prefix, name), name)
+                return ((prefix, name), name, nil)
+            }
+            if fileSizeBytes == nil,
+               resource.type == .photo || resource.type == .video || resource.type == .fullSizePhoto || resource.type == .fullSizeVideo,
+               let num = resource.value(forKey: "fileSize") as? NSNumber,
+               num.int64Value > 0 {
+                fileSizeBytes = num.int64Value
             }
             guard !name.isEmpty else { continue }
             if resource.type == .photo || resource.type == .video {
@@ -69,7 +76,15 @@ final class PhotoLibraryService {
                 fallbackFilename = name
             }
         }
-        return (nil, primaryFilename ?? fallbackFilename)
+        return (nil, primaryFilename ?? fallbackFilename, fileSizeBytes)
+    }
+
+    /// Reads the original filename stored in Photos SQLite/CoreData without downloading iCloud media bytes.
+    static func inspectAssetResources(
+        for asset: PHAsset
+    ) -> (proxyMatch: (prefix: String, filename: String)?, originalFilename: String?) {
+        let full = inspectAssetResourcesWithSize(for: asset)
+        return (full.proxyMatch, full.originalFilename)
     }
 
     static func proxyHashPrefixFromAssetResources(_ asset: PHAsset) -> (prefix: String, filename: String)? {
@@ -225,14 +240,14 @@ final class PhotoLibraryService {
             autoreleasepool {
                 let asset = assets.object(at: i)
                 if tracker.isKnownProxy(assetId: asset.localIdentifier) { return }
-                let info = inspectAssetResources(for: asset)
+                let info = inspectAssetResourcesWithSize(for: asset)
                 guard info.proxyMatch == nil, let name = info.originalFilename else { return }
                 let base = URL(fileURLWithPath: name).lastPathComponent
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                     .lowercased()
                 guard !base.isEmpty else { return }
                 let stem = normalizeFilenameStem(base)
-                let sizeBytes = resourceFileSizeBytes(for: asset)
+                let sizeBytes = info.fileSizeBytes
                 let kind = (asset.mediaType == .video) ? "v" : "i"
                 let localId = asset.localIdentifier
 
@@ -314,28 +329,119 @@ final class PhotoLibraryService {
         return nil
     }
 
-    /// Reconciles server photos against local Apple Photos metadata (zero iCloud download) so
-    /// already-present originals & proxies link immediately to `LocalProxyTracker` for zero-download browsing.
-    static func reconcileExistingNativeGalleryAssets(for photos: [ServerPhoto]) {
+    /// Single-pass metadata scan of Apple Photos returning BOTH `proxyPrefixes` (`prefix16 -> localId`)
+    /// and `originalsMap` (`matchKey -> localId`) with only ONE `PHAsset.fetchAssets` and ONE
+    /// `PHAssetResource.assetResources(for:)` call per asset (2x-4x faster than separate scans).
+    static func scanGalleryMetadataSinglePass() -> (proxyPrefixes: [String: String], originalsMap: [String: String]) {
         let auth = PHPhotoLibrary.authorizationStatus(for: .readWrite)
-        guard auth == .authorized || auth == .limited, !photos.isEmpty else { return }
+        guard auth == .authorized || auth == .limited else { return ([:], [:]) }
 
         let tracker = LocalProxyTracker.shared
-        let unresolved = photos.filter { !tracker.hasAnyLiveGalleryAsset(forMasterHash: $0.hash) }
-        guard !unresolved.isEmpty else { return }
+        let options = PHFetchOptions()
+        options.includeHiddenAssets = false
+        options.predicate = NSPredicate(
+            format: "mediaType == %d OR mediaType == %d",
+            PHAssetMediaType.image.rawValue,
+            PHAssetMediaType.video.rawValue
+        )
+        let assets = PHAsset.fetchAssets(with: options)
+        var proxyPrefixes: [String: String] = [:]
+        var originalsMap: [String: String] = [:]
+        originalsMap.reserveCapacity(assets.count * 3)
 
-        let proxyPrefixes = scanExistingProxyPrefixesInPhotos()
-        let originalsMap = scanExistingOriginalMapInPhotos()
+        for i in 0..<assets.count {
+            autoreleasepool {
+                let asset = assets.object(at: i)
+                let localId = asset.localIdentifier
+                let info = inspectAssetResourcesWithSize(for: asset)
+                if let proxyMatch = info.proxyMatch {
+                    if proxyPrefixes[proxyMatch.prefix] == nil {
+                        proxyPrefixes[proxyMatch.prefix] = localId
+                    }
+                    return
+                }
+                if tracker.isKnownProxy(assetId: localId) { return }
+                guard let name = info.originalFilename else { return }
+                let base = URL(fileURLWithPath: name).lastPathComponent
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                guard !base.isEmpty else { return }
+                let stem = normalizeFilenameStem(base)
+                let sizeBytes = info.fileSizeBytes
+                let kind = (asset.mediaType == .video) ? "v" : "i"
+
+                if let sizeBytes, sizeBytes > 0 {
+                    if originalsMap["sz:\(base)|\(sizeBytes)"] == nil { originalsMap["sz:\(base)|\(sizeBytes)"] = localId }
+                    if !stem.isEmpty && originalsMap["szs:\(stem)|\(sizeBytes)"] == nil {
+                        originalsMap["szs:\(stem)|\(sizeBytes)"] = localId
+                    }
+                }
+                if let created = asset.creationDate {
+                    let dayStr = originalDayKeyFormatter.string(from: created)
+                    if let sizeBytes, sizeBytes > 0 {
+                        let szdKey = "szd:\(kind)|\(sizeBytes)|\(dayStr)"
+                        if originalsMap[szdKey] == nil { originalsMap[szdKey] = localId }
+                    }
+                    let datedKey = "dt:\(base)|\(dayStr)"
+                    if originalsMap[datedKey] == nil { originalsMap[datedKey] = localId }
+                    if !stem.isEmpty {
+                        let stemDatedKey = "dts:\(stem)|\(dayStr)"
+                        if originalsMap[stemDatedKey] == nil { originalsMap[stemDatedKey] = localId }
+                    }
+                }
+                if originalsMap["nm:\(base)"] == nil { originalsMap["nm:\(base)"] = localId }
+                if !stem.isEmpty && originalsMap["nms:\(stem)"] == nil { originalsMap["nms:\(stem)"] = localId }
+            }
+        }
+        return (proxyPrefixes, originalsMap)
+    }
+
+    private static let reconcileStateLock = NSLock()
+    private static var lastReconcileAt: Date = .distantPast
+
+    /// Reconciles server photos against local Apple Photos metadata (zero iCloud download) so
+    /// already-present originals & proxies link immediately to `LocalProxyTracker` for zero-download browsing.
+    /// Uses a single batched `PHAsset` check + single-pass metadata scan + single `UserDefaults` flush.
+    /// Returns the number of newly linked native gallery assets.
+    @discardableResult
+    static func reconcileExistingNativeGalleryAssets(for photos: [ServerPhoto], force: Bool = false) -> Int {
+        let auth = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard auth == .authorized || auth == .limited, !photos.isEmpty else { return 0 }
+
+        // Always prime the fast in-memory PHAsset cache in ONE batched PhotoKit call (~5ms).
+        let allHashes = photos.map(\.hash)
+        let resolvedLive = NativeGalleryThumbnailCache.shared.primeLiveAssets(forMasterHashes: allHashes)
+
+        if !force {
+            reconcileStateLock.lock()
+            let elapsed = Date().timeIntervalSince(lastReconcileAt)
+            reconcileStateLock.unlock()
+            if elapsed < 30.0 {
+                return 0
+            }
+        }
+
+        let unresolved = photos.filter { resolvedLive[$0.hash.lowercased()] == nil }
+        guard !unresolved.isEmpty else {
+            reconcileStateLock.lock()
+            lastReconcileAt = Date()
+            reconcileStateLock.unlock()
+            return 0
+        }
+
+        let scan = scanGalleryMetadataSinglePass()
+        var newProxies: [(assetId: String, proxySha256: String, masterHash: String, originalName: String)] = []
+        var newOriginals: [(assetId: String, masterHash: String)] = []
 
         for photo in unresolved {
             let prefix = ProxyGenerator.proxyPrefixTag(forMasterHash: photo.hash)
-            if !prefix.isEmpty, let proxyAssetId = proxyPrefixes[prefix] {
-                tracker.markAsProxy(
+            if !prefix.isEmpty, let proxyAssetId = scan.proxyPrefixes[prefix] {
+                newProxies.append((
                     assetId: proxyAssetId,
                     proxySha256: photo.proxyHash ?? "",
                     masterHash: photo.hash,
                     originalName: photo.originalName
-                )
+                ))
                 continue
             }
             let keys = originalMatchKeys(
@@ -345,26 +451,72 @@ final class PhotoLibraryService {
                 isVideo: photo.isVideo
             )
             for key in keys {
-                if let origAssetId = originalsMap[key] {
-                    tracker.markUploadedOriginal(assetId: origAssetId, masterHash: photo.hash)
+                if let origAssetId = scan.originalsMap[key] {
+                    newOriginals.append((assetId: origAssetId, masterHash: photo.hash))
                     break
                 }
             }
         }
+
+        let linkedCount = newProxies.count + newOriginals.count
+        if linkedCount > 0 {
+            LocalProxyTracker.shared.batchRecordReconciledLinks(
+                proxies: newProxies,
+                uploadedOriginals: newOriginals
+            )
+            let newlyLinkedHashes = newProxies.map(\.masterHash) + newOriginals.map(\.masterHash)
+            NativeGalleryThumbnailCache.shared.primeLiveAssets(forMasterHashes: newlyLinkedHashes)
+        }
+
+        reconcileStateLock.lock()
+        lastReconcileAt = Date()
+        reconcileStateLock.unlock()
+        return linkedCount
+    }
+
+    /// Primes the in-memory `masterHash -> PHAsset` lookup map with ONE batched PhotoKit fetch.
+    static func primeNativeGalleryAssetCache(forMasterHashes hashes: [String]) {
+        _ = NativeGalleryThumbnailCache.shared.primeLiveAssets(forMasterHashes: hashes)
+    }
+
+    /// Preheats upcoming grid thumbnails in Apple's `PHCachingImageManager` for smooth scrolling.
+    static func preheatNativeGalleryThumbnails(forMasterHashes hashes: [String], maxPixelSize: CGFloat = 280) {
+        NativeGalleryThumbnailCache.shared.preheatThumbnails(forMasterHashes: hashes, maxPixelSize: maxPixelSize)
+    }
+
+    /// Releases preheated thumbnail buffers when leaving Cloud or switching filters.
+    static func stopPreheatingNativeGalleryThumbnails() {
+        NativeGalleryThumbnailCache.shared.stopPreheating()
+    }
+
+    /// Loads a fast local thumbnail directly from Apple Photos via `PHCachingImageManager`
+    /// with bounded concurrency, task-cancellation -> `cancelImageRequest`, and optional progressive
+    /// `.opportunistic` delivery (instant ~1ms pre-baked thumbnail followed by sharp thumbnail).
+    static func loadNativeGalleryThumbnailProgressive(
+        forMasterHash masterHash: String,
+        maxPixelSize: CGFloat = 280,
+        onDegraded: ((UIImage) -> Void)? = nil
+    ) async -> UIImage? {
+        guard !Task.isCancelled else { return nil }
+        guard let asset = NativeGalleryThumbnailCache.shared.cachedAsset(forMasterHash: masterHash) else {
+            return nil
+        }
+        return await NativeGalleryThumbnailCache.shared.requestGridThumbnail(
+            for: asset,
+            maxPixelSize: maxPixelSize,
+            onDegraded: onDegraded
+        )
     }
 
     /// Loads a fast local thumbnail directly from Apple Photos (zero network, zero app cache duplication)
     /// when a live copy (restored original, uploaded original, or saved proxy) already exists on this phone.
-    static func loadNativeGalleryThumbnail(forMasterHash masterHash: String, maxPixelSize: CGFloat = 360) async -> UIImage? {
-        guard let asset = LocalProxyTracker.shared.liveGalleryAsset(forMasterHash: masterHash) else {
-            return nil
-        }
-        return await requestLocalGalleryImage(for: asset, maxPixelSize: maxPixelSize, fastResize: true)
+    static func loadNativeGalleryThumbnail(forMasterHash masterHash: String, maxPixelSize: CGFloat = 280) async -> UIImage? {
+        await loadNativeGalleryThumbnailProgressive(forMasterHash: masterHash, maxPixelSize: maxPixelSize, onDegraded: nil)
     }
 
     /// Loads a crisp preview directly from Apple Photos for the Cloud Lightbox without hitting the server.
     static func loadNativeGalleryPreviewImage(forMasterHash masterHash: String, maxPixelSize: CGFloat = 1600) async -> UIImage? {
-        guard let asset = LocalProxyTracker.shared.liveGalleryAsset(forMasterHash: masterHash) else {
+        guard let asset = NativeGalleryThumbnailCache.shared.cachedAsset(forMasterHash: masterHash) else {
             return nil
         }
         return await requestLocalGalleryImage(for: asset, maxPixelSize: maxPixelSize, fastResize: false)
@@ -372,7 +524,7 @@ final class PhotoLibraryService {
 
     /// Loads a local `AVPlayerItem` directly from Apple Photos for instant video playback with zero server download.
     static func loadNativeGalleryAVPlayerItem(forMasterHash masterHash: String) async -> AVPlayerItem? {
-        guard let asset = LocalProxyTracker.shared.liveGalleryAsset(forMasterHash: masterHash),
+        guard let asset = NativeGalleryThumbnailCache.shared.cachedAsset(forMasterHash: masterHash),
               asset.mediaType == .video else {
             return nil
         }
@@ -399,35 +551,41 @@ final class PhotoLibraryService {
         maxPixelSize: CGFloat,
         fastResize: Bool
     ) async -> UIImage? {
-        await withCheckedContinuation { continuation in
-            let options = PHImageRequestOptions()
-            options.isNetworkAccessAllowed = false
-            options.deliveryMode = .highQualityFormat
-            options.resizeMode = fastResize ? .fast : .exact
-            options.isSynchronous = false
-            let targetSize = CGSize(width: maxPixelSize, height: maxPixelSize)
-            let lock = NSLock()
-            var resumed = false
-            PHImageManager.default().requestImage(
-                for: asset,
-                targetSize: targetSize,
-                contentMode: .aspectFill,
-                options: options
-            ) { image, info in
-                let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
-                let isCancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
-                let hasError = info?[PHImageErrorKey] != nil
-                if isDegraded && !isCancelled && !hasError {
-                    return
+        let cancelBox = ImageRequestCancelBox()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let options = PHImageRequestOptions()
+                options.isNetworkAccessAllowed = false
+                options.deliveryMode = .highQualityFormat
+                options.resizeMode = fastResize ? .fast : .exact
+                options.isSynchronous = false
+                let targetSize = CGSize(width: maxPixelSize, height: maxPixelSize)
+                let lock = NSLock()
+                var resumed = false
+                let reqId = PHImageManager.default().requestImage(
+                    for: asset,
+                    targetSize: targetSize,
+                    contentMode: .aspectFill,
+                    options: options
+                ) { image, info in
+                    let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+                    let isCancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
+                    let hasError = info?[PHImageErrorKey] != nil
+                    if isDegraded && !isCancelled && !hasError {
+                        return
+                    }
+                    lock.lock()
+                    let shouldResume = !resumed
+                    resumed = true
+                    lock.unlock()
+                    if shouldResume {
+                        continuation.resume(returning: image)
+                    }
                 }
-                lock.lock()
-                let shouldResume = !resumed
-                resumed = true
-                lock.unlock()
-                if shouldResume {
-                    continuation.resume(returning: image)
-                }
+                cancelBox.store(requestId: reqId, manager: PHImageManager.default())
             }
+        } onCancel: {
+            cancelBox.cancel()
         }
     }
 
@@ -1271,6 +1429,9 @@ final class PhotoLibraryService {
                 updated = nil
             } else {
                 updated = try? await client.setOriginalProtected(masterHash: photo.hash, protected: true)
+                if updated == nil {
+                    LocalProxyTracker.shared.markPendingProtectionSync(masterHashes: [photo.hash])
+                }
             }
             return (updated, max(0, photo.size))
         }
@@ -1341,6 +1502,9 @@ final class PhotoLibraryService {
             updated = nil
         } else {
             updated = try? await client.setOriginalProtected(masterHash: photo.hash, protected: true)
+            if updated == nil {
+                LocalProxyTracker.shared.markPendingProtectionSync(masterHashes: [photo.hash])
+            }
         }
         return (updated, fileSize)
     }
@@ -2300,5 +2464,306 @@ enum OriginalMediaResolver {
                 errorMessage: error.localizedDescription
             )
         }
+    }
+}
+
+/// Thread-safe bridge allowing Swift Task cancellation to cancel an in-flight `PHImageManager` request immediately,
+/// even if cancellation races before `requestImage` returns its `PHImageRequestID`.
+private final class ImageRequestCancelBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var requestId: PHImageRequestID?
+    private weak var manager: PHImageManager?
+    private var isCancelled = false
+    private var onCancelAction: (() -> Void)?
+
+    func setCancelAction(_ action: @escaping () -> Void) {
+        lock.lock()
+        let alreadyCancelled = isCancelled
+        if !alreadyCancelled {
+            onCancelAction = action
+        }
+        lock.unlock()
+        if alreadyCancelled {
+            action()
+        }
+    }
+
+    func store(requestId: PHImageRequestID, manager: PHImageManager) {
+        lock.lock()
+        let alreadyCancelled = isCancelled
+        if !alreadyCancelled {
+            self.requestId = requestId
+            self.manager = manager
+        }
+        lock.unlock()
+        if alreadyCancelled && requestId != PHInvalidImageRequestID {
+            manager.cancelImageRequest(requestId)
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        if isCancelled {
+            lock.unlock()
+            return
+        }
+        isCancelled = true
+        let reqId = requestId
+        let mgr = manager
+        let action = onCancelAction
+        requestId = nil
+        manager = nil
+        onCancelAction = nil
+        lock.unlock()
+
+        if let reqId, reqId != PHInvalidImageRequestID {
+            mgr?.cancelImageRequest(reqId)
+        }
+        action?()
+    }
+}
+
+/// Process-wide native Apple Photos thumbnail manager for the Cloud tab.
+/// Uses `PHCachingImageManager` (Apple's hardware-accelerated grid preheater),
+/// a batched in-memory `masterHash -> PHAsset` lookup map, automatic `PHPhotoLibraryChangeObserver`
+/// invalidation, bounded decode concurrency, and immediate `cancelImageRequest` on scroll-off.
+final class NativeGalleryThumbnailCache: NSObject, PHPhotoLibraryChangeObserver, @unchecked Sendable {
+    static let shared = NativeGalleryThumbnailCache()
+
+    private let lock = NSLock()
+    private let cachingManager: PHCachingImageManager = {
+        let mgr = PHCachingImageManager()
+        mgr.allowsCachingHighQualityImages = false
+        return mgr
+    }()
+    private let decodeSemaphore = AsyncSemaphore(value: 6)
+
+    private var assetByMasterHash: [String: PHAsset] = [:]
+    private var missingMasterHashes: Set<String> = []
+    private var preheatedAssetIds: Set<String> = []
+    private var isObservingPhotoLibrary = false
+
+    private override init() {
+        super.init()
+    }
+
+    private func ensureObserverRegistered() {
+        let auth = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard auth == .authorized || auth == .limited else { return }
+        lock.lock()
+        let shouldRegister = !isObservingPhotoLibrary
+        if shouldRegister { isObservingPhotoLibrary = true }
+        lock.unlock()
+        if shouldRegister {
+            PHPhotoLibrary.shared().register(self)
+        }
+    }
+
+    func photoLibraryDidChange(_ changeInstance: PHChange) {
+        lock.lock()
+        // Invalidate only deleted assets and clear negative-miss cache so newly saved proxies/originals are found.
+        var invalidatedHashes: [String] = []
+        for (hash, asset) in assetByMasterHash {
+            if let details = changeInstance.changeDetails(for: asset), details.objectWasDeleted {
+                invalidatedHashes.append(hash)
+            }
+        }
+        for h in invalidatedHashes {
+            assetByMasterHash.removeValue(forKey: h)
+        }
+        missingMasterHashes.removeAll()
+        lock.unlock()
+    }
+
+    /// Resolves and caches `PHAsset` objects for many master hashes in ONE batched PhotoKit fetch.
+    @discardableResult
+    func primeLiveAssets(forMasterHashes hashes: [String]) -> [String: PHAsset] {
+        let auth = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard auth == .authorized || auth == .limited, !hashes.isEmpty else { return [:] }
+        ensureObserverRegistered()
+
+        let resolved = LocalProxyTracker.shared.batchResolveLiveGalleryAssets(forMasterHashes: hashes)
+        lock.lock()
+        for rawHash in hashes {
+            let norm = rawHash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !norm.isEmpty else { continue }
+            if let asset = resolved[norm] {
+                assetByMasterHash[norm] = asset
+                missingMasterHashes.remove(norm)
+            } else {
+                assetByMasterHash.removeValue(forKey: norm)
+                missingMasterHashes.insert(norm)
+            }
+        }
+        lock.unlock()
+        return resolved
+    }
+
+    /// O(1) memory lookup of a live `PHAsset` for `masterHash`, falling back to a single fetch only on cache miss.
+    func cachedAsset(forMasterHash masterHash: String) -> PHAsset? {
+        let norm = masterHash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !norm.isEmpty else { return nil }
+
+        lock.lock()
+        if let hit = assetByMasterHash[norm] {
+            lock.unlock()
+            return hit
+        }
+        if missingMasterHashes.contains(norm) {
+            lock.unlock()
+            return nil
+        }
+        lock.unlock()
+
+        ensureObserverRegistered()
+        if let asset = LocalProxyTracker.shared.liveGalleryAsset(forMasterHash: norm) {
+            lock.lock()
+            assetByMasterHash[norm] = asset
+            missingMasterHashes.remove(norm)
+            lock.unlock()
+            return asset
+        } else {
+            lock.lock()
+            missingMasterHashes.insert(norm)
+            lock.unlock()
+            return nil
+        }
+    }
+
+    func invalidateAll() {
+        lock.lock()
+        assetByMasterHash.removeAll()
+        missingMasterHashes.removeAll()
+        preheatedAssetIds.removeAll()
+        lock.unlock()
+        cachingManager.stopCachingImagesForAllAssets()
+    }
+
+    private func gridImageOptions() -> PHImageRequestOptions {
+        let options = PHImageRequestOptions()
+        options.isNetworkAccessAllowed = false
+        options.deliveryMode = .opportunistic
+        options.resizeMode = .fast
+        options.isSynchronous = false
+        return options
+    }
+
+    func preheatThumbnails(forMasterHashes hashes: [String], maxPixelSize: CGFloat = 280) {
+        guard !hashes.isEmpty else { return }
+        let auth = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard auth == .authorized || auth == .limited else { return }
+
+        var toPreheat: [PHAsset] = []
+        toPreheat.reserveCapacity(hashes.count)
+
+        lock.lock()
+        for rawHash in hashes {
+            let norm = rawHash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !norm.isEmpty,
+                  let asset = assetByMasterHash[norm],
+                  !preheatedAssetIds.contains(asset.localIdentifier) else {
+                continue
+            }
+            preheatedAssetIds.insert(asset.localIdentifier)
+            toPreheat.append(asset)
+        }
+        // Keep preheated set bounded so Apple Photos cache stays lean on multi-thousand-photo libraries.
+        let shouldResetCache = preheatedAssetIds.count > 160
+        if shouldResetCache {
+            preheatedAssetIds = Set(toPreheat.map(\.localIdentifier))
+        }
+        lock.unlock()
+
+        if shouldResetCache {
+            cachingManager.stopCachingImagesForAllAssets()
+        }
+        guard !toPreheat.isEmpty else { return }
+        let targetSize = CGSize(width: maxPixelSize, height: maxPixelSize)
+        cachingManager.startCachingImages(
+            for: toPreheat,
+            targetSize: targetSize,
+            contentMode: .aspectFill,
+            options: gridImageOptions()
+        )
+    }
+
+    func stopPreheating() {
+        lock.lock()
+        preheatedAssetIds.removeAll()
+        lock.unlock()
+        cachingManager.stopCachingImagesForAllAssets()
+    }
+
+    func requestGridThumbnail(
+        for asset: PHAsset,
+        maxPixelSize: CGFloat = 280,
+        onDegraded: ((UIImage) -> Void)? = nil
+    ) async -> UIImage? {
+        guard !Task.isCancelled else { return nil }
+        await decodeSemaphore.acquire()
+        if Task.isCancelled {
+            await decodeSemaphore.release()
+            return nil
+        }
+
+        let cancelBox = ImageRequestCancelBox()
+        let result: UIImage? = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let options = gridImageOptions()
+                let targetSize = CGSize(width: maxPixelSize, height: maxPixelSize)
+                let stateLock = NSLock()
+                var resumed = false
+                var lastDegraded: UIImage?
+
+                let resumeOnce: (UIImage?) -> Void = { img in
+                    stateLock.lock()
+                    let shouldResume = !resumed
+                    resumed = true
+                    stateLock.unlock()
+                    if shouldResume {
+                        continuation.resume(returning: img)
+                    }
+                }
+
+                cancelBox.setCancelAction {
+                    resumeOnce(nil)
+                }
+
+                let reqId = cachingManager.requestImage(
+                    for: asset,
+                    targetSize: targetSize,
+                    contentMode: .aspectFill,
+                    options: options
+                ) { image, info in
+                    let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+                    let isCancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
+                    let hasError = info?[PHImageErrorKey] != nil
+
+                    if isCancelled {
+                        resumeOnce(nil)
+                        return
+                    }
+                    if isDegraded && !hasError {
+                        if let image {
+                            stateLock.lock()
+                            lastDegraded = image
+                            stateLock.unlock()
+                            onDegraded?(image)
+                        }
+                        return
+                    }
+                    stateLock.lock()
+                    let fallback = lastDegraded
+                    stateLock.unlock()
+                    resumeOnce(image ?? fallback)
+                }
+                cancelBox.store(requestId: reqId, manager: cachingManager)
+            }
+        } onCancel: {
+            cancelBox.cancel()
+        }
+
+        await decodeSemaphore.release()
+        return result
     }
 }

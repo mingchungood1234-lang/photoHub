@@ -175,6 +175,8 @@ private struct ServerPhotosResponse: Decodable {
     let total: Int
     let hasMore: Bool?
     let trashCount: Int?
+    let protectedCount: Int?
+    let favoriteCount: Int?
     let photos: [ServerPhoto]
 }
 
@@ -614,6 +616,60 @@ final class PhotoHubAPIClient {
 
     private func photosCacheScopeKey() -> String {
         "\(settings.normalizedBaseURL?.absoluteString ?? "none")|\(settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines))"
+    }
+
+    func invalidatePhotosETagCache() {
+        let scopeKey = photosCacheScopeKey()
+        Self.photosETagLock.lock()
+        Self.photosETagByScope.removeValue(forKey: scopeKey)
+        Self.photosETagLock.unlock()
+    }
+
+    /// Lightweight sync endpoint returning the authoritative set of protected master hashes on the server
+    /// (`GET /api/photos?protected=1`), returning `nil` if connected to an older backend without `?protected=1`.
+    func fetchProtectedMasterHashes() async throws -> Set<String>? {
+        var collected = Set<String>()
+        var offset = 0
+        let pageSize = 1000
+        while true {
+            var components = URLComponents(url: try makeURL("/api/photos"), resolvingAgainstBaseURL: false)
+            components?.queryItems = [
+                URLQueryItem(name: "protected", value: "1"),
+                URLQueryItem(name: "limit", value: String(pageSize)),
+                URLQueryItem(name: "offset", value: String(offset)),
+            ]
+            guard let url = components?.url else {
+                throw APIClientError.invalidServerURL
+            }
+            var request = URLRequest(url: url)
+            request.httpMethod = "GET"
+            applyAuth(to: &request)
+
+            let (data, response) = try await pooledSession.data(for: request)
+            try validateHTTP(response: response, data: data)
+            let decoded = try JSONDecoder().decode(ServerPhotosResponse.self, from: data)
+            // Guard against older server builds that ignore `?protected=1` and omit `protectedCount`.
+            if decoded.protectedCount == nil {
+                return nil
+            }
+            for item in decoded.photos where item.isProtectedOriginal {
+                collected.insert(item.hash.lowercased())
+            }
+            if decoded.photos.isEmpty { break }
+            offset += decoded.photos.count
+            let serverHasMore = decoded.hasMore ?? (offset < decoded.total)
+            if !serverHasMore || offset >= decoded.total { break }
+        }
+        return collected
+    }
+
+    /// Pushes any locally restored original protections that previously failed to reach the server (offline restore).
+    func flushPendingProtectionUploads() async {
+        let pending = LocalProxyTracker.shared.pendingProtectionSyncHashes()
+        guard !pending.isEmpty else { return }
+        if (try? await setOriginalsProtectedBatch(masterHashes: pending, protected: true, notifyStore: false)) != nil {
+            LocalProxyTracker.shared.clearPendingProtectionSync(masterHashes: pending)
+        }
     }
 
     func fetchServerPhotos(limit: Int = 500, offset: Int = 0, sync: Bool = false) async throws -> [ServerPhoto] {
@@ -2037,6 +2093,7 @@ final class PhotoHubAPIClient {
             apiKey: settings.apiKey,
             notify: true
         )
+        invalidatePhotosETagCache()
         return updated
     }
 
@@ -2096,6 +2153,7 @@ final class PhotoHubAPIClient {
                 apiKey: settings.apiKey,
                 notify: notifyStore
             )
+            invalidatePhotosETagCache()
         }
         return allUpdated
     }
@@ -2210,6 +2268,7 @@ final class PhotoHubAPIClient {
             apiKey: settings.apiKey,
             notify: true
         )
+        invalidatePhotosETagCache()
         return updated
     }
 

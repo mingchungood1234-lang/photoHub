@@ -10,12 +10,20 @@ const fsp = require('fs/promises');
 const path = require('path');
 
 const VALID_CATEGORIES = new Set(['trip', 'event', 'family', 'custom']);
+const MAX_CATEGORY_LENGTH = 40;
 const MAX_ALBUMS_PER_USER = 300;
 const MAX_PHOTOS_PER_ALBUM = 2000;
 
 function normalizeCategory(raw) {
-  const clean = String(raw || '').trim().toLowerCase();
-  return VALID_CATEGORIES.has(clean) ? clean : 'custom';
+  const cleaned = String(raw || '')
+    .replace(/[\x00-\x1F\x7F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, MAX_CATEGORY_LENGTH);
+  if (!cleaned) return 'custom';
+  const lower = cleaned.toLowerCase();
+  if (VALID_CATEGORIES.has(lower)) return lower;
+  return cleaned;
 }
 
 function normalizeHashes(hashes = []) {

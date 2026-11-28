@@ -58,8 +58,10 @@ final class LocalProxySyncManager: ObservableObject {
         let task = Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
             do {
+                await client.flushPendingProtectionUploads()
                 let fetched = try await client.fetchAllServerPhotos(sync: false)
                 if Task.isCancelled { return }
+                LocalProxyTracker.shared.syncProtectionStateFromServer(photos: fetched)
                 LocalProxyStore.shared.savePhotos(fetched, baseURL: baseURL, apiKey: apiKey)
                 DispatchQueue.main.async {
                     NotificationCenter.default.post(name: .localProxyStoreDidChange, object: nil)
@@ -173,15 +175,20 @@ final class LocalProxySyncManager: ObservableObject {
     ) async {
         let store = LocalProxyStore.shared
         let tracker = LocalProxyTracker.shared
+        tracker.syncProtectionStateFromServer(photos: photos)
         let canReadPhotos = PhotoLibraryService.canWriteToPhotosLibrary()
         let canWritePhotos = saveToPhotosApp && canReadPhotos
-        let existingProxyPrefixes = canReadPhotos
-            ? PhotoLibraryService.scanExistingProxyPrefixesInPhotos()
+        let resolvedLiveAssets = canReadPhotos
+            ? tracker.batchResolveLiveGalleryAssets(forMasterHashes: photos.map(\.hash))
             : [:]
-        let existingOriginalsMap = canReadPhotos
-            ? PhotoLibraryService.scanExistingOriginalMapInPhotos()
-            : [:]
+        let singlePassScan = canReadPhotos
+            ? PhotoLibraryService.scanGalleryMetadataSinglePass()
+            : (proxyPrefixes: [:], originalsMap: [:])
+        let existingProxyPrefixes = singlePassScan.proxyPrefixes
+        let existingOriginalsMap = singlePassScan.originalsMap
 
+        var reconciledProxies: [(assetId: String, proxySha256: String, masterHash: String, originalName: String)] = []
+        var reconciledOriginals: [(assetId: String, masterHash: String)] = []
         var workItems: [LocalPrefetchWorkItem] = []
 
         for photo in photos {
@@ -191,12 +198,12 @@ final class LocalProxySyncManager: ObservableObject {
             let prefixTag = ProxyGenerator.proxyPrefixTag(forMasterHash: photo.hash)
             let iCloudSyncedProxyAssetId = existingProxyPrefixes[prefixTag]
             if let iCloudSyncedProxyAssetId {
-                tracker.markAsProxy(
+                reconciledProxies.append((
                     assetId: iCloudSyncedProxyAssetId,
                     proxySha256: photo.proxyHash ?? "",
                     masterHash: photo.hash,
                     originalName: photo.originalName
-                )
+                ))
             }
 
             // Detect any matching original already sitting in Apple Photos (prevents duplicate downloads & saves!)
@@ -211,7 +218,7 @@ final class LocalProxySyncManager: ObservableObject {
                 for key in matchKeys {
                     if let foundId = existingOriginalsMap[key] {
                         matchedOriginalAssetId = foundId
-                        tracker.markUploadedOriginal(assetId: foundId, masterHash: photo.hash)
+                        reconciledOriginals.append((assetId: foundId, masterHash: photo.hash))
                         break
                     }
                 }
@@ -219,7 +226,7 @@ final class LocalProxySyncManager: ObservableObject {
 
             let isActiveUpload = AssetUploadCoordinator.shared.isMasterHashActive(photo.hash)
                 || BackgroundUploadTransport.shared.activeMasterHashes().contains(photo.hash.lowercased())
-            let hasLiveNativeGalleryAsset = tracker.hasAnyLiveGalleryAsset(forMasterHash: photo.hash)
+            let hasLiveNativeGalleryAsset = (resolvedLiveAssets[photo.hash.lowercased()] != nil)
                 || iCloudSyncedProxyAssetId != nil
                 || matchedOriginalAssetId != nil
                 || isActiveUpload
@@ -270,6 +277,16 @@ final class LocalProxySyncManager: ObservableObject {
                     )
                 )
             }
+        }
+
+        if !reconciledProxies.isEmpty || !reconciledOriginals.isEmpty {
+            tracker.batchRecordReconciledLinks(
+                proxies: reconciledProxies,
+                uploadedOriginals: reconciledOriginals
+            )
+            PhotoLibraryService.primeNativeGalleryAssetCache(
+                forMasterHashes: reconciledProxies.map(\.masterHash) + reconciledOriginals.map(\.masterHash)
+            )
         }
 
         guard !workItems.isEmpty else {
@@ -820,11 +837,15 @@ enum BatchRestoreRunner {
             guard pendingProtectHashes.count >= threshold else { return }
             let chunk = pendingProtectHashes
             pendingProtectHashes.removeAll(keepingCapacity: true)
-            _ = try? await client.setOriginalsProtectedBatch(
-                masterHashes: chunk,
-                protected: true,
-                notifyStore: false
-            )
+            do {
+                _ = try await client.setOriginalsProtectedBatch(
+                    masterHashes: chunk,
+                    protected: true,
+                    notifyStore: false
+                )
+            } catch {
+                LocalProxyTracker.shared.markPendingProtectionSync(masterHashes: chunk)
+            }
         }
 
         await flushProtectChunkIfNeeded(force: false)

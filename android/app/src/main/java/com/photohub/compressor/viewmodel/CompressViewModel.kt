@@ -182,6 +182,15 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
         val cur = settings.current
         val backupOnly = cur.isBackupOnlyMode
         viewModelScope.launch(Dispatchers.IO) {
+            // Sync webpage Allow Re-Proxy / Protect updates BEFORE scanning Gallery
+            // so unlocked originals immediately show up ready to compress!
+            if (cur.isSignedIn) {
+                val apiClient = PhotoHubApiClient(context, settings)
+                runCatching { apiClient.flushPendingProtectionUploads() }
+                runCatching { apiClient.fetchProtectedMasterHashes() }.getOrNull()?.let { serverProtected ->
+                    tracker.syncProtectedMasterHashesFromServer(serverProtected)
+                }
+            }
             val cached = LocalProxyStore.getInstance(context)
                 .cachedPhotos(cur.normalizedBaseUrl, cur.apiKeyCacheScope)
             val raw = mediaService.scanCandidates(
@@ -242,6 +251,13 @@ class CompressViewModel(application: Application) : AndroidViewModel(application
         val cur = settings.current
         val backupOnly = cur.isBackupOnlyMode
         viewModelScope.launch(Dispatchers.IO) {
+            if (cur.isSignedIn) {
+                val apiClient = PhotoHubApiClient(context, settings)
+                runCatching { apiClient.flushPendingProtectionUploads() }
+                runCatching { apiClient.fetchProtectedMasterHashes() }.getOrNull()?.let { serverProtected ->
+                    tracker.syncProtectedMasterHashesFromServer(serverProtected)
+                }
+            }
             val cached = LocalProxyStore.getInstance(context)
                 .cachedPhotos(cur.normalizedBaseUrl, cur.apiKeyCacheScope)
             val raw = mediaService.scanCandidates(

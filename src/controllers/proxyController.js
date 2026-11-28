@@ -17,6 +17,21 @@ const {
   generateServerSideProxy,
 } = require('../services/proxyService');
 
+const MAX_BASE64_IMAGE_PROXY_BYTES = 10 * 1024 * 1024; // 10 MB
+const MAX_BASE64_VIDEO_PROXY_BYTES = 20 * 1024 * 1024; // 20 MB
+const MAX_STREAM_VIDEO_PROXY_BYTES = 500 * 1024 * 1024; // 500 MB
+
+function resolveSafeChildPath(baseDir, fileName) {
+  const root = path.resolve(baseDir);
+  const resolved = path.resolve(root, fileName);
+  if (resolved === root || !resolved.startsWith(root + path.sep)) {
+    const err = new Error('Invalid proxy path');
+    err.statusCode = 400;
+    throw err;
+  }
+  return resolved;
+}
+
 function createProxyController({ config }) {
   return {
     async registerProxy(req, res) {
@@ -36,13 +51,52 @@ function createProxyController({ config }) {
           });
         }
 
+        const rawMaster = String(masterHash).trim().toLowerCase();
+        if (!/^[a-f0-9]{16,128}$/.test(rawMaster)) {
+          return res.status(400).json({
+            success: false,
+            error: 'Invalid "masterHash" format',
+          });
+        }
+
         const { hashIndex, storageDir } = req.userContext;
-        const normMaster = String(masterHash).trim().toLowerCase();
+        // CRITICAL: Verify master exists in this user's HashIndex BEFORE writing any file to disk!
+        const lookupResult = await hashIndex.lookup(rawMaster, { allowStatFastPath: true });
+        if (lookupResult.status === 'missing' || !lookupResult.record) {
+          return res.status(404).json({
+            success: false,
+            error: 'Master photo not found or failed disk verification',
+          });
+        }
+
+        const normMaster = String(lookupResult.masterHash || rawMaster)
+          .trim()
+          .toLowerCase()
+          .replace(/[^a-f0-9]/g, '');
+        if (!normMaster || normMaster.length < 16) {
+          return res.status(400).json({
+            success: false,
+            error: 'Invalid canonical master hash',
+          });
+        }
+
         const proxyMeta = {};
         const proxiesDir = path.join(storageDir, '.proxies');
 
         if (proxyBase64 && typeof proxyBase64 === 'string') {
+          if (proxyBase64.length > Math.ceil((MAX_BASE64_IMAGE_PROXY_BYTES * 4) / 3) + 64) {
+            return res.status(413).json({
+              success: false,
+              error: 'Image proxy payload exceeds maximum allowed size (10 MB)',
+            });
+          }
           const proxyBuf = Buffer.from(proxyBase64, 'base64');
+          if (proxyBuf.length > MAX_BASE64_IMAGE_PROXY_BYTES) {
+            return res.status(413).json({
+              success: false,
+              error: 'Image proxy payload exceeds maximum allowed size (10 MB)',
+            });
+          }
           if (proxyBuf.length > 0) {
             const ext =
               String(proxyFormat || '').toLowerCase() === 'heic'
@@ -50,7 +104,7 @@ function createProxyController({ config }) {
                 : '.jpg';
             await fs.promises.mkdir(proxiesDir, { recursive: true });
             const proxyFileName = `${normMaster}${ext}`;
-            const proxyFullPath = path.join(proxiesDir, proxyFileName);
+            const proxyFullPath = resolveSafeChildPath(proxiesDir, proxyFileName);
             await fs.promises.writeFile(proxyFullPath, proxyBuf);
             proxyMeta.proxyRelativePath = `.proxies/${proxyFileName}`;
             proxyMeta.proxySize = proxyBuf.length;
@@ -58,11 +112,23 @@ function createProxyController({ config }) {
         }
 
         if (videoProxyBase64 && typeof videoProxyBase64 === 'string') {
+          if (videoProxyBase64.length > Math.ceil((MAX_BASE64_VIDEO_PROXY_BYTES * 4) / 3) + 64) {
+            return res.status(413).json({
+              success: false,
+              error: 'Video proxy base64 payload exceeds maximum allowed size (20 MB)',
+            });
+          }
           const videoBuf = Buffer.from(videoProxyBase64, 'base64');
+          if (videoBuf.length > MAX_BASE64_VIDEO_PROXY_BYTES) {
+            return res.status(413).json({
+              success: false,
+              error: 'Video proxy base64 payload exceeds maximum allowed size (20 MB)',
+            });
+          }
           if (videoBuf.length > 0) {
             await fs.promises.mkdir(proxiesDir, { recursive: true });
             const videoFileName = `${normMaster}.mp4`;
-            const videoFullPath = path.join(proxiesDir, videoFileName);
+            const videoFullPath = resolveSafeChildPath(proxiesDir, videoFileName);
             await fs.promises.writeFile(videoFullPath, videoBuf);
             proxyMeta.videoProxyRelativePath = `.proxies/${videoFileName}`;
             proxyMeta.videoProxySize = videoBuf.length;
@@ -70,7 +136,7 @@ function createProxyController({ config }) {
         }
 
         const updated = await hashIndex.registerProxy(
-          masterHash,
+          lookupResult.masterHash,
           proxyHash,
           assetId,
           proxyMeta
@@ -91,7 +157,7 @@ function createProxyController({ config }) {
           savedPath: updated.relativePath,
         });
       } catch (err) {
-        return res.status(500).json({
+        return res.status(err.statusCode || 500).json({
           success: false,
           error: err.message,
         });
@@ -111,13 +177,17 @@ function createProxyController({ config }) {
           });
         }
 
-        const normMaster = lookupResult.masterHash.replace(/[^a-f0-9_-]/gi, '');
+        const normMaster = lookupResult.masterHash.replace(/[^a-f0-9]/gi, '');
         const proxiesDir = path.join(storageDir, '.proxies');
         await fs.promises.mkdir(proxiesDir, { recursive: true });
         const videoFileName = `${normMaster}.mp4`;
-        const videoFullPath = path.join(proxiesDir, videoFileName);
+        const videoFullPath = resolveSafeChildPath(proxiesDir, videoFileName);
         tmpPath = `${videoFullPath}.${process.pid}.${Date.now()}.tmp`;
 
+        const maxVideoProxyBytes = Math.min(
+          Number(config.maxFileSizeBytes) || MAX_STREAM_VIDEO_PROXY_BYTES,
+          MAX_STREAM_VIDEO_PROXY_BYTES
+        );
         const providedProxyHash = String(req.headers['x-proxy-hash'] || '').trim().toLowerCase();
         const assetId = String(req.headers['x-asset-id'] || '').trim();
         const shaHasher = providedProxyHash ? null : crypto.createHash('sha256');
@@ -137,7 +207,7 @@ function createProxyController({ config }) {
           req.on('error', fail);
           req.on('data', (chunk) => {
             totalBytes += chunk.length;
-            if (totalBytes > config.maxFileSizeBytes) {
+            if (totalBytes > maxVideoProxyBytes) {
               const err = new Error('Video proxy exceeds maximum upload size');
               err.statusCode = 413;
               fail(err);

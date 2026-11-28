@@ -19,7 +19,7 @@ const path = require('path');
 const zlib = require('zlib');
 const { promisify } = require('util');
 const { isS3Configured, createPresignedUrl, deleteS3Object } = require('../services/s3Service');
-const { isVideoFilename } = require('../services/proxyService');
+const { isVideoFilename, generateGridThumbnail } = require('../services/proxyService');
 const { buildMemories } = require('../services/memoryService');
 const { buildCleanupSuggestions } = require('../services/mediaAnalysisService');
 const {
@@ -339,7 +339,83 @@ async function streamImmutableFileFast(
   });
 }
 
+function sendSmallCachedBufferFast(
+  req,
+  res,
+  {
+    buffer,
+    mtimeMs = Date.now(),
+    contentType,
+    variant = null,
+    masterHash = null,
+    cacheStatus = null,
+    varyAccept = false,
+  }
+) {
+  if (req.socket && typeof req.socket.setNoDelay === 'function') {
+    req.socket.setNoDelay(true);
+  }
+  const size = buffer.length;
+  const mtimeInt = Math.trunc(Number(mtimeMs) || Date.now());
+  const etag = masterHash
+    ? `W/"t-${String(masterHash).slice(0, 16)}-${variant || 'img'}-${size.toString(16)}"`
+    : `W/"t-${size.toString(16)}-${mtimeInt.toString(16)}"`;
+  res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+  res.setHeader('ETag', etag);
+  res.setHeader('Last-Modified', new Date(mtimeInt).toUTCString());
+  res.setHeader('Content-Type', contentType || 'image/jpeg');
+  if (varyAccept) res.setHeader('Vary', 'Accept');
+  if (variant) res.setHeader('X-Photo-Variant', variant);
+  if (masterHash) res.setHeader('X-Master-Sha256', masterHash);
+  if (cacheStatus) res.setHeader('X-Thumb-Cache', cacheStatus);
+
+  const ifNoneMatch = String((req.headers && req.headers['if-none-match']) || '').trim();
+  if (
+    ifNoneMatch &&
+    (ifNoneMatch === etag || ifNoneMatch.split(',').map((s) => s.trim()).includes(etag))
+  ) {
+    return res.status(304).end();
+  }
+
+  res.setHeader('Content-Length', String(size));
+  res.status(200);
+  if (req.method === 'HEAD') return res.end();
+  return res.end(buffer);
+}
+
 function createPhotoController({ config }) {
+  function getThumbCacheDir(folderName, storageDir) {
+    if (config && config.dataDir) {
+      const safeFolder = String(folderName || '_root_')
+        .trim()
+        .replace(/[^a-zA-Z0-9_-]/g, '_') || '_root_';
+      return path.join(config.dataDir, 'thumb-cache', safeFolder);
+    }
+    return path.join(storageDir, '.proxies', 'thumbs');
+  }
+
+  async function lookupPhotoFastForPreview(req, res) {
+    const { hashIndex } = req.userContext;
+    const rawHash = String(req.params.hash || '').trim().toLowerCase();
+    if (!rawHash) {
+      res.status(404).json({ success: false, error: 'Photo not found' });
+      return null;
+    }
+    const direct = hashIndex.records.get(rawHash);
+    if (direct) {
+      const masterHash = String(direct.diskHash || direct.hash || rawHash).trim().toLowerCase();
+      return { status: 'master', masterHash, record: direct };
+    }
+    const mappedMaster = hashIndex.proxyToMaster.get(rawHash);
+    if (mappedMaster) {
+      const rec = hashIndex.records.get(mappedMaster);
+      if (rec) {
+        return { status: 'proxy', masterHash: mappedMaster, record: rec };
+      }
+    }
+    return lookupPhotoOr404(req, res);
+  }
+
   async function lookupPhotoOr404(req, res, { includeTrashed = true, includeStat = false } = {}) {
     const { hashIndex } = req.userContext;
     const lookupResult = await hashIndex.lookup(req.params.hash, {
@@ -433,6 +509,26 @@ function createPhotoController({ config }) {
       await unlinkIfExists(videoProxyFullPath);
     }
 
+    // Clean up any cached local SSD grid thumbnails for this photo
+    const canonicalHash = String(record.diskHash || record.hash || '').trim().toLowerCase();
+    if (canonicalHash) {
+      const baseDirs = new Set([path.join(storageDir, '.proxies', 'thumbs')]);
+      if (config && config.dataDir) {
+        const thumbRoot = path.join(config.dataDir, 'thumb-cache');
+        const folderGuess = path.relative(config.storageDir || storageDir, storageDir);
+        const safeFolder =
+          folderGuess && !folderGuess.startsWith('..')
+            ? folderGuess.replace(/[^a-zA-Z0-9_-]/g, '_') || '_root_'
+            : '_root_';
+        baseDirs.add(path.join(thumbRoot, safeFolder));
+        baseDirs.add(path.join(thumbRoot, '_root_'));
+      }
+      for (const dir of baseDirs) {
+        await unlinkIfExists(path.join(dir, `${canonicalHash}.webp`)).catch(() => {});
+        await unlinkIfExists(path.join(dir, `${canonicalHash}.jpg`)).catch(() => {});
+      }
+    }
+
     return (
       (Number(record.size) || 0) +
       (Number(record.proxySize) || 0) +
@@ -487,7 +583,7 @@ function createPhotoController({ config }) {
         const searchParam = req.query.q ? String(req.query.q).trim() : '';
         const orderParam = req.query.order === 'asc' ? 'asc' : 'desc';
 
-        const etag = `W/"v${hashIndex.version || 1}-${hashIndex.size()}-${offset}-${limit}-${yearParam}-${mediaTypeParam}-${prefixParam}-${favoriteParam}-${protectedParam}-${encodeURIComponent(searchParam)}-${orderParam}"`;
+        const etag = `W/"v${hashIndex.version || 1}-${hashIndex.instanceNonce || '1'}-${hashIndex.size()}-${offset}-${limit}-${yearParam}-${mediaTypeParam}-${prefixParam}-${favoriteParam}-${protectedParam}-${encodeURIComponent(searchParam)}-${orderParam}"`;
         res.setHeader('ETag', etag);
         res.setHeader('Cache-Control', 'private, no-cache');
         const ifNoneMatch = String(req.headers['if-none-match'] || '').trim();
@@ -579,12 +675,18 @@ function createPhotoController({ config }) {
     async getPhotoMap(req, res) {
       try {
         const { hashIndex } = req.userContext;
+        const forceRescan = req.query.rescan === '1' || req.query.rescan === 'true';
+        const scanResult = await hashIndex.backfillExifGeo({
+          maxFiles: forceRescan ? 5000 : 350,
+          force: forceRescan,
+        });
+
         const all = hashIndex.listMasters();
         const geoPhotos = all.filter(
           (p) => typeof p.gpsLat === 'number' && typeof p.gpsLng === 'number'
         );
 
-        // Cluster nearby photos (~0.15 deg grid cell ~ 15km) for snappy map markers
+        // Cluster nearby photos (~0.15 deg grid cell ~ 15km) for place filter pills & summary
         const clusterMap = new Map();
         for (const p of geoPhotos) {
           const cellLat = Math.round(p.gpsLat * 6) / 6;
@@ -619,13 +721,22 @@ function createPhotoController({ config }) {
           }))
           .sort((a, b) => b.count - a.count);
 
+        const googleMapsApiKey = config.googleMapsApiKey || null;
+
         return sendJsonOptimized(req, res, {
           success: true,
           totalPhotos: all.length,
           geoTaggedCount: geoPhotos.length,
           clusterCount: clusters.length,
+          scannedNow: scanResult.scanned,
+          newlyFoundGps: scanResult.foundGps,
+          remainingToScan: scanResult.remaining,
+          mapConfig: {
+            googleMapsApiKey,
+            defaultProvider: googleMapsApiKey ? 'google' : 'leaflet',
+          },
           clusters,
-          photos: geoPhotos.slice(0, 1000),
+          photos: geoPhotos.slice(0, 5000),
         });
       } catch (err) {
         return res.status(500).json({ success: false, error: err.message });
@@ -656,22 +767,103 @@ function createPhotoController({ config }) {
 
     async streamPreview(req, res) {
       try {
-        const lookupResult = await lookupPhotoOr404(req, res);
+        const lookupResult = await lookupPhotoFastForPreview(req, res);
         if (!lookupResult) return undefined;
 
-        const { storageDir } = req.userContext;
+        const { storageDir, folderName } = req.userContext;
         const record = lookupResult.record;
-        if (record.proxyRelativePath) {
-          const proxyPath = path.join(storageDir, record.proxyRelativePath);
-          if (await fileExistsAsync(proxyPath)) {
-            return sendImmutableMediaFile(res, proxyPath, {
-              variant: 'proxy',
-              masterHash: lookupResult.masterHash,
+        const masterHash = lookupResult.masterHash;
+        const isVideo = isVideoFilename(record.originalName || record.relativePath || '');
+
+        const rawSize = String(req.query.size || '').trim().toLowerCase();
+        const rawW = Number(req.query.w || 0);
+        const wantsGridThumb = rawSize === 'thumb' || (Number.isFinite(rawW) && rawW > 0 && rawW <= 720);
+
+        if (wantsGridThumb) {
+          const targetPx = Number.isFinite(rawW) && rawW > 0 ? Math.min(720, Math.max(120, Math.round(rawW))) : 360;
+          const acceptHeader = String((req.headers && req.headers.accept) || '').toLowerCase();
+          const useWebp = acceptHeader.includes('image/webp');
+          const ext = useWebp ? 'webp' : 'jpg';
+          const suffix = targetPx === 360 ? '' : `_${targetPx}`;
+          const thumbsDir = getThumbCacheDir(folderName, storageDir);
+          const cachedThumbPath = path.join(thumbsDir, `${masterHash}${suffix}.${ext}`);
+
+          // Fast path: serve existing micro-thumbnail directly from local SSD (0 master/FUSE syscalls!)
+          try {
+            const [thumbStat, thumbBuf] = await Promise.all([
+              fsp.stat(cachedThumbPath),
+              fsp.readFile(cachedThumbPath),
+            ]);
+            if (thumbBuf && thumbBuf.length > 0) {
+              return sendSmallCachedBufferFast(req, res, {
+                buffer: thumbBuf,
+                mtimeMs: thumbStat.mtimeMs,
+                contentType: useWebp ? 'image/webp' : 'image/jpeg',
+                variant: useWebp ? 'thumb-webp' : 'thumb-jpeg',
+                masterHash,
+                cacheStatus: 'hit',
+                varyAccept: true,
+              });
+            }
+          } catch {
+            // cache miss -> generate below
+          }
+
+          // Pick fastest existing source (prefer existing JPEG proxy over huge 48MP master)
+          let sourcePath = null;
+          if (record.proxyRelativePath) {
+            const candidateProxy = path.join(storageDir, record.proxyRelativePath);
+            if (await fileExistsAsync(candidateProxy)) {
+              sourcePath = candidateProxy;
+            }
+          }
+          if (!sourcePath && !isVideo && record.storageType !== 's3' && record.relativePath) {
+            const candidateMaster = path.join(storageDir, record.relativePath);
+            if (await fileExistsAsync(candidateMaster)) {
+              sourcePath = candidateMaster;
+            }
+          }
+
+          if (sourcePath) {
+            const generated = await generateGridThumbnail({
+              sourcePath,
+              thumbsDir,
+              masterHash,
+              width: targetPx,
+              format: useWebp ? 'webp' : 'jpeg',
             });
+            if (generated && generated.buffer && generated.buffer.length > 0) {
+              return sendSmallCachedBufferFast(req, res, {
+                buffer: generated.buffer,
+                mtimeMs: Date.now(),
+                contentType: generated.contentType,
+                variant: useWebp ? 'thumb-webp' : 'thumb-jpeg',
+                masterHash,
+                cacheStatus: 'generated',
+                varyAccept: true,
+              });
+            }
           }
         }
 
-        if (isVideoFilename(record.originalName || record.relativePath || '')) {
+        // Full preview (Lightbox) or fallback when micro-thumb couldn't be generated
+        if (record.proxyRelativePath) {
+          const proxyPath = path.join(storageDir, record.proxyRelativePath);
+          try {
+            const proxyStat = await fsp.stat(proxyPath);
+            if (proxyStat.isFile()) {
+              return await streamImmutableFileFast(req, res, proxyPath, {
+                stat: proxyStat,
+                variant: 'proxy',
+                masterHash,
+              });
+            }
+          } catch {
+            // fall through to master check
+          }
+        }
+
+        if (isVideo) {
           return res.status(404).json({
             success: false,
             needsProxy: true,
@@ -682,16 +874,25 @@ function createPhotoController({ config }) {
         if (redirectIfS3(res, record)) return undefined;
 
         const fullPath = path.join(storageDir, record.relativePath);
-        if (!(await fileExistsAsync(fullPath))) {
+        try {
+          const masterStat = await fsp.stat(fullPath);
+          if (!masterStat.isFile()) {
+            return res.status(404).json({
+              success: false,
+              error: 'Photo file not found on disk',
+            });
+          }
+          return await streamImmutableFileFast(req, res, fullPath, {
+            stat: masterStat,
+            variant: 'master',
+            masterHash,
+          });
+        } catch {
           return res.status(404).json({
             success: false,
             error: 'Photo file not found on disk',
           });
         }
-        return sendImmutableMediaFile(res, fullPath, {
-          variant: 'master',
-          masterHash: lookupResult.masterHash,
-        });
       } catch (err) {
         return res.status(500).json({
           success: false,
@@ -749,9 +950,13 @@ function createPhotoController({ config }) {
           });
         }
 
+        const counts = hashIndex.getCategoryCounts();
         return res.json({
           success: true,
           keepOriginalOnDevice: Boolean(updated.keepOriginalOnDevice),
+          protectedCount: counts.protectedCount,
+          favoriteCount: counts.favoriteCount,
+          trashCount: counts.trashCount,
           photo: hashIndex.formatMasterSummary(updated, req.params.hash),
         });
       } catch (err) {
@@ -786,10 +991,14 @@ function createPhotoController({ config }) {
           keepOriginal
         );
 
+        const counts = hashIndex.getCategoryCounts();
         return sendJsonOptimized(req, res, {
           success: true,
           keepOriginalOnDevice: keepOriginal,
           updatedCount: updated.length,
+          protectedCount: counts.protectedCount,
+          favoriteCount: counts.favoriteCount,
+          trashCount: counts.trashCount,
           photos: updated,
           missing,
         });
@@ -820,9 +1029,13 @@ function createPhotoController({ config }) {
           });
         }
 
+        const counts = hashIndex.getCategoryCounts();
         return res.json({
           success: true,
           isFavorite: Boolean(updated.isFavorite),
+          protectedCount: counts.protectedCount,
+          favoriteCount: counts.favoriteCount,
+          trashCount: counts.trashCount,
           photo: hashIndex.formatMasterSummary(updated, req.params.hash),
         });
       } catch (err) {
@@ -867,6 +1080,7 @@ function createPhotoController({ config }) {
         const { trashed, missing } = await hashIndex.moveToTrash(
           rawHashes.slice(0, MAX_BATCH_DELETE_COUNT)
         );
+        const counts = hashIndex.getCategoryCounts();
         return res.json({
           success: true,
           mode: 'trash',
@@ -875,6 +1089,9 @@ function createPhotoController({ config }) {
           missing,
           trashedCount: trashed.length,
           deletedCount: trashed.length,
+          protectedCount: counts.protectedCount,
+          favoriteCount: counts.favoriteCount,
+          trashCount: counts.trashCount,
           freedBytes: 0,
           retentionDays: TRASH_RETENTION_DAYS,
           storage: hashIndex.getStorageUsage(),
@@ -900,11 +1117,15 @@ function createPhotoController({ config }) {
         const { restored, missing } = await hashIndex.restoreFromTrash(
           rawHashes.slice(0, MAX_BATCH_DELETE_COUNT)
         );
+        const counts = hashIndex.getCategoryCounts();
         return res.json({
           success: true,
           restored,
           missing,
           restoredCount: restored.length,
+          protectedCount: counts.protectedCount,
+          favoriteCount: counts.favoriteCount,
+          trashCount: counts.trashCount,
           storage: hashIndex.getStorageUsage(),
         });
       } catch (err) {
@@ -948,11 +1169,15 @@ function createPhotoController({ config }) {
           await hashIndex.removeKeys(Array.from(keysToRemove), { persist: true });
         }
 
+        const counts = hashIndex.getCategoryCounts();
         return res.json({
           success: failed.length === 0,
           deleted,
           failed,
           deletedCount: deleted.length,
+          protectedCount: counts.protectedCount,
+          favoriteCount: counts.favoriteCount,
+          trashCount: counts.trashCount,
           freedBytes,
           storage: hashIndex.getStorageUsage(),
         });

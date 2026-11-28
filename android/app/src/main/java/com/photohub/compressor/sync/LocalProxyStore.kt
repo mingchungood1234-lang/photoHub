@@ -189,9 +189,11 @@ class LocalProxyStore private constructor(context: Context) {
         }
     }
 
-    fun previewData(hash: String): ByteArray? = synchronized(lock) {
+    fun previewData(hash: String): ByteArray? {
+        // Content-addressed preview blobs are written atomically; read without holding `lock`
+        // so parallel Cloud grid thumbnail decodes never serialize behind index mutations.
         val file = previewFile(hash)
-        if (!file.exists()) null else runCatching { file.readBytes() }.getOrNull()
+        return if (!file.exists()) null else runCatching { file.readBytes() }.getOrNull()
     }
 
     /**
@@ -225,7 +227,17 @@ class LocalProxyStore private constructor(context: Context) {
         var shouldTrim = false
         synchronized(lock) {
             ensureDirsLocked()
-            previewFile(hash).writeBytes(data)
+            val dest = previewFile(hash)
+            val tmp = File(dest.parentFile, "${dest.name}.tmp")
+            runCatching {
+                tmp.writeBytes(data)
+                if (!tmp.renameTo(dest)) {
+                    dest.writeBytes(data)
+                    tmp.delete()
+                }
+            }.onFailure {
+                runCatching { tmp.delete() }
+            }
             cacheWriteCounter++
             if (cacheWriteCounter % 32 == 0 && !isTrimmingDiskCache) {
                 isTrimmingDiskCache = true
